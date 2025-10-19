@@ -1,0 +1,412 @@
+# audio_graph.py
+import networkx as nx
+from .utils import as_BCF, assert_BCF
+from .config import RAW_DTYPE
+
+# =========================
+# Graph nodes
+# =========================
+class Node:
+    def __init__(self,name): self.name=name
+    def process(self,frames,sr,audio_in,mods,params): raise NotImplementedError
+
+class DelayNode(Node):
+    def __init__(self,name,delay_samples=64):
+        super().__init__(name)
+        self.delay = delay_samples
+        self.buf = np.zeros((1, 1, delay_samples), RAW_DTYPE)  # (B,C,D)
+        self.w   = np.zeros((1, 1), dtype=int)                 # (B,C)
+
+    def _ensure(self, B, C):
+        if self.buf.shape[:2] != (B, C):
+            self.buf = np.zeros((B, C, self.delay), RAW_DTYPE)
+            self.w   = np.zeros((B, C), dtype=int)
+
+    def process(self, frames, sr, audio_in, mods, params):
+        x = np.zeros((1,1,frames), RAW_DTYPE) if audio_in is None else assert_BCF(audio_in, name="delay.in")
+        B, C, F = x.shape
+        self._ensure(B, C)
+
+        out = np.empty_like(x)
+        idxs = (self.w[..., None] + np.arange(F)[None, None, :]) % self.delay  # (B,C,F)
+        out[:] = self.buf.take(idxs, axis=2, mode='wrap')
+        self.buf[np.arange(B)[:,None,None], np.arange(C)[None,:,None], idxs] = x
+        self.w = (self.w + F) % self.delay
+        return out
+
+class LFONode(Node):
+    def __init__(self,name,wave="sine",rate_hz=4.0,depth=0.5,use_input=False,slew_ms=0.0):
+        super().__init__(name)
+        self.wave=wave; self.rate=rate_hz; self.depth=depth
+        self.use_input=use_input; self.slew_ms=slew_ms
+        self.phase=0.0
+    def _make(self,ph):
+        if self.wave=="sine": return np.sin(2*np.pi*ph,dtype=RAW_DTYPE)
+        if self.wave=="square": return np.where((ph%1.0)<0.5,1.0,-1.0).astype(RAW_DTYPE)
+        if self.wave=="saw": return (2.0*((ph%1.0)) - 1.0).astype(RAW_DTYPE)
+        if self.wave=="triangle": return (2.0*np.abs(2.0*(ph%1.0)-1.0)-1.0).astype(RAW_DTYPE)
+        return np.zeros_like(ph)
+    def process(self,frames,sr,audio_in,mods,params):
+        B = audio_in.shape[0] if self.use_input and audio_in is not None else 1
+        C = 1; F = frames
+        if self.use_input and audio_in is not None:
+            x = assert_BCF(audio_in, name="lfo.in")
+            m = np.maximum(1e-12, np.max(np.abs(x), axis=(1,2)))  # (B,)
+            out = (x[:, :1, :] / m[:, None, None]) * float(self.depth)
+        else:
+            t = (self.phase + np.arange(F)*(self.rate/sr)) % 1.0
+            self.phase = float(t[-1])
+            wave = self._make(t)  # (F,)
+            out = np.tile(wave, (B,1,1))  # (B,1,F)
+            out *= float(self.depth)
+        if self.slew_ms > 0:
+            alpha = 1.0 - math.exp(-1.0/(sr*(self.slew_ms/1000.0)))
+            z = np.zeros((B,1), RAW_DTYPE)
+            for i in range(F):
+                z = z + alpha * (out[:,:,i:i+1] - z)
+                out[:,:,i] = z[:,0]
+        return out  # (B,1,F)
+
+class OscNode(Node):
+    def __init__(self, name, wave="sine"):
+        super().__init__(name); self.wave = wave; self.phase = None
+
+    def process(self, frames, sr, audio_in, mods, params):
+        B = audio_in.shape[0] if audio_in is not None else 1
+        C = 1
+        F = frames
+
+        f = as_BCF(params.get("freq", 0.0), B, C, F, name="osc.freq")[:,0,:]  # (B,F)
+        a = as_BCF(params.get("amp",  1.0), B, C, F, name="osc.amp") [:,0,:]  # (B,F)
+
+        dphi = f / float(sr)
+        if self.phase is None or self.phase.shape[0] != B:
+            self.phase = np.zeros(B, RAW_DTYPE)
+        ph = (self.phase[:, None] + np.cumsum(dphi, axis=1)) % 1.0
+        self.phase = ph[:, -1]
+
+        if self.wave == "sine":
+            w = np.sin(2*np.pi*ph, dtype=RAW_DTYPE)
+        elif self.wave == "saw":
+            w = osc_saw_blep(ph, dphi)
+        elif self.wave == "square":
+            w = osc_square_blep(ph, dphi)
+        elif self.wave == "triangle":
+            w = osc_triangle_blep(ph, dphi)
+        else:
+            w = np.zeros_like(ph)
+
+        return (w * a)[:, None, :]  # (B,1,F)
+
+class SamplerNode(Node):
+    def __init__(self,name,sampler:Sampler):
+        super().__init__(name); self.sampler=sampler
+    def process(self,frames,sr,audio_in,mods,params):
+        B = 1 if audio_in is None else audio_in.shape[0]
+        out = np.empty((B, frames), RAW_DTYPE)
+        rate = params.get("rate", 1.0)
+        tr = params.get("transpose", 0.0)
+        gain = params.get("gain", 1.0)
+        # Vectorized: if params are arrays, use them per channel, else broadcast
+        for b in range(B):
+            self.sampler.render_into(
+                out[b],
+                sr,
+                rate[b] if isinstance(rate, np.ndarray) and rate.shape[0] == B else rate,
+                tr[b] if isinstance(tr, np.ndarray) and tr.shape[0] == B else tr,
+                gain[b] if isinstance(gain, np.ndarray) and gain.shape[0] == B else gain
+            )
+        return out
+
+class MixNode(Node):
+    """
+    Mixes N input bundles (num_inputs, channels, frames) down to (channels, frames).
+    Applies per-channel gain, expands mono to stereo if needed, and supports ALC and compression.
+    """
+    def __init__(self, name, out_channels=2, alc=True, compression="tanh"):
+        super().__init__(name)
+        self.out_channels = out_channels
+        self.alc = alc
+        self.compression = compression  # "tanh" or None
+        self.stats = ClipStats()
+        # For ALC
+        self.rms_hist = [np.zeros(out_channels, dtype=RAW_DTYPE) for _ in range(256)]
+        self.peak_hist = [np.zeros(out_channels, dtype=RAW_DTYPE) for _ in range(256)]
+        self.alpha = 0.5
+        self.attack = 16
+        self.sustain = 128
+        self.decay = 256
+
+    def process(self, frames, sr, audio_in, mods, params):
+        x = assert_BCF(audio_in, name="mix.in")  # (B,C,F)
+        B, C, F = x.shape
+        y = np.sum(x, axis=1, keepdims=True)     # (B,1,F)
+        if self.out_channels > 1:
+            y = np.repeat(y, self.out_channels, axis=1)  # (B,outC,F)
+
+        # (optional) ALC/compression can operate per-channel over y[:,c,:] here
+
+        self.stats.update(y.reshape(-1, F))
+        return y
+
+class BiquadNode(Node):
+    def __init__(self,name,fs,ftype="lowpass"):
+        super().__init__(name); self.ftype=ftype; self.filt=FilterLPBiquad(fs)
+        self.peaking_db=6.0
+    def process(self,frames,sr,audio_in,mods,params):
+        if audio_in is None: return np.zeros((1,frames),RAW_DTYPE)
+        cutoff=params.get("cutoff", 1000.0)  # Default cutoff to 1000.0 Hz if not provided
+        Q=params.get("Q", 0.707)  # Default Q to 0.707 if not provided
+        # cutoff, Q: (B,F)
+        B = audio_in.shape[0]
+        self.filt.ensure_B(B)
+        # Use last frame for filter update (per batch)
+        self.filt.update(float(cutoff[-1,-1]), float(Q[-1,-1]), self.ftype, self.peaking_db)
+        return self.filt.process(audio_in)
+
+class GainNode(Node):
+    def __init__(self,name,gain=1.0): super().__init__(name); self.gain=gain
+    def process(self,frames,sr,audio_in,mods,params):
+        if audio_in is None: return np.zeros((1,frames),RAW_DTYPE)
+        g=params.get("gain",None)
+        if g is None: return audio_in*self.gain
+        return audio_in*g
+
+class SourceSwitch(Node):
+    def __init__(self,name,osc_node:OscNode,samp_node:SamplerNode|None, state):
+        super().__init__(name); self.osc=osc_node; self.samp=samp_node; self.state=state
+    def process(self,frames,sr,audio_in,mods,params):
+        B = audio_in.shape[0] if audio_in is not None else 1
+        if self.state["source_type"]=="sampler" and self.samp is not None:
+            return self.samp.process(frames,sr,audio_in,mods,{"rate":1.0,"transpose":0.0,"gain":1.0})
+        return self.osc.process(frames,sr,audio_in,mods,params)
+
+class ClipStats:
+    def __init__(self):
+        self.last_max = 0.0
+        self.last_min = 0.0
+        self.last_clipped = False
+    def update(self, arr):
+        self.last_max = float(np.max(arr))
+        self.last_min = float(np.min(arr))
+        self.last_clipped = np.any(np.abs(arr) > 1.0)
+
+class SafetyFilterNode(Node):
+    def __init__(self, name, sr, n_ch=2):
+        super().__init__(name)
+        self.a = 0.995
+        self.prev_in = np.zeros((1, n_ch), RAW_DTYPE)  # (B,C)
+        self.prev_dc = np.zeros((1, n_ch), RAW_DTYPE)
+
+    def _ensure(self, B, C):
+        if self.prev_in.shape != (B, C):
+            self.prev_in = np.zeros((B, C), RAW_DTYPE)
+            self.prev_dc = np.zeros((B, C), RAW_DTYPE)
+
+    def process(self, frames, sr, audio_in, mods, params):
+        x = assert_BCF(audio_in, name="safety.in")  # (B,C,F)
+        B, C, F = x.shape
+        self._ensure(B,C)
+        y = np.empty_like(x)
+        pi, pd = self.prev_in, self.prev_dc
+        for i in range(F):
+            pd = self.a * pd + x[:,:,i] - pi
+            pi = x[:,:,i]
+            y[:,:,i] = pd
+        self.prev_in, self.prev_dc = pi, pd
+        return y
+
+class NormalizerCompressorNode(Node):
+    def __init__(self, name, n_ch=2, alpha=0.5, attack=16, sustain=128, decay=256):
+        super().__init__(name)
+        self.n_ch = n_ch
+        self.alpha = alpha
+        self.attack = attack
+        self.sustain = sustain
+        self.decay = decay
+        self.rms_hist = [np.zeros(n_ch, dtype=RAW_DTYPE) for _ in range(decay)]
+        self.peak_hist = [np.zeros(n_ch, dtype=RAW_DTYPE) for _ in range(decay)]
+        self.stats = ClipStats()
+    def process(self, frames, sr, audio_in, mods, params):
+        # Compute RMS and peak over moving window (attack/sustain/decay)
+        rms = np.sqrt(np.mean(audio_in**2, axis=1))
+        peak = np.max(np.abs(audio_in), axis=1)
+        self.rms_hist.pop(0)
+        self.rms_hist.append(rms)
+        self.peak_hist.pop(0)
+        self.peak_hist.append(peak)
+        # Weighted window: attack, sustain, decay
+        def weighted_avg(hist, attack, sustain, decay):
+            hist_arr = np.stack(hist)
+            weights = np.concatenate([
+                np.full(attack, 1.0),
+                np.full(sustain, 0.5),
+                np.full(decay, 0.25)
+            ])
+            weights = weights[:hist_arr.shape[0]]
+            weights = weights / np.sum(weights)
+            return np.sum(hist_arr * weights[:, None], axis=0)
+        rms_val = weighted_avg(self.rms_hist, self.attack, self.sustain, self.decay)
+        peak_val = weighted_avg(self.peak_hist, self.attack, self.sustain, self.decay)
+        norm_val = self.alpha * rms_val + (1.0 - self.alpha) * peak_val + 1e-8
+        # Normalize
+        normed = audio_in / norm_val[:, None]
+        # Tanh soft-knee compression
+        compressed = np.tanh(normed)
+        self.stats.update(compressed)
+        return compressed
+
+class SubharmonicGeneratorNode(Node):
+    """
+    Generates subharmonics by dividing the input signal's frequency and mixing the result.
+    Supports both 'aggregate' (group effect, then split by contribution) and 'independent' (per-signal) modes.
+    Mode is controlled by self.aggregate_mode (True=aggregate, False=independent).
+    """
+    def __init__(self, name, n_ch=2, mix=0.5, divisions=(2,), aggregate_mode=False):
+        super().__init__(name)
+        self.n_ch = n_ch
+        self.mix = mix  # Amount of subharmonic to mix in (0..1)
+        self.divisions = divisions  # Tuple of integer divisors (e.g., (2, 3))
+        self.aggregate_mode = aggregate_mode
+        self.stats = ClipStats()
+        # Simple state for each channel/division
+        self.phases = None  # Will be initialized on first call
+
+    def process(self, frames, sr, audio_in, mods, params):
+        x = np.asarray(audio_in)
+        if x.ndim == 1:      x = x[None, None, :]
+        elif x.ndim == 2:    x = x[None, :, :]
+        elif x.ndim != 3:    raise ValueError(f"subharm.in rank {x.ndim}")
+        B, C, F = x.shape
+
+        if self.phases is None or self.phases.shape != (B, C, len(self.divisions)):
+            self.phases = np.zeros((B, C, len(self.divisions)), dtype=RAW_DTYPE)
+
+        freq = params.get("freq", 110.0)
+        freq = as_BCF(freq, B, C, F, name="subharm.freq")[:,:,0]  # (B,C)
+
+        out = np.copy(x)
+        t = np.arange(F) / sr
+        for idx, div in enumerate(self.divisions):
+            sub_f = freq / div
+            for b in range(B):
+                for c in range(C):
+                    phase = self.phases[b, c, idx]
+                    out[b, c] += self.mix * np.sin(2*np.pi*sub_f[b, c]*t + phase)
+                    self.phases[b, c, idx] = (phase + 2*np.pi*sub_f[b, c]*F/sr) % (2*np.pi)
+        return out  # (B,C,F)
+
+# =========================
+# Graph Engine
+# =========================
+class AudioGraph:
+    """
+    Edges:
+      kind="audio": linear audio flow
+      kind="mod": carries control signal; attributes: target, scale, mode ("mul" or "add")
+    """
+    def __init__(self, fs):
+        self.G = nx.DiGraph()
+        self.fs = fs
+        self.nodes = {}
+        self.sink = None
+
+    def add_node(self, node: Node):
+        self.G.add_node(node.name)
+        self.nodes[node.name] = node
+
+    def connect_audio(self, src, dst):
+        self.G.add_edge(src, dst, kind="audio")
+
+    def connect_mod(self, src, dst, target, scale=1.0, mode="add"):
+        self.G.add_edge(src, dst, kind="mod", target=target, scale=scale, mode=mode)
+
+    def insert_delay(self, name, delay_samples, src, dst):
+        dname = f"{name}_delay"
+        dn = DelayNode(dname, delay_samples)
+        self.add_node(dn)
+        if self.G.has_edge(src, dst) and self.G.edges[src, dst].get("kind") == "audio":
+            self.G.remove_edge(src, dst)
+        self.connect_audio(src, dname)
+        self.connect_audio(dname, dst)
+        return dname
+
+    def set_sink(self, name):
+        self.sink = name
+
+    def _topo(self):
+        H = nx.DiGraph()
+        H.add_nodes_from(self.G.nodes())  # Ensure all nodes are included
+        for u, v, d in self.G.edges(data=True):
+            if d.get("kind") == "audio":
+                H.add_edge(u, v)
+        return list(nx.topological_sort(H))
+
+    def render(self, frames, sr, base_params):
+        order = self._topo()
+        caches = {n: None for n in self.G.nodes()}
+
+        for n in order:
+            # ---- Gather audio inputs; concat ALONG CHANNELS ----
+            audio_inputs = []
+            for pred in self.G.predecessors(n):
+                ed = self.G.edges[pred, n]
+                if ed.get("kind") == "audio":
+                    buf = caches[pred]
+                    if buf is None:
+                        continue
+                    a = np.asarray(buf)
+                    # Coerce to (B,C,F)
+                    if a.ndim == 1:      # (F,)
+                        a = a[None, None, :]
+                    elif a.ndim == 2:    # (C,F) or (B,F) -> assume (C,F)
+                        a = a[None, :, :]
+                    elif a.ndim != 3:
+                        raise ValueError(f"{pred}->{n}: unexpected rank {a.ndim}, shape={a.shape}")
+                    audio_inputs.append(a)
+
+            if audio_inputs:
+                B = audio_inputs[0].shape[0]; F = audio_inputs[0].shape[2]
+                for a in audio_inputs[1:]:
+                    if a.shape[0] != B or a.shape[2] != F:
+                        raise ValueError(f"Fan-in shape mismatch into {n}: got {a.shape}, want (B,*,{F})")
+                # concat channels
+                audio_in = np.concatenate(audio_inputs, axis=1)  # (B, sumC, F)
+            else:
+                audio_in = None
+                B = int(base_params.get("_B", 1))
+                F = frames
+
+            # ---- Params as (B,C,F) where C = input channels (or 1 if source) ----
+            C = audio_in.shape[1] if audio_in is not None else int(base_params.get("_C", 1))
+            bp = base_params.get(n, {})
+            p = {k: as_BCF(v, B, C, F, name=f"{n}.{k}") for k, v in bp.items()}
+
+            # ---- Mods as (B,C,F) and merge ----
+            mods = {}
+            for pred in self.G.predecessors(n):
+                ed = self.G.edges[pred, n]
+                if ed.get("kind") != "mod":
+                    continue
+                m_sig = caches[pred]
+                if m_sig is None:
+                    continue
+                sig = as_BCF(m_sig, B, C, F, name=f"mod {pred}->{n}")
+                mods.setdefault(ed["target"], []).append((sig, ed.get("scale", 1.0), ed.get("mode", "add")))
+
+            for t, lst in mods.items():
+                if t not in p:
+                    p[t] = np.zeros((B, C, F), RAW_DTYPE)
+                arr = p[t]
+                for sig, scale, mode in lst:
+                    if mode == "add":
+                        arr += sig * scale
+                    else:
+                        arr *= (1.0 + sig * scale)
+                p[t] = arr
+
+            # ---- Node ----
+            out = self.nodes[n].process(frames, sr, audio_in, mods, p)
+            caches[n] = assert_BCF(out, name=f"{n}.out")
+
+        return assert_BCF(caches[self.sink], name="sink")
