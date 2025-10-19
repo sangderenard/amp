@@ -27,6 +27,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.summary or config.runtime.log_summary:
         print(app.summary())
+        if app.joystick_error and not app.joystick:
+            print(f"Warning: {app.joystick_error}")
 
     buffer = app.render(frames=args.frames)
     # We do not write to an audio device; simply report success and stats.

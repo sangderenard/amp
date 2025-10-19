@@ -9,6 +9,7 @@ def test_cli_renders_default(tmp_path, capsys):
     exit_code = cli_main(["--config", str(DEFAULT_CONFIG_PATH), "--frames", "32", "--summary"])
     assert exit_code == 0
     captured = capsys.readouterr()
+    assert "Joystick: disabled" in captured.out
     assert "Rendered 32 frames" in captured.out
 
 
