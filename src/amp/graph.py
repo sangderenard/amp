@@ -287,6 +287,19 @@ class ControlDelay:
         return output
 
 
+@dataclass(slots=True)
+class _ModGroupPlan:
+    param: str
+    connections: Tuple[ModConnection, ...]
+
+
+@dataclass(slots=True)
+class _NodeExecutionPlan:
+    name: str
+    audio_inputs: Tuple[str, ...]
+    mod_groups: Tuple[_ModGroupPlan, ...]
+
+
 class AudioGraph:
     """Directed audio processing graph supporting modulation links."""
 
@@ -301,6 +314,12 @@ class AudioGraph:
         self._levels_lock = Lock()
         self._last_node_levels: Dict[str, np.ndarray] = {}
         self.control_delay = ControlDelay(self.sample_rate)
+        self._plan_dirty = True
+        self._execution_plan: Tuple[_NodeExecutionPlan, ...] = ()
+        self._ordered_node_names: Tuple[str, ...] = ()
+        self._param_buffers: Dict[Tuple[str, str], np.ndarray] = {}
+        self._mod_buffers: Dict[Tuple[str, str, str, int | None], np.ndarray] = {}
+        self._merge_scratch: Dict[Tuple[int, int, int], np.ndarray] = {}
 
     @classmethod
     def from_config(cls, config: GraphConfig, sample_rate: int, output_channels: int) -> "AudioGraph":
@@ -354,12 +373,14 @@ class AudioGraph:
         self._audio_inputs.setdefault(node.name, [])
         self._audio_successors.setdefault(node.name, [])
         self._mod_inputs.setdefault(node.name, [])
+        self._invalidate_plan()
 
     def connect_audio(self, source: str, target: str) -> None:
         if source not in self._nodes or target not in self._nodes:
             raise ValueError("Audio connections must reference defined nodes")
         self._audio_inputs.setdefault(target, []).append(source)
         self._audio_successors.setdefault(source, []).append(target)
+        self._invalidate_plan()
 
     def connect_mod(
         self,
@@ -384,15 +405,19 @@ class AudioGraph:
             channel=int(channel) if channel is not None else None,
         )
         self._mod_inputs.setdefault(target, []).append(connection)
+        self._invalidate_plan()
 
     def set_sink(self, name: str) -> None:
         if name not in self._nodes:
             raise ValueError(f"Unknown sink node '{name}'")
         self.sink = name
+        # Sink changes do not affect topology but may change execution order queries.
+        # Keep the cached plan to ensure downstream lookups remain consistent.
 
     @property
     def ordered_nodes(self) -> Sequence[AudioNode]:
-        return [self._nodes[name] for name in self._topo_order()]
+        plan = self._ensure_execution_plan()
+        return [self._nodes[entry.name] for entry in plan]
 
     def mod_connections(self, target: str) -> Sequence[ModConnection]:
         """Return modulation connections arriving at ``target``."""
@@ -400,8 +425,23 @@ class AudioGraph:
         return tuple(self._mod_inputs.get(target, ()))
 
     def _topo_order(self) -> Iterable[str]:
+        return tuple(entry.name for entry in self._ensure_execution_plan())
+
+    def _invalidate_plan(self) -> None:
+        self._plan_dirty = True
+
+    def _ensure_execution_plan(self) -> Tuple[_NodeExecutionPlan, ...]:
+        if not self._plan_dirty:
+            return self._execution_plan
+        plan = self._build_execution_plan()
+        self._execution_plan = plan
+        self._ordered_node_names = tuple(entry.name for entry in plan)
+        self._plan_dirty = False
+        return plan
+
+    def _build_execution_plan(self) -> Tuple[_NodeExecutionPlan, ...]:
         if not self._nodes:
-            return []
+            return ()
         incoming = {name: len(self._audio_inputs.get(name, [])) for name in self._nodes}
         outgoing: Dict[str, List[str]] = {
             name: list(self._audio_successors.get(name, [])) for name in self._nodes
@@ -410,9 +450,7 @@ class AudioGraph:
             incoming[target] = incoming.get(target, 0) + len(entries)
             for entry in entries:
                 outgoing.setdefault(entry.source, []).append(target)
-        queue: Deque[str] = deque(
-            name for name, count in incoming.items() if count == 0
-        )
+        queue: Deque[str] = deque(name for name, count in incoming.items() if count == 0)
         order: List[str] = []
         while queue:
             name = queue.popleft()
@@ -423,7 +461,118 @@ class AudioGraph:
                     queue.append(successor)
         if len(order) != len(self._nodes):
             raise ValueError("Graph contains cycles or disconnected nodes")
-        return order
+        plan: List[_NodeExecutionPlan] = []
+        valid_mod_keys: set[Tuple[str, str, str, int | None]] = set()
+        for name in order:
+            audio_inputs = tuple(self._audio_inputs.get(name, ()))
+            mod_entries = self._mod_inputs.get(name, ())
+            groups: List[_ModGroupPlan] = []
+            if mod_entries:
+                grouped: Dict[str, List[ModConnection]] = {}
+                param_order: List[str] = []
+                for connection in mod_entries:
+                    param = connection.param or "value"
+                    if param not in grouped:
+                        grouped[param] = []
+                        param_order.append(param)
+                    grouped[param].append(connection)
+                    valid_mod_keys.add((connection.source, name, param, connection.channel))
+                groups = [_ModGroupPlan(param, tuple(grouped[param])) for param in param_order]
+            plan.append(_NodeExecutionPlan(name, audio_inputs, tuple(groups)))
+        if self._mod_buffers:
+            self._mod_buffers = {
+                key: buf for key, buf in self._mod_buffers.items() if key in valid_mod_keys
+            }
+        return tuple(plan)
+
+    def _prepare_param_buffer(
+        self,
+        node: str,
+        param: str,
+        value: np.ndarray | float,
+        batches: int,
+        channels: int,
+        frames: int,
+    ) -> np.ndarray:
+        key = (node, param)
+        target_shape = (batches, channels, frames)
+        buffer = self._param_buffers.get(key)
+        if buffer is None or buffer.shape != target_shape:
+            buffer = np.empty(target_shape, dtype=RAW_DTYPE)
+            self._param_buffers[key] = buffer
+        array = np.asarray(value, dtype=RAW_DTYPE)
+        self._copy_to_bcf(array, buffer, batches, channels, frames, name=f"{node}.{param}")
+        return buffer
+
+    def _copy_to_bcf(
+        self,
+        source: np.ndarray,
+        dest: np.ndarray,
+        batches: int,
+        channels: int,
+        frames: int,
+        *,
+        name: str,
+    ) -> None:
+        if source.ndim == 0:
+            dest.fill(float(source))
+            return
+        if source.ndim == 1:
+            if source.shape[0] != frames:
+                raise ValueError(f"{name}: expected length {frames}, got {source.shape[0]}")
+            dest[...] = source.reshape(1, 1, frames)
+            return
+        if source.ndim == 2:
+            if source.shape[1] != frames:
+                raise ValueError(f"{name}: expected (*, {frames}); got {source.shape}")
+            if source.shape == (batches, frames):
+                reshaped = source.reshape(batches, 1, frames)
+            elif source.shape == (channels, frames):
+                reshaped = source.reshape(1, channels, frames)
+            else:
+                raise ValueError(f"{name}: expected {(batches, frames)} or {(channels, frames)}; got {source.shape}")
+            np.copyto(dest, reshaped)
+            return
+        if source.ndim == 3:
+            if source.shape[2] != frames:
+                raise ValueError(f"{name}: expected frame count {frames}; got {source.shape[2]}")
+            np.copyto(dest, source)
+            return
+        raise ValueError(f"{name}: unsupported rank {source.ndim}")
+
+    def _prepare_mod_buffer(
+        self,
+        target_node: str,
+        param: str,
+        connection: ModConnection,
+        source_buffer: np.ndarray,
+        batches: int,
+        channels: int,
+        frames: int,
+    ) -> np.ndarray:
+        key = (connection.source, target_node, param, connection.channel)
+        target_shape = (batches, channels, frames)
+        buffer = self._mod_buffers.get(key)
+        if buffer is None or buffer.shape != target_shape:
+            buffer = np.empty(target_shape, dtype=RAW_DTYPE)
+            self._mod_buffers[key] = buffer
+        if connection.channel is not None:
+            if connection.channel >= source_buffer.shape[1]:
+                raise ValueError(
+                    f"Mod channel {connection.channel} out of range for '{connection.source}'"
+                )
+            sliced = source_buffer[:, connection.channel : connection.channel + 1, :]
+        else:
+            sliced = source_buffer
+        self._copy_to_bcf(sliced, buffer, batches, channels, frames, name=f"mod {connection.source}->{target_node}")
+        return buffer
+
+    def _acquire_merge_scratch(self, shape: Tuple[int, int, int]) -> np.ndarray:
+        buffer = self._merge_scratch.get(shape)
+        if buffer is None or buffer.shape != shape:
+            buffer = np.empty(shape, dtype=RAW_DTYPE)
+            self._merge_scratch[shape] = buffer
+        return buffer
 
     def render_block(
         self,
@@ -434,12 +583,13 @@ class AudioGraph:
         if not self.sink:
             raise RuntimeError("Sink node has not been configured")
         sr = int(sample_rate or self.sample_rate)
-        order = self._topo_order()
+        plan = self._ensure_execution_plan()
         caches: Dict[str, np.ndarray | None] = {name: None for name in self._nodes}
-        for name in order:
-            audio_inputs = []
-            for predecessor in self._audio_inputs.get(name, []):
-                buffer = caches[predecessor]
+        for entry in plan:
+            name = entry.name
+            audio_inputs: List[np.ndarray] = []
+            for predecessor in entry.audio_inputs:
+                buffer = caches.get(predecessor)
                 if buffer is None:
                     continue
                 audio_inputs.append(_assert_bcf(buffer, name=f"{predecessor}.out"))
@@ -450,51 +600,73 @@ class AudioGraph:
                     if buf.shape[0] != batches or buf.shape[2] != frame_count:
                         raise ValueError(f"Shape mismatch in inputs to '{name}'")
                 audio_in = np.concatenate(audio_inputs, axis=1)
+                channels = audio_in.shape[1]
             else:
                 audio_in = None
                 batches = int(base_params.get("_B", 1)) if base_params else 1
                 frame_count = frames
-            channels = audio_in.shape[1] if audio_in is not None else int(base_params.get("_C", 1)) if base_params else 1
+                channels = int(base_params.get("_C", 1)) if base_params else 1
             node_params: Dict[str, np.ndarray] = {}
             if base_params and name in base_params:
                 for key, value in base_params[name].items():
-                    node_params[key] = _as_bcf(value, batches, channels, frame_count, name=f"{name}.{key}")
-            mods: Dict[str, list[tuple[np.ndarray, float, str]]] = {}
-            for entry in self._mod_inputs.get(name, []):
-                buffer = caches[entry.source]
-                if buffer is None:
-                    continue
-                target_param = entry.param or "value"
-                buf = _assert_bcf(buffer, name=f"{entry.source}.out")
-                channel = entry.channel
-                if channel is not None:
-                    if channel >= buf.shape[1]:
-                        raise ValueError(
-                            f"Mod channel {channel} out of range for '{entry.source}'"
-                        )
-                    buf = buf[:, channel : channel + 1, :]
-                mods.setdefault(target_param, []).append(
-                    (
-                        _as_bcf(
-                            buf,
+                    node_params[key] = self._prepare_param_buffer(
+                        name,
+                        key,
+                        value,
+                        batches,
+                        channels,
+                        frame_count,
+                    )
+            mods: Dict[str, List[tuple[np.ndarray, float, str]]] = {}
+            for group in entry.mod_groups:
+                signals: List[tuple[np.ndarray, float, str]] = []
+                for connection in group.connections:
+                    buffer = caches.get(connection.source)
+                    if buffer is None:
+                        continue
+                    source_buf = _assert_bcf(buffer, name=f"{connection.source}.out")
+                    mod_signal = self._prepare_mod_buffer(
+                        name,
+                        group.param,
+                        connection,
+                        source_buf,
+                        batches,
+                        channels,
+                        frame_count,
+                    )
+                    signals.append((mod_signal, connection.scale, connection.mode))
+                if signals:
+                    mods[group.param] = signals
+            merged_params: Dict[str, np.ndarray] = dict(node_params)
+            if mods:
+                shape = (batches, channels, frame_count)
+                scratch = self._acquire_merge_scratch(shape)
+                for param_name, entries in mods.items():
+                    base = merged_params.get(
+                        param_name,
+                        self._prepare_param_buffer(
+                            name,
+                            param_name,
+                            0.0,
                             batches,
                             channels,
                             frame_count,
-                            name=f"mod {entry.source}->{name}",
                         ),
-                        entry.scale,
-                        entry.mode,
                     )
-                )
-            merged_params: Dict[str, np.ndarray] = dict(node_params)
-            for param_name, entries in mods.items():
-                base = merged_params.get(param_name, np.zeros((batches, channels, frame_count), dtype=RAW_DTYPE))
-                for signal, scale, mode in entries:
-                    if mode == "add":
-                        base = base + signal * scale
-                    else:
-                        base = base * (1.0 + signal * scale)
-                merged_params[param_name] = base
+                    for signal, scale, mode in entries:
+                        if mode == "add":
+                            if scale == 0.0:
+                                continue
+                            if scale == 1.0:
+                                np.add(base, signal, out=base)
+                            else:
+                                np.multiply(signal, scale, out=scratch)
+                                np.add(base, scratch, out=base)
+                        else:
+                            np.multiply(signal, scale, out=scratch)
+                            np.add(scratch, 1.0, out=scratch)
+                            np.multiply(base, scratch, out=base)
+                    merged_params[param_name] = base
             node = self._nodes[name]
             output = node.process(frame_count, sr, audio_in, mods, merged_params)
             caches[name] = _assert_bcf(output, name=f"{name}.out")
