@@ -7,11 +7,14 @@ to pure-Python/numpy implementations.
 """
 from __future__ import annotations
 
-import numpy as np
+import traceback
 from typing import Optional
+
+import numpy as np
 
 AVAILABLE = False
 _impl = None
+UNAVAILABLE_REASON: str | None = None
 
 try:
     import cffi
@@ -528,16 +531,36 @@ void osc_triangle_blep_c(const double* ph, const double* dphi, double* out, int 
 """
     try:
         ffi.set_source("_amp_ckernels_cffi", C_SRC)
-        # compile lazy; this will create a module in-place
-        ffi.compile(verbose=False)
-        import importlib
-        _impl = importlib.import_module("_amp_ckernels_cffi")
+        # compile lazy; this will create a module in-place and return its path
+        module_path = ffi.compile(verbose=False)
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location("_amp_ckernels_cffi", module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to load compiled module from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["_amp_ckernels_cffi"] = module
+        spec.loader.exec_module(module)
+        _impl = module
         AVAILABLE = True
-    except Exception:
+        UNAVAILABLE_REASON = None
+    except Exception as exc:
         # any compile/import error -> disable C backend
         AVAILABLE = False
-except Exception:
+        detail = traceback.format_exc()
+        UNAVAILABLE_REASON = (
+            "Failed to compile C kernels via cffi: "
+            f"{exc}\n{detail}"
+        )
+except ModuleNotFoundError as exc:
     AVAILABLE = False
+    UNAVAILABLE_REASON = f"cffi is not installed ({exc})"
+except Exception as exc:
+    AVAILABLE = False
+    UNAVAILABLE_REASON = (
+        "Unexpected error initialising cffi for C kernels: "
+        f"{exc}"
+    )
 
 
 def lfo_slew_c(x: np.ndarray, r: float, alpha: float, z0: Optional[np.ndarray]) -> np.ndarray:

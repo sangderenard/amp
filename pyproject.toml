@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "networkx",
+    "cffi>=2.0.0",
+    "setuptools>=65",
 ]
 
 [project.scripts]

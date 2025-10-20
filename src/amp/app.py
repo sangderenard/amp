@@ -428,6 +428,11 @@ def run(
             f"(peak {peak:.3f}, trough {trough:.3f})",
             force=True,
         )
+        node_timings = getattr(app.graph, "last_node_timings", None)
+        if node_timings:
+            STATUS_PRINTER.emit("Node timings (ms):", force=True)
+            for name, duration in sorted(node_timings.items(), key=lambda item: item[1], reverse=True):
+                STATUS_PRINTER.emit(f"  {name:<24} {duration * 1000.0:7.3f}", force=True)
         if app.joystick_error and not app.joystick:
             STATUS_PRINTER.emit(f"Warning: {app.joystick_error}", force=True)
         STATUS_PRINTER.flush()
@@ -462,6 +467,7 @@ def run(
     last_freq_target_display: float | None = None
     last_velocity_target_display: float | None = None
     last_node_levels_snapshot: dict[str, np.ndarray] = {}
+    last_node_timings_snapshot: dict[str, float] = {}
     status_signature_pending: tuple[Any, ...] | None = None
     last_status_signature: tuple[Any, ...] | None = None
     last_console_signature: tuple[Any, ...] | None = None
@@ -688,11 +694,14 @@ def run(
 
         render_duration = time.perf_counter() - start_time
         allotted_time = (frames / sr) if sr else 0.0
+        node_timings = graph.last_node_timings
 
         meta = {
             "render_duration": render_duration,
             "allotted_time": allotted_time,
         }
+        if node_timings:
+            meta["node_timings"] = node_timings
 
         return buffer, meta
 
@@ -770,6 +779,9 @@ def run(
             "queue_capacity": queue_capacity,
             "queue_underflow": queue_underflow,
         }
+        node_timings_meta = meta.get("node_timings")
+        if node_timings_meta:
+            sample["node_timings"] = dict(node_timings_meta)
 
         with callback_timing_lock:
             callback_timing_samples.append(sample)
@@ -817,6 +829,9 @@ def run(
                             "allotted_time": allotted_per_chunk,
                             "queue_underflow": False,
                         }
+                        node_timings_meta = meta.get("node_timings") if idx == 0 else None
+                        if node_timings_meta:
+                            chunk_meta["node_timings"] = dict(node_timings_meta)
                         while running and not producer_stop_event.is_set():
                             try:
                                 pcm_queue.put((chunk, chunk_meta), timeout=0.05)
@@ -889,7 +904,8 @@ def run(
         velocity_target: float,
     ) -> None:
         nonlocal last_freq_target_display, last_velocity_target_display
-        nonlocal last_node_levels_snapshot, status_signature_pending, last_status_signature
+        nonlocal last_node_levels_snapshot, last_node_timings_snapshot
+        nonlocal status_signature_pending, last_status_signature
 
         text_cache.start_frame()
         try:
@@ -909,6 +925,7 @@ def run(
                 last_status_signature = pending_signature
 
             node_levels = getattr(graph, "last_node_levels", {})
+            node_timings = getattr(graph, "last_node_timings", {})
 
             freq_changed = (
                 last_freq_target_display is None
@@ -929,6 +946,7 @@ def run(
                         text_cache.invalidate(name)
 
             updated_levels: dict[str, np.ndarray] = {}
+            updated_timings: dict[str, float] = {}
             changed_nodes: set[str] = set()
             for name in nodes_in_graph:
                 levels = node_levels.get(name)
@@ -937,12 +955,24 @@ def run(
                     prev = last_node_levels_snapshot.get(name)
                     if prev is None or prev.shape != levels.shape or not np.allclose(prev, levels, atol=1e-4):
                         changed_nodes.add(name)
+                timing_value = node_timings.get(name)
+                if timing_value is not None:
+                    timing_float = float(timing_value)
+                    updated_timings[name] = timing_float
+                    prev_timing = last_node_timings_snapshot.get(name)
+                    if prev_timing is None or abs(prev_timing - timing_float) > 1e-6:
+                        changed_nodes.add(name)
+                elif name in last_node_timings_snapshot:
+                    changed_nodes.add(name)
             for removed in set(last_node_levels_snapshot) - set(updated_levels):
+                changed_nodes.add(removed)
+            for removed in set(last_node_timings_snapshot) - set(updated_timings):
                 changed_nodes.add(removed)
             if changed_nodes:
                 for node_name in changed_nodes:
                     text_cache.invalidate(node_name)
             last_node_levels_snapshot = updated_levels
+            last_node_timings_snapshot = updated_timings
 
             width, height = screen.get_size()
             margin = 32
@@ -1082,6 +1112,9 @@ def run(
                 screen.blit(title, (rect.x + 10, rect.y + 6))
 
                 lines_to_render: list[str] = []
+                node_time = node_timings.get(name)
+                if node_time is not None:
+                    lines_to_render.append(f"time={node_time * 1000.0:.3f}ms")
                 if isinstance(node, nodes.OscNode):
                     lines_to_render.extend(
                         [
@@ -1429,6 +1462,17 @@ def run(
                 timing_colour = (240, 120, 120) if underrun_recent else (180, 220, 255)
                 lines_with_colour.append((timing_text, timing_colour))
                 console_lines.append(timing_text)
+                latest_node_timings = timing_snapshot[-1].get("node_timings") or {}
+                if latest_node_timings:
+                    sorted_nodes = sorted(
+                        latest_node_timings.items(), key=lambda item: item[1], reverse=True
+                    )
+                    top_entries = ", ".join(
+                        f"{name}:{duration * 1000.0:0.2f}ms" for name, duration in sorted_nodes[:3]
+                    )
+                    nodes_text = f"Nodes: {top_entries}"
+                    lines_with_colour.append((nodes_text, (200, 210, 255)))
+                    console_lines.append(nodes_text)
             screen = pygame.display.get_surface()
             if screen:
                 draw_visualisation(screen, lines_with_colour, freq_target, velocity_target)
