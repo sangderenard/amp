@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import math
+import queue
+import threading
 from collections.abc import Mapping, Sequence
 
 import numpy as np
@@ -198,6 +200,19 @@ class ControllerNode(ConfigNode):
         self.channels = len(self._output_order)
         self._output_index = {name: idx for idx, name in enumerate(self._output_order)}
         self._context_base = {"np": np, "math": math}
+        self._task_queue: queue.Queue[
+            tuple[dict[str, np.ndarray], int, int]
+        ] = queue.Queue(maxsize=1)
+        self._result_lock = threading.Lock()
+        self._latest_output: np.ndarray | None = None
+        self._latest_meta: tuple[int, int] | None = None
+        self._last_error: Exception | None = None
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"{self.name}-controller",
+            daemon=True,
+        )
+        self._worker.start()
 
     @staticmethod
     def _sanitise(name: str) -> str:
@@ -215,6 +230,39 @@ class ControllerNode(ConfigNode):
             raise KeyError(f"{self.name}: unknown output '{name}'") from exc
 
     def process(self, frames, sr, audio_in, mods, params):
+        batches, param_frames = self._infer_dimensions(params, frames)
+        expected_meta = (batches, param_frames)
+
+        error: Exception | None = None
+        with self._result_lock:
+            if self._last_error is not None:
+                error = self._last_error
+                self._last_error = None
+            cached_output = (
+                self._latest_output
+                if self._latest_meta == expected_meta
+                else None
+            )
+        if error is not None:
+            raise error
+
+        computed_sync = False
+        if cached_output is None:
+            output, batches, param_frames = self._evaluate(params, frames, sr)
+            with self._result_lock:
+                self._latest_output = output
+                self._latest_meta = (batches, param_frames)
+            computed_sync = True
+        else:
+            output = cached_output
+
+        if not computed_sync:
+            self._submit_async(params, frames, sr)
+        return output
+
+    def _infer_dimensions(
+        self, params: Mapping[str, np.ndarray], frames: int
+    ) -> tuple[int, int]:
         example = None
         for value in params.values():
             if isinstance(value, np.ndarray):
@@ -224,6 +272,15 @@ class ControllerNode(ConfigNode):
             batches, _, param_frames = example.shape
         else:
             batches, param_frames = 1, frames
+        return batches, param_frames
+
+    def _evaluate(
+        self,
+        params: Mapping[str, np.ndarray],
+        frames: int,
+        sr: int,
+    ) -> tuple[np.ndarray, int, int]:
+        batches, param_frames = self._infer_dimensions(params, frames)
 
         def _zero_value() -> np.ndarray:
             return np.zeros((batches, param_frames), dtype=RAW_DTYPE)
@@ -282,7 +339,50 @@ class ControllerNode(ConfigNode):
                 name=f"{self.name}.{self._output_order[idx]}",
             )[:, 0, :]
             output[:, idx, :] = value
-        return output
+        return output, batches, param_frames
+
+    def _worker_loop(self) -> None:
+        while True:
+            try:
+                params, frames, sr = self._task_queue.get()
+            except Exception:
+                continue
+            try:
+                output, batches, param_frames = self._evaluate(params, frames, sr)
+            except Exception as exc:  # pragma: no cover - defensive
+                with self._result_lock:
+                    self._last_error = exc
+            else:
+                with self._result_lock:
+                    self._latest_output = output
+                    self._latest_meta = (batches, param_frames)
+            finally:
+                self._task_queue.task_done()
+
+    def _submit_async(
+        self,
+        params: Mapping[str, np.ndarray],
+        frames: int,
+        sr: int,
+    ) -> None:
+        cloned: dict[str, np.ndarray] = {
+            key: np.array(value, copy=True)
+            for key, value in params.items()
+        }
+        task = (cloned, frames, sr)
+        try:
+            self._task_queue.put_nowait(task)
+        except queue.Full:
+            try:
+                self._task_queue.get_nowait()
+            except queue.Empty:  # pragma: no cover - defensive
+                pass
+            else:
+                self._task_queue.task_done()
+            try:
+                self._task_queue.put_nowait(task)
+            except queue.Full:  # pragma: no cover - defensive
+                pass
 
 
 class SilenceNode(ConfigNode):
