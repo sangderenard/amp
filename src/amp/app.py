@@ -50,6 +50,11 @@ def build_runtime_graph(
     for am in am_lfos:
         graph_obj.add_node(am)
 
+    nodes.EnvelopeModulatorNode.reset_groups()
+
+    pitch_node = nodes.PitchQuantizerNode("pitch", runtime_state)
+    graph_obj.add_node(pitch_node)
+
     env_cfg = runtime_state.get("envelope_params", {})
     poly_mode = runtime_state.get("polyphony_mode", "strings")
     default_voice_count = len(osc_nodes) if poly_mode == "piano" else 1
@@ -57,6 +62,7 @@ def build_runtime_graph(
     if voice_count < 1:
         voice_count = 1
     voice_count = min(len(osc_nodes), voice_count)
+    group_name = "voices" if voice_count > 1 else None
     for i in range(voice_count):
         env = nodes.EnvelopeModulatorNode(
             f"env{i+1}",
@@ -67,6 +73,7 @@ def build_runtime_graph(
             sustain_ms=env_cfg.get("sustain_ms", 0.0),
             release_ms=env_cfg.get("release_ms", 220.0),
             send_resets=env_cfg.get("send_resets", True),
+            group=group_name,
         )
         env_nodes.append(env)
         graph_obj.add_node(env)
@@ -77,6 +84,7 @@ def build_runtime_graph(
             graph_obj.connect_mod(env.name, osc.name, "amp", scale=1.0, mode="add", channel=0)
             if getattr(osc, "accept_reset", True) and env_cfg.get("send_resets", True):
                 graph_obj.connect_mod(env.name, osc.name, "reset", scale=1.0, mode="add", channel=1)
+        graph_obj.connect_mod(pitch_node.name, osc.name, "freq", scale=1.0, mode="add", channel=0)
         graph_obj.connect_mod(am_lfos[i].name, osc.name, "amp", scale=0.5, mode="mul")
         graph_obj.connect_mod(pan_lfos[i].name, osc.name, "pan", scale=1.0, mode="add")
 
@@ -263,6 +271,11 @@ def run(
     q_target = 0.8
     q_current = 0.8
     gate_momentary = False
+    root_midi_value = state.get("root_midi", 60)
+    pitch_input_value = 0.0
+    pitch_span_value = float(state.get("free_span_oct", 2.0))
+    pitch_effective_token = state.get("base_token", "12tet/full")
+    pitch_free_variant = state.get("free_variant", "continuous")
 
     envelope_modes = ("envelope", "drone", "hold")
     envelope_mode_idx = 0
@@ -276,6 +289,7 @@ def run(
     sampler = _load_sampler(state)
 
     graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+    pitch_node = graph._nodes.get("pitch")
     menu_instance = menu.Menu(state)
     menu_instance.toggle()
     menu_instance.draw()
@@ -302,13 +316,14 @@ def run(
     drone_prev = False
 
     def audio_callback(outdata, frames, time_info, status):
-        nonlocal sample_rate, freq_current, velocity_current, cutoff_current, q_current, graph
+        nonlocal sample_rate, freq_current, freq_target, velocity_current, cutoff_current, q_current, graph
         nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger, amp_mod_names
+        nonlocal pitch_node, pitch_input_value, pitch_span_value, pitch_effective_token
+        nonlocal root_midi_value, pitch_free_variant
 
         sr = sample_rate
         utils._scratch.ensure(frames)
 
-        f = utils.cubic_ramp(freq_current, freq_target, frames, utils._scratch.f[:frames])
         v = utils.cubic_ramp(velocity_current, velocity_target, frames, utils._scratch.a[:frames])
         c = utils.cubic_ramp(cutoff_current, cutoff_target, frames, utils._scratch.c[:frames])
         q = utils.cubic_ramp(q_current, q_target, frames, utils._scratch.q[:frames])
@@ -339,7 +354,7 @@ def run(
             "_B": B,
             "_C": C,
             "source": {
-                "freq": utils.as_BCF(f, B, C, frames, name="freq"),
+                "freq": utils.as_BCF(0.0, B, C, frames, name="freq"),
                 "amp": utils.as_BCF(v, B, C, frames, name="velocity"),
             },
             "filter": {
@@ -348,10 +363,26 @@ def run(
             },
         }
 
+        pitch_ref = pitch_node
+        if pitch_ref is None or pitch_ref.name not in graph._nodes:
+            pitch_ref = graph._nodes.get("pitch")
+            pitch_node = pitch_ref
+        if pitch_ref is not None:
+            pitch_ref.update_mode(
+                effective_token=pitch_effective_token,
+                free_variant=pitch_free_variant,
+                span_oct=pitch_span_value,
+            )
+            base_params[pitch_ref.name] = {
+                "input": utils.as_BCF(pitch_input_value, B, 1, frames, name="pitch.input"),
+                "root_midi": utils.as_BCF(root_midi_value, B, 1, frames, name="pitch.root"),
+                "span_oct": utils.as_BCF(pitch_span_value, B, 1, frames, name="pitch.span"),
+            }
+
         osc_names = [name for name in ("osc1", "osc2", "osc3") if name in graph._nodes]
         for name in osc_names:
             base_params[name] = {
-                "freq": utils.as_BCF(f, B, 1, frames, name=f"{name}.freq"),
+                "freq": utils.as_BCF(0.0, B, 1, frames, name=f"{name}.freq"),
                 "amp": utils.as_BCF(0.0, B, 1, frames, name=f"{name}.amp"),
             }
 
@@ -391,7 +422,13 @@ def run(
         for ch in range(chans):
             outdata[:, ch] = y[0, ch].astype(np.float32, copy=False)
 
-        freq_current = float(f[-1])
+        if pitch_ref is not None:
+            last = pitch_ref.last_output
+            targets = pitch_ref.last_target
+            if last is not None and last.size > 0:
+                freq_current = float(np.asarray(last)[0, -1]) if last.ndim == 2 else float(last[-1])
+            if targets is not None and targets.size > 0:
+                freq_target = float(np.asarray(targets)[-1])
         velocity_current = float(v[-1])
         cutoff_current = float(c[-1])
         q_current = float(q[-1])
@@ -416,6 +453,7 @@ def run(
         sd.default.device = (None, dev_index)
         print(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz")
         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+        pitch_node = graph._nodes.get("pitch")
 
         def audio_thread() -> None:
             nonlocal running
@@ -644,30 +682,36 @@ def run(
                     elif event.key == state["keymap"].get("toggle_source", pygame.K_n):
                         state["source_type"] = "sampler" if state["source_type"] == "osc" else "osc"
                         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                        pitch_node = graph._nodes.get("pitch")
                         print(f"Source → {state['source_type'].upper()}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("wave_next", pygame.K_x):
                         state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
                         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                        pitch_node = graph._nodes.get("pitch")
                         print(f"Waveform → {state['waves'][state['wave_idx']]}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("free_variant_next", pygame.K_z):
                         i = quantizer.FREE_VARIANTS.index(state["free_variant"])
                         state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
+                        pitch_free_variant = state["free_variant"]
                         print(f"FREE variant → {state['free_variant']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("drone_toggle", pygame.K_b):
                         cycle_envelope_mode()
                     elif event.key == state["keymap"].get("root_up", pygame.K_PERIOD):
                         state["root_midi"] = min(127, state["root_midi"] + 1)
+                        root_midi_value = state["root_midi"]
                         print(f"Root MIDI → {state['root_midi']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("root_down", pygame.K_COMMA):
                         state["root_midi"] = max(0, state["root_midi"] - 1)
+                        root_midi_value = state["root_midi"]
                         print(f"Root MIDI → {state['root_midi']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("root_reset", pygame.K_SLASH):
                         state["root_midi"] = 60
+                        root_midi_value = state["root_midi"]
                         print("Root MIDI → 60 (C4)")
                         menu_instance.draw()
 
@@ -679,6 +723,7 @@ def run(
                 if pressed and not prev_buttons[fvb]:
                     i = quantizer.FREE_VARIANTS.index(state["free_variant"])
                     state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
+                    pitch_free_variant = state["free_variant"]
                     print(f"FREE variant → {state['free_variant']}")
                     menu_instance.draw()
 
@@ -721,24 +766,12 @@ def run(
             q_target = 0.5 + ry01 * (12.0 - 0.5)
 
             root_midi = state.get("root_midi", 60)
-            root_f = quantizer.Quantizer.midi_to_freq(root_midi)
             span_oct = float(state.get("free_span_oct", 2.0))
-            grid = quantizer.get_reference_grid_cents(state, effective_token)
-            if quantizer.is_free_mode_token(effective_token):
-                N = max(1, len(utils._grid_sorted(grid)[0]))
-                u = lx * span_oct * N
-                fv = state.get("free_variant", "continuous")
-                if fv == "continuous":
-                    cents = lx * span_oct * 1200.0
-                elif fv == "weighted":
-                    cents = quantizer.grid_warp_inverse(u, grid)
-                else:
-                    cents = quantizer.grid_warp_inverse(round(u), grid)
-            else:
-                cents_unq = lx * span_oct * 1200.0
-                u = quantizer.grid_warp_forward(cents_unq, grid)
-                cents = quantizer.grid_warp_inverse(round(u), grid)
-            freq_target = root_f * (2.0 ** (cents / 1200.0))
+            pitch_input_value = lx
+            pitch_span_value = span_oct
+            pitch_effective_token = effective_token
+            pitch_free_variant = state.get("free_variant", "continuous")
+            root_midi_value = root_midi
 
             velocity_target = max(0.0, 1.0 - (ly + 1.0) / 2.0)
 
@@ -750,6 +783,7 @@ def run(
             if bX and not prev_buttons[2]:
                 state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
                 graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                pitch_node = graph._nodes.get("pitch")
                 print(f"Waveform → {state['waves'][state['wave_idx']]}")
                 menu_instance.draw()
 
@@ -761,6 +795,8 @@ def run(
                     idx = names.index(m) if (m in names) else -1
                     m2 = names[(idx + 1) % len(names)] if idx >= 0 else names[0]
                     state["base_token"] = f"12tet/{m2}"
+                    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                    pitch_node = graph._nodes.get("pitch")
                     print(f"Base token → {state['base_token']}")
                     menu_instance.draw()
                 else:
@@ -770,6 +806,8 @@ def run(
                         state["base_token"] = et[(idx + 1) % len(et)]
                     except ValueError:
                         state["base_token"] = et[0]
+                    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                    pitch_node = graph._nodes.get("pitch")
                     print(f"Base token  {state['base_token']}")
                     menu_instance.draw()
 
