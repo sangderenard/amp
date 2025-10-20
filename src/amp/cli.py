@@ -52,7 +52,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Warning: {app.joystick_error}")
         return 0
 
-    from .interactive import run_app
+    from .app import run as run_app
 
     allow_no_joystick = args.allow_no_joystick
     no_audio = args.no_audio

@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Mapping, Sequence
 import numpy as np
 
 from .config import GraphConfig
-from .nodes import NODE_TYPES, AudioNode
+from .nodes import NODE_TYPES, Node as AudioNode
 
 RAW_DTYPE = np.float64
 

@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from .interactive import run_app
+from .app import run as run_app
 
 __all__ = ["run_app"]
