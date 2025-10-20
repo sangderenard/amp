@@ -55,6 +55,10 @@ class ConnectionConfig:
     source: str
     target: str
     kind: str = "audio"  # future expansion
+    param: str | None = None
+    scale: float = 1.0
+    mode: str = "add"
+    channel: int | str | None = None
 
 
 @dataclass(slots=True)
@@ -98,14 +102,26 @@ def _normalise_graph(data: Mapping[str, Any]) -> GraphConfig:
         )
         for item in node_items
     ]
-    connections = [
-        ConnectionConfig(
-            source=str(item["source"]),
-            target=str(item["target"]),
-            kind=str(item.get("kind", "audio")),
+    connections = []
+    for item in data.get("connections", []):
+        channel = item.get("channel")
+        if isinstance(channel, str) and not channel:
+            channel = None
+        elif channel is not None and not isinstance(channel, (int, str)):
+            raise TypeError(
+                "graph.connections[].channel must be an integer index or output name"
+            )
+        connections.append(
+            ConnectionConfig(
+                source=str(item["source"]),
+                target=str(item["target"]),
+                kind=str(item.get("kind", "audio")),
+                param=(lambda value: None if value is None else str(value))(item.get("param")),
+                scale=float(item.get("scale", 1.0)),
+                mode=str(item.get("mode", "add")),
+                channel=channel,
+            )
         )
-        for item in data.get("connections", [])
-    ]
     sink = str(data.get("sink"))
     if not sink:
         raise ValueError("graph.sink must be provided")

@@ -65,6 +65,24 @@
       }
     ],
     "connections": [
+      {
+        "source": "keyboard_ctrl",
+        "target": "carrier",
+        "kind": "mod",
+        "param": "amplitude",
+        "mode": "mul",
+        "scale": 1.0,
+        "channel": "velocity"
+      },
+      {
+        "source": "joystick_ctrl",
+        "target": "carrier",
+        "kind": "mod",
+        "param": "frequency",
+        "mode": "add",
+        "scale": 240.0,
+        "channel": "pitch_input"
+      },
       {"source": "carrier", "target": "mixer"},
       {"source": "mixer", "target": "safety"}
     ],
