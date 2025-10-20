@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional, cast
 
 import numpy as np
 
@@ -50,6 +50,11 @@ def build_runtime_graph(
     for am in am_lfos:
         graph_obj.add_node(am)
 
+    nodes.EnvelopeModulatorNode.reset_groups()
+
+    pitch_node = nodes.PitchQuantizerNode("pitch", runtime_state)
+    graph_obj.add_node(pitch_node)
+
     env_cfg = runtime_state.get("envelope_params", {})
     poly_mode = runtime_state.get("polyphony_mode", "strings")
     default_voice_count = len(osc_nodes) if poly_mode == "piano" else 1
@@ -57,6 +62,7 @@ def build_runtime_graph(
     if voice_count < 1:
         voice_count = 1
     voice_count = min(len(osc_nodes), voice_count)
+    group_name = "voices" if voice_count > 1 else None
     for i in range(voice_count):
         env = nodes.EnvelopeModulatorNode(
             f"env{i+1}",
@@ -67,6 +73,7 @@ def build_runtime_graph(
             sustain_ms=env_cfg.get("sustain_ms", 0.0),
             release_ms=env_cfg.get("release_ms", 220.0),
             send_resets=env_cfg.get("send_resets", True),
+            group=group_name,
         )
         env_nodes.append(env)
         graph_obj.add_node(env)
@@ -77,6 +84,7 @@ def build_runtime_graph(
             graph_obj.connect_mod(env.name, osc.name, "amp", scale=1.0, mode="add", channel=0)
             if getattr(osc, "accept_reset", True) and env_cfg.get("send_resets", True):
                 graph_obj.connect_mod(env.name, osc.name, "reset", scale=1.0, mode="add", channel=1)
+        graph_obj.connect_mod(pitch_node.name, osc.name, "freq", scale=1.0, mode="add", channel=0)
         graph_obj.connect_mod(am_lfos[i].name, osc.name, "amp", scale=0.5, mode="mul")
         graph_obj.connect_mod(pan_lfos[i].name, osc.name, "pan", scale=1.0, mode="add")
 
@@ -253,6 +261,10 @@ def run(
         joy = pygame.joystick.Joystick(0)
         joy.init()
 
+    state = app_state.build_default_state(joy=joy, pygame=pygame)
+    persistence.load_mappings(state)
+    sampler = _load_sampler(state)
+
     sample_rate = 44100
     freq_target = 220.0
     freq_current = 220.0
@@ -263,19 +275,19 @@ def run(
     q_target = 0.8
     q_current = 0.8
     gate_momentary = False
+    root_midi_value = state.get("root_midi", 60)
+    pitch_input_value = 0.0
+    pitch_span_value = float(state.get("free_span_oct", 2.0))
+    pitch_effective_token = state.get("base_token", "12tet/full")
+    pitch_free_variant = state.get("free_variant", "continuous")
 
     envelope_modes = ("envelope", "drone", "hold")
     envelope_mode_idx = 0
     envelope_mode = envelope_modes[envelope_mode_idx]
     pending_trigger = False
 
-    state = app_state.build_default_state(joy=joy, pygame=pygame)
-
-    persistence.load_mappings(state)
-
-    sampler = _load_sampler(state)
-
     graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+    pitch_node = graph._nodes.get("pitch")
     menu_instance = menu.Menu(state)
     menu_instance.toggle()
     menu_instance.draw()
@@ -302,13 +314,14 @@ def run(
     drone_prev = False
 
     def audio_callback(outdata, frames, time_info, status):
-        nonlocal sample_rate, freq_current, velocity_current, cutoff_current, q_current, graph
+        nonlocal sample_rate, freq_current, freq_target, velocity_current, cutoff_current, q_current, graph
         nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger, amp_mod_names
+        nonlocal pitch_node, pitch_input_value, pitch_span_value, pitch_effective_token
+        nonlocal root_midi_value, pitch_free_variant
 
         sr = sample_rate
         utils._scratch.ensure(frames)
 
-        f = utils.cubic_ramp(freq_current, freq_target, frames, utils._scratch.f[:frames])
         v = utils.cubic_ramp(velocity_current, velocity_target, frames, utils._scratch.a[:frames])
         c = utils.cubic_ramp(cutoff_current, cutoff_target, frames, utils._scratch.c[:frames])
         q = utils.cubic_ramp(q_current, q_target, frames, utils._scratch.q[:frames])
@@ -339,7 +352,7 @@ def run(
             "_B": B,
             "_C": C,
             "source": {
-                "freq": utils.as_BCF(f, B, C, frames, name="freq"),
+                "freq": utils.as_BCF(0.0, B, C, frames, name="freq"),
                 "amp": utils.as_BCF(v, B, C, frames, name="velocity"),
             },
             "filter": {
@@ -348,10 +361,26 @@ def run(
             },
         }
 
+        pitch_ref = pitch_node
+        if pitch_ref is None or pitch_ref.name not in graph._nodes:
+            pitch_ref = graph._nodes.get("pitch")
+            pitch_node = pitch_ref
+        if pitch_ref is not None:
+            pitch_ref.update_mode(
+                effective_token=pitch_effective_token,
+                free_variant=pitch_free_variant,
+                span_oct=pitch_span_value,
+            )
+            base_params[pitch_ref.name] = {
+                "input": utils.as_BCF(pitch_input_value, B, 1, frames, name="pitch.input"),
+                "root_midi": utils.as_BCF(root_midi_value, B, 1, frames, name="pitch.root"),
+                "span_oct": utils.as_BCF(pitch_span_value, B, 1, frames, name="pitch.span"),
+            }
+
         osc_names = [name for name in ("osc1", "osc2", "osc3") if name in graph._nodes]
         for name in osc_names:
             base_params[name] = {
-                "freq": utils.as_BCF(f, B, 1, frames, name=f"{name}.freq"),
+                "freq": utils.as_BCF(0.0, B, 1, frames, name=f"{name}.freq"),
                 "amp": utils.as_BCF(0.0, B, 1, frames, name=f"{name}.amp"),
             }
 
@@ -391,7 +420,13 @@ def run(
         for ch in range(chans):
             outdata[:, ch] = y[0, ch].astype(np.float32, copy=False)
 
-        freq_current = float(f[-1])
+        if pitch_ref is not None:
+            last = pitch_ref.last_output
+            targets = pitch_ref.last_target
+            if last is not None and last.size > 0:
+                freq_current = float(np.asarray(last)[0, -1]) if last.ndim == 2 else float(last[-1])
+            if targets is not None and targets.size > 0:
+                freq_target = float(np.asarray(targets)[-1])
         velocity_current = float(v[-1])
         cutoff_current = float(c[-1])
         q_current = float(q[-1])
@@ -416,6 +451,7 @@ def run(
         sd.default.device = (None, dev_index)
         print(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz")
         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+        pitch_node = graph._nodes.get("pitch")
 
         def audio_thread() -> None:
             nonlocal running
@@ -487,25 +523,85 @@ def run(
         margin = 32
         tile_w = 280
         tile_h = 210
-        cols = max(1, min(len(nodes_in_graph), max(1, (width - margin) // (tile_w + margin))))
-        rows = (len(nodes_in_graph) + cols - 1) // cols
+
+        grouped: dict[str, list[str]] = {}
+        for name in nodes_in_graph:
+            node = graph._nodes.get(name)
+            if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
+                grouped.setdefault(node.group, []).append(name)
+
+        entries: list[dict[str, Any]] = []
+        seen_groups: set[str] = set()
+        for name in nodes_in_graph:
+            node = graph._nodes.get(name)
+            if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
+                group_name = node.group
+                if group_name in seen_groups:
+                    continue
+                members = [member for member in grouped.get(group_name, []) if member in graph._nodes]
+                if members:
+                    entries.append({"kind": "group", "group": group_name, "names": members})
+                seen_groups.add(group_name)
+            else:
+                entries.append({"kind": "single", "name": name})
+
+        display_count = len(entries)
+        cols = max(1, min(display_count, max(1, (width - margin) // (tile_w + margin))))
+        rows = (display_count + cols - 1) // cols
         total_height = rows * (tile_h + margin) + margin
         if total_height > height - 160:
             available = max(height - 200, tile_h + margin)
             tile_h = max(120, available // max(rows, 1) - margin)
 
         layout: dict[str, pygame.Rect] = {}
-        for idx, name in enumerate(nodes_in_graph):
+        entry_rects: list[tuple[dict[str, Any], pygame.Rect]] = []
+        for idx, entry in enumerate(entries):
             row = idx // cols
             col = idx % cols
             x = margin + col * (tile_w + margin)
             y = margin + row * (tile_h + margin)
-            layout[name] = pygame.Rect(x, y, tile_w, tile_h)
+            rect = pygame.Rect(x, y, tile_w, tile_h)
+            entry_rects.append((entry, rect))
+            if entry["kind"] == "single":
+                node_name = cast(str, entry["name"])
+                layout[node_name] = rect
+            else:
+                names = cast(list[str], entry["names"])
+                if not names:
+                    continue
+                header_h = font.get_height() + 12
+                inner_top = rect.y + header_h
+                inner_height = rect.height - header_h - 10
+                inner_available = max(inner_height, 0)
+                spacing = 6 if len(names) > 1 else 0
+                min_slot = 48
+                min_total = len(names) * min_slot + spacing * (len(names) - 1)
+                effective_height = max(inner_available, min_total)
+                slot_h = (effective_height - spacing * (len(names) - 1)) // len(names)
+                slot_h = max(min_slot, slot_h)
+                total_stack = len(names) * slot_h + spacing * (len(names) - 1)
+                start_y = inner_top + max(0, (inner_available - total_stack) // 2)
+                max_bottom = rect.bottom - 6
+                if start_y + total_stack > max_bottom:
+                    start_y = max(inner_top, max_bottom - total_stack)
+                for member in names:
+                    layout[member] = pygame.Rect(rect.x + 8, start_y, rect.width - 16, slot_h)
+                    start_y += slot_h + spacing
 
         centres = {name: rect.center for name, rect in layout.items()}
 
         audio_colour = (90, 160, 240)
         mod_colour = (200, 140, 255)
+
+        group_visuals: list[tuple[str, pygame.Rect, int]] = []
+        for entry, rect in entry_rects:
+            if entry["kind"] == "group":
+                names = cast(list[str], entry["names"])
+                group_name = cast(str, entry["group"])
+                member_count = len(names)
+                pygame.draw.rect(screen, (36, 28, 64), rect, border_radius=14)
+                pygame.draw.rect(screen, (210, 210, 235), rect, width=2, border_radius=14)
+                group_visuals.append((group_name, rect, member_count))
 
         for source, targets in getattr(graph, "_audio_successors", {}).items():
             if source not in centres:
@@ -526,16 +622,24 @@ def run(
                     continue
                 pygame.draw.line(screen, mod_colour, start, end, 2)
 
-        for name, rect in layout.items():
+        def _brighten(colour: tuple[int, int, int], amount: int = 18) -> tuple[int, int, int]:
+            return tuple(min(255, max(0, c + amount)) for c in colour)
+
+        def render_node_tile(name: str, rect: pygame.Rect, *, header: str | None = None, tint: bool = False) -> None:
             node = graph._nodes.get(name)
             if node is None:
-                continue
+                return
             colour = _node_colour(node)
+            if tint:
+                colour = _brighten(colour)
+            border_width = 1 if rect.height < 120 else 2
             pygame.draw.rect(screen, colour, rect, border_radius=10)
-            pygame.draw.rect(screen, (220, 220, 220), rect, width=2, border_radius=10)
+            pygame.draw.rect(screen, (220, 220, 220), rect, width=border_width, border_radius=10)
 
-            title = font.render(name, True, (250, 250, 250))
-            screen.blit(title, (rect.x + 10, rect.y + 8))
+            header_font = font if rect.height >= 140 else font_small
+            header_text = header or name
+            title = header_font.render(header_text, True, (250, 250, 250))
+            screen.blit(title, (rect.x + 10, rect.y + 6))
 
             lines_to_render: list[str] = []
             if isinstance(node, nodes.OscNode):
@@ -549,8 +653,10 @@ def run(
             else:
                 lines_to_render.extend(_extract_node_stats(node))
 
-            info_start_y = rect.y + 34
-            for idx_line, text_line in enumerate(lines_to_render[:5]):
+            info_start_y = rect.y + header_font.get_height() + 8
+            max_lines = 5 if rect.height >= 160 else 3 if rect.height >= 120 else 2
+            rendered_lines = lines_to_render[:max_lines]
+            for idx_line, text_line in enumerate(rendered_lines):
                 text_surface = font_small.render(text_line, True, (240, 240, 240))
                 screen.blit(
                     text_surface,
@@ -565,10 +671,11 @@ def run(
                         label = f"B{batch_idx}C{channel_idx}"
                         vu_rows.append((label, float(levels[batch_idx, channel_idx])))
                 if vu_rows:
-                    vu_bar_h = 12
+                    vu_bar_h = 12 if rect.height >= 140 else 10
                     row_spacing = vu_bar_h + 4
-                    base_y = rect.bottom - (len(vu_rows) * row_spacing) - 10
-                    base_y = max(base_y, info_start_y + len(lines_to_render[:5]) * (font_small.get_height() + 2) + 8)
+                    base_y = rect.bottom - (len(vu_rows) * row_spacing) - 8
+                    min_y = info_start_y + len(rendered_lines) * (font_small.get_height() + 2) + 4
+                    base_y = max(base_y, min_y)
                     bar_x = rect.x + 12
                     bar_w = rect.width - 24
                     for idx_row, (label, value) in enumerate(vu_rows):
@@ -595,6 +702,19 @@ def run(
                         peak_x = bar_x + label_w + meter_w + 4
                         peak_x = min(peak_x, rect.right - peak_text.get_width() - 6)
                         screen.blit(peak_text, (peak_x, row_y))
+
+        for entry, rect in entry_rects:
+            if entry["kind"] == "group":
+                names = cast(list[str], entry["names"])
+                for member in names:
+                    render_node_tile(member, layout[member], tint=True)
+            else:
+                node_name = cast(str, entry["name"])
+                render_node_tile(node_name, layout[node_name])
+
+        for group_name, rect, member_count in group_visuals:
+            header = font.render(f"{group_name} [{member_count}]", True, (235, 235, 245))
+            screen.blit(header, (rect.x + 12, rect.y + 8))
 
         legend_x = margin
         legend_y = height - (len(lines) + 3) * (font.get_height() + 4)
@@ -644,30 +764,36 @@ def run(
                     elif event.key == state["keymap"].get("toggle_source", pygame.K_n):
                         state["source_type"] = "sampler" if state["source_type"] == "osc" else "osc"
                         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                        pitch_node = graph._nodes.get("pitch")
                         print(f"Source → {state['source_type'].upper()}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("wave_next", pygame.K_x):
                         state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
                         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                        pitch_node = graph._nodes.get("pitch")
                         print(f"Waveform → {state['waves'][state['wave_idx']]}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("free_variant_next", pygame.K_z):
                         i = quantizer.FREE_VARIANTS.index(state["free_variant"])
                         state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
+                        pitch_free_variant = state["free_variant"]
                         print(f"FREE variant → {state['free_variant']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("drone_toggle", pygame.K_b):
                         cycle_envelope_mode()
                     elif event.key == state["keymap"].get("root_up", pygame.K_PERIOD):
                         state["root_midi"] = min(127, state["root_midi"] + 1)
+                        root_midi_value = state["root_midi"]
                         print(f"Root MIDI → {state['root_midi']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("root_down", pygame.K_COMMA):
                         state["root_midi"] = max(0, state["root_midi"] - 1)
+                        root_midi_value = state["root_midi"]
                         print(f"Root MIDI → {state['root_midi']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("root_reset", pygame.K_SLASH):
                         state["root_midi"] = 60
+                        root_midi_value = state["root_midi"]
                         print("Root MIDI → 60 (C4)")
                         menu_instance.draw()
 
@@ -679,6 +805,7 @@ def run(
                 if pressed and not prev_buttons[fvb]:
                     i = quantizer.FREE_VARIANTS.index(state["free_variant"])
                     state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
+                    pitch_free_variant = state["free_variant"]
                     print(f"FREE variant → {state['free_variant']}")
                     menu_instance.draw()
 
@@ -721,24 +848,12 @@ def run(
             q_target = 0.5 + ry01 * (12.0 - 0.5)
 
             root_midi = state.get("root_midi", 60)
-            root_f = quantizer.Quantizer.midi_to_freq(root_midi)
             span_oct = float(state.get("free_span_oct", 2.0))
-            grid = quantizer.get_reference_grid_cents(state, effective_token)
-            if quantizer.is_free_mode_token(effective_token):
-                N = max(1, len(utils._grid_sorted(grid)[0]))
-                u = lx * span_oct * N
-                fv = state.get("free_variant", "continuous")
-                if fv == "continuous":
-                    cents = lx * span_oct * 1200.0
-                elif fv == "weighted":
-                    cents = quantizer.grid_warp_inverse(u, grid)
-                else:
-                    cents = quantizer.grid_warp_inverse(round(u), grid)
-            else:
-                cents_unq = lx * span_oct * 1200.0
-                u = quantizer.grid_warp_forward(cents_unq, grid)
-                cents = quantizer.grid_warp_inverse(round(u), grid)
-            freq_target = root_f * (2.0 ** (cents / 1200.0))
+            pitch_input_value = lx
+            pitch_span_value = span_oct
+            pitch_effective_token = effective_token
+            pitch_free_variant = state.get("free_variant", "continuous")
+            root_midi_value = root_midi
 
             velocity_target = max(0.0, 1.0 - (ly + 1.0) / 2.0)
 
@@ -750,6 +865,7 @@ def run(
             if bX and not prev_buttons[2]:
                 state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
                 graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                pitch_node = graph._nodes.get("pitch")
                 print(f"Waveform → {state['waves'][state['wave_idx']]}")
                 menu_instance.draw()
 
@@ -761,6 +877,8 @@ def run(
                     idx = names.index(m) if (m in names) else -1
                     m2 = names[(idx + 1) % len(names)] if idx >= 0 else names[0]
                     state["base_token"] = f"12tet/{m2}"
+                    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                    pitch_node = graph._nodes.get("pitch")
                     print(f"Base token → {state['base_token']}")
                     menu_instance.draw()
                 else:
@@ -770,6 +888,8 @@ def run(
                         state["base_token"] = et[(idx + 1) % len(et)]
                     except ValueError:
                         state["base_token"] = et[0]
+                    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+                    pitch_node = graph._nodes.get("pitch")
                     print(f"Base token  {state['base_token']}")
                     menu_instance.draw()
 

@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
+from . import quantizer, utils
 from .utils import (
     as_BCF,
     assert_BCF,
@@ -17,6 +18,109 @@ from .utils import (
     soft_clip,
 )
 from .state import RAW_DTYPE, MAX_FRAMES
+
+
+class _EnvelopeGroupState:
+    """Runtime helper that distributes triggers across grouped envelopes."""
+
+    def __init__(self) -> None:
+        self.members: list[str] = []
+        self._assignments: dict[str, dict[str, np.ndarray]] = {}
+        self._next_voice = 0
+        self._block_token: int | None = None
+        self._latched_voice: list[int] = []
+
+    def register(self, name: str) -> None:
+        if name not in self.members:
+            self.members.append(name)
+
+    def reset(self) -> None:
+        self._assignments.clear()
+        self._block_token = None
+        self._latched_voice = []
+        self._next_voice = 0
+
+    def _token(self, trigger: np.ndarray) -> int:
+        ptr = trigger.__array_interface__["data"][0]
+        return hash((ptr, trigger.shape))
+
+    def assign(
+        self,
+        name: str,
+        trigger: np.ndarray,
+        gate: np.ndarray,
+        drone: np.ndarray,
+        velocity: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if not self.members or name not in self.members:
+            return trigger, gate, drone, velocity
+
+        token = self._token(trigger)
+        if token != self._block_token:
+            self._prepare_assignments(trigger, gate, drone, velocity, token)
+        bundles = self._assignments.get(name)
+        if bundles is None:
+            zero = np.zeros_like(trigger)
+            return zero, gate, drone, velocity
+        return bundles["trigger"], bundles["gate"], bundles["drone"], bundles["velocity"]
+
+    def _prepare_assignments(
+        self,
+        trigger: np.ndarray,
+        gate: np.ndarray,
+        drone: np.ndarray,
+        velocity: np.ndarray,
+        token: int,
+    ) -> None:
+        B, F = trigger.shape
+        assignments: dict[str, dict[str, np.ndarray]] = {}
+        dtype = trigger.dtype
+        for member in self.members:
+            assignments[member] = {
+                "trigger": np.zeros((B, F), dtype=dtype),
+                "gate": np.zeros((B, F), dtype=dtype),
+                "drone": np.zeros((B, F), dtype=dtype),
+                "velocity": np.zeros((B, F), dtype=dtype),
+            }
+
+        member_count = len(self.members)
+        if member_count:
+            if len(self._latched_voice) != B:
+                self._latched_voice = [-1] * B
+            idx = self._next_voice % member_count
+            for frame in range(F):
+                for batch in range(B):
+                    trig_val = trigger[batch, frame] > 0.5
+                    gate_val = gate[batch, frame]
+                    drone_val = drone[batch, frame]
+                    vel_val = velocity[batch, frame]
+                    voice = self._latched_voice[batch]
+
+                    if trig_val:
+                        voice = idx
+                        idx = (idx + 1) % member_count
+                        self._latched_voice[batch] = voice
+                        member = self.members[voice]
+                        assignments[member]["trigger"][batch, frame] = trigger[batch, frame]
+                        assignments[member]["velocity"][batch, frame] = vel_val
+                    elif voice >= 0:
+                        member = self.members[voice]
+                        if gate_val > 0.0 or drone_val > 0.0:
+                            assignments[member]["velocity"][batch, frame] = vel_val
+
+                    if voice >= 0:
+                        member = self.members[voice]
+                        if gate_val > 0.0:
+                            assignments[member]["gate"][batch, frame] = gate_val
+                        if drone_val > 0.0:
+                            assignments[member]["drone"][batch, frame] = drone_val
+                        if (gate_val <= 0.5 and drone_val <= 0.5) and not trig_val:
+                            self._latched_voice[batch] = -1
+
+            self._next_voice = idx
+        self._assignments = assignments
+        self._block_token = token
+
 
 
 def _ensure_bcf(audio_in, frames: int, *, name: str):
@@ -202,6 +306,12 @@ class LFONode(Node):
 class EnvelopeModulatorNode(Node):
     """Multi-stage envelope generator that emits control signals."""
 
+    _GROUPS: dict[str, _EnvelopeGroupState] = {}
+
+    @classmethod
+    def reset_groups(cls) -> None:
+        cls._GROUPS.clear()
+
     _IDLE = 0
     _ATTACK = 1
     _HOLD = 2
@@ -220,6 +330,7 @@ class EnvelopeModulatorNode(Node):
         sustain_ms=0.0,
         release_ms=160.0,
         send_resets=True,
+        group: str | None = None,
     ):
         super().__init__(name)
         self.attack_ms = float(attack_ms)
@@ -229,12 +340,16 @@ class EnvelopeModulatorNode(Node):
         self.sustain_ms = float(sustain_ms)
         self.release_ms = float(release_ms)
         self.send_resets = bool(send_resets)
+        self.group = group
         self._stage = None
         self._value = None
         self._timer = None
         self._velocity = None
         self._activation_count = None
         self._release_start = None
+        if self.group:
+            state = self._GROUPS.setdefault(self.group, _EnvelopeGroupState())
+            state.register(self.name)
 
     def _ensure(self, B: int) -> None:
         if (
@@ -270,6 +385,11 @@ class EnvelopeModulatorNode(Node):
             F,
             name=f"{self.name}.send_reset",
         )[:, 0, :]
+
+        if self.group:
+            state = self._GROUPS.setdefault(self.group, _EnvelopeGroupState())
+            state.register(self.name)
+            trigger, gate, drone, velocity = state.assign(self.name, trigger, gate, drone, velocity)
 
         atk_frames = self._stage_frames(self.attack_ms, sr)
         hold_frames = self._stage_frames(self.hold_ms, sr)
@@ -402,6 +522,97 @@ class EnvelopeModulatorNode(Node):
 
         out = np.stack([amp, reset], axis=1)
         return out
+
+
+class PitchQuantizerNode(Node):
+    """Convert controller input into quantised pitch values."""
+
+    def __init__(self, name: str, state: Mapping[str, object], *, slew: bool = True) -> None:
+        super().__init__(name)
+        self.state = state
+        self.slew = bool(slew)
+        self.effective_token = "12tet/full"
+        self.free_variant = "continuous"
+        self.span_oct = 2.0
+        self._last_freq: np.ndarray | None = None
+        self._last_output: np.ndarray | None = None
+        self._last_target: np.ndarray | None = None
+
+    def update_mode(
+        self,
+        *,
+        effective_token: str,
+        free_variant: str,
+        span_oct: float,
+    ) -> None:
+        self.effective_token = effective_token
+        self.free_variant = free_variant
+        self.span_oct = float(span_oct)
+
+    @staticmethod
+    def _midi_to_freq(midi: np.ndarray) -> np.ndarray:
+        return 440.0 * np.power(2.0, (midi - 69.0) / 12.0, dtype=RAW_DTYPE)
+
+    def _compute_cents(self, value: float, span: float, grid_cents: Sequence[float]) -> float:
+        token = self.effective_token
+        if quantizer.is_free_mode_token(token):
+            grid = utils._grid_sorted(grid_cents)[0]
+            N = max(1, len(grid))
+            variant = self.free_variant
+            if variant == "continuous":
+                return value * span * 1200.0
+            u = value * span * N
+            if variant == "weighted":
+                return quantizer.grid_warp_inverse(u, grid_cents)
+            return quantizer.grid_warp_inverse(round(u), grid_cents)
+        cents_unq = value * span * 1200.0
+        u = quantizer.grid_warp_forward(cents_unq, grid_cents)
+        return quantizer.grid_warp_inverse(round(u), grid_cents)
+
+    @property
+    def last_output(self) -> np.ndarray | None:
+        return None if self._last_output is None else self._last_output.copy()
+
+    @property
+    def last_target(self) -> np.ndarray | None:
+        return None if self._last_target is None else self._last_target.copy()
+
+    def process(self, frames, sr, audio_in, mods, params):
+        B = audio_in.shape[0] if audio_in is not None else 1
+        C = 1
+        F = frames
+
+        ctrl = as_BCF(params.get("input", 0.0), B, C, F, name=f"{self.name}.input")[:, 0, :]
+        root_midi = as_BCF(params.get("root_midi", 60.0), B, C, F, name=f"{self.name}.root")[:, 0, :]
+        span_arr = as_BCF(params.get("span_oct", self.span_oct), B, C, F, name=f"{self.name}.span")[:, 0, :]
+
+        token = self.effective_token or str(self.state.get("base_token", "12tet/full"))
+        grid = quantizer.get_reference_grid_cents(self.state, token)
+        root_freq = self._midi_to_freq(root_midi)
+
+        freq_target = np.empty((B, F), dtype=RAW_DTYPE)
+        for b in range(B):
+            for i in range(F):
+                span_val = float(span_arr[b, i])
+                freq_target[b, i] = root_freq[b, i] * (
+                    2.0
+                    ** (self._compute_cents(float(ctrl[b, i]), span_val, grid) / 1200.0)
+                )
+
+        if not self.slew:
+            block = freq_target
+        else:
+            if self._last_freq is None or self._last_freq.shape[0] != B:
+                self._last_freq = freq_target[:, 0].copy()
+            block = np.empty_like(freq_target)
+            for b in range(B):
+                block[b] = utils.cubic_ramp(self._last_freq[b], freq_target[b, -1], F)
+            self._last_freq = block[:, -1].copy()
+
+        self._last_output = block.copy()
+        self._last_target = freq_target[:, -1].copy()
+
+        return block[:, None, :]
 
 
 class AmplifierModulatorNode(Node):
@@ -1014,6 +1225,7 @@ NODE_TYPES = {
     "oscillator": OscNode,
     "envelope": EnvelopeModulatorNode,
     "envelope_modulator": EnvelopeModulatorNode,
+    "pitch_quantizer": PitchQuantizerNode,
     "amplifier_modulator": AmplifierModulatorNode,
     "mix": MixNode,
     "safety": SafetyNode,
@@ -1027,6 +1239,7 @@ __all__ = [
     "SilenceNode",
     "ConstantNode",
     "SineOscillatorNode",
+    "PitchQuantizerNode",
     "EnvelopeModulatorNode",
     "AmplifierModulatorNode",
     "OscNode",
