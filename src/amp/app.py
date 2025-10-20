@@ -13,14 +13,16 @@ from .graph import AudioGraph
 from . import menu, nodes, persistence, quantizer, state as app_state, utils
 
 
-def build_runtime_graph(fs: int, runtime_state: dict) -> tuple[AudioGraph, list[str]]:
+def build_runtime_graph(
+    fs: int, runtime_state: dict
+) -> tuple[AudioGraph, list[str], list[str]]:
     """Construct the default audio graph for the given runtime state.
 
-    This helper returns both the populated :class:`AudioGraph` instance and the
-    list of envelope node names so the caller can feed control data during the
-    audio callback.  Keeping this as a module-level function allows tests to
-    inspect the generated graph without needing to spin up the interactive
-    application loop.
+    This helper returns the populated :class:`AudioGraph` instance together with
+    the list of envelope modulators and any downstream amplifier modulators (the
+    default graph currently returns none).  Keeping this as a module-level
+    function allows tests to inspect the generated graph without needing to spin
+    up the interactive application loop.
     """
 
     use_subharm = runtime_state.get("use_subharm", True)
@@ -56,7 +58,7 @@ def build_runtime_graph(fs: int, runtime_state: dict) -> tuple[AudioGraph, list[
         voice_count = 1
     voice_count = min(len(osc_nodes), voice_count)
     for i in range(voice_count):
-        env = nodes.EnvelopeNode(
+        env = nodes.EnvelopeModulatorNode(
             f"env{i+1}",
             attack_ms=env_cfg.get("attack_ms", 12.0),
             hold_ms=env_cfg.get("hold_ms", 8.0),
@@ -104,12 +106,9 @@ def build_runtime_graph(fs: int, runtime_state: dict) -> tuple[AudioGraph, list[
     graph_obj.add_node(mixer)
     graph_obj.connect_audio(mixer_in, mixer.name)
 
-    safety = nodes.SafetyFilterNode("safety", fs, n_ch=2)
-    graph_obj.add_node(safety)
-    graph_obj.connect_audio(mixer.name, safety.name)
-    graph_obj.set_sink(safety.name)
+    graph_obj.set_sink(mixer.name)
 
-    return graph_obj, [env.name for env in env_nodes]
+    return graph_obj, [env.name for env in env_nodes], []
 from .config import DEFAULT_CONFIG_PATH, load_configuration
 
 
@@ -274,7 +273,7 @@ def run(
 
     sampler = _load_sampler(state)
 
-    graph, envelope_names = build_runtime_graph(sample_rate, state)
+    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
     menu_instance = menu.Menu(state)
     menu_instance.toggle()
     menu_instance.draw()
@@ -302,7 +301,7 @@ def run(
 
     def audio_callback(outdata, frames, time_info, status):
         nonlocal sample_rate, freq_current, velocity_current, cutoff_current, q_current, graph
-        nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger
+        nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger, amp_mod_names
 
         sr = sample_rate
         utils._scratch.ensure(frames)
@@ -376,6 +375,11 @@ def run(
                     "send_reset": send_reset_bcf,
                 }
 
+        if amp_mod_names:
+            amp_base = utils.as_BCF(v, B, 1, frames, name="amp_mod.base")
+            for name in amp_mod_names:
+                base_params[name] = {"base": amp_base}
+
         y = graph.render(frames, sr, base_params)
         y = utils.assert_BCF(y, name="sink")
         if y.shape[0] != 1 or y.shape[1] not in (1, outdata.shape[1]):
@@ -409,7 +413,7 @@ def run(
         sample_rate = dev_sr
         sd.default.device = (None, dev_index)
         print(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz")
-        graph, envelope_names = build_runtime_graph(sample_rate, state)
+        graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
 
         def audio_thread() -> None:
             nonlocal running
@@ -467,12 +471,12 @@ def run(
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("toggle_source", pygame.K_n):
                         state["source_type"] = "sampler" if state["source_type"] == "osc" else "osc"
-                        graph, envelope_names = build_runtime_graph(sample_rate, state)
+                        graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                         print(f"Source → {state['source_type'].upper()}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("wave_next", pygame.K_x):
                         state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
-                        graph, envelope_names = build_runtime_graph(sample_rate, state)
+                        graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                         print(f"Waveform → {state['waves'][state['wave_idx']]}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("free_variant_next", pygame.K_z):
@@ -573,7 +577,7 @@ def run(
             bX = joy.get_button(2)
             if bX and not prev_buttons[2]:
                 state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
-                graph, envelope_names = build_runtime_graph(sample_rate, state)
+                graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                 print(f"Waveform → {state['waves'][state['wave_idx']]}")
                 menu_instance.draw()
 
