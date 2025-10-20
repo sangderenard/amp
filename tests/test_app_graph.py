@@ -33,6 +33,22 @@ def test_default_graph_routes_envelopes_directly_to_oscillators():
 
     assert len(envelope_names) == 3
     assert amp_mod_names == []
+    assert "keyboard_ctrl" in graph._nodes
+    assert "joystick_ctrl" in graph._nodes
+
+    for env_name in envelope_names:
+        mods = graph.mod_connections(env_name)
+        for param in ("velocity", "gate", "drone", "trigger"):
+            sources = {conn.source for conn in mods if conn.param == param}
+            assert "keyboard_ctrl" in sources, f"{env_name}.{param} missing keyboard controller"
+            assert "joystick_ctrl" in sources, f"{env_name}.{param} missing joystick controller"
+
+    if "pitch" in graph._nodes:
+        pitch_mods = graph.mod_connections("pitch")
+        pitch_inputs = {conn.param: conn.source for conn in pitch_mods}
+        assert pitch_inputs.get("input") == "joystick_ctrl"
+        assert pitch_inputs.get("span_oct") == "joystick_ctrl"
+        assert pitch_inputs.get("root_midi") == "joystick_ctrl"
 
     for osc_name in ("osc1", "osc2", "osc3"):
         mods = graph.mod_connections(osc_name)
@@ -64,21 +80,36 @@ def test_triggered_envelopes_produce_audible_output():
     trigger[0] = 1.0
     trigger_bcf = utils.as_BCF(trigger, 1, 1, frames, name="trigger")
     ones = utils.as_BCF(np.ones(frames), 1, 1, frames, name="send_reset")
+    root = utils.as_BCF(np.full(frames, 60.0), 1, 1, frames, name="root")
+    span = utils.as_BCF(np.full(frames, 2.0), 1, 1, frames, name="span")
+    cutoff = utils.as_BCF(np.full(frames, 1200.0), 1, 1, frames, name="cutoff")
+    q_values = utils.as_BCF(np.full(frames, 0.8), 1, 1, frames, name="q")
 
     base_params = {"_B": 1, "_C": 1}
+    base_params["keyboard_ctrl"] = {
+        "trigger": silence,
+        "gate": silence,
+        "drone": silence,
+        "velocity": silence,
+    }
+    base_params["joystick_ctrl"] = {
+        "trigger": trigger_bcf,
+        "gate": silence,
+        "drone": silence,
+        "velocity": velocity,
+        "pitch_input": silence,
+        "pitch_span": span,
+        "pitch_root": root,
+        "cutoff": cutoff,
+        "q": q_values,
+    }
     for osc_name in ("osc1", "osc2", "osc3"):
         if osc_name in graph._nodes:
             base_params.setdefault(osc_name, {})
             base_params[osc_name]["freq"] = freq
             base_params[osc_name]["amp"] = silence
     for env_name in envelope_names:
-        base_params[env_name] = {
-            "velocity": velocity,
-            "gate": silence,
-            "drone": silence,
-            "trigger": trigger_bcf,
-            "send_reset": ones,
-        }
+        base_params[env_name] = {"send_reset": ones}
 
     output = graph.render(frames, 48000, base_params)
     assert np.max(np.abs(output)) > 1e-3
