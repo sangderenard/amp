@@ -206,6 +206,13 @@ def expo_map(norm,lo,hi):
 # Oscillator (polyBLEP)
 # =========================
 def _polyblep_arr(t,dt):
+    try:
+        from . import c_kernels
+        if getattr(c_kernels, "AVAILABLE", False):
+            # c_kernels expects contiguous arrays and flattens as needed
+            return c_kernels._polyblep_arr_c(t, dt)
+    except Exception:
+        pass
     out=np.zeros_like(t)
     m=t<dt
     if np.any(m):
@@ -219,22 +226,55 @@ def _polyblep_arr(t,dt):
 
 def osc_sine(ph): return np.sin(2*np.pi*ph,dtype=RAW_DTYPE)
 def osc_saw_blep(ph,dphi):
+    try:
+        from . import c_kernels
+        if getattr(c_kernels, "AVAILABLE", False):
+            return c_kernels.osc_saw_blep_c(ph, dphi)
+    except Exception:
+        pass
     t=ph; y=2.0*t-1.0; return y-_polyblep_arr(t,dphi)
 def osc_square_blep(ph,dphi,pw=0.5):
+    try:
+        from . import c_kernels
+        if getattr(c_kernels, "AVAILABLE", False):
+            return c_kernels.osc_square_blep_c(ph, dphi, float(pw))
+    except Exception:
+        pass
     t=ph; y=np.where(t<pw,1.0,-1.0)
     y-=_polyblep_arr(t,dphi)
     t2=(t+(1.0-pw))%1.0
     y+=_polyblep_arr(t2,dphi)
     return y
-_tri_state=0.0
-def osc_triangle_blep(ph,dphi):
+_tri_state = None
+
+def osc_triangle_blep(ph, dphi):
     global _tri_state
-    sq=osc_square_blep(ph,dphi)
-    leak=0.9995; y=np.empty_like(sq); s=_tri_state
-    for i,v in enumerate(sq):
-        s=leak*s + (1.0-leak)*v
-        y[i]=s
-    _tri_state=s
+    try:
+        from . import c_kernels
+        if getattr(c_kernels, "AVAILABLE", False):
+            if _tri_state is None:
+                _tri_state = np.zeros(ph.shape[0], dtype=RAW_DTYPE) if ph.ndim == 2 else np.zeros(1, dtype=RAW_DTYPE)
+            out = c_kernels.osc_triangle_blep_c(ph, dphi, _tri_state)
+            return out
+    except Exception:
+        pass
+
+    if _tri_state is None or (isinstance(_tri_state, np.ndarray) and _tri_state.shape[0] != ph.shape[0]):
+        # initialize per-batch triangle state
+        _tri_state = np.zeros(ph.shape[0], dtype=RAW_DTYPE)
+    sq = osc_square_blep(ph, dphi)
+    leak = 0.9995
+    y = np.empty_like(sq)
+    # per-batch state vector
+    s = _tri_state.copy() if isinstance(_tri_state, np.ndarray) else np.full(ph.shape[0], float(_tri_state), dtype=RAW_DTYPE)
+    # iterate frames and update per-batch state
+    B = ph.shape[0]
+    F = ph.shape[1]
+    for i in range(F):
+        v = sq[:, i]
+        s = leak * s + (1.0 - leak) * v
+        y[:, i] = s
+    _tri_state = s
     return y
 
 def make_wave_hq(name,phase,dphi):

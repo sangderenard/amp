@@ -19,6 +19,7 @@ from .utils import (
     osc_triangle_blep,
     soft_clip,
 )
+from . import c_kernels
 from .state import RAW_DTYPE, MAX_FRAMES
 
 
@@ -463,7 +464,8 @@ class SafetyNode(ConfigNode):
         super().__init__(name, params)
         self.channels = int(self.params.get("channels", 2))
         self.dc_alpha = float(self.params.get("dc_alpha", 0.995))
-        self._state: dict[int, np.ndarray] = {}
+        # persistent per-batch/state array (B, C). Start empty; _ensure will size it.
+        self._state: np.ndarray = np.zeros((0, self.channels), dtype=RAW_DTYPE)
 
     def process(self, frames, sr, audio_in, mods, params):
         audio, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
@@ -471,18 +473,14 @@ class SafetyNode(ConfigNode):
             data = np.zeros((batches, self.channels, frames), dtype=RAW_DTYPE)
         else:
             data = _match_channels(audio, self.channels)
-        out = np.empty_like(data)
-        for batch in range(batches):
-            state = self._state.get(batch)
-            if state is None or state.shape[0] != self.channels:
-                state = np.zeros(self.channels, dtype=RAW_DTYPE)
-            for ch in range(self.channels):
-                dc = state[ch]
-                for i in range(frames):
-                    dc = self.dc_alpha * dc + (1.0 - self.dc_alpha) * data[batch, ch, i]
-                    out[batch, ch, i] = data[batch, ch, i] - dc
-                state[ch] = dc
-            self._state[batch] = state
+        # Use C kernel when available; fallback to Python implementation inside c_kernels
+        # Ensure state array is sized for current batches
+        if not isinstance(self._state, np.ndarray) or self._state.shape != (batches, self.channels):
+            self._state = np.zeros((batches, self.channels), dtype=RAW_DTYPE)
+        try:
+            out = c_kernels.dc_block_c(data, float(self.dc_alpha), self._state)
+        except Exception:
+            out = c_kernels.dc_block_py(data, float(self.dc_alpha), self._state)
         np.clip(out, -1.0, 1.0, out=out)
         return out
 
@@ -511,11 +509,15 @@ class DelayNode(Node):
         return out
 
 class LFONode(Node):
-    def __init__(self,name,wave="sine",rate_hz=4.0,depth=0.5,use_input=False,slew_ms=0.0):
+    def __init__(self,name,wave="sine",rate_hz=4.0,depth=0.5,use_input=False,slew_ms=0.0, slew_backend: str = "vector"):
         super().__init__(name)
         self.wave=wave; self.rate=rate_hz; self.depth=depth
         self.use_input=use_input; self.slew_ms=slew_ms
         self.phase=0.0
+        # slew_backend: 'vector' (numpy closed-form), 'iter' (python loop), 'c' (cffi kernel if available)
+        self.slew_backend = str(slew_backend)
+        # state for iterative/backed implementations
+        self._slew_z0: np.ndarray | None = None
     def _make(self,ph):
         if self.wave=="sine": return np.sin(2*np.pi*ph,dtype=RAW_DTYPE)
         if self.wave=="square": return np.where((ph%1.0)<0.5,1.0,-1.0).astype(RAW_DTYPE)
@@ -537,10 +539,32 @@ class LFONode(Node):
             out *= float(self.depth)
         if self.slew_ms > 0:
             alpha = 1.0 - math.exp(-1.0/(sr*(self.slew_ms/1000.0)))
-            z = np.zeros((B,1), RAW_DTYPE)
-            for i in range(F):
-                z = z + alpha * (out[:,:,i:i+1] - z)
-                out[:,:,i] = z[:,0]
+            # Exponential smoothing across time: z[n] = r*z[n-1] + alpha*x[n]
+            # where r = 1-alpha. We can compute closed-form or use an iterative kernel.
+            r = 1.0 - alpha
+            if alpha >= 1.0 - 1e-15:
+                # alpha==1 -> z = x
+                out = out.copy()
+            else:
+                xarr = out[:, 0, :]
+                # ensure z0 exists for iterative backends
+                if self._slew_z0 is None or self._slew_z0.shape[0] != xarr.shape[0]:
+                    self._slew_z0 = np.zeros(xarr.shape[0], dtype=RAW_DTYPE)
+                if self.slew_backend == "c":
+                    try:
+                        out_s = c_kernels.lfo_slew_c(xarr, r, alpha, self._slew_z0)
+                        out[:, 0, :] = out_s
+                    except Exception:
+                        # fallback to python fallback
+                        out_s = c_kernels.lfo_slew_py(xarr, r, alpha, self._slew_z0)
+                        out[:, 0, :] = out_s
+                elif self.slew_backend == "iter":
+                    out_s = c_kernels.lfo_slew_py(xarr, r, alpha, self._slew_z0)
+                    out[:, 0, :] = out_s
+                else:
+                    # vector closed form
+                    out_s = c_kernels.lfo_slew_vector(xarr, r, alpha, self._slew_z0)
+                    out[:, 0, :] = out_s
         return out  # (B,1,F)
 
 class EnvelopeModulatorNode(Node):
@@ -637,128 +661,47 @@ class EnvelopeModulatorNode(Node):
         sus_frames = self._stage_frames(self.sustain_ms, sr)
         rel_frames = self._stage_frames(self.release_ms, sr)
 
-        amp = np.zeros((B, F), dtype=RAW_DTYPE)
-        reset = np.zeros((B, F), dtype=RAW_DTYPE)
-
-        for b in range(B):
-            stage = self._stage[b]
-            value = self._value[b]
-            timer = self._timer[b]
-            vel = self._velocity[b]
-            activations = self._activation_count[b]
-            release_start = self._release_start[b]
-
-            for i in range(F):
-                trig = trigger[b, i] > 0.5
-                gate_on = gate[b, i] > 0.5
-                drone_on = drone[b, i] > 0.5
-
-                if trig:
-                    stage = self._ATTACK
-                    timer = 0.0
-                    value = 0.0
-                    vel = max(0.0, velocity[b, i])
-                    release_start = vel
-                    activations += 1
-                    if send_reset[b, i] > 0.5:
-                        reset[b, i] = 1.0
-                elif stage == self._IDLE and (gate_on or drone_on):
-                    # Allow sustain without explicit trigger when latched drone activates.
-                    stage = self._ATTACK
-                    timer = 0.0
-                    value = 0.0
-                    vel = max(0.0, velocity[b, i])
-                    release_start = vel
-                    activations += 1
-                    if send_reset[b, i] > 0.5:
-                        reset[b, i] = 1.0
-
-                if stage == self._ATTACK:
-                    if atk_frames <= 0:
-                        value = vel
-                        stage = self._HOLD if hold_frames > 0 else (self._DECAY if dec_frames > 0 else self._SUSTAIN)
-                        timer = 0.0
-                    else:
-                        value += vel / atk_frames
-                        if value > vel:
-                            value = vel
-                        timer += 1.0
-                        if timer >= atk_frames:
-                            value = vel
-                            stage = self._HOLD if hold_frames > 0 else (self._DECAY if dec_frames > 0 else self._SUSTAIN)
-                            timer = 0.0
-
-                elif stage == self._HOLD:
-                    value = vel
-                    if hold_frames <= 0:
-                        stage = self._DECAY if dec_frames > 0 else self._SUSTAIN
-                        timer = 0.0
-                    else:
-                        timer += 1.0
-                        if timer >= hold_frames:
-                            stage = self._DECAY if dec_frames > 0 else self._SUSTAIN
-                            timer = 0.0
-
-                elif stage == self._DECAY:
-                    target = vel * self.sustain_level
-                    if dec_frames <= 0:
-                        value = target
-                        stage = self._SUSTAIN
-                        timer = 0.0
-                    else:
-                        delta = (vel - target) / max(dec_frames, 1)
-                        value = max(target, value - delta)
-                        timer += 1.0
-                        if timer >= dec_frames:
-                            value = target
-                            stage = self._SUSTAIN
-                            timer = 0.0
-
-                elif stage == self._SUSTAIN:
-                    value = vel * self.sustain_level
-                    if sus_frames > 0:
-                        timer += 1.0
-                        if timer >= sus_frames:
-                            stage = self._RELEASE
-                            release_start = value
-                            timer = 0.0
-                    elif not gate_on and not drone_on:
-                        stage = self._RELEASE
-                        release_start = value
-                        timer = 0.0
-
-                elif stage == self._RELEASE:
-                    if rel_frames <= 0:
-                        value = 0.0
-                        stage = self._IDLE
-                        timer = 0.0
-                    else:
-                        step = release_start / max(rel_frames, 1)
-                        value = max(0.0, value - step)
-                        timer += 1.0
-                        if timer >= rel_frames:
-                            value = 0.0
-                            stage = self._IDLE
-                            timer = 0.0
-                    if gate_on or drone_on:
-                        stage = self._ATTACK
-                        timer = 0.0
-                        value = 0.0
-                        vel = max(0.0, velocity[b, i])
-                        release_start = vel
-                        activations += 1
-                        if send_reset[b, i] > 0.5:
-                            reset[b, i] = 1.0
-
-                value = max(0.0, value)
-                amp[b, i] = value
-
-            self._stage[b] = stage
-            self._value[b] = value
-            self._timer[b] = timer
-            self._velocity[b] = vel
-            self._activation_count[b] = activations
-            self._release_start[b] = release_start
+        # Prefer C kernel for the sequential envelope state machine; fall back to Python
+        try:
+            amp, reset = c_kernels.envelope_process_c(
+                trigger,
+                gate,
+                drone,
+                velocity,
+                atk_frames,
+                hold_frames,
+                dec_frames,
+                sus_frames,
+                rel_frames,
+                self.sustain_level,
+                bool(send_reset.mean() > 0.5) if isinstance(send_reset, np.ndarray) else bool(self.send_resets),
+                self._stage,
+                self._value,
+                self._timer,
+                self._velocity,
+                self._activation_count,
+                self._release_start,
+            )
+        except Exception:
+            amp, reset = c_kernels.envelope_process_py(
+                trigger,
+                gate,
+                drone,
+                velocity,
+                atk_frames,
+                hold_frames,
+                dec_frames,
+                sus_frames,
+                rel_frames,
+                self.sustain_level,
+                bool(send_reset.mean() > 0.5) if isinstance(send_reset, np.ndarray) else bool(self.send_resets),
+                self._stage,
+                self._value,
+                self._timer,
+                self._velocity,
+                self._activation_count,
+                self._release_start,
+            )
 
         out = np.stack([amp, reset], axis=1)
         return out
@@ -831,22 +774,26 @@ class PitchQuantizerNode(Node):
         root_freq = self._midi_to_freq(root_midi)
 
         freq_target = np.empty((B, F), dtype=RAW_DTYPE)
-        for b in range(B):
-            for i in range(F):
-                span_val = float(span_arr[b, i])
-                freq_target[b, i] = root_freq[b, i] * (
-                    2.0
-                    ** (self._compute_cents(float(ctrl[b, i]), span_val, grid) / 1200.0)
-                )
+        # Vectorised computation of target frequency via cents mapping.
+        # Flatten inputs, compute cents per-sample using numpy.vectorize wrapper
+        flat_ctrl = ctrl.ravel()
+        flat_span = span_arr.ravel()
+        vfunc = np.vectorize(lambda v, s: self._compute_cents(float(v), float(s), grid), otypes=[RAW_DTYPE])
+        cents_flat = vfunc(flat_ctrl, flat_span)
+        cents = cents_flat.reshape(B, F)
+        freq_target = root_freq * np.power(2.0, cents / 1200.0)
 
         if not self.slew:
             block = freq_target
         else:
             if self._last_freq is None or self._last_freq.shape[0] != B:
                 self._last_freq = freq_target[:, 0].copy()
-            block = np.empty_like(freq_target)
-            for b in range(B):
-                block[b] = utils.cubic_ramp(self._last_freq[b], freq_target[b, -1], F)
+            # Vectorized cubic ramp across batches
+            y0 = self._last_freq
+            y1 = freq_target[:, -1]
+            t = np.linspace(0.0, 1.0, F, endpoint=False, dtype=RAW_DTYPE)
+            ramp = (3.0 * t * t - 2.0 * t * t * t)[None, :]
+            block = y0[:, None] + (y1 - y0)[:, None] * ramp
             self._last_freq = block[:, -1].copy()
 
         self._last_output = block.copy()
@@ -955,12 +902,13 @@ class OscNode(Node):
         state = self._voice_phase.get(key)
         if state is None or state.shape[0] != batches:
             state = np.zeros(batches, dtype=RAW_DTYPE)
-        ph = np.empty((batches, frames), dtype=RAW_DTYPE)
-        current = state.copy()
-        for i in range(frames):
-            current = (current + dphi[:, i]) % 1.0
-            ph[:, i] = current
-        self._voice_phase[key] = current
+        # Prefer C kernel for phase advance; fallback to Python implementation
+        try:
+            ph = c_kernels.phase_advance_c(dphi, None, state)
+        except Exception:
+            ph = c_kernels.phase_advance_py(dphi, None, state)
+        # state is updated in-place by the kernel
+        self._voice_phase[key] = state
         return ph
 
     def _render_wave(self, phase: np.ndarray, dphi: np.ndarray) -> np.ndarray:
@@ -1056,27 +1004,16 @@ class OscNode(Node):
         if arp_plan is not None:
             seq_vals, fps = arp_plan
             if self._arp_step is None or self._arp_step.shape[0] != B:
-                self._arp_step = np.zeros(B, dtype=np.int64)
-                self._arp_timer = np.zeros(B, dtype=np.int64)
+                self._arp_step = np.zeros(B, dtype=np.int32)
+                self._arp_timer = np.zeros(B, dtype=np.int32)
             assert self._arp_timer is not None
-            offsets = np.zeros((B, F), dtype=RAW_DTYPE)
-            step = self._arp_step.copy()
-            timer = self._arp_timer.copy()
             seq_arr = np.asarray(seq_vals, dtype=RAW_DTYPE)
-            seq_len = seq_arr.size if seq_arr.size > 0 else 1
-            if seq_len == 0:
+            if seq_arr.size == 0:
                 seq_arr = np.array([0.0], dtype=RAW_DTYPE)
-                seq_len = 1
-            for i in range(F):
-                idx = step % seq_len
-                offsets[:, i] = seq_arr[idx]
-                timer += 1
-                reached = timer >= fps
-                if np.any(reached):
-                    timer[reached] = 0
-                    step[reached] = (step[reached] + 1) % seq_len
-            self._arp_step = step
-            self._arp_timer = timer
+            try:
+                offsets = c_kernels.arp_advance_c(seq_arr, int(seq_arr.size), B, F, self._arp_step, self._arp_timer, int(fps))
+            except Exception:
+                offsets = c_kernels.arp_advance_py(seq_arr, int(seq_arr.size), B, F, self._arp_step, self._arp_timer, int(fps))
             self._last_arp_offsets = offsets
             freq_target = freq_target * np.power(2.0, offsets / 1200.0)
         else:
@@ -1085,17 +1022,11 @@ class OscNode(Node):
         if port_arr is not None and np.any(port_arr):
             if self._freq_state is None or self._freq_state.shape[0] != B:
                 self._freq_state = freq_target[:, 0].copy()
-            current = self._freq_state.copy()
-            smoothed = np.empty_like(freq_target)
-            for i in range(F):
-                target = freq_target[:, i]
-                active = port_arr[:, i] if port_arr is not None else np.zeros(B, dtype=bool)
-                frames_const = np.maximum(slide_time[:, i] * float(sr), 1.0)
-                alpha = np.exp(-1.0 / frames_const)
-                alpha = alpha ** (1.0 + np.clip(slide_damp[:, i], 0.0, 4.0))
-                current = np.where(active, alpha * current + (1.0 - alpha) * target, target)
-                smoothed[:, i] = current
-            self._freq_state = current
+            try:
+                smoothed = c_kernels.portamento_smooth_c(freq_target, port_arr, slide_time, slide_damp, sr, self._freq_state)
+            except Exception:
+                smoothed = c_kernels.portamento_smooth_py(freq_target, port_arr, slide_time, slide_damp, sr, self._freq_state)
+            self._freq_state = self._freq_state
             freq_target = smoothed
         else:
             self._freq_state = freq_target[:, -1].copy()
@@ -1108,16 +1039,10 @@ class OscNode(Node):
         if self.accept_reset and "reset" in params:
             reset = self._ensure_array("osc.reset", params.get("reset", 0.0), B, F)
 
-        ph_base = np.empty((B, F), dtype=RAW_DTYPE)
-        current = self.phase.copy()
-        for i in range(F):
-            if reset is not None:
-                mask = reset[:, i] > 0.5
-                if np.any(mask):
-                    current = np.where(mask, 0.0, current)
-            current = (current + dphi[:, i]) % 1.0
-            ph_base[:, i] = current
-        self.phase = current
+        try:
+            ph_base = c_kernels.phase_advance_c(dphi, reset, self.phase)
+        except Exception:
+            ph_base = c_kernels.phase_advance_py(dphi, reset, self.phase)
 
         wave = self._render_wave(ph_base, dphi)
 
@@ -1259,14 +1184,11 @@ class SafetyFilterNode(Node):
     def process(self, frames, sr, audio_in, mods, params):
         x = assert_BCF(audio_in, name="safety.in")  # (B,C,F)
         B, C, F = x.shape
-        self._ensure(B,C)
-        y = np.empty_like(x)
-        pi, pd = self.prev_in, self.prev_dc
-        for i in range(F):
-            pd = self.a * pd + x[:,:,i] - pi
-            pi = x[:,:,i]
-            y[:,:,i] = pd
-        self.prev_in, self.prev_dc = pi, pd
+        self._ensure(B, C)
+        try:
+            y = c_kernels.safety_filter_c(x, float(self.a), self.prev_in, self.prev_dc)
+        except Exception:
+            y = c_kernels.safety_filter_py(x, float(self.a), self.prev_in, self.prev_dc)
         return y
 
 class NormalizerCompressorNode(Node):
@@ -1401,57 +1323,85 @@ class SubharmonicLowLifterNode(Node):
         a_hp_out = self._alpha_hp(out_hp, sr)
 
         y = np.empty_like(x)
-
-        for t in range(F):
-            xt = x[:, :, t]
-
-            # Bandpass driver: simple HP then LP
-            self.hp_y = a_hp_in * (self.hp_y + xt - self.prev)
-            self.prev = xt
-            bp = self.lp_y + a_lp_in * (self.hp_y - self.lp_y)
-            self.lp_y = bp
-
-            abs_bp = np.abs(bp)
-            self.env = np.where(
-                abs_bp > self.env,
-                self.env + a_env_attack * (abs_bp - self.env),
-                self.env + a_env_release * (abs_bp - self.env),
+        # Try C kernel for the heavy sequential per-sample logic; fallback to Python implementation
+        try:
+            y = c_kernels.subharmonic_process_c(
+                x,
+                a_hp_in,
+                a_lp_in,
+                a_sub2,
+                self.use_div4,
+                a_sub4 if a_sub4 is not None else 0.0,
+                a_env_attack,
+                a_env_release,
+                a_hp_out,
+                drive,
+                mix,
+                self.hp_y,
+                self.lp_y,
+                self.prev,
+                self.sign,
+                self.ff2,
+                self.ff4,
+                self.ff4_count,
+                self.sub2_lp,
+                self.sub4_lp,
+                self.env,
+                self.hp_out_y,
+                self.hp_out_x,
             )
+        except Exception:
+            # fallback to existing Python loop
+            for t in range(F):
+                xt = x[:, :, t]
 
-            prev_sign = self.sign
-            sign_now = (bp > 0.0).astype(np.int8) * 2 - 1
-            pos_zc = (prev_sign < 0) & (sign_now > 0)
-            self.sign = sign_now
+                # Bandpass driver: simple HP then LP
+                self.hp_y = a_hp_in * (self.hp_y + xt - self.prev)
+                self.prev = xt
+                bp = self.lp_y + a_lp_in * (self.hp_y - self.lp_y)
+                self.lp_y = bp
 
-            self.ff2 = np.where(pos_zc, -self.ff2, self.ff2)
+                abs_bp = np.abs(bp)
+                self.env = np.where(
+                    abs_bp > self.env,
+                    self.env + a_env_attack * (abs_bp - self.env),
+                    self.env + a_env_release * (abs_bp - self.env),
+                )
 
-            if self.use_div4:
-                self.ff4_count = np.where(pos_zc, self.ff4_count + 1, self.ff4_count)
-                toggle4 = pos_zc & (self.ff4_count >= 2)
-                self.ff4 = np.where(toggle4, -self.ff4, self.ff4)
-                self.ff4_count = np.where(toggle4, 0, self.ff4_count)
+                prev_sign = self.sign
+                sign_now = (bp > 0.0).astype(np.int8) * 2 - 1
+                pos_zc = (prev_sign < 0) & (sign_now > 0)
+                self.sign = sign_now
 
-            sq2 = self.ff2.astype(RAW_DTYPE)
-            self.sub2_lp = self.sub2_lp + a_sub2 * (sq2 - self.sub2_lp)
-            sub = self.sub2_lp
+                self.ff2 = np.where(pos_zc, -self.ff2, self.ff2)
 
-            if self.use_div4 and self.sub4_lp is not None and self.ff4 is not None:
-                sq4 = self.ff4.astype(RAW_DTYPE)
-                self.sub4_lp = self.sub4_lp + a_sub4 * (sq4 - self.sub4_lp)
-                sub = sub + 0.6 * self.sub4_lp
+                if self.use_div4:
+                    self.ff4_count = np.where(pos_zc, self.ff4_count + 1, self.ff4_count)
+                    toggle4 = pos_zc & (self.ff4_count >= 2)
+                    self.ff4 = np.where(toggle4, -self.ff4, self.ff4)
+                    self.ff4_count = np.where(toggle4, 0, self.ff4_count)
 
-            sub = np.tanh(drive * sub) * (self.env + 1e-6)
+                sq2 = self.ff2.astype(RAW_DTYPE)
+                self.sub2_lp = self.sub2_lp + a_sub2 * (sq2 - self.sub2_lp)
+                sub = self.sub2_lp
 
-            dry = xt
-            wet = sub
-            out_t = (1.0 - mix) * dry + mix * wet
+                if self.use_div4 and self.sub4_lp is not None and self.ff4 is not None:
+                    sq4 = self.ff4.astype(RAW_DTYPE)
+                    self.sub4_lp = self.sub4_lp + a_sub4 * (sq4 - self.sub4_lp)
+                    sub = sub + 0.6 * self.sub4_lp
 
-            y_prev = self.hp_out_y
-            x_prev = self.hp_out_x
-            hp = a_hp_out * (y_prev + out_t - x_prev)
-            self.hp_out_y = hp
-            self.hp_out_x = out_t
-            y[:, :, t] = hp
+                sub = np.tanh(drive * sub) * (self.env + 1e-6)
+
+                dry = xt
+                wet = sub
+                out_t = (1.0 - mix) * dry + mix * wet
+
+                y_prev = self.hp_out_y
+                x_prev = self.hp_out_x
+                hp = a_hp_out * (y_prev + out_t - x_prev)
+                self.hp_out_y = hp
+                self.hp_out_x = out_t
+                y[:, :, t] = hp
 
         return y
 

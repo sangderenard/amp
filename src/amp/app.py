@@ -1460,7 +1460,12 @@ def run(
             except queue.Empty:
                 pass
         if hasattr(joy, "quit"):
-            joy.quit()
+            try:
+                joy.quit()
+            except Exception:
+                # Defensive: some pygame setups may raise when joystick subsystem
+                # has already been shut down; ignore errors during cleanup.
+                pass
         STATUS_PRINTER.flush()
 
     return 0
