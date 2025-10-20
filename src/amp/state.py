@@ -103,7 +103,7 @@ def build_default_state(*, joy: Any, pygame: ModuleType) -> Dict[str, Any]:
         "double_tap_window": 0.33,
         "free_variant_button": 6,
         "polyphony_mode": "strings",
-        "polyphony_voices": 1,
+        "polyphony_voices": 3,
         "envelope_params": {
             "attack_ms": 12.0,
             "hold_ms": 8.0,
