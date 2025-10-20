@@ -1,7 +1,8 @@
 # utils.py
-import numpy as np
 import math
-from .config import RAW_DTYPE
+import os
+
+import numpy as np
 
 # =========================
 # Settings / fidelity

@@ -1,8 +1,31 @@
 # nodes.py
-import numpy as np
 import math
-from .utils import as_BCF, assert_BCF, dc_block, soft_clip, make_wave_hq, kaiser_sinc_table, sinc_sample_table
-from .config import RAW_DTYPE, MAX_FRAMES
+import numpy as np
+
+from .utils import as_BCF, assert_BCF, dc_block, soft_clip, make_wave_hq
+from .state import RAW_DTYPE, MAX_FRAMES
+
+
+def _ensure_bcf(audio_in, frames: int, *, name: str):
+    if audio_in is None:
+        return None, 1
+    array = assert_BCF(audio_in, name=name)
+    if array.shape[2] != frames:
+        raise ValueError(f"{name}: expected {frames} frames, got {array.shape[2]}")
+    return array, array.shape[0]
+
+
+def _match_channels(data: np.ndarray, channels: int) -> np.ndarray:
+    if data.shape[1] == channels:
+        return data
+    if data.shape[1] == 1:
+        return np.repeat(data, channels, axis=1)
+    if data.shape[1] > channels:
+        return data[:, :channels, :]
+    pad = np.zeros((data.shape[0], channels - data.shape[1], data.shape[2]), dtype=data.dtype)
+    return np.concatenate([data, pad], axis=1)
+
+
 
 # =========================
 # Graph nodes
@@ -10,6 +33,98 @@ from .config import RAW_DTYPE, MAX_FRAMES
 class Node:
     def __init__(self,name): self.name=name
     def process(self,frames,sr,audio_in,mods,params): raise NotImplementedError
+
+
+class ConfigNode(Node):
+    def __init__(self, name, params=None):
+        super().__init__(name)
+        self.params = dict(params or {})
+
+
+class SilenceNode(ConfigNode):
+    def __init__(self, name, params=None):
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 1))
+
+    def process(self, frames, sr, audio_in, mods, params):
+        _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
+        return np.zeros((batches, self.channels, frames), dtype=RAW_DTYPE)
+
+
+class ConstantNode(ConfigNode):
+    def __init__(self, name, params=None):
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 1))
+        self.value = float(self.params.get("value", 0.0))
+
+    def process(self, frames, sr, audio_in, mods, params):
+        _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
+        buffer = np.full((batches, self.channels, frames), self.value, dtype=RAW_DTYPE)
+        return buffer
+
+
+class SineOscillatorNode(ConfigNode):
+    def __init__(self, name, params=None):
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 1))
+        self.frequency = float(self.params.get("frequency", 440.0))
+        self.amplitude = float(self.params.get("amplitude", 0.5))
+        phase = float(self.params.get("phase", 0.0)) % 1.0
+        self._phase = np.array([[phase]], dtype=RAW_DTYPE)
+
+    def process(self, frames, sr, audio_in, mods, params):
+        _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
+        channels = self.channels
+        freq = as_BCF(
+            params.get("frequency", self.frequency),
+            batches,
+            channels,
+            frames,
+            name=f"{self.name}.frequency",
+        )
+        amp = as_BCF(
+            params.get("amplitude", self.amplitude),
+            batches,
+            channels,
+            frames,
+            name=f"{self.name}.amplitude",
+        )
+        if self._phase.shape != (batches, channels):
+            self._phase = np.full((batches, channels), self._phase[0, 0], dtype=RAW_DTYPE)
+        dphi = freq / float(sr)
+        phase = (self._phase[..., None] + np.cumsum(dphi, axis=2)) % 1.0
+        self._phase = phase[..., -1]
+        wave = np.sin(2.0 * np.pi * phase, dtype=RAW_DTYPE)
+        return wave * amp
+
+
+class SafetyNode(ConfigNode):
+    def __init__(self, name, params=None):
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 2))
+        self.dc_alpha = float(self.params.get("dc_alpha", 0.995))
+        self._state: dict[int, np.ndarray] = {}
+
+    def process(self, frames, sr, audio_in, mods, params):
+        audio, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
+        if audio is None:
+            data = np.zeros((batches, self.channels, frames), dtype=RAW_DTYPE)
+        else:
+            data = _match_channels(audio, self.channels)
+        out = np.empty_like(data)
+        for batch in range(batches):
+            state = self._state.get(batch)
+            if state is None or state.shape[0] != self.channels:
+                state = np.zeros(self.channels, dtype=RAW_DTYPE)
+            for ch in range(self.channels):
+                dc = state[ch]
+                for i in range(frames):
+                    dc = self.dc_alpha * dc + (1.0 - self.dc_alpha) * data[batch, ch, i]
+                    out[batch, ch, i] = data[batch, ch, i] - dc
+                state[ch] = dc
+            self._state[batch] = state
+        np.clip(out, -1.0, 1.0, out=out)
+        return out
 
 class DelayNode(Node):
     def __init__(self,name,delay_samples=64):
@@ -100,18 +215,19 @@ class OscNode(Node):
         return (w * a)[:, None, :]  # (B,1,F)
 
 class SamplerNode(Node):
-    def __init__(self,name,sampler:Sampler):
-        super().__init__(name); self.sampler=sampler
+    def __init__(self, name, sampler):
+        super().__init__(name)
+        self.sampler = sampler
     def process(self,frames,sr,audio_in,mods,params):
-        B = 1 if audio_in is None else audio_in.shape[0]
-        out = np.empty((B, frames), RAW_DTYPE)
+        _, B = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
+        out = np.empty((B, 1, frames), RAW_DTYPE)
         rate = params.get("rate", 1.0)
         tr = params.get("transpose", 0.0)
         gain = params.get("gain", 1.0)
         # Vectorized: if params are arrays, use them per channel, else broadcast
         for b in range(B):
             self.sampler.render_into(
-                out[b],
+                out[b, 0],
                 sr,
                 rate[b] if isinstance(rate, np.ndarray) and rate.shape[0] == B else rate,
                 tr[b] if isinstance(tr, np.ndarray) and tr.shape[0] == B else tr,
@@ -124,21 +240,27 @@ class MixNode(Node):
     Mixes N input bundles (num_inputs, channels, frames) down to (channels, frames).
     Applies per-channel gain, expands mono to stereo if needed, and supports ALC and compression.
     """
-    def __init__(self, name, out_channels=2, alc=True, compression="tanh"):
+
+    def __init__(self, name, params=None, *, out_channels=2, alc=True, compression="tanh"):
         super().__init__(name)
-        self.out_channels = out_channels
-        self.alc = alc
-        self.compression = compression  # "tanh" or None
+        cfg = dict(params or {}) if params is not None else {}
+        if params is not None and not isinstance(params, dict):
+            raise TypeError("MixNode params must be a mapping")
+        self.out_channels = int(cfg.get("channels", out_channels))
+        self.alc = bool(cfg.get("alc", alc))
+        self.compression = cfg.get("compression", compression)
         self.stats = ClipStats()
         # For ALC
-        self.rms_hist = [np.zeros(out_channels, dtype=RAW_DTYPE) for _ in range(256)]
-        self.peak_hist = [np.zeros(out_channels, dtype=RAW_DTYPE) for _ in range(256)]
+        self.rms_hist = [np.zeros(self.out_channels, dtype=RAW_DTYPE) for _ in range(256)]
+        self.peak_hist = [np.zeros(self.out_channels, dtype=RAW_DTYPE) for _ in range(256)]
         self.alpha = 0.5
         self.attack = 16
         self.sustain = 128
         self.decay = 256
 
     def process(self, frames, sr, audio_in, mods, params):
+        if audio_in is None:
+            return np.zeros((1, self.out_channels, frames), dtype=RAW_DTYPE)
         x = assert_BCF(audio_in, name="mix.in")  # (B,C,F)
         B, C, F = x.shape
         y = np.sum(x, axis=1, keepdims=True)     # (B,1,F)
@@ -296,3 +418,24 @@ class SubharmonicGeneratorNode(Node):
                     out[b, c] += self.mix * np.sin(2*np.pi*sub_f[b, c]*t + phase)
                     self.phases[b, c, idx] = (phase + 2*np.pi*sub_f[b, c]*F/sr) % (2*np.pi)
         return out  # (B,C,F)
+
+
+NODE_TYPES = {
+    "silence": SilenceNode,
+    "constant": ConstantNode,
+    "sine": SineOscillatorNode,
+    "sine_oscillator": SineOscillatorNode,
+    "mix": MixNode,
+    "safety": SafetyNode,
+}
+
+
+__all__ = [
+    "NODE_TYPES",
+    "Node",
+    "SilenceNode",
+    "ConstantNode",
+    "SineOscillatorNode",
+    "MixNode",
+    "SafetyNode",
+]
