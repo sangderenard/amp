@@ -78,6 +78,7 @@ def build_runtime_graph(
             if getattr(osc, "accept_reset", True) and env_cfg.get("send_resets", True):
                 graph_obj.connect_mod(env.name, osc.name, "reset", scale=1.0, mode="add", channel=1)
         graph_obj.connect_mod(am_lfos[i].name, osc.name, "amp", scale=0.5, mode="mul")
+        graph_obj.connect_mod(pan_lfos[i].name, osc.name, "pan", scale=1.0, mode="add")
 
     if use_subharm:
         subharm = nodes.SubharmonicLowLifterNode(
@@ -237,7 +238,7 @@ def run(
     pygame.joystick.init()
 
     pygame.display.set_caption("Controller Synth (Graph)")
-    pygame.display.set_mode((960, 540))
+    pygame.display.set_mode((1280, 800))
     pygame.font.init()
     font = pygame.font.SysFont("monospace", 16)
     font_small = pygame.font.SysFont("monospace", 12)
@@ -480,16 +481,18 @@ def run(
             pygame.display.flip()
             return
 
+        node_levels = getattr(graph, "last_node_levels", {})
+
         width, height = screen.get_size()
-        margin = 24
-        tile_w = 200
-        tile_h = 120
-        cols = max(1, min(len(nodes_in_graph), (width - margin) // (tile_w + margin)))
+        margin = 32
+        tile_w = 280
+        tile_h = 210
+        cols = max(1, min(len(nodes_in_graph), max(1, (width - margin) // (tile_w + margin))))
         rows = (len(nodes_in_graph) + cols - 1) // cols
         total_height = rows * (tile_h + margin) + margin
-        if total_height > height - 120:
-            available = max(height - 160, tile_h + margin)
-            tile_h = max(80, available // max(rows, 1) - margin)
+        if total_height > height - 160:
+            available = max(height - 200, tile_h + margin)
+            tile_h = max(120, available // max(rows, 1) - margin)
 
         layout: dict[str, pygame.Rect] = {}
         for idx, name in enumerate(nodes_in_graph):
@@ -546,12 +549,52 @@ def run(
             else:
                 lines_to_render.extend(_extract_node_stats(node))
 
+            info_start_y = rect.y + 34
             for idx_line, text_line in enumerate(lines_to_render[:5]):
                 text_surface = font_small.render(text_line, True, (240, 240, 240))
                 screen.blit(
                     text_surface,
-                    (rect.x + 12, rect.y + 34 + idx_line * (font_small.get_height() + 2)),
+                    (rect.x + 12, info_start_y + idx_line * (font_small.get_height() + 2)),
                 )
+
+            levels = node_levels.get(name)
+            if isinstance(levels, np.ndarray) and levels.size:
+                vu_rows: list[tuple[str, float]] = []
+                for batch_idx in range(levels.shape[0]):
+                    for channel_idx in range(levels.shape[1]):
+                        label = f"B{batch_idx}C{channel_idx}"
+                        vu_rows.append((label, float(levels[batch_idx, channel_idx])))
+                if vu_rows:
+                    vu_bar_h = 12
+                    row_spacing = vu_bar_h + 4
+                    base_y = rect.bottom - (len(vu_rows) * row_spacing) - 10
+                    base_y = max(base_y, info_start_y + len(lines_to_render[:5]) * (font_small.get_height() + 2) + 8)
+                    bar_x = rect.x + 12
+                    bar_w = rect.width - 24
+                    for idx_row, (label, value) in enumerate(vu_rows):
+                        row_y = base_y + idx_row * row_spacing
+                        label_surface = font_small.render(label, True, (210, 210, 210))
+                        screen.blit(label_surface, (bar_x, row_y))
+                        label_w = label_surface.get_width() + 6
+                        meter_w = max(24, bar_w - label_w)
+                        meter_rect = pygame.Rect(bar_x + label_w, row_y, meter_w, vu_bar_h)
+                        pygame.draw.rect(screen, (30, 30, 46), meter_rect, border_radius=4)
+                        level = max(0.0, value)
+                        colour_scale = min(1.0, level)
+                        if level > 1.0:
+                            vu_colour = (230, 60, 60)
+                        elif colour_scale > 0.85:
+                            vu_colour = (235, 180, 60)
+                        else:
+                            vu_colour = (90, 200, 120)
+                        fill_w = int(meter_w * min(1.0, colour_scale))
+                        if fill_w > 0:
+                            fill_rect = pygame.Rect(bar_x + label_w, row_y, fill_w, vu_bar_h)
+                            pygame.draw.rect(screen, vu_colour, fill_rect, border_radius=4)
+                        peak_text = font_small.render(f"{level:0.2f}", True, (190, 190, 190))
+                        peak_x = bar_x + label_w + meter_w + 4
+                        peak_x = min(peak_x, rect.right - peak_text.get_width() - 6)
+                        screen.blit(peak_text, (peak_x, row_y))
 
         legend_x = margin
         legend_y = height - (len(lines) + 3) * (font.get_height() + 4)
