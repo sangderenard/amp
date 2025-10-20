@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Optional, cast
 
 import numpy as np
@@ -451,13 +452,19 @@ def run(
     momentary_prev = False
     drone_prev = False
 
+    callback_timing_samples: deque[dict[str, Any]] = deque(maxlen=256)
+    callback_timing_lock = threading.Lock()
+    last_callback_started = 0.0
+
     def audio_callback(outdata, frames, time_info, status):
         nonlocal sample_rate, freq_current, freq_target, velocity_current, cutoff_current, q_current, graph
         nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger, amp_mod_names
         nonlocal pitch_node, pitch_input_value, pitch_span_value, pitch_effective_token
         nonlocal root_midi_value, pitch_free_variant
+        nonlocal last_callback_started
 
         sr = sample_rate
+        start_time = time.perf_counter()
         utils._scratch.ensure(frames)
 
         v = utils.cubic_ramp(velocity_current, velocity_target, frames, utils._scratch.a[:frames])
@@ -575,6 +582,29 @@ def run(
         momentary_prev = momentary_now
         drone_prev = drone_now
 
+        end_time = time.perf_counter()
+        render_duration = end_time - start_time
+        period = 0.0
+        if last_callback_started:
+            period = start_time - last_callback_started
+        last_callback_started = start_time
+        allotted_time = (frames / sr) if sr else 0.0
+        status_obj = status or 0
+        underrun = bool(
+            getattr(status_obj, "output_underflow", False)
+            or getattr(status_obj, "input_underflow", False)
+        )
+
+        sample = {
+            "render_duration": render_duration,
+            "callback_period": period,
+            "allotted_time": allotted_time,
+            "underrun": underrun,
+        }
+
+        with callback_timing_lock:
+            callback_timing_samples.append(sample)
+
     running = True
     audio_failures: list[Exception] = []
 
@@ -647,7 +677,7 @@ def run(
 
     def draw_visualisation(
         screen,
-        lines: list[str],
+        lines: list[Any],
         freq_target: float,
         velocity_target: float,
     ) -> None:
@@ -940,7 +970,12 @@ def run(
 
             info_y = legend_y + font_small.get_height() + 12
             for line in lines:
-                text = _render_text("__status__", line, (255, 255, 255), font)
+                if isinstance(line, tuple):
+                    text_value, colour = line
+                else:
+                    text_value = cast(str, line)
+                    colour = (255, 255, 255)
+                text = _render_text("__status__", text_value, colour, font)
                 screen.blit(text, (margin, info_y))
                 info_y += font.get_height() + 4
 
@@ -1106,6 +1141,35 @@ def run(
             for i in range(len(prev_buttons)):
                 prev_buttons[i] = joy.get_button(i)
 
+            with callback_timing_lock:
+                timing_snapshot = list(callback_timing_samples)
+
+            render_mean_ms = render_peak_ms = allotted_ms = 0.0
+            period_mean_ms = period_peak_ms = 0.0
+            underrun_recent = False
+            if timing_snapshot:
+                render_values = [entry["render_duration"] for entry in timing_snapshot]
+                render_mean_ms = sum(render_values) / len(render_values) * 1000.0
+                render_peak_ms = max(render_values) * 1000.0
+                allotted_ms = timing_snapshot[-1]["allotted_time"] * 1000.0
+
+                period_values = [entry["callback_period"] for entry in timing_snapshot if entry["callback_period"] > 0.0]
+                if period_values:
+                    period_mean_ms = sum(period_values) / len(period_values) * 1000.0
+                    period_peak_ms = max(period_values) * 1000.0
+                underrun_recent = any(entry.get("underrun") for entry in timing_snapshot)
+
+            timing_signature = None
+            if timing_snapshot:
+                timing_signature = (
+                    round(render_mean_ms, 4),
+                    round(render_peak_ms, 4),
+                    round(allotted_ms, 4),
+                    round(period_mean_ms, 4),
+                    round(period_peak_ms, 4),
+                    underrun_recent,
+                )
+
             status_signature_pending = (
                 state["root_midi"],
                 float(freq_target),
@@ -1123,18 +1187,45 @@ def run(
                 pitch_effective_token,
                 state["base_token"],
                 state["free_variant"],
+                timing_signature,
             )
 
-            lines = [
-                f"Eff:{effective_token:<16} Base:{state['base_token']:<16} Free:{state['free_variant']:<10} Src:{state['source_type']}",
-                f"Root:{state['root_midi']:3d}  Freq:{freq_target:7.2f}Hz  Vel:{velocity_target:.2f}",
-                f"Cut:{cutoff_target:7.1f}Hz  Q:{q_target:4.2f}  Filter:{state['filter_type']}",
-                f"Wave:{state['waves'][state['wave_idx']]}  Mode:{envelope_mode.title():<9}  LFO:{state['mod_wave_types'][state['mod_wave_idx']]}/{state['mod_rate_hz']:.2f}Hz d={state['mod_depth']:.2f} src={'input' if state['mod_use_input'] else 'free'}",
+            base_line_colour = (255, 255, 255)
+            lines_with_colour: list[tuple[str, tuple[int, int, int]]] = [
+                (
+                    f"Eff:{effective_token:<16} Base:{state['base_token']:<16} Free:{state['free_variant']:<10} Src:{state['source_type']}",
+                    base_line_colour,
+                ),
+                (
+                    f"Root:{state['root_midi']:3d}  Freq:{freq_target:7.2f}Hz  Vel:{velocity_target:.2f}",
+                    base_line_colour,
+                ),
+                (
+                    f"Cut:{cutoff_target:7.1f}Hz  Q:{q_target:4.2f}  Filter:{state['filter_type']}",
+                    base_line_colour,
+                ),
+                (
+                    f"Wave:{state['waves'][state['wave_idx']]}  Mode:{envelope_mode.title():<9}  LFO:{state['mod_wave_types'][state['mod_wave_idx']]}/{state['mod_rate_hz']:.2f}Hz d={state['mod_depth']:.2f} src={'input' if state['mod_use_input'] else 'free'}",
+                    base_line_colour,
+                ),
             ]
+
+            console_lines = [entry[0] for entry in lines_with_colour]
+
+            if timing_snapshot:
+                budget_text = f"Audio: render {render_mean_ms:5.2f}/{render_peak_ms:5.2f}ms budget {allotted_ms:5.2f}ms"
+                period_text = ""
+                if period_mean_ms or period_peak_ms:
+                    period_text = f" period {period_mean_ms:5.2f}/{period_peak_ms:5.2f}ms"
+                underrun_text = " UNDERRUN" if underrun_recent else ""
+                timing_text = budget_text + period_text + underrun_text
+                timing_colour = (240, 120, 120) if underrun_recent else (180, 220, 255)
+                lines_with_colour.append((timing_text, timing_colour))
+                console_lines.append(timing_text)
             screen = pygame.display.get_surface()
             if screen:
-                draw_visualisation(screen, lines, freq_target, velocity_target)
-            print("\r" + " | ".join(lines), end="")
+                draw_visualisation(screen, lines_with_colour, freq_target, velocity_target)
+            print("\r" + " | ".join(console_lines), end="")
 
             clock.tick(120)
     finally:
