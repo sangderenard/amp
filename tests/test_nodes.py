@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from amp import nodes
 
@@ -81,3 +82,31 @@ def test_oscillator_applies_arpeggiation_plan():
         osc._last_arp_offsets[0],
         np.array([0.0, 1200.0, 0.0, 1200.0], dtype=np.float64),
     )
+
+
+def test_controller_node_evaluates_expressions():
+    frames = 8
+    ctrl = nodes.ControllerNode(
+        "ctrl",
+        params={
+            "outputs": {
+                "sum": "signals['a'] + 2.0 * signals['b']",
+                "clipped": "np.clip(signals['a'] - signals['b'], 0.0, 1.0)",
+            }
+        },
+    )
+    a = np.full((1, 1, frames), 0.25, dtype=np.float64)
+    b = np.linspace(0.0, 0.5, frames, dtype=np.float64)[None, None, :]
+    params = {"a": a, "b": b}
+
+    output = ctrl.process(frames, 48000, None, {}, params)
+
+    assert output.shape == (1, 2, frames)
+    sum_idx = ctrl.output_index("sum")
+    clip_idx = ctrl.output_index("clipped")
+    expected_sum = a[:, 0, :] + 2.0 * b[:, 0, :]
+    expected_clip = np.clip(a[:, 0, :] - b[:, 0, :], 0.0, 1.0)
+    assert np.allclose(output[:, sum_idx, :], expected_sum)
+    assert np.allclose(output[:, clip_idx, :], expected_clip)
+    with pytest.raises(KeyError):
+        ctrl.output_index("missing")

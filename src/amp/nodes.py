@@ -161,6 +161,130 @@ class ConfigNode(Node):
         self.params = dict(params or {})
 
 
+class ControllerNode(ConfigNode):
+    """Map controller actions to modulation signals via expressions."""
+
+    def __init__(self, name, params=None):
+        super().__init__(name, params)
+        cfg = dict(params or {})
+        outputs_cfg = cfg.get("outputs")
+        if not isinstance(outputs_cfg, Mapping) or not outputs_cfg:
+            raise ValueError(f"{self.name}: outputs configuration is required")
+
+        self._output_order: list[str] = []
+        self._compiled: list[object] = []
+        for out_name, spec in outputs_cfg.items():
+            if isinstance(spec, str):
+                expression = spec
+            elif isinstance(spec, Mapping):
+                expr_value = (
+                    spec.get("equation")
+                    or spec.get("expr")
+                    or spec.get("expression")
+                )
+                if expr_value is None:
+                    raise ValueError(
+                        f"{self.name}.{out_name}: expression is required"
+                    )
+                expression = str(expr_value)
+            else:
+                raise TypeError(
+                    f"{self.name}.{out_name}: unsupported specification type {type(spec)!r}"
+                )
+            compiled = compile(expression, f"{self.name}.{out_name}", "eval")
+            self._output_order.append(str(out_name))
+            self._compiled.append(compiled)
+
+        self.channels = len(self._output_order)
+        self._output_index = {name: idx for idx, name in enumerate(self._output_order)}
+        self._context_base = {"np": np, "math": math}
+
+    @staticmethod
+    def _sanitise(name: str) -> str:
+        safe = [
+            ch if ch.isalnum() or ch == "_" else "_"
+            for ch in name
+        ]
+        token = "_".join("".join(part) for part in "".join(safe).split())
+        return f"param_{token}" if token and token[0].isdigit() else token or "param"
+
+    def output_index(self, name: str) -> int:
+        try:
+            return self._output_index[name]
+        except KeyError as exc:
+            raise KeyError(f"{self.name}: unknown output '{name}'") from exc
+
+    def process(self, frames, sr, audio_in, mods, params):
+        example = None
+        for value in params.values():
+            if isinstance(value, np.ndarray):
+                example = value
+                break
+        if example is not None:
+            batches, _, param_frames = example.shape
+        else:
+            batches, param_frames = 1, frames
+
+        def _zero_value() -> np.ndarray:
+            return np.zeros((batches, param_frames), dtype=RAW_DTYPE)
+
+        def _zero_raw() -> np.ndarray:
+            return np.zeros((batches, 1, param_frames), dtype=RAW_DTYPE)
+
+        class _DefaultDict(dict):
+            def __init__(self, *args, factory):
+                super().__init__(*args)
+                self._factory = factory
+
+            def __getitem__(self, key):
+                if key not in self:
+                    return self._factory()
+                return super().__getitem__(key)
+
+            def get(self, key, default=None):
+                if key in self:
+                    return super().get(key)
+                return self._factory() if default is None else default
+
+        values: dict[str, np.ndarray] = {}
+        raw_values: dict[str, np.ndarray] = {}
+        for key, value in params.items():
+            array = assert_BCF(value, name=f"{self.name}.{key}")
+            raw_values[key] = array
+            if array.shape[1] == 1:
+                values[key] = array[:, 0, :]
+            else:
+                values[key] = array
+
+        signals = _DefaultDict(values, factory=_zero_value)
+        raw_signals = _DefaultDict(raw_values, factory=_zero_raw)
+
+        context = dict(self._context_base)
+        context.update(
+            {
+                "signals": signals,
+                "raw_signals": raw_signals,
+                "frames": param_frames,
+                "sample_rate": sr,
+            }
+        )
+        for key, value in values.items():
+            context[self._sanitise(key)] = value
+
+        output = np.zeros((batches, self.channels, param_frames), dtype=RAW_DTYPE)
+        for idx, code in enumerate(self._compiled):
+            result = eval(code, context, {})
+            value = as_BCF(
+                result,
+                batches,
+                1,
+                param_frames,
+                name=f"{self.name}.{self._output_order[idx]}",
+            )[:, 0, :]
+            output[:, idx, :] = value
+        return output
+
+
 class SilenceNode(ConfigNode):
     def __init__(self, name, params=None):
         super().__init__(name, params)
@@ -1219,6 +1343,7 @@ class SubharmonicLowLifterNode(Node):
 NODE_TYPES = {
     "silence": SilenceNode,
     "constant": ConstantNode,
+    "controller": ControllerNode,
     "sine": SineOscillatorNode,
     "sine_oscillator": SineOscillatorNode,
     "osc": OscNode,
@@ -1238,6 +1363,7 @@ __all__ = [
     "Node",
     "SilenceNode",
     "ConstantNode",
+    "ControllerNode",
     "SineOscillatorNode",
     "PitchQuantizerNode",
     "EnvelopeModulatorNode",
