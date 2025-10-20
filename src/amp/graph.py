@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
 from threading import Lock
-from typing import Deque, Dict, Iterable, List, Mapping, Sequence
+from typing import Deque, Dict, Iterable, List, Mapping, Sequence, Tuple
 import numpy as np
 
 from .config import GraphConfig
@@ -68,6 +69,224 @@ class ModConnection:
     channel: int | None = None
 
 
+@dataclass(slots=True)
+class ControlEvent:
+    """Timestamped controller state used for read-ahead interpolation."""
+
+    timestamp: float
+    pitch: np.ndarray
+    envelope: np.ndarray
+    extras: Mapping[str, np.ndarray] | None = None
+
+    def __post_init__(self) -> None:
+        self.timestamp = float(self.timestamp)
+        self.pitch = np.atleast_1d(np.asarray(self.pitch, dtype=RAW_DTYPE))
+        if self.pitch.ndim != 1:
+            raise ValueError("pitch events must be 1-D sequences")
+        self.envelope = np.atleast_1d(np.asarray(self.envelope, dtype=RAW_DTYPE))
+        if self.envelope.ndim != 1:
+            raise ValueError("envelope events must be 1-D sequences")
+        if self.extras:
+            self.extras = {key: np.asarray(value, dtype=RAW_DTYPE) for key, value in self.extras.items()}
+
+
+@dataclass(slots=True)
+class PcmChunk:
+    """Block of PCM samples aligned to an absolute timeline."""
+
+    timestamp: float
+    data: np.ndarray
+    sample_rate: float
+
+    def __post_init__(self) -> None:
+        self.timestamp = float(self.timestamp)
+        self.sample_rate = float(self.sample_rate)
+        array = np.asarray(self.data, dtype=RAW_DTYPE)
+        if array.ndim == 1:
+            array = array[None, :]
+        if array.ndim != 2:
+            raise ValueError("pcm data must be shaped (C, F)")
+        self.data = array
+
+    @property
+    def frames(self) -> int:
+        return int(self.data.shape[1])
+
+    @property
+    def channels(self) -> int:
+        return int(self.data.shape[0])
+
+    @property
+    def end_time(self) -> float:
+        return self.timestamp + self.frames / self.sample_rate
+
+
+class ControlDelay:
+    """Retains controller history for pre-buffered read-ahead rendering."""
+
+    def __init__(
+        self,
+        sample_rate: float,
+        *,
+        history_seconds: float = 1.0,
+        lookahead_seconds: float = 0.25,
+    ) -> None:
+        self.sample_rate = float(sample_rate)
+        self.history_seconds = float(history_seconds)
+        self.lookahead_seconds = float(lookahead_seconds)
+        self._events: Deque[ControlEvent] = deque()
+        self._pcm: Deque[PcmChunk] = deque()
+        self._latest_time: float = 0.0
+        self._pitch_dim: int | None = None
+        self._env_dim: int | None = None
+
+    @property
+    def events(self) -> Tuple[ControlEvent, ...]:
+        return tuple(self._events)
+
+    @property
+    def pcm_chunks(self) -> Tuple[PcmChunk, ...]:
+        return tuple(self._pcm)
+
+    @property
+    def latest_time(self) -> float:
+        return self._latest_time
+
+    def record_event(
+        self,
+        timestamp: float,
+        *,
+        pitch: np.ndarray | float,
+        envelope: np.ndarray | float,
+        extras: Mapping[str, np.ndarray] | None = None,
+    ) -> ControlEvent:
+        event = ControlEvent(timestamp, pitch, envelope, extras)
+        self._insert_event(event)
+        self._pitch_dim = event.pitch.shape[0] if self._pitch_dim is None else self._pitch_dim
+        self._env_dim = event.envelope.shape[0] if self._env_dim is None else self._env_dim
+        if event.pitch.shape[0] != self._pitch_dim:
+            raise ValueError("pitch dimensionality mismatch in control history")
+        if event.envelope.shape[0] != self._env_dim:
+            raise ValueError("envelope dimensionality mismatch in control history")
+        self._latest_time = max(self._latest_time, event.timestamp)
+        self._trim_history()
+        return event
+
+    def add_pcm(
+        self,
+        timestamp: float,
+        data: np.ndarray,
+        *,
+        sample_rate: float | None = None,
+    ) -> PcmChunk:
+        chunk = PcmChunk(timestamp, data, sample_rate or self.sample_rate)
+        if not np.isclose(chunk.sample_rate, self.sample_rate):
+            raise ValueError("PCM chunk sample rate must match the graph sample rate")
+        self._insert_pcm(chunk)
+        self._latest_time = max(self._latest_time, chunk.end_time)
+        self._trim_history()
+        return chunk
+
+    def sample(
+        self,
+        start_time: float,
+        frames: int,
+        *,
+        update_hz: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        if frames <= 0:
+            raise ValueError("frames must be a positive integer")
+        update_rate = float(update_hz or self.sample_rate)
+        step = 1.0 / update_rate
+        times = start_time + np.arange(frames, dtype=RAW_DTYPE) * step
+        pitch = self._interpolate_series(times, "pitch", self._pitch_dim)
+        envelope = self._interpolate_series(times, "envelope", self._env_dim)
+        timestamps = times[:, None]
+        controls = np.concatenate([pitch, envelope, timestamps], axis=1)
+        pcm = self._gather_pcm(start_time, frames)
+        return {
+            "times": times,
+            "pitch": pitch,
+            "envelope": envelope,
+            "control_tensor": controls,
+            "pcm": pcm,
+        }
+
+    def lookahead_events(self, start_time: float) -> Tuple[ControlEvent, ...]:
+        window_end = start_time + self.lookahead_seconds
+        return tuple(event for event in self._events if start_time <= event.timestamp <= window_end)
+
+    def _insert_event(self, event: ControlEvent) -> None:
+        if not self._events or event.timestamp >= self._events[-1].timestamp:
+            self._events.append(event)
+            return
+        timestamps = [entry.timestamp for entry in self._events]
+        idx = bisect_right(timestamps, event.timestamp)
+        self._events.insert(idx, event)
+
+    def _insert_pcm(self, chunk: PcmChunk) -> None:
+        if not self._pcm or chunk.timestamp >= self._pcm[-1].timestamp:
+            self._pcm.append(chunk)
+            return
+        timestamps = [entry.timestamp for entry in self._pcm]
+        idx = bisect_right(timestamps, chunk.timestamp)
+        self._pcm.insert(idx, chunk)
+
+    def _trim_history(self) -> None:
+        cutoff = self._latest_time - self.history_seconds
+        while self._events and self._events[0].timestamp < cutoff:
+            self._events.popleft()
+        while self._pcm and self._pcm[0].end_time < cutoff:
+            self._pcm.popleft()
+
+    def _interpolate_series(
+        self,
+        times: np.ndarray,
+        attr: str,
+        expected_dim: int | None,
+    ) -> np.ndarray:
+        if not self._events:
+            dim = expected_dim or 1
+            return np.zeros((times.size, dim), dtype=RAW_DTYPE)
+        event_times = np.array([event.timestamp for event in self._events], dtype=RAW_DTYPE)
+        values = np.stack([getattr(event, attr) for event in self._events])
+        if values.ndim == 1:
+            values = values[:, None]
+        result = np.zeros((times.size, values.shape[1]), dtype=RAW_DTYPE)
+        for column in range(values.shape[1]):
+            result[:, column] = np.interp(
+                times,
+                event_times,
+                values[:, column],
+                left=values[0, column],
+                right=values[-1, column],
+            )
+        return result
+
+    def _gather_pcm(self, start_time: float, frames: int) -> np.ndarray:
+        if not self._pcm:
+            return np.zeros((1, frames), dtype=RAW_DTYPE)
+        out_channels = self._pcm[-1].channels
+        output = np.zeros((out_channels, frames), dtype=RAW_DTYPE)
+        frame_step = 1.0 / self.sample_rate
+        end_time = start_time + frames * frame_step
+        for chunk in self._pcm:
+            chunk_start = chunk.timestamp
+            chunk_end = chunk.end_time
+            if chunk_end <= start_time or chunk_start >= end_time:
+                continue
+            overlap_start = max(chunk_start, start_time)
+            overlap_end = min(chunk_end, end_time)
+            local_start = int(round((overlap_start - chunk_start) * self.sample_rate))
+            local_end = int(round((overlap_end - chunk_start) * self.sample_rate))
+            out_start = int(round((overlap_start - start_time) * self.sample_rate))
+            out_end = out_start + (local_end - local_start)
+            if chunk.channels != out_channels:
+                raise ValueError("PCM chunk channel count mismatch in history")
+            output[:, out_start:out_end] = chunk.data[:, local_start:local_end]
+        return output
+
+
 class AudioGraph:
     """Directed audio processing graph supporting modulation links."""
 
@@ -81,6 +300,7 @@ class AudioGraph:
         self.sink: str | None = None
         self._levels_lock = Lock()
         self._last_node_levels: Dict[str, np.ndarray] = {}
+        self.control_delay = ControlDelay(self.sample_rate)
 
     @classmethod
     def from_config(cls, config: GraphConfig, sample_rate: int, output_channels: int) -> "AudioGraph":
@@ -313,5 +533,46 @@ class AudioGraph:
         with self._levels_lock:
             return {name: levels.copy() for name, levels in self._last_node_levels.items()}
 
+    def record_control_event(
+        self,
+        timestamp: float,
+        *,
+        pitch: np.ndarray | float,
+        envelope: np.ndarray | float,
+        extras: Mapping[str, np.ndarray] | None = None,
+    ) -> ControlEvent:
+        """Store a controller snapshot for future read-ahead sampling."""
 
-__all__ = ["AudioGraph", "GraphEdge", "ModConnection"]
+        return self.control_delay.record_event(timestamp, pitch=pitch, envelope=envelope, extras=extras)
+
+    def add_pcm_history(
+        self,
+        timestamp: float,
+        data: np.ndarray,
+        *,
+        sample_rate: float | None = None,
+    ) -> PcmChunk:
+        """Append PCM history aligned to the graph timeline."""
+
+        return self.control_delay.add_pcm(timestamp, data, sample_rate=sample_rate)
+
+    def sample_control_tensor(
+        self,
+        start_time: float,
+        frames: int,
+        *,
+        update_hz: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Generate an interpolated control tensor from retained history."""
+
+        return self.control_delay.sample(start_time, frames, update_hz=update_hz)
+
+
+__all__ = [
+    "AudioGraph",
+    "ControlDelay",
+    "ControlEvent",
+    "GraphEdge",
+    "ModConnection",
+    "PcmChunk",
+]
