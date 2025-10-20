@@ -70,6 +70,7 @@ def run(
     *,
     allow_no_joystick: bool = False,
     no_audio: bool = False,
+    headless: bool = False,
     config_path: str | None = None,
 ) -> int:
     """Launch the synthesiser.
@@ -82,6 +83,9 @@ def run(
     no_audio:
         Skip initialising the sounddevice output stream.  Useful for CI where no
         PortAudio backend is available.
+    headless:
+        Render the configured graph without initialising pygame.  This is useful
+        for automated verification of graph behaviour.
     config_path:
         Optional configuration override used when the application needs to
         fall back to a summary render (for example when pygame is unavailable).
@@ -114,6 +118,9 @@ def run(
         if app.joystick_error and not app.joystick:
             print(f"Warning: {app.joystick_error}")
         return 0
+
+    if headless:
+        return render_summary("Headless run requested.")
 
     try:
         import pygame
