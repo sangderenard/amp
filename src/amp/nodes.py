@@ -611,6 +611,8 @@ class EnvelopeModulatorNode(Node):
         self._velocity = None
         self._activation_count = None
         self._release_start = None
+        self._gate_state = None
+        self._drone_state = None
         if self.group:
             state = self._GROUPS.setdefault(self.group, _EnvelopeGroupState())
             state.register(self.name)
@@ -626,6 +628,187 @@ class EnvelopeModulatorNode(Node):
             self._velocity = np.zeros(B, RAW_DTYPE)
             self._activation_count = np.zeros(B, dtype=np.int64)
             self._release_start = np.zeros(B, RAW_DTYPE)
+            self._gate_state = np.zeros(B, dtype=bool)
+            self._drone_state = np.zeros(B, dtype=bool)
+
+        if self._gate_state is None or self._gate_state.shape[0] != B:
+            self._gate_state = np.zeros(B, dtype=bool)
+        if self._drone_state is None or self._drone_state.shape[0] != B:
+            self._drone_state = np.zeros(B, dtype=bool)
+
+    def _process_quiescent(
+        self,
+        atk_frames: int,
+        hold_frames: int,
+        dec_frames: int,
+        sus_frames: int,
+        rel_frames: int,
+        sustain_level: float,
+        frames: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        B = self._stage.shape[0]
+        amp = np.zeros((B, frames), dtype=RAW_DTYPE)
+        reset = np.zeros((B, frames), dtype=RAW_DTYPE)
+
+        next_attack_stage = (
+            self._HOLD
+            if hold_frames > 0
+            else (self._DECAY if dec_frames > 0 else self._SUSTAIN)
+        )
+        next_hold_stage = self._DECAY if dec_frames > 0 else self._SUSTAIN
+
+        for b in range(B):
+            st = int(self._stage[b])
+            val = float(self._value[b])
+            tim = float(self._timer[b])
+            vel = float(self._velocity[b])
+            rel_start = float(self._release_start[b])
+            frame = 0
+
+            while frame < frames:
+                if st == self._IDLE:
+                    amp[b, frame:] = 0.0
+                    val = 0.0
+                    tim = 0.0
+                    frame = frames
+                elif st == self._ATTACK:
+                    if atk_frames <= 0:
+                        val = vel
+                        tim = 0.0
+                        st = next_attack_stage
+                        continue
+                    remaining = max(atk_frames - int(tim), 0)
+                    if remaining <= 0:
+                        tim = 0.0
+                        val = vel
+                        st = next_attack_stage
+                        continue
+                    seg = min(frames - frame, remaining)
+                    if seg <= 0:
+                        break
+                    step = vel / max(atk_frames, 1)
+                    idx = np.arange(1, seg + 1, dtype=RAW_DTYPE)
+                    seg_vals = np.minimum(vel, val + step * idx)
+                    amp[b, frame : frame + seg] = seg_vals
+                    val = float(seg_vals[-1])
+                    tim += seg
+                    frame += seg
+                    if tim >= atk_frames:
+                        tim = 0.0
+                        val = vel
+                        st = next_attack_stage
+                    continue
+                elif st == self._HOLD:
+                    val = vel
+                    if hold_frames <= 0:
+                        tim = 0.0
+                        st = next_hold_stage
+                        continue
+                    remaining = max(hold_frames - int(tim), 0)
+                    if remaining <= 0:
+                        tim = 0.0
+                        st = next_hold_stage
+                        continue
+                    seg = min(frames - frame, remaining)
+                    if seg <= 0:
+                        break
+                    amp[b, frame : frame + seg] = val
+                    frame += seg
+                    tim += seg
+                    if tim >= hold_frames:
+                        tim = 0.0
+                        st = next_hold_stage
+                    continue
+                elif st == self._DECAY:
+                    target = vel * sustain_level
+                    if dec_frames <= 0:
+                        val = target
+                        tim = 0.0
+                        st = self._SUSTAIN
+                        continue
+                    remaining = max(dec_frames - int(tim), 0)
+                    if remaining <= 0:
+                        val = target
+                        tim = 0.0
+                        st = self._SUSTAIN
+                        continue
+                    seg = min(frames - frame, remaining)
+                    if seg <= 0:
+                        break
+                    delta = (vel - target) / max(dec_frames, 1)
+                    idx = np.arange(1, seg + 1, dtype=RAW_DTYPE)
+                    seg_vals = np.maximum(target, val - delta * idx)
+                    amp[b, frame : frame + seg] = seg_vals
+                    val = float(seg_vals[-1])
+                    tim += seg
+                    frame += seg
+                    if tim >= dec_frames:
+                        tim = 0.0
+                        val = target
+                        st = self._SUSTAIN
+                    continue
+                elif st == self._SUSTAIN:
+                    val = vel * sustain_level
+                    if sus_frames > 0:
+                        remaining = max(sus_frames - int(tim), 0)
+                        if remaining <= 0:
+                            tim = 0.0
+                            rel_start = val
+                            st = self._RELEASE
+                            continue
+                        seg = min(frames - frame, remaining)
+                        if seg <= 0:
+                            break
+                        amp[b, frame : frame + seg] = val
+                        frame += seg
+                        tim += seg
+                        if tim >= sus_frames:
+                            tim = 0.0
+                            rel_start = val
+                            st = self._RELEASE
+                    else:
+                        amp[b, frame:] = val
+                        frame = frames
+                    continue
+                elif st == self._RELEASE:
+                    if rel_frames <= 0:
+                        val = 0.0
+                        tim = 0.0
+                        st = self._IDLE
+                        continue
+                    remaining = max(rel_frames - int(tim), 0)
+                    if remaining <= 0:
+                        val = 0.0
+                        tim = 0.0
+                        st = self._IDLE
+                        continue
+                    seg = min(frames - frame, remaining)
+                    if seg <= 0:
+                        break
+                    step = rel_start / max(rel_frames, 1)
+                    idx = np.arange(1, seg + 1, dtype=RAW_DTYPE)
+                    seg_vals = np.maximum(0.0, val - step * idx)
+                    amp[b, frame : frame + seg] = seg_vals
+                    val = float(seg_vals[-1])
+                    tim += seg
+                    frame += seg
+                    if tim >= rel_frames:
+                        tim = 0.0
+                        val = 0.0
+                        st = self._IDLE
+                else:
+                    amp[b, frame:] = 0.0
+                    val = 0.0
+                    tim = 0.0
+                    frame = frames
+
+            self._stage[b] = st
+            self._value[b] = RAW_DTYPE(val)
+            self._timer[b] = RAW_DTYPE(tim)
+            self._velocity[b] = RAW_DTYPE(vel)
+            self._release_start[b] = RAW_DTYPE(rel_start)
+
+        return amp, reset
 
     def _stage_frames(self, ms: float, sr: int) -> int:
         if ms <= 0.0:
@@ -655,53 +838,92 @@ class EnvelopeModulatorNode(Node):
             state.register(self.name)
             trigger, gate, drone, velocity = state.assign(self.name, trigger, gate, drone, velocity)
 
+        if (
+            self._stage.size
+            and np.all(self._stage == self._IDLE)
+            and not np.any(trigger > 0.5)
+            and not np.any(gate > 0.5)
+            and not np.any(drone > 0.5)
+        ):
+            return np.zeros((B, 2, F), dtype=RAW_DTYPE)
+
         atk_frames = self._stage_frames(self.attack_ms, sr)
         hold_frames = self._stage_frames(self.hold_ms, sr)
         dec_frames = self._stage_frames(self.decay_ms, sr)
         sus_frames = self._stage_frames(self.sustain_ms, sr)
         rel_frames = self._stage_frames(self.release_ms, sr)
 
-        # Prefer C kernel for the sequential envelope state machine; fall back to Python
-        try:
-            amp, reset = c_kernels.envelope_process_c(
-                trigger,
-                gate,
-                drone,
-                velocity,
+        trigger_active = trigger > 0.5
+        gate_active = gate > 0.5
+        drone_active = drone > 0.5
+
+        eventful = (
+            np.any(trigger_active)
+            or np.any(gate_active[:, 0] != self._gate_state)
+            or np.any(drone_active[:, 0] != self._drone_state)
+            or np.any(gate_active[:, 1:] != gate_active[:, :-1])
+            or np.any(drone_active[:, 1:] != drone_active[:, :-1])
+        )
+
+        if not eventful:
+            amp, reset = self._process_quiescent(
                 atk_frames,
                 hold_frames,
                 dec_frames,
                 sus_frames,
                 rel_frames,
                 self.sustain_level,
-                bool(send_reset.mean() > 0.5) if isinstance(send_reset, np.ndarray) else bool(self.send_resets),
-                self._stage,
-                self._value,
-                self._timer,
-                self._velocity,
-                self._activation_count,
-                self._release_start,
+                F,
             )
-        except Exception:
-            amp, reset = c_kernels.envelope_process_py(
-                trigger,
-                gate,
-                drone,
-                velocity,
-                atk_frames,
-                hold_frames,
-                dec_frames,
-                sus_frames,
-                rel_frames,
-                self.sustain_level,
-                bool(send_reset.mean() > 0.5) if isinstance(send_reset, np.ndarray) else bool(self.send_resets),
-                self._stage,
-                self._value,
-                self._timer,
-                self._velocity,
-                self._activation_count,
-                self._release_start,
-            )
+        else:
+            # Prefer C kernel for the sequential envelope state machine; fall back to Python
+            try:
+                amp, reset = c_kernels.envelope_process_c(
+                    trigger,
+                    gate,
+                    drone,
+                    velocity,
+                    atk_frames,
+                    hold_frames,
+                    dec_frames,
+                    sus_frames,
+                    rel_frames,
+                    self.sustain_level,
+                    bool(send_reset.mean() > 0.5)
+                    if isinstance(send_reset, np.ndarray)
+                    else bool(self.send_resets),
+                    self._stage,
+                    self._value,
+                    self._timer,
+                    self._velocity,
+                    self._activation_count,
+                    self._release_start,
+                )
+            except Exception:
+                amp, reset = c_kernels.envelope_process_py(
+                    trigger,
+                    gate,
+                    drone,
+                    velocity,
+                    atk_frames,
+                    hold_frames,
+                    dec_frames,
+                    sus_frames,
+                    rel_frames,
+                    self.sustain_level,
+                    bool(send_reset.mean() > 0.5)
+                    if isinstance(send_reset, np.ndarray)
+                    else bool(self.send_resets),
+                    self._stage,
+                    self._value,
+                    self._timer,
+                    self._velocity,
+                    self._activation_count,
+                    self._release_start,
+                )
+
+        self._gate_state = gate_active[:, -1].astype(bool, copy=False)
+        self._drone_state = drone_active[:, -1].astype(bool, copy=False)
 
         out = np.stack([amp, reset], axis=1)
         return out
