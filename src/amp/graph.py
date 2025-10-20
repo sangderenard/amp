@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from threading import Lock
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Deque, Dict, Iterable, List, Mapping, Sequence
 import numpy as np
 
 from .config import GraphConfig
@@ -189,10 +190,12 @@ class AudioGraph:
             incoming[target] = incoming.get(target, 0) + len(entries)
             for entry in entries:
                 outgoing.setdefault(entry.source, []).append(target)
-        queue = [name for name, count in incoming.items() if count == 0]
+        queue: Deque[str] = deque(
+            name for name, count in incoming.items() if count == 0
+        )
         order: List[str] = []
         while queue:
-            name = queue.pop(0)
+            name = queue.popleft()
             order.append(name)
             for successor in outgoing.get(name, []):
                 incoming[successor] -= 1

@@ -1,9 +1,11 @@
+import time
+
 import numpy as np
 import pytest
 
 from amp.application import SynthApplication
 from amp.config import AppConfig, GraphConfig, NodeConfig, ConnectionConfig, RuntimeConfig
-from amp.graph import AudioGraph
+from amp.graph import RAW_DTYPE, AudioGraph
 
 
 def simple_config() -> AppConfig:
@@ -90,3 +92,36 @@ def test_invalid_node_type_raises() -> None:
     config.graph.nodes.append(bad_node)
     with pytest.raises(KeyError):
         AudioGraph.from_config(config.graph, config.sample_rate, config.runtime.output_channels)
+
+
+def test_topo_order_large_graph_is_deterministic_and_fast() -> None:
+    class DummyNode:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def process(self, frames, sr, audio_in, mods, params):  # pragma: no cover - signature compatibility
+            if audio_in is None:
+                return np.zeros((1, 1, frames), dtype=RAW_DTYPE)
+            return np.array(audio_in, copy=True)
+
+    graph = AudioGraph(sample_rate=48000)
+    node_names = [f"node_{idx}" for idx in range(200)]
+    for name in node_names:
+        graph.add_node(DummyNode(name))
+
+    for idx in range(10, len(node_names)):
+        graph.connect_audio(node_names[idx - 10], node_names[idx])
+
+    graph.set_sink(node_names[-1])
+
+    expected_order = node_names
+    first_order = list(graph._topo_order())
+    second_order = list(graph._topo_order())
+    assert first_order == expected_order
+    assert second_order == expected_order
+
+    start = time.perf_counter()
+    for _ in range(25):
+        graph.render_block(32)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.5, f"rendering took too long: {elapsed:.3f}s"
