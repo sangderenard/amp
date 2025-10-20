@@ -11,6 +11,105 @@ import numpy as np
 
 from .graph import AudioGraph
 from . import menu, nodes, persistence, quantizer, state as app_state, utils
+
+
+def build_runtime_graph(fs: int, runtime_state: dict) -> tuple[AudioGraph, list[str]]:
+    """Construct the default audio graph for the given runtime state.
+
+    This helper returns both the populated :class:`AudioGraph` instance and the
+    list of envelope node names so the caller can feed control data during the
+    audio callback.  Keeping this as a module-level function allows tests to
+    inspect the generated graph without needing to spin up the interactive
+    application loop.
+    """
+
+    use_subharm = runtime_state.get("use_subharm", True)
+    use_normalizer = runtime_state.get("use_normalizer", True)
+    use_hardclip = runtime_state.get("use_hardclip", False)
+
+    osc_waves = ["sine", "square", "saw"]
+    osc_nodes = []
+    pan_lfos = []
+    am_lfos = []
+    env_nodes = []
+    for i, wave in enumerate(osc_waves):
+        osc = nodes.OscNode(f"osc{i+1}", wave=wave)
+        pan_lfo = nodes.LFONode(f"pan_lfo{i+1}", wave="sine", rate_hz=0.2 + 0.1 * i, depth=1.0)
+        am_lfo = nodes.LFONode(f"am_lfo{i+1}", wave="sine", rate_hz=4.0 + i, depth=0.5)
+        osc_nodes.append(osc)
+        pan_lfos.append(pan_lfo)
+        am_lfos.append(am_lfo)
+
+    graph_obj = AudioGraph(fs, output_channels=2)
+    for osc in osc_nodes:
+        graph_obj.add_node(osc)
+    for pan in pan_lfos:
+        graph_obj.add_node(pan)
+    for am in am_lfos:
+        graph_obj.add_node(am)
+
+    env_cfg = runtime_state.get("envelope_params", {})
+    poly_mode = runtime_state.get("polyphony_mode", "strings")
+    default_voice_count = len(osc_nodes) if poly_mode == "piano" else 1
+    voice_count = int(runtime_state.get("polyphony_voices", default_voice_count))
+    if voice_count < 1:
+        voice_count = 1
+    voice_count = min(len(osc_nodes), voice_count)
+    for i in range(voice_count):
+        env = nodes.EnvelopeNode(
+            f"env{i+1}",
+            attack_ms=env_cfg.get("attack_ms", 12.0),
+            hold_ms=env_cfg.get("hold_ms", 8.0),
+            decay_ms=env_cfg.get("decay_ms", 90.0),
+            sustain_level=env_cfg.get("sustain_level", 0.65),
+            sustain_ms=env_cfg.get("sustain_ms", 0.0),
+            release_ms=env_cfg.get("release_ms", 220.0),
+            send_resets=env_cfg.get("send_resets", True),
+        )
+        env_nodes.append(env)
+        graph_obj.add_node(env)
+
+    for i, osc in enumerate(osc_nodes):
+        env = env_nodes[i % len(env_nodes)] if env_nodes else None
+        if env is not None:
+            graph_obj.connect_mod(env.name, osc.name, "amp", scale=1.0, mode="add", channel=0)
+            if getattr(osc, "accept_reset", True) and env_cfg.get("send_resets", True):
+                graph_obj.connect_mod(env.name, osc.name, "reset", scale=1.0, mode="add", channel=1)
+        graph_obj.connect_mod(am_lfos[i].name, osc.name, "amp", scale=0.5, mode="mul")
+
+    if use_subharm:
+        subharm = nodes.SubharmonicLowLifterNode(
+            "subharm",
+            fs,
+            band_lo=70.0,
+            band_hi=160.0,
+            mix=0.6,
+            drive=1.2,
+            out_hp=25.0,
+            use_div4=True,
+        )
+        graph_obj.add_node(subharm)
+        for osc in osc_nodes:
+            graph_obj.connect_audio(osc.name, subharm.name)
+        mixer_in = subharm.name
+    else:
+        mixer_in = osc_nodes[0].name
+
+    mixer = nodes.MixNode(
+        "mixer",
+        out_channels=2,
+        alc=runtime_state.get("use_normalizer", True),
+        compression="tanh" if not runtime_state.get("use_hardclip", False) else "clip",
+    )
+    graph_obj.add_node(mixer)
+    graph_obj.connect_audio(mixer_in, mixer.name)
+
+    safety = nodes.SafetyFilterNode("safety", fs, n_ch=2)
+    graph_obj.add_node(safety)
+    graph_obj.connect_audio(mixer.name, safety.name)
+    graph_obj.set_sink(safety.name)
+
+    return graph_obj, [env.name for env in env_nodes]
 from .config import DEFAULT_CONFIG_PATH, load_configuration
 
 
@@ -156,14 +255,18 @@ def run(
     sample_rate = 44100
     freq_target = 220.0
     freq_current = 220.0
-    amp_target = 0.0
-    amp_current = 0.0
+    velocity_target = 0.0
+    velocity_current = 0.0
     cutoff_target = 1000.0
     cutoff_current = 1000.0
     q_target = 0.8
     q_current = 0.8
     gate_momentary = False
-    drone_on = False
+
+    envelope_modes = ("envelope", "drone", "hold")
+    envelope_mode_idx = 0
+    envelope_mode = envelope_modes[envelope_mode_idx]
+    pending_trigger = False
 
     state = app_state.build_default_state(joy=joy, pygame=pygame)
 
@@ -171,72 +274,22 @@ def run(
 
     sampler = _load_sampler(state)
 
-    def build_graph(fs: int, runtime_state: dict) -> AudioGraph:
-        use_subharm = runtime_state.get("use_subharm", True)
-        use_normalizer = runtime_state.get("use_normalizer", True)
-        use_hardclip = runtime_state.get("use_hardclip", False)
-
-        osc_waves = ["sine", "square", "saw"]
-        osc_nodes = []
-        pan_lfos = []
-        am_lfos = []
-        for i, wave in enumerate(osc_waves):
-            osc = nodes.OscNode(f"osc{i+1}", wave=wave)
-            pan_lfo = nodes.LFONode(f"pan_lfo{i+1}", wave="sine", rate_hz=0.2 + 0.1 * i, depth=1.0)
-            am_lfo = nodes.LFONode(f"am_lfo{i+1}", wave="sine", rate_hz=4.0 + i, depth=0.5)
-            osc_nodes.append(osc)
-            pan_lfos.append(pan_lfo)
-            am_lfos.append(am_lfo)
-
-        graph_obj = AudioGraph(fs, output_channels=2)
-        for osc in osc_nodes:
-            graph_obj.add_node(osc)
-        for pan in pan_lfos:
-            graph_obj.add_node(pan)
-        for am in am_lfos:
-            graph_obj.add_node(am)
-
-        for i, osc in enumerate(osc_nodes):
-            graph_obj.connect_mod(am_lfos[i].name, osc.name, "amp", scale=1.0, mode="add")
-
-        if use_subharm:
-            subharm = nodes.SubharmonicLowLifterNode(
-                "subharm",
-                fs,
-                band_lo=70.0,
-                band_hi=160.0,
-                mix=0.6,
-                drive=1.2,
-                out_hp=25.0,
-                use_div4=True,
-            )
-            graph_obj.add_node(subharm)
-            for osc in osc_nodes:
-                graph_obj.connect_audio(osc.name, subharm.name)
-            mixer_in = subharm.name
-        else:
-            mixer_in = osc_nodes[0].name
-
-        mixer = nodes.MixNode(
-            "mixer",
-            out_channels=2,
-            alc=runtime_state.get("use_normalizer", True),
-            compression="tanh" if not runtime_state.get("use_hardclip", False) else "clip",
-        )
-        graph_obj.add_node(mixer)
-        graph_obj.connect_audio(mixer_in, mixer.name)
-
-        safety = nodes.SafetyFilterNode("safety", fs, n_ch=2)
-        graph_obj.add_node(safety)
-        graph_obj.connect_audio(mixer.name, safety.name)
-        graph_obj.set_sink(safety.name)
-
-        return graph_obj
-
-    graph = build_graph(sample_rate, state)
+    graph, envelope_names = build_runtime_graph(sample_rate, state)
     menu_instance = menu.Menu(state)
     menu_instance.toggle()
     menu_instance.draw()
+
+    def cycle_envelope_mode() -> None:
+        nonlocal envelope_mode_idx, envelope_mode, pending_trigger
+
+        envelope_mode_idx = (envelope_mode_idx + 1) % len(envelope_modes)
+        envelope_mode = envelope_modes[envelope_mode_idx]
+        if envelope_mode == "drone":
+            pending_trigger = True
+        elif envelope_mode == "hold" and gate_momentary:
+            pending_trigger = True
+        print(f"Envelope mode → {envelope_mode.title()}")
+        menu_instance.draw()
 
     prev_buttons = [0] * joy.get_numbuttons()
     button_last_press: dict[int, float] = {}
@@ -244,16 +297,41 @@ def run(
 
     utils._scratch.ensure(app_state.MAX_FRAMES)
 
+    momentary_prev = False
+    drone_prev = False
+
     def audio_callback(outdata, frames, time_info, status):
-        nonlocal sample_rate, freq_current, amp_current, cutoff_current, q_current, graph
+        nonlocal sample_rate, freq_current, velocity_current, cutoff_current, q_current, graph
+        nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger
 
         sr = sample_rate
         utils._scratch.ensure(frames)
 
         f = utils.cubic_ramp(freq_current, freq_target, frames, utils._scratch.f[:frames])
-        a = utils.cubic_ramp(amp_current, amp_target, frames, utils._scratch.a[:frames])
+        v = utils.cubic_ramp(velocity_current, velocity_target, frames, utils._scratch.a[:frames])
         c = utils.cubic_ramp(cutoff_current, cutoff_target, frames, utils._scratch.c[:frames])
         q = utils.cubic_ramp(q_current, q_target, frames, utils._scratch.q[:frames])
+
+        mode = envelope_mode
+        momentary_now = gate_momentary
+        drone_now = mode == "drone"
+
+        trigger_now = False
+        if pending_trigger:
+            trigger_now = True
+            pending_trigger = False
+
+        if mode in ("envelope", "hold") and momentary_now and not momentary_prev:
+            trigger_now = True
+        elif mode == "drone" and drone_now and not drone_prev:
+            trigger_now = True
+
+        gate_now = mode == "hold" and momentary_now
+        trigger_signal = np.zeros(frames, dtype=utils.RAW_DTYPE)
+        if trigger_now:
+            trigger_signal[0] = 1.0
+        gate_signal = np.full(frames, 1.0 if gate_now else 0.0, dtype=utils.RAW_DTYPE)
+        drone_signal = np.full(frames, 1.0 if drone_now else 0.0, dtype=utils.RAW_DTYPE)
 
         B, C = 1, 1
         base_params = {
@@ -261,7 +339,7 @@ def run(
             "_C": C,
             "source": {
                 "freq": utils.as_BCF(f, B, C, frames, name="freq"),
-                "amp": utils.as_BCF(a, B, C, frames, name="amp"),
+                "amp": utils.as_BCF(v, B, C, frames, name="velocity"),
             },
             "filter": {
                 "cutoff": utils.as_BCF(c, B, C, frames, name="cutoff"),
@@ -273,8 +351,30 @@ def run(
         for name in osc_names:
             base_params[name] = {
                 "freq": utils.as_BCF(f, B, 1, frames, name=f"{name}.freq"),
-                "amp": utils.as_BCF(a, B, 1, frames, name=f"{name}.amp"),
+                "amp": utils.as_BCF(0.0, B, 1, frames, name=f"{name}.amp"),
             }
+
+        if envelope_names:
+            vel_bcf = utils.as_BCF(v, B, 1, frames, name="env.velocity")
+            gate_bcf = utils.as_BCF(gate_signal, B, 1, frames, name="env.gate")
+            drone_bcf = utils.as_BCF(drone_signal, B, 1, frames, name="env.drone")
+            trigger_bcf = utils.as_BCF(trigger_signal, B, 1, frames, name="env.trigger")
+            send_reset_flag = state.get("envelope_params", {}).get("send_resets", True)
+            send_reset_bcf = utils.as_BCF(
+                1.0 if send_reset_flag else 0.0,
+                B,
+                1,
+                frames,
+                name="env.send_reset",
+            )
+            for env_name in envelope_names:
+                base_params[env_name] = {
+                    "velocity": vel_bcf,
+                    "gate": gate_bcf,
+                    "drone": drone_bcf,
+                    "trigger": trigger_bcf,
+                    "send_reset": send_reset_bcf,
+                }
 
         y = graph.render(frames, sr, base_params)
         y = utils.assert_BCF(y, name="sink")
@@ -286,9 +386,11 @@ def run(
             outdata[:, ch] = y[0, ch].astype(np.float32, copy=False)
 
         freq_current = float(f[-1])
-        amp_current = float(a[-1])
+        velocity_current = float(v[-1])
         cutoff_current = float(c[-1])
         q_current = float(q[-1])
+        momentary_prev = momentary_now
+        drone_prev = drone_now
 
     running = True
     audio_failures: list[Exception] = []
@@ -307,7 +409,7 @@ def run(
         sample_rate = dev_sr
         sd.default.device = (None, dev_index)
         print(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz")
-        graph = build_graph(sample_rate, state)
+        graph, envelope_names = build_runtime_graph(sample_rate, state)
 
         def audio_thread() -> None:
             nonlocal running
@@ -340,7 +442,9 @@ def run(
             y += 16
         pygame.display.flip()
 
-    print("Menu:'m'  LS=pitch/vel  RS=filter.  A=gate  B=drone  X=wave  Y=cycle  N=source (osc/sampler).")
+    print(
+        "Menu:'m'  LS=pitch/vel  RS=filter.  A=trigger  B=mode  X=wave  Y=cycle  N=source (osc/sampler)."
+    )
     print("Bumpers: hold=momentary, double-tap=latch. RB default FREE; LB default 12tet/full.")
     print("Z cycles FREE variant. </> root down/up, / resets root.")
 
@@ -363,12 +467,12 @@ def run(
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("toggle_source", pygame.K_n):
                         state["source_type"] = "sampler" if state["source_type"] == "osc" else "osc"
-                        graph = build_graph(sample_rate, state)
+                        graph, envelope_names = build_runtime_graph(sample_rate, state)
                         print(f"Source → {state['source_type'].upper()}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("wave_next", pygame.K_x):
                         state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
-                        graph = build_graph(sample_rate, state)
+                        graph, envelope_names = build_runtime_graph(sample_rate, state)
                         print(f"Waveform → {state['waves'][state['wave_idx']]}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("free_variant_next", pygame.K_z):
@@ -376,6 +480,8 @@ def run(
                         state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
                         print(f"FREE variant → {state['free_variant']}")
                         menu_instance.draw()
+                    elif event.key == state["keymap"].get("drone_toggle", pygame.K_b):
+                        cycle_envelope_mode()
                     elif event.key == state["keymap"].get("root_up", pygame.K_PERIOD):
                         state["root_midi"] = min(127, state["root_midi"] + 1)
                         print(f"Root MIDI → {state['root_midi']}")
@@ -458,17 +564,16 @@ def run(
                 cents = quantizer.grid_warp_inverse(round(u), grid)
             freq_target = root_f * (2.0 ** (cents / 1200.0))
 
-            amp_target = max(0.0, 1.0 - (ly + 1.0) / 2.0)
+            velocity_target = max(0.0, 1.0 - (ly + 1.0) / 2.0)
 
             gate_momentary = bool(joy.get_button(0))
             bB = joy.get_button(1)
             if bB and not prev_buttons[1]:
-                drone_on = not drone_on
-                print(f"Drone → {'ON' if drone_on else 'OFF'}")
+                cycle_envelope_mode()
             bX = joy.get_button(2)
             if bX and not prev_buttons[2]:
                 state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
-                graph = build_graph(sample_rate, state)
+                graph, envelope_names = build_runtime_graph(sample_rate, state)
                 print(f"Waveform → {state['waves'][state['wave_idx']]}")
                 menu_instance.draw()
 
@@ -497,9 +602,9 @@ def run(
 
             lines = [
                 f"Eff:{effective_token:<16} Base:{state['base_token']:<16} Free:{state['free_variant']:<10} Src:{state['source_type']}",
-                f"Root:{state['root_midi']:3d}  Freq:{freq_target:7.2f}Hz  Amp:{amp_target:.2f}",
+                f"Root:{state['root_midi']:3d}  Freq:{freq_target:7.2f}Hz  Vel:{velocity_target:.2f}",
                 f"Cut:{cutoff_target:7.1f}Hz  Q:{q_target:4.2f}  Filter:{state['filter_type']}",
-                f"Wave:{state['waves'][state['wave_idx']]}  Drone:{'ON' if drone_on else 'OFF'}  LFO:{state['mod_wave_types'][state['mod_wave_idx']]}/{state['mod_rate_hz']:.2f}Hz d={state['mod_depth']:.2f} src={'input' if state['mod_use_input'] else 'free'}",
+                f"Wave:{state['waves'][state['wave_idx']]}  Mode:{envelope_mode.title():<9}  LFO:{state['mod_wave_types'][state['mod_wave_idx']]}/{state['mod_rate_hz']:.2f}Hz d={state['mod_depth']:.2f} src={'input' if state['mod_use_input'] else 'free'}",
             ]
             screen = pygame.display.get_surface()
             if screen:
@@ -515,4 +620,4 @@ def run(
     return 0
 
 
-__all__ = ["run"]
+__all__ = ["run", "build_runtime_graph"]

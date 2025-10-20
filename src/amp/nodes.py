@@ -192,26 +192,249 @@ class LFONode(Node):
                 out[:,:,i] = z[:,0]
         return out  # (B,1,F)
 
+class EnvelopeNode(Node):
+    """Multi-stage envelope generator with optional phase reset pulses."""
+
+    _IDLE = 0
+    _ATTACK = 1
+    _HOLD = 2
+    _DECAY = 3
+    _SUSTAIN = 4
+    _RELEASE = 5
+
+    def __init__(
+        self,
+        name,
+        *,
+        attack_ms=8.0,
+        hold_ms=10.0,
+        decay_ms=80.0,
+        sustain_level=0.7,
+        sustain_ms=0.0,
+        release_ms=160.0,
+        send_resets=True,
+    ):
+        super().__init__(name)
+        self.attack_ms = float(attack_ms)
+        self.hold_ms = float(hold_ms)
+        self.decay_ms = float(decay_ms)
+        self.sustain_level = float(sustain_level)
+        self.sustain_ms = float(sustain_ms)
+        self.release_ms = float(release_ms)
+        self.send_resets = bool(send_resets)
+        self._stage = None
+        self._value = None
+        self._timer = None
+        self._velocity = None
+        self._activation_count = None
+        self._release_start = None
+
+    def _ensure(self, B: int) -> None:
+        if (
+            self._stage is None
+            or self._stage.shape[0] != B
+        ):
+            self._stage = np.full(B, self._IDLE, dtype=np.int32)
+            self._value = np.zeros(B, RAW_DTYPE)
+            self._timer = np.zeros(B, RAW_DTYPE)
+            self._velocity = np.zeros(B, RAW_DTYPE)
+            self._activation_count = np.zeros(B, dtype=np.int64)
+            self._release_start = np.zeros(B, RAW_DTYPE)
+
+    def _stage_frames(self, ms: float, sr: int) -> int:
+        if ms <= 0.0:
+            return 0
+        return max(1, int(round(ms * sr / 1000.0)))
+
+    def process(self, frames, sr, audio_in, mods, params):
+        B = audio_in.shape[0] if audio_in is not None else 1
+        C = 1
+        F = frames
+        self._ensure(B)
+
+        trigger = as_BCF(params.get("trigger", 0.0), B, C, F, name=f"{self.name}.trigger")[:, 0, :]
+        gate = as_BCF(params.get("gate", 0.0), B, C, F, name=f"{self.name}.gate")[:, 0, :]
+        drone = as_BCF(params.get("drone", 0.0), B, C, F, name=f"{self.name}.drone")[:, 0, :]
+        velocity = as_BCF(params.get("velocity", 1.0), B, C, F, name=f"{self.name}.velocity")[:, 0, :]
+        send_reset = as_BCF(
+            params.get("send_reset", float(self.send_resets)),
+            B,
+            C,
+            F,
+            name=f"{self.name}.send_reset",
+        )[:, 0, :]
+
+        atk_frames = self._stage_frames(self.attack_ms, sr)
+        hold_frames = self._stage_frames(self.hold_ms, sr)
+        dec_frames = self._stage_frames(self.decay_ms, sr)
+        sus_frames = self._stage_frames(self.sustain_ms, sr)
+        rel_frames = self._stage_frames(self.release_ms, sr)
+
+        amp = np.zeros((B, F), dtype=RAW_DTYPE)
+        reset = np.zeros((B, F), dtype=RAW_DTYPE)
+        count = np.zeros((B, F), dtype=RAW_DTYPE)
+
+        for b in range(B):
+            stage = self._stage[b]
+            value = self._value[b]
+            timer = self._timer[b]
+            vel = self._velocity[b]
+            activations = self._activation_count[b]
+            release_start = self._release_start[b]
+
+            for i in range(F):
+                trig = trigger[b, i] > 0.5
+                gate_on = gate[b, i] > 0.5
+                drone_on = drone[b, i] > 0.5
+
+                if trig:
+                    stage = self._ATTACK
+                    timer = 0.0
+                    value = 0.0
+                    vel = max(0.0, velocity[b, i])
+                    release_start = vel
+                    activations += 1
+                    if send_reset[b, i] > 0.5:
+                        reset[b, i] = 1.0
+                elif stage == self._IDLE and (gate_on or drone_on):
+                    # Allow sustain without explicit trigger when latched drone activates.
+                    stage = self._ATTACK
+                    timer = 0.0
+                    value = 0.0
+                    vel = max(0.0, velocity[b, i])
+                    release_start = vel
+                    activations += 1
+                    if send_reset[b, i] > 0.5:
+                        reset[b, i] = 1.0
+
+                if stage == self._ATTACK:
+                    if atk_frames <= 0:
+                        value = vel
+                        stage = self._HOLD if hold_frames > 0 else (self._DECAY if dec_frames > 0 else self._SUSTAIN)
+                        timer = 0.0
+                    else:
+                        value += vel / atk_frames
+                        if value > vel:
+                            value = vel
+                        timer += 1.0
+                        if timer >= atk_frames:
+                            value = vel
+                            stage = self._HOLD if hold_frames > 0 else (self._DECAY if dec_frames > 0 else self._SUSTAIN)
+                            timer = 0.0
+
+                elif stage == self._HOLD:
+                    value = vel
+                    if hold_frames <= 0:
+                        stage = self._DECAY if dec_frames > 0 else self._SUSTAIN
+                        timer = 0.0
+                    else:
+                        timer += 1.0
+                        if timer >= hold_frames:
+                            stage = self._DECAY if dec_frames > 0 else self._SUSTAIN
+                            timer = 0.0
+
+                elif stage == self._DECAY:
+                    target = vel * self.sustain_level
+                    if dec_frames <= 0:
+                        value = target
+                        stage = self._SUSTAIN
+                        timer = 0.0
+                    else:
+                        delta = (vel - target) / max(dec_frames, 1)
+                        value = max(target, value - delta)
+                        timer += 1.0
+                        if timer >= dec_frames:
+                            value = target
+                            stage = self._SUSTAIN
+                            timer = 0.0
+
+                elif stage == self._SUSTAIN:
+                    value = vel * self.sustain_level
+                    if sus_frames > 0:
+                        timer += 1.0
+                        if timer >= sus_frames:
+                            stage = self._RELEASE
+                            release_start = value
+                            timer = 0.0
+                    elif not gate_on and not drone_on:
+                        stage = self._RELEASE
+                        release_start = value
+                        timer = 0.0
+
+                elif stage == self._RELEASE:
+                    if rel_frames <= 0:
+                        value = 0.0
+                        stage = self._IDLE
+                        timer = 0.0
+                    else:
+                        step = release_start / max(rel_frames, 1)
+                        value = max(0.0, value - step)
+                        timer += 1.0
+                        if timer >= rel_frames:
+                            value = 0.0
+                            stage = self._IDLE
+                            timer = 0.0
+                    if gate_on or drone_on:
+                        stage = self._ATTACK
+                        timer = 0.0
+                        value = 0.0
+                        vel = max(0.0, velocity[b, i])
+                        release_start = vel
+                        activations += 1
+                        if send_reset[b, i] > 0.5:
+                            reset[b, i] = 1.0
+
+                value = max(0.0, value)
+                amp[b, i] = value
+                count[b, i] = float(activations)
+
+            self._stage[b] = stage
+            self._value[b] = value
+            self._timer[b] = timer
+            self._velocity[b] = vel
+            self._activation_count[b] = activations
+            self._release_start[b] = release_start
+
+        out = np.stack([amp, reset, count], axis=1)
+        return out
+
+
 class OscNode(Node):
-    def __init__(self, name, wave="sine"):
-        super().__init__(name); self.wave = wave; self.phase = None
+    def __init__(self, name, wave="sine", *, accept_reset: bool = True):
+        super().__init__(name)
+        self.wave = wave
+        self.phase = None
+        self.accept_reset = bool(accept_reset)
 
     def process(self, frames, sr, audio_in, mods, params):
         B = audio_in.shape[0] if audio_in is not None else 1
         C = 1
         F = frames
 
-        f = as_BCF(params.get("freq", 0.0), B, C, F, name="osc.freq")[:,0,:]  # (B,F)
-        a = as_BCF(params.get("amp",  1.0), B, C, F, name="osc.amp") [:,0,:]  # (B,F)
+        f = as_BCF(params.get("freq", 0.0), B, C, F, name="osc.freq")[:, 0, :]
+        a = as_BCF(params.get("amp", 1.0), B, C, F, name="osc.amp")[:, 0, :]
+        reset = None
+        if self.accept_reset and "reset" in params:
+            reset = as_BCF(params.get("reset", 0.0), B, C, F, name="osc.reset")[:, 0, :]
 
         dphi = f / float(sr)
         if self.phase is None or self.phase.shape[0] != B:
             self.phase = np.zeros(B, RAW_DTYPE)
-        ph = (self.phase[:, None] + np.cumsum(dphi, axis=1)) % 1.0
-        self.phase = ph[:, -1]
+
+        ph = np.empty((B, F), dtype=RAW_DTYPE)
+        current = self.phase.copy()
+        for i in range(F):
+            if reset is not None:
+                mask = reset[:, i] > 0.5
+                if np.any(mask):
+                    current = np.where(mask, 0.0, current)
+            current = (current + dphi[:, i]) % 1.0
+            ph[:, i] = current
+
+        self.phase = current
 
         if self.wave == "sine":
-            w = np.sin(2*np.pi*ph, dtype=RAW_DTYPE)
+            w = np.sin(2 * np.pi * ph, dtype=RAW_DTYPE)
         elif self.wave == "saw":
             w = osc_saw_blep(ph, dphi)
         elif self.wave == "square":
@@ -221,7 +444,7 @@ class OscNode(Node):
         else:
             w = np.zeros_like(ph)
 
-        return (w * a)[:, None, :]  # (B,1,F)
+        return (w * a)[:, None, :]
 
 class SamplerNode(Node):
     def __init__(self, name, sampler):
@@ -540,6 +763,9 @@ NODE_TYPES = {
     "constant": ConstantNode,
     "sine": SineOscillatorNode,
     "sine_oscillator": SineOscillatorNode,
+    "osc": OscNode,
+    "oscillator": OscNode,
+    "envelope": EnvelopeNode,
     "mix": MixNode,
     "safety": SafetyNode,
     "subharmonic_low_lifter": SubharmonicLowLifterNode,
@@ -552,6 +778,8 @@ __all__ = [
     "SilenceNode",
     "ConstantNode",
     "SineOscillatorNode",
+    "EnvelopeNode",
+    "OscNode",
     "MixNode",
     "SafetyNode",
     "SubharmonicLowLifterNode",
