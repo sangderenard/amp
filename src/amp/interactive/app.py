@@ -149,48 +149,7 @@ def run(
     gate_momentary = False
     drone_on = False
 
-    waves = ["sine", "square", "saw", "triangle"]
-
-    state = {
-        "base_token": "12tet/full",
-        "root_midi": 60,
-        "free_variant": "continuous",
-        "waves": waves,
-        "wave_idx": 0,
-        "filter_types": ["lowpass", "highpass", "bandpass", "notch", "peaking"],
-        "filter_type": "lowpass",
-        "filter_axis_cutoff": min(4, joy.get_numaxes() - 1) if joy.get_numaxes() > 4 else 3,
-        "filter_axis_q": min(5, joy.get_numaxes() - 1) if joy.get_numaxes() > 5 else 4,
-        "peaking_gain_db": 6.0,
-        "source_type": "osc",
-        "sample_file": os.path.join(os.path.dirname(__file__), "sample.wav"),
-        "mod_wave_types": ["sine", "square", "saw", "triangle"],
-        "mod_wave_idx": 0,
-        "mod_rate_hz": 4.0,
-        "mod_depth": 0.5,
-        "mod_route": "both",
-        "mod_use_input": False,
-        "mod_slew_ms": 5.0,
-        "keymap": {
-            "toggle_menu": pygame.K_m,
-            "open_keymap": pygame.K_k,
-            "wave_next": pygame.K_x,
-            "mode_next": pygame.K_y,
-            "drone_toggle": pygame.K_b,
-            "toggle_source": pygame.K_n,
-            "free_variant_next": pygame.K_z,
-            "root_up": pygame.K_PERIOD,
-            "root_down": pygame.K_COMMA,
-            "root_reset": pygame.K_SLASH,
-        },
-        "buttonmap": {
-            4: {"token": "12tet/full"},
-            5: {"token": "FREE"},
-        },
-        "bumper_priority": [4, 5],
-        "double_tap_window": 0.33,
-        "free_variant_button": 6,
-    }
+    state = config.build_default_state(joy=joy, pygame=pygame)
 
     persistence.load_mappings(state)
 
