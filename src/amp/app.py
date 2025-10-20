@@ -237,9 +237,10 @@ def run(
     pygame.joystick.init()
 
     pygame.display.set_caption("Controller Synth (Graph)")
-    pygame.display.set_mode((600, 180))
+    pygame.display.set_mode((960, 540))
     pygame.font.init()
-    font = pygame.font.SysFont("monospace", 14)
+    font = pygame.font.SysFont("monospace", 16)
+    font_small = pygame.font.SysFont("monospace", 12)
 
     if pygame.joystick.get_count() == 0:
         if not allow_no_joystick:
@@ -437,13 +438,141 @@ def run(
 
     clock = pygame.time.Clock()
 
-    def draw_status(screen, lines):
-        screen.fill((0, 0, 0))
-        y = 10
+    def _extract_node_stats(node: nodes.Node) -> list[str]:
+        stats: list[str] = []
+        for key, value in vars(node).items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, (bool, int)):
+                stats.append(f"{key}={value}")
+            elif isinstance(value, float):
+                stats.append(f"{key}={value:.2f}")
+            elif isinstance(value, str):
+                stats.append(f"{key}={value}")
+        return stats[:4]
+
+    def _node_colour(node: nodes.Node) -> tuple[int, int, int]:
+        if isinstance(node, nodes.OscNode):
+            return (48, 92, 180)
+        if isinstance(node, nodes.LFONode):
+            return (34, 135, 92)
+        if isinstance(node, nodes.EnvelopeModulatorNode):
+            return (128, 84, 168)
+        if isinstance(node, nodes.MixNode):
+            return (150, 94, 40)
+        if isinstance(node, nodes.SubharmonicLowLifterNode):
+            return (92, 110, 160)
+        return (70, 70, 90)
+
+    def draw_visualisation(
+        screen,
+        lines: list[str],
+        freq_target: float,
+        velocity_target: float,
+    ) -> None:
+        if screen is None:
+            return
+
+        screen.fill((10, 10, 16))
+
+        nodes_in_graph = list(getattr(graph, "_nodes", {}).keys())
+        if not nodes_in_graph:
+            pygame.display.flip()
+            return
+
+        width, height = screen.get_size()
+        margin = 24
+        tile_w = 200
+        tile_h = 120
+        cols = max(1, min(len(nodes_in_graph), (width - margin) // (tile_w + margin)))
+        rows = (len(nodes_in_graph) + cols - 1) // cols
+        total_height = rows * (tile_h + margin) + margin
+        if total_height > height - 120:
+            available = max(height - 160, tile_h + margin)
+            tile_h = max(80, available // max(rows, 1) - margin)
+
+        layout: dict[str, pygame.Rect] = {}
+        for idx, name in enumerate(nodes_in_graph):
+            row = idx // cols
+            col = idx % cols
+            x = margin + col * (tile_w + margin)
+            y = margin + row * (tile_h + margin)
+            layout[name] = pygame.Rect(x, y, tile_w, tile_h)
+
+        centres = {name: rect.center for name, rect in layout.items()}
+
+        audio_colour = (90, 160, 240)
+        mod_colour = (200, 140, 255)
+
+        for source, targets in getattr(graph, "_audio_successors", {}).items():
+            if source not in centres:
+                continue
+            start = centres[source]
+            for target in targets:
+                if target not in centres:
+                    continue
+                pygame.draw.line(screen, audio_colour, start, centres[target], 3)
+
+        for target, conns in getattr(graph, "_mod_inputs", {}).items():
+            if target not in centres:
+                continue
+            end = centres[target]
+            for conn in conns:
+                start = centres.get(conn.source)
+                if start is None:
+                    continue
+                pygame.draw.line(screen, mod_colour, start, end, 2)
+
+        for name, rect in layout.items():
+            node = graph._nodes.get(name)
+            if node is None:
+                continue
+            colour = _node_colour(node)
+            pygame.draw.rect(screen, colour, rect, border_radius=10)
+            pygame.draw.rect(screen, (220, 220, 220), rect, width=2, border_radius=10)
+
+            title = font.render(name, True, (250, 250, 250))
+            screen.blit(title, (rect.x + 10, rect.y + 8))
+
+            lines_to_render: list[str] = []
+            if isinstance(node, nodes.OscNode):
+                lines_to_render.extend(
+                    [
+                        f"wave={node.wave}",
+                        f"freq≈{freq_target:.1f}Hz",
+                        f"vel≈{velocity_target:.2f}",
+                    ]
+                )
+            else:
+                lines_to_render.extend(_extract_node_stats(node))
+
+            for idx_line, text_line in enumerate(lines_to_render[:5]):
+                text_surface = font_small.render(text_line, True, (240, 240, 240))
+                screen.blit(
+                    text_surface,
+                    (rect.x + 12, rect.y + 34 + idx_line * (font_small.get_height() + 2)),
+                )
+
+        legend_x = margin
+        legend_y = height - (len(lines) + 3) * (font.get_height() + 4)
+        if legend_y < rows * (tile_h + margin) + margin:
+            legend_y = rows * (tile_h + margin) + margin
+
+        pygame.draw.line(screen, audio_colour, (legend_x, legend_y), (legend_x + 24, legend_y), 3)
+        label_audio = font_small.render("audio", True, (200, 200, 200))
+        screen.blit(label_audio, (legend_x + 32, legend_y - font_small.get_height() // 2))
+
+        legend_y += font_small.get_height() + 8
+        pygame.draw.line(screen, mod_colour, (legend_x, legend_y), (legend_x + 24, legend_y), 2)
+        label_mod = font_small.render("mod", True, (200, 200, 200))
+        screen.blit(label_mod, (legend_x + 32, legend_y - font_small.get_height() // 2))
+
+        info_y = legend_y + font_small.get_height() + 12
         for line in lines:
             text = font.render(line, True, (255, 255, 255))
-            screen.blit(text, (10, y))
-            y += 16
+            screen.blit(text, (margin, info_y))
+            info_y += font.get_height() + 4
+
         pygame.display.flip()
 
     print(
@@ -612,7 +741,7 @@ def run(
             ]
             screen = pygame.display.get_surface()
             if screen:
-                draw_status(screen, lines)
+                draw_visualisation(screen, lines, freq_target, velocity_target)
             print("\r" + " | ".join(lines), end="")
 
             clock.tick(120)
