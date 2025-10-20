@@ -1,13 +1,7 @@
-"""Minimal audio graph synthesis framework."""
+"""Controller-driven synthesiser package."""
 
 from __future__ import annotations
 
-from .application import SynthApplication
-from .config import DEFAULT_CONFIG_PATH, AppConfig, load_configuration
+from .interactive import run_app
 
-__all__ = [
-    "SynthApplication",
-    "AppConfig",
-    "DEFAULT_CONFIG_PATH",
-    "load_configuration",
-]
+__all__ = ["run_app"]

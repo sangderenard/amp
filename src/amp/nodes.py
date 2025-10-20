@@ -1,131 +1,167 @@
-"""Builtin audio node implementations."""
+"""Builtin node implementations for the shared audio graph."""
 
 from __future__ import annotations
 
 import math
-from typing import Callable, Dict, Sequence
+from typing import Dict, Mapping, Sequence
 
 import numpy as np
 
 DEFAULT_DTYPE = np.float64
 
 
+def _ensure_bcf(audio_in: np.ndarray | None, frames: int) -> tuple[np.ndarray | None, int]:
+    """Normalise *audio_in* to ``(B, C, F)`` for downstream processing."""
+
+    if audio_in is None:
+        return None, 1
+    arr = np.asarray(audio_in, dtype=DEFAULT_DTYPE)
+    if arr.ndim == 1:
+        arr = arr[None, None, :]
+    elif arr.ndim == 2:
+        arr = arr[None, :, :]
+    elif arr.ndim != 3:
+        raise ValueError(f"Expected audio input to have rank 1, 2, or 3; got {arr.ndim}")
+    if arr.shape[2] != frames:
+        raise ValueError(f"Audio input frame mismatch: got {arr.shape[2]}, expected {frames}")
+    return arr, arr.shape[0]
+
+
 class AudioNode:
-    """Base class for audio graph nodes."""
+    """Base class for graph nodes that operate on ``(B, C, F)`` buffers."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, params: Mapping[str, float] | None = None) -> None:
         self.name = name
+        self.params = dict(params or {})
 
-    def render(self, frames: int, sample_rate: int, inputs: Sequence[np.ndarray]) -> np.ndarray:
+    def process(
+        self,
+        frames: int,
+        sample_rate: int,
+        audio_in: np.ndarray | None,
+        mods: Mapping[str, Sequence[tuple[np.ndarray, float, str]]],
+        params: Mapping[str, np.ndarray],
+    ) -> np.ndarray:
         raise NotImplementedError
 
 
 class SilenceNode(AudioNode):
-    """Produce a silent buffer."""
+    """Produce a silent buffer with the configured channel count."""
 
-    def __init__(self, name: str, params: Dict[str, float] | None = None) -> None:
-        super().__init__(name)
-        self.channels = int((params or {}).get("channels", 1))
+    def __init__(self, name: str, params: Mapping[str, float] | None = None) -> None:
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 1))
 
-    def render(self, frames: int, sample_rate: int, inputs: Sequence[np.ndarray]) -> np.ndarray:  # noqa: D401 - see base class
-        return np.zeros((self.channels, frames), dtype=DEFAULT_DTYPE)
-
-
-class SineOscillatorNode(AudioNode):
-    """Simple sine oscillator."""
-
-    def __init__(self, name: str, params: Dict[str, float] | None = None) -> None:
-        super().__init__(name)
-        params = params or {}
-        self.frequency = float(params.get("frequency", 440.0))
-        self.amplitude = float(params.get("amplitude", 0.5))
-        self._phase = float(params.get("phase", 0.0)) % 1.0
-
-    def render(self, frames: int, sample_rate: int, inputs: Sequence[np.ndarray]) -> np.ndarray:  # noqa: D401 - see base class
-        phase_inc = self.frequency / float(sample_rate)
-        steps = np.arange(frames, dtype=DEFAULT_DTYPE)
-        phases = (self._phase + steps * phase_inc) % 1.0
-        self._phase = float((phases[-1] + phase_inc) % 1.0)
-        wave = np.sin(2.0 * math.pi * phases).astype(DEFAULT_DTYPE, copy=False)
-        return (wave * self.amplitude)[None, :]
+    def process(self, frames: int, sample_rate: int, audio_in, mods, params):  # noqa: D401 - see base class
+        _, batches = _ensure_bcf(audio_in, frames)
+        return np.zeros((batches, self.channels, frames), dtype=DEFAULT_DTYPE)
 
 
 class ConstantNode(AudioNode):
-    """Emit a constant signal."""
+    """Emit a constant signal for each requested channel."""
 
-    def __init__(self, name: str, params: Dict[str, float] | None = None) -> None:
-        super().__init__(name)
-        params = params or {}
-        self.value = float(params.get("value", 0.0))
-        self.channels = int(params.get("channels", 1))
+    def __init__(self, name: str, params: Mapping[str, float] | None = None) -> None:
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 1))
+        self.value = float(self.params.get("value", 0.0))
 
-    def render(self, frames: int, sample_rate: int, inputs: Sequence[np.ndarray]) -> np.ndarray:  # noqa: D401 - see base class
-        buffer = np.full((self.channels, frames), self.value, dtype=DEFAULT_DTYPE)
+    def process(self, frames: int, sample_rate: int, audio_in, mods, params):  # noqa: D401 - see base class
+        _, batches = _ensure_bcf(audio_in, frames)
+        buffer = np.full((batches, self.channels, frames), self.value, dtype=DEFAULT_DTYPE)
         return buffer
 
 
+class SineOscillatorNode(AudioNode):
+    """Simple sine oscillator with optional overrides via ``params``."""
+
+    def __init__(self, name: str, params: Mapping[str, float] | None = None) -> None:
+        super().__init__(name, params)
+        self.frequency = float(self.params.get("frequency", 440.0))
+        self.amplitude = float(self.params.get("amplitude", 0.5))
+        self._phase = float(self.params.get("phase", 0.0)) % 1.0
+
+    def process(self, frames: int, sample_rate: int, audio_in, mods, params):  # noqa: D401 - see base class
+        _, batches = _ensure_bcf(audio_in, frames)
+        batch_size = batches
+        freq = params.get("frequency")
+        amp = params.get("amplitude")
+        if freq is None:
+            freq = np.full((batch_size, 1, frames), self.frequency, dtype=DEFAULT_DTYPE)
+        if amp is None:
+            amp = np.full((batch_size, 1, frames), self.amplitude, dtype=DEFAULT_DTYPE)
+        freq = np.asarray(freq, dtype=DEFAULT_DTYPE)[:, 0, :]
+        amp = np.asarray(amp, dtype=DEFAULT_DTYPE)[:, 0, :]
+
+        dphi = freq / float(sample_rate)
+        phase = (self._phase + np.cumsum(dphi, axis=1)) % 1.0
+        self._phase = float((phase[0, -1] + dphi[0, -1]) % 1.0)
+        wave = np.sin(2.0 * math.pi * phase, dtype=DEFAULT_DTYPE)
+        return (wave * amp)[:, None, :]
+
+
 def _match_channels(data: np.ndarray, channels: int) -> np.ndarray:
-    if data.shape[0] == channels:
+    if data.shape[1] == channels:
         return data
-    if data.shape[0] == 1:
-        return np.repeat(data, channels, axis=0)
-    if data.shape[0] > channels:
-        return data[:channels]
-    pad = np.zeros((channels - data.shape[0], data.shape[1]), dtype=data.dtype)
-    return np.concatenate([data, pad], axis=0)
+    if data.shape[1] == 1:
+        return np.repeat(data, channels, axis=1)
+    if data.shape[1] > channels:
+        return data[:, :channels, :]
+    pad = np.zeros((data.shape[0], channels - data.shape[1], data.shape[2]), dtype=data.dtype)
+    return np.concatenate([data, pad], axis=1)
 
 
 class MixNode(AudioNode):
-    """Sum inputs into a fixed number of channels."""
+    """Sum all inputs into a target channel count."""
 
-    def __init__(self, name: str, params: Dict[str, float] | None = None) -> None:
-        super().__init__(name)
-        params = params or {}
-        self.channels = int(params.get("channels", 2))
-        self.gain = float(params.get("gain", 1.0))
+    def __init__(self, name: str, params: Mapping[str, float] | None = None) -> None:
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 2))
+        self.gain = float(self.params.get("gain", 1.0))
 
-    def render(self, frames: int, sample_rate: int, inputs: Sequence[np.ndarray]) -> np.ndarray:  # noqa: D401 - see base class
-        out = np.zeros((self.channels, frames), dtype=DEFAULT_DTYPE)
-        for buf in inputs:
-            if buf.ndim != 2:
-                raise ValueError(f"Input to {self.name} must be 2D (channels, frames), got {buf.shape}")
-            out += _match_channels(buf, self.channels)
-        out *= self.gain
-        return out
+    def process(self, frames: int, sample_rate: int, audio_in, mods, params):  # noqa: D401 - see base class
+        data, batches = _ensure_bcf(audio_in, frames)
+        if data is None:
+            return np.zeros((batches, self.channels, frames), dtype=DEFAULT_DTYPE)
+        summed = np.sum(data, axis=1, keepdims=True)
+        if self.channels > 1:
+            summed = np.repeat(summed, self.channels, axis=1)
+        return summed * self.gain
 
 
 class SafetyNode(AudioNode):
-    """Last stage that ensures stability and channel count."""
+    """Final node that applies a simple DC blocker per channel."""
 
-    def __init__(self, name: str, params: Dict[str, float] | None = None) -> None:
-        super().__init__(name)
-        params = params or {}
-        self.channels = int(params.get("channels", 2))
-        self.dc_alpha = float(params.get("dc_alpha", 0.995))
-        self._state = np.zeros(self.channels, dtype=DEFAULT_DTYPE)
+    def __init__(self, name: str, params: Mapping[str, float] | None = None) -> None:
+        super().__init__(name, params)
+        self.channels = int(self.params.get("channels", 2))
+        self.dc_alpha = float(self.params.get("dc_alpha", 0.995))
+        self._state: Dict[int, np.ndarray] = {}
 
-    def render(self, frames: int, sample_rate: int, inputs: Sequence[np.ndarray]) -> np.ndarray:  # noqa: D401 - see base class
-        if inputs:
-            data = _match_channels(inputs[0], self.channels)
+    def process(self, frames: int, sample_rate: int, audio_in, mods, params):  # noqa: D401 - see base class
+        data, batches = _ensure_bcf(audio_in, frames)
+        if data is None:
+            data = np.zeros((batches, self.channels, frames), dtype=DEFAULT_DTYPE)
         else:
-            data = np.zeros((self.channels, frames), dtype=DEFAULT_DTYPE)
-        # simple DC blocking per channel
+            data = _match_channels(data, self.channels)
+
         out = np.empty_like(data)
-        for ch in range(self.channels):
-            prev = self._state[ch]
-            for i in range(frames):
-                prev = self.dc_alpha * prev + (1.0 - self.dc_alpha) * data[ch, i]
-                out[ch, i] = data[ch, i] - prev
-            self._state[ch] = prev
+        for batch in range(batches):
+            state = self._state.setdefault(batch, np.zeros(self.channels, dtype=DEFAULT_DTYPE))
+            for ch in range(self.channels):
+                prev = state[ch]
+                for i in range(frames):
+                    prev = self.dc_alpha * prev + (1.0 - self.dc_alpha) * data[batch, ch, i]
+                    out[batch, ch, i] = data[batch, ch, i] - prev
+                state[ch] = prev
         np.clip(out, -1.0, 1.0, out=out)
         return out
 
 
-NODE_TYPES: Dict[str, Callable[[str, Dict[str, float] | None], AudioNode]] = {
+NODE_TYPES: Dict[str, type[AudioNode]] = {
     "silence": SilenceNode,
     "constant": ConstantNode,
-    "sine_oscillator": SineOscillatorNode,
     "sine": SineOscillatorNode,
+    "sine_oscillator": SineOscillatorNode,
     "mix": MixNode,
     "safety": SafetyNode,
 }

@@ -10,10 +10,17 @@ authors = [{name = "Amp Contributors"}]
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "networkx",
 ]
 
 [project.scripts]
 amp = "amp.cli:main"
+
+[project.optional-dependencies]
+interactive = [
+    "pygame",
+    "sounddevice",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
