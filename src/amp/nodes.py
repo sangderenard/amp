@@ -388,45 +388,151 @@ class NormalizerCompressorNode(Node):
         self.stats.update(compressed)
         return compressed
 
-class SubharmonicGeneratorNode(Node):
-    """
-    Generates subharmonics by dividing the input signal's frequency and mixing the result.
-    Supports both 'aggregate' (group effect, then split by contribution) and 'independent' (per-signal) modes.
-    Mode is controlled by self.aggregate_mode (True=aggregate, False=independent).
-    """
-    def __init__(self, name, n_ch=2, mix=0.5, divisions=(2,), aggregate_mode=False):
+class SubharmonicLowLifterNode(Node):
+    """Low-lifter style subharmonic enhancer operating purely on audio input."""
+
+    def __init__(
+        self,
+        name,
+        sample_rate,
+        *,
+        band_lo=70.0,
+        band_hi=160.0,
+        mix=0.5,
+        drive=1.0,
+        out_hp=25.0,
+        use_div4=False,
+    ):
         super().__init__(name)
-        self.n_ch = n_ch
-        self.mix = mix  # Amount of subharmonic to mix in (0..1)
-        self.divisions = divisions  # Tuple of integer divisors (e.g., (2, 3))
-        self.aggregate_mode = aggregate_mode
-        self.stats = ClipStats()
-        # Simple state for each channel/division
-        self.phases = None  # Will be initialized on first call
+        self.sr = float(sample_rate)
+        self.band_lo = float(band_lo)
+        self.band_hi = float(band_hi)
+        self.mix = float(mix)
+        self.drive = float(drive)
+        self.out_hp = float(out_hp)
+        self.use_div4 = bool(use_div4)
+        self._init = False
+
+    # --- coefficient helpers -------------------------------------------------
+    def _alpha_lp(self, fc, sr):
+        return 1.0 - math.exp(-2.0 * math.pi * max(fc, 1.0) / sr)
+
+    def _alpha_hp(self, fc, sr):
+        fc = max(fc, 1.0)
+        rc = 1.0 / (2.0 * math.pi * fc)
+        return rc / (rc + 1.0 / sr)
+
+    def _ensure_state(self, B, C):
+        if self._init and self.prev.shape == (B, C):
+            return
+        self.hp_y = np.zeros((B, C), dtype=RAW_DTYPE)
+        self.lp_y = np.zeros((B, C), dtype=RAW_DTYPE)
+        self.prev = np.zeros((B, C), dtype=RAW_DTYPE)
+        self.sign = np.zeros((B, C), dtype=np.int8)
+        self.ff2 = np.ones((B, C), dtype=np.int8)
+        self.sub2_lp = np.zeros((B, C), dtype=RAW_DTYPE)
+        self.env = np.zeros((B, C), dtype=RAW_DTYPE)
+        self.hp_out_y = np.zeros((B, C), dtype=RAW_DTYPE)
+        self.hp_out_x = np.zeros((B, C), dtype=RAW_DTYPE)
+        if self.use_div4:
+            self.ff4 = np.ones((B, C), dtype=np.int8)
+            self.ff4_count = np.zeros((B, C), dtype=np.int32)
+            self.sub4_lp = np.zeros((B, C), dtype=RAW_DTYPE)
+        else:
+            self.ff4 = None
+            self.ff4_count = None
+            self.sub4_lp = None
+        self._init = True
+
+    @staticmethod
+    def _scalar_param(params, key, default):
+        value = params.get(key)
+        if value is None:
+            return float(default)
+        arr = np.asarray(value, dtype=RAW_DTYPE)
+        if arr.ndim == 0:
+            return float(arr)
+        return float(arr.reshape(-1)[-1])
 
     def process(self, frames, sr, audio_in, mods, params):
-        x = np.asarray(audio_in)
-        if x.ndim == 1:      x = x[None, None, :]
-        elif x.ndim == 2:    x = x[None, :, :]
-        elif x.ndim != 3:    raise ValueError(f"subharm.in rank {x.ndim}")
+        if audio_in is None:
+            return np.zeros((1, 1, frames), dtype=RAW_DTYPE)
+
+        x = assert_BCF(audio_in, name=f"{self.name}.in")
         B, C, F = x.shape
 
-        if self.phases is None or self.phases.shape != (B, C, len(self.divisions)):
-            self.phases = np.zeros((B, C, len(self.divisions)), dtype=RAW_DTYPE)
+        self._ensure_state(B, C)
 
-        freq = params.get("freq", 110.0)
-        freq = as_BCF(freq, B, C, F, name="subharm.freq")[:,:,0]  # (B,C)
+        # Allow slow parameter modulation by sampling the last provided value.
+        sr = float(sr or self.sr)
+        band_lo = self._scalar_param(params, "band_lo", self.band_lo)
+        band_hi = self._scalar_param(params, "band_hi", self.band_hi)
+        mix = self._scalar_param(params, "mix", self.mix)
+        drive = self._scalar_param(params, "drive", self.drive)
+        out_hp = self._scalar_param(params, "out_hp", self.out_hp)
 
-        out = np.copy(x)
-        t = np.arange(F) / sr
-        for idx, div in enumerate(self.divisions):
-            sub_f = freq / div
-            for b in range(B):
-                for c in range(C):
-                    phase = self.phases[b, c, idx]
-                    out[b, c] += self.mix * np.sin(2*np.pi*sub_f[b, c]*t + phase)
-                    self.phases[b, c, idx] = (phase + 2*np.pi*sub_f[b, c]*F/sr) % (2*np.pi)
-        return out  # (B,C,F)
+        a_hp_in = self._alpha_hp(band_lo, sr)
+        a_lp_in = self._alpha_lp(band_hi, sr)
+        a_sub2 = self._alpha_lp(max(band_hi / 3.0, 30.0), sr)
+        a_sub4 = self._alpha_lp(max(band_hi / 5.0, 20.0), sr) if self.use_div4 else None
+        a_env_attack = self._alpha_lp(100.0, sr)
+        a_env_release = self._alpha_lp(5.0, sr)
+        a_hp_out = self._alpha_hp(out_hp, sr)
+
+        y = np.empty_like(x)
+
+        for t in range(F):
+            xt = x[:, :, t]
+
+            # Bandpass driver: simple HP then LP
+            self.hp_y = a_hp_in * (self.hp_y + xt - self.prev)
+            self.prev = xt
+            bp = self.lp_y + a_lp_in * (self.hp_y - self.lp_y)
+            self.lp_y = bp
+
+            abs_bp = np.abs(bp)
+            self.env = np.where(
+                abs_bp > self.env,
+                self.env + a_env_attack * (abs_bp - self.env),
+                self.env + a_env_release * (abs_bp - self.env),
+            )
+
+            prev_sign = self.sign
+            sign_now = (bp > 0.0).astype(np.int8) * 2 - 1
+            pos_zc = (prev_sign < 0) & (sign_now > 0)
+            self.sign = sign_now
+
+            self.ff2 = np.where(pos_zc, -self.ff2, self.ff2)
+
+            if self.use_div4:
+                self.ff4_count = np.where(pos_zc, self.ff4_count + 1, self.ff4_count)
+                toggle4 = pos_zc & (self.ff4_count >= 2)
+                self.ff4 = np.where(toggle4, -self.ff4, self.ff4)
+                self.ff4_count = np.where(toggle4, 0, self.ff4_count)
+
+            sq2 = self.ff2.astype(RAW_DTYPE)
+            self.sub2_lp = self.sub2_lp + a_sub2 * (sq2 - self.sub2_lp)
+            sub = self.sub2_lp
+
+            if self.use_div4 and self.sub4_lp is not None and self.ff4 is not None:
+                sq4 = self.ff4.astype(RAW_DTYPE)
+                self.sub4_lp = self.sub4_lp + a_sub4 * (sq4 - self.sub4_lp)
+                sub = sub + 0.6 * self.sub4_lp
+
+            sub = np.tanh(drive * sub) * (self.env + 1e-6)
+
+            dry = xt
+            wet = sub
+            out_t = (1.0 - mix) * dry + mix * wet
+
+            y_prev = self.hp_out_y
+            x_prev = self.hp_out_x
+            hp = a_hp_out * (y_prev + out_t - x_prev)
+            self.hp_out_y = hp
+            self.hp_out_x = out_t
+            y[:, :, t] = hp
+
+        return y
 
 
 NODE_TYPES = {
@@ -436,6 +542,7 @@ NODE_TYPES = {
     "sine_oscillator": SineOscillatorNode,
     "mix": MixNode,
     "safety": SafetyNode,
+    "subharmonic_low_lifter": SubharmonicLowLifterNode,
 }
 
 
@@ -447,4 +554,5 @@ __all__ = [
     "SineOscillatorNode",
     "MixNode",
     "SafetyNode",
+    "SubharmonicLowLifterNode",
 ]

@@ -200,7 +200,16 @@ def run(
             graph_obj.connect_mod(am_lfos[i].name, osc.name, "amp", scale=1.0, mode="add")
 
         if use_subharm:
-            subharm = nodes.SubharmonicGeneratorNode("subharm", n_ch=1, mix=0.4, divisions=(2, 3))
+            subharm = nodes.SubharmonicLowLifterNode(
+                "subharm",
+                fs,
+                band_lo=70.0,
+                band_hi=160.0,
+                mix=0.6,
+                drive=1.2,
+                out_hp=25.0,
+                use_div4=True,
+            )
             graph_obj.add_node(subharm)
             for osc in osc_nodes:
                 graph_obj.connect_audio(osc.name, subharm.name)
@@ -259,6 +268,13 @@ def run(
                 "Q": utils.as_BCF(q, B, C, frames, name="Q"),
             },
         }
+
+        osc_names = [name for name in ("osc1", "osc2", "osc3") if name in graph._nodes]
+        for name in osc_names:
+            base_params[name] = {
+                "freq": utils.as_BCF(f, B, 1, frames, name=f"{name}.freq"),
+                "amp": utils.as_BCF(a, B, 1, frames, name=f"{name}.amp"),
+            }
 
         y = graph.render(frames, sr, base_params)
         y = utils.assert_BCF(y, name="sink")
