@@ -7,6 +7,8 @@ from collections import deque
 from dataclasses import dataclass
 from threading import Lock
 from typing import Deque, Dict, Iterable, List, Mapping, Sequence, Tuple
+import time
+
 import numpy as np
 
 from .config import GraphConfig
@@ -325,6 +327,7 @@ class AudioGraph:
         ] = {}
         self._merge_scratch: Dict[Tuple[int, int, int], np.ndarray] = {}
         self._audio_workspaces: Dict[Tuple[int, int, int], np.ndarray] = {}
+        self._last_node_timings: Dict[str, float] = {}
 
     @classmethod
     def from_config(cls, config: GraphConfig, sample_rate: int, output_channels: int) -> "AudioGraph":
@@ -601,6 +604,7 @@ class AudioGraph:
         sr = int(sample_rate or self.sample_rate)
         plan = self._ensure_execution_plan()
         caches: Dict[str, np.ndarray | None] = {name: None for name in self._nodes}
+        node_timings: Dict[str, float] = {}
         for entry in plan:
             name = entry.name
             audio_inputs: List[np.ndarray] = []
@@ -699,7 +703,9 @@ class AudioGraph:
                             np.multiply(base, scratch, out=base)
                     merged_params[param_name] = base
             node = self._nodes[name]
+            start = time.perf_counter()
             output = node.process(frame_count, sr, audio_in, mods, merged_params)
+            node_timings[name] = time.perf_counter() - start
             caches[name] = _assert_bcf(output, name=f"{name}.out")
         with self._levels_lock:
             self._last_node_levels = {
@@ -707,6 +713,7 @@ class AudioGraph:
                 for name, buf in caches.items()
                 if buf is not None
             }
+            self._last_node_timings = dict(node_timings)
         sink_output = caches[self.sink]
         if sink_output is None:
             raise RuntimeError(f"Sink node '{self.sink}' produced no data")
@@ -735,6 +742,11 @@ class AudioGraph:
     def last_node_levels(self) -> Dict[str, np.ndarray]:
         with self._levels_lock:
             return {name: levels.copy() for name, levels in self._last_node_levels.items()}
+
+    @property
+    def last_node_timings(self) -> Dict[str, float]:
+        with self._levels_lock:
+            return dict(self._last_node_timings)
 
     def record_control_event(
         self,
