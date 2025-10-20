@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 from typing import Dict, Iterable, List, Mapping, Sequence
 import numpy as np
 
@@ -77,6 +78,8 @@ class AudioGraph:
         self._audio_successors: Dict[str, List[str]] = {}
         self._mod_inputs: Dict[str, List[ModConnection]] = {}
         self.sink: str | None = None
+        self._levels_lock = Lock()
+        self._last_node_levels: Dict[str, np.ndarray] = {}
 
     @classmethod
     def from_config(cls, config: GraphConfig, sample_rate: int, output_channels: int) -> "AudioGraph":
@@ -243,6 +246,12 @@ class AudioGraph:
             node = self._nodes[name]
             output = node.process(frame_count, sr, audio_in, mods, merged_params)
             caches[name] = _assert_bcf(output, name=f"{name}.out")
+        with self._levels_lock:
+            self._last_node_levels = {
+                name: np.max(np.abs(buf), axis=2)
+                for name, buf in caches.items()
+                if buf is not None
+            }
         sink_output = caches[self.sink]
         if sink_output is None:
             raise RuntimeError(f"Sink node '{self.sink}' produced no data")
@@ -266,6 +275,11 @@ class AudioGraph:
             elif channels > self.output_channels:
                 data = data[: self.output_channels]
         return data
+
+    @property
+    def last_node_levels(self) -> Dict[str, np.ndarray]:
+        with self._levels_lock:
+            return {name: levels.copy() for name, levels in self._last_node_levels.items()}
 
 
 __all__ = ["AudioGraph", "GraphEdge", "ModConnection"]
