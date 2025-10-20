@@ -28,6 +28,7 @@ class _EnvelopeGroupState:
         self._assignments: dict[str, dict[str, np.ndarray]] = {}
         self._next_voice = 0
         self._block_token: int | None = None
+        self._latched_voice: list[int] = []
 
     def register(self, name: str) -> None:
         if name not in self.members:
@@ -36,6 +37,8 @@ class _EnvelopeGroupState:
     def reset(self) -> None:
         self._assignments.clear()
         self._block_token = None
+        self._latched_voice = []
+        self._next_voice = 0
 
     def _token(self, trigger: np.ndarray) -> int:
         ptr = trigger.__array_interface__["data"][0]
@@ -71,22 +74,49 @@ class _EnvelopeGroupState:
     ) -> None:
         B, F = trigger.shape
         assignments: dict[str, dict[str, np.ndarray]] = {}
+        dtype = trigger.dtype
         for member in self.members:
             assignments[member] = {
-                "trigger": np.zeros((B, F), dtype=trigger.dtype),
-                "gate": gate.copy(),
-                "drone": drone.copy(),
-                "velocity": velocity.copy(),
+                "trigger": np.zeros((B, F), dtype=dtype),
+                "gate": np.zeros((B, F), dtype=dtype),
+                "drone": np.zeros((B, F), dtype=dtype),
+                "velocity": np.zeros((B, F), dtype=dtype),
             }
-        if self.members:
-            idx = self._next_voice % len(self.members)
+
+        member_count = len(self.members)
+        if member_count:
+            if len(self._latched_voice) != B:
+                self._latched_voice = [-1] * B
+            idx = self._next_voice % member_count
             for frame in range(F):
-                active = trigger[:, frame] > 0.5
-                if not np.any(active):
-                    continue
-                member = self.members[idx]
-                assignments[member]["trigger"][active, frame] = trigger[active, frame]
-                idx = (idx + 1) % len(self.members)
+                for batch in range(B):
+                    trig_val = trigger[batch, frame] > 0.5
+                    gate_val = gate[batch, frame]
+                    drone_val = drone[batch, frame]
+                    vel_val = velocity[batch, frame]
+                    voice = self._latched_voice[batch]
+
+                    if trig_val:
+                        voice = idx
+                        idx = (idx + 1) % member_count
+                        self._latched_voice[batch] = voice
+                        member = self.members[voice]
+                        assignments[member]["trigger"][batch, frame] = trigger[batch, frame]
+                        assignments[member]["velocity"][batch, frame] = vel_val
+                    elif voice >= 0:
+                        member = self.members[voice]
+                        if gate_val > 0.0 or drone_val > 0.0:
+                            assignments[member]["velocity"][batch, frame] = vel_val
+
+                    if voice >= 0:
+                        member = self.members[voice]
+                        if gate_val > 0.0:
+                            assignments[member]["gate"][batch, frame] = gate_val
+                        if drone_val > 0.0:
+                            assignments[member]["drone"][batch, frame] = drone_val
+                        if (gate_val <= 0.5 and drone_val <= 0.5) and not trig_val:
+                            self._latched_voice[batch] = -1
+
             self._next_voice = idx
         self._assignments = assignments
         self._block_token = token

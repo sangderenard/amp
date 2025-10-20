@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional, cast
 
 import numpy as np
 
@@ -261,6 +261,10 @@ def run(
         joy = pygame.joystick.Joystick(0)
         joy.init()
 
+    state = app_state.build_default_state(joy=joy, pygame=pygame)
+    persistence.load_mappings(state)
+    sampler = _load_sampler(state)
+
     sample_rate = 44100
     freq_target = 220.0
     freq_current = 220.0
@@ -281,12 +285,6 @@ def run(
     envelope_mode_idx = 0
     envelope_mode = envelope_modes[envelope_mode_idx]
     pending_trigger = False
-
-    state = app_state.build_default_state(joy=joy, pygame=pygame)
-
-    persistence.load_mappings(state)
-
-    sampler = _load_sampler(state)
 
     graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
     pitch_node = graph._nodes.get("pitch")
@@ -525,25 +523,85 @@ def run(
         margin = 32
         tile_w = 280
         tile_h = 210
-        cols = max(1, min(len(nodes_in_graph), max(1, (width - margin) // (tile_w + margin))))
-        rows = (len(nodes_in_graph) + cols - 1) // cols
+
+        grouped: dict[str, list[str]] = {}
+        for name in nodes_in_graph:
+            node = graph._nodes.get(name)
+            if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
+                grouped.setdefault(node.group, []).append(name)
+
+        entries: list[dict[str, Any]] = []
+        seen_groups: set[str] = set()
+        for name in nodes_in_graph:
+            node = graph._nodes.get(name)
+            if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
+                group_name = node.group
+                if group_name in seen_groups:
+                    continue
+                members = [member for member in grouped.get(group_name, []) if member in graph._nodes]
+                if members:
+                    entries.append({"kind": "group", "group": group_name, "names": members})
+                seen_groups.add(group_name)
+            else:
+                entries.append({"kind": "single", "name": name})
+
+        display_count = len(entries)
+        cols = max(1, min(display_count, max(1, (width - margin) // (tile_w + margin))))
+        rows = (display_count + cols - 1) // cols
         total_height = rows * (tile_h + margin) + margin
         if total_height > height - 160:
             available = max(height - 200, tile_h + margin)
             tile_h = max(120, available // max(rows, 1) - margin)
 
         layout: dict[str, pygame.Rect] = {}
-        for idx, name in enumerate(nodes_in_graph):
+        entry_rects: list[tuple[dict[str, Any], pygame.Rect]] = []
+        for idx, entry in enumerate(entries):
             row = idx // cols
             col = idx % cols
             x = margin + col * (tile_w + margin)
             y = margin + row * (tile_h + margin)
-            layout[name] = pygame.Rect(x, y, tile_w, tile_h)
+            rect = pygame.Rect(x, y, tile_w, tile_h)
+            entry_rects.append((entry, rect))
+            if entry["kind"] == "single":
+                node_name = cast(str, entry["name"])
+                layout[node_name] = rect
+            else:
+                names = cast(list[str], entry["names"])
+                if not names:
+                    continue
+                header_h = font.get_height() + 12
+                inner_top = rect.y + header_h
+                inner_height = rect.height - header_h - 10
+                inner_available = max(inner_height, 0)
+                spacing = 6 if len(names) > 1 else 0
+                min_slot = 48
+                min_total = len(names) * min_slot + spacing * (len(names) - 1)
+                effective_height = max(inner_available, min_total)
+                slot_h = (effective_height - spacing * (len(names) - 1)) // len(names)
+                slot_h = max(min_slot, slot_h)
+                total_stack = len(names) * slot_h + spacing * (len(names) - 1)
+                start_y = inner_top + max(0, (inner_available - total_stack) // 2)
+                max_bottom = rect.bottom - 6
+                if start_y + total_stack > max_bottom:
+                    start_y = max(inner_top, max_bottom - total_stack)
+                for member in names:
+                    layout[member] = pygame.Rect(rect.x + 8, start_y, rect.width - 16, slot_h)
+                    start_y += slot_h + spacing
 
         centres = {name: rect.center for name, rect in layout.items()}
 
         audio_colour = (90, 160, 240)
         mod_colour = (200, 140, 255)
+
+        group_visuals: list[tuple[str, pygame.Rect, int]] = []
+        for entry, rect in entry_rects:
+            if entry["kind"] == "group":
+                names = cast(list[str], entry["names"])
+                group_name = cast(str, entry["group"])
+                member_count = len(names)
+                pygame.draw.rect(screen, (36, 28, 64), rect, border_radius=14)
+                pygame.draw.rect(screen, (210, 210, 235), rect, width=2, border_radius=14)
+                group_visuals.append((group_name, rect, member_count))
 
         for source, targets in getattr(graph, "_audio_successors", {}).items():
             if source not in centres:
@@ -564,16 +622,24 @@ def run(
                     continue
                 pygame.draw.line(screen, mod_colour, start, end, 2)
 
-        for name, rect in layout.items():
+        def _brighten(colour: tuple[int, int, int], amount: int = 18) -> tuple[int, int, int]:
+            return tuple(min(255, max(0, c + amount)) for c in colour)
+
+        def render_node_tile(name: str, rect: pygame.Rect, *, header: str | None = None, tint: bool = False) -> None:
             node = graph._nodes.get(name)
             if node is None:
-                continue
+                return
             colour = _node_colour(node)
+            if tint:
+                colour = _brighten(colour)
+            border_width = 1 if rect.height < 120 else 2
             pygame.draw.rect(screen, colour, rect, border_radius=10)
-            pygame.draw.rect(screen, (220, 220, 220), rect, width=2, border_radius=10)
+            pygame.draw.rect(screen, (220, 220, 220), rect, width=border_width, border_radius=10)
 
-            title = font.render(name, True, (250, 250, 250))
-            screen.blit(title, (rect.x + 10, rect.y + 8))
+            header_font = font if rect.height >= 140 else font_small
+            header_text = header or name
+            title = header_font.render(header_text, True, (250, 250, 250))
+            screen.blit(title, (rect.x + 10, rect.y + 6))
 
             lines_to_render: list[str] = []
             if isinstance(node, nodes.OscNode):
@@ -587,8 +653,10 @@ def run(
             else:
                 lines_to_render.extend(_extract_node_stats(node))
 
-            info_start_y = rect.y + 34
-            for idx_line, text_line in enumerate(lines_to_render[:5]):
+            info_start_y = rect.y + header_font.get_height() + 8
+            max_lines = 5 if rect.height >= 160 else 3 if rect.height >= 120 else 2
+            rendered_lines = lines_to_render[:max_lines]
+            for idx_line, text_line in enumerate(rendered_lines):
                 text_surface = font_small.render(text_line, True, (240, 240, 240))
                 screen.blit(
                     text_surface,
@@ -603,10 +671,11 @@ def run(
                         label = f"B{batch_idx}C{channel_idx}"
                         vu_rows.append((label, float(levels[batch_idx, channel_idx])))
                 if vu_rows:
-                    vu_bar_h = 12
+                    vu_bar_h = 12 if rect.height >= 140 else 10
                     row_spacing = vu_bar_h + 4
-                    base_y = rect.bottom - (len(vu_rows) * row_spacing) - 10
-                    base_y = max(base_y, info_start_y + len(lines_to_render[:5]) * (font_small.get_height() + 2) + 8)
+                    base_y = rect.bottom - (len(vu_rows) * row_spacing) - 8
+                    min_y = info_start_y + len(rendered_lines) * (font_small.get_height() + 2) + 4
+                    base_y = max(base_y, min_y)
                     bar_x = rect.x + 12
                     bar_w = rect.width - 24
                     for idx_row, (label, value) in enumerate(vu_rows):
@@ -633,6 +702,19 @@ def run(
                         peak_x = bar_x + label_w + meter_w + 4
                         peak_x = min(peak_x, rect.right - peak_text.get_width() - 6)
                         screen.blit(peak_text, (peak_x, row_y))
+
+        for entry, rect in entry_rects:
+            if entry["kind"] == "group":
+                names = cast(list[str], entry["names"])
+                for member in names:
+                    render_node_tile(member, layout[member], tint=True)
+            else:
+                node_name = cast(str, entry["name"])
+                render_node_tile(node_name, layout[node_name])
+
+        for group_name, rect, member_count in group_visuals:
+            header = font.render(f"{group_name} [{member_count}]", True, (235, 235, 245))
+            screen.blit(header, (rect.x + 12, rect.y + 8))
 
         legend_x = margin
         legend_y = height - (len(lines) + 3) * (font.get_height() + 4)
