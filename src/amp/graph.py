@@ -54,6 +54,18 @@ class GraphEdge:
     kind: str = "audio"
 
 
+@dataclass(slots=True)
+class ModConnection:
+    """Control edge linking a modulation source to a target parameter."""
+
+    source: str
+    target: str
+    param: str
+    scale: float = 1.0
+    mode: str = "add"
+    channel: int | None = None
+
+
 class AudioGraph:
     """Directed audio processing graph supporting modulation links."""
 
@@ -63,7 +75,7 @@ class AudioGraph:
         self._nodes: Dict[str, AudioNode] = {}
         self._audio_inputs: Dict[str, List[str]] = {}
         self._audio_successors: Dict[str, List[str]] = {}
-        self._mod_inputs: Dict[str, List[dict]] = {}
+        self._mod_inputs: Dict[str, List[ModConnection]] = {}
         self.sink: str | None = None
 
     @classmethod
@@ -110,15 +122,15 @@ class AudioGraph:
             raise ValueError("Mod connections must reference defined nodes")
         if channel is not None and channel < 0:
             raise ValueError("Mod channel index must be non-negative")
-        self._mod_inputs.setdefault(target, []).append(
-            {
-                "source": source,
-                "target_param": param,
-                "scale": float(scale),
-                "mode": mode,
-                "channel": int(channel) if channel is not None else None,
-            }
+        connection = ModConnection(
+            source=source,
+            target=target,
+            param=param,
+            scale=float(scale),
+            mode=mode,
+            channel=int(channel) if channel is not None else None,
         )
+        self._mod_inputs.setdefault(target, []).append(connection)
 
     def set_sink(self, name: str) -> None:
         if name not in self._nodes:
@@ -129,16 +141,28 @@ class AudioGraph:
     def ordered_nodes(self) -> Sequence[AudioNode]:
         return [self._nodes[name] for name in self._topo_order()]
 
+    def mod_connections(self, target: str) -> Sequence[ModConnection]:
+        """Return modulation connections arriving at ``target``."""
+
+        return tuple(self._mod_inputs.get(target, ()))
+
     def _topo_order(self) -> Iterable[str]:
         if not self._nodes:
             return []
         incoming = {name: len(self._audio_inputs.get(name, [])) for name in self._nodes}
+        outgoing: Dict[str, List[str]] = {
+            name: list(self._audio_successors.get(name, [])) for name in self._nodes
+        }
+        for target, entries in self._mod_inputs.items():
+            incoming[target] = incoming.get(target, 0) + len(entries)
+            for entry in entries:
+                outgoing.setdefault(entry.source, []).append(target)
         queue = [name for name, count in incoming.items() if count == 0]
         order: List[str] = []
         while queue:
             name = queue.pop(0)
             order.append(name)
-            for successor in self._audio_successors.get(name, []):
+            for successor in outgoing.get(name, []):
                 incoming[successor] -= 1
                 if incoming[successor] == 0:
                     queue.append(successor)
@@ -182,16 +206,16 @@ class AudioGraph:
                     node_params[key] = _as_bcf(value, batches, channels, frame_count, name=f"{name}.{key}")
             mods: Dict[str, list[tuple[np.ndarray, float, str]]] = {}
             for entry in self._mod_inputs.get(name, []):
-                buffer = caches[entry["source"]]
+                buffer = caches[entry.source]
                 if buffer is None:
                     continue
-                target_param = entry.get("target_param", "value")
-                buf = _assert_bcf(buffer, name=f"{entry['source']}.out")
-                channel = entry.get("channel")
+                target_param = entry.param or "value"
+                buf = _assert_bcf(buffer, name=f"{entry.source}.out")
+                channel = entry.channel
                 if channel is not None:
                     if channel >= buf.shape[1]:
                         raise ValueError(
-                            f"Mod channel {channel} out of range for '{entry['source']}'"
+                            f"Mod channel {channel} out of range for '{entry.source}'"
                         )
                     buf = buf[:, channel : channel + 1, :]
                 mods.setdefault(target_param, []).append(
@@ -201,10 +225,10 @@ class AudioGraph:
                             batches,
                             channels,
                             frame_count,
-                            name=f"mod {entry['source']}->{name}",
+                            name=f"mod {entry.source}->{name}",
                         ),
-                        entry.get("scale", 1.0),
-                        entry.get("mode", "add"),
+                        entry.scale,
+                        entry.mode,
                     )
                 )
             merged_params: Dict[str, np.ndarray] = dict(node_params)
@@ -244,4 +268,4 @@ class AudioGraph:
         return data
 
 
-__all__ = ["AudioGraph", "GraphEdge"]
+__all__ = ["AudioGraph", "GraphEdge", "ModConnection"]

@@ -1,7 +1,10 @@
 import types
 
+import numpy as np
+
 from amp import app
 from amp import state as app_state
+from amp import utils
 
 
 class DummyJoy:
@@ -24,15 +27,107 @@ def _fake_pygame():
     return module
 
 
-def test_default_graph_assigns_envelopes_to_all_oscillators():
+def test_default_graph_routes_envelopes_directly_to_oscillators():
     state = app_state.build_default_state(joy=DummyJoy(), pygame=_fake_pygame())
-    graph, envelope_names = app.build_runtime_graph(48000, state)
+    graph, envelope_names, amp_mod_names = app.build_runtime_graph(48000, state)
 
     assert len(envelope_names) == 3
+    assert amp_mod_names == []
 
     for osc_name in ("osc1", "osc2", "osc3"):
-        mods = graph._mod_inputs.get(osc_name, [])
-        amp_sources = [entry for entry in mods if entry["target_param"] == "amp"]
-        assert any(entry["source"] in envelope_names for entry in amp_sources), (
-            f"{osc_name} has no envelope connected"
-        )
+        mods = graph.mod_connections(osc_name)
+        env_links = [
+            entry for entry in mods if entry.param == "amp" and entry.source in envelope_names
+        ]
+        assert env_links, f"{osc_name} missing envelope amplitude"
+        for entry in env_links:
+            assert entry.channel == 0
+            assert entry.mode == "add"
+        reset_links = [
+            entry for entry in mods if entry.param == "reset" and entry.source in envelope_names
+        ]
+        if reset_links:
+            for entry in reset_links:
+                assert entry.channel == 1
+                assert entry.mode == "add"
+
+
+def test_triggered_envelopes_produce_audible_output():
+    state = app_state.build_default_state(joy=DummyJoy(), pygame=_fake_pygame())
+    graph, envelope_names, amp_mod_names = app.build_runtime_graph(48000, state)
+
+    frames = 512
+    freq = utils.as_BCF(np.full(frames, 220.0), 1, 1, frames, name="freq")
+    silence = utils.as_BCF(np.zeros(frames), 1, 1, frames, name="silence")
+    velocity = utils.as_BCF(np.full(frames, 0.75), 1, 1, frames, name="velocity")
+    trigger = np.zeros(frames, dtype=float)
+    trigger[0] = 1.0
+    trigger_bcf = utils.as_BCF(trigger, 1, 1, frames, name="trigger")
+    ones = utils.as_BCF(np.ones(frames), 1, 1, frames, name="send_reset")
+
+    base_params = {"_B": 1, "_C": 1}
+    for osc_name in ("osc1", "osc2", "osc3"):
+        if osc_name in graph._nodes:
+            base_params.setdefault(osc_name, {})
+            base_params[osc_name]["freq"] = freq
+            base_params[osc_name]["amp"] = silence
+    for env_name in envelope_names:
+        base_params[env_name] = {
+            "velocity": velocity,
+            "gate": silence,
+            "drone": silence,
+            "trigger": trigger_bcf,
+            "send_reset": ones,
+        }
+
+    output = graph.render(frames, 48000, base_params)
+    assert np.max(np.abs(output)) > 1e-3
+
+
+def test_envelopes_drive_amp_and_reset_control_channels():
+    state = app_state.build_default_state(joy=DummyJoy(), pygame=_fake_pygame())
+    graph, envelope_names, amp_mod_names = app.build_runtime_graph(48000, state)
+
+    send_resets = state["envelope_params"].get("send_resets", True)
+
+    for osc_name in ("osc1", "osc2", "osc3"):
+        if osc_name not in graph._nodes:
+            continue
+        oscillator = graph._nodes[osc_name]
+        amp_conns = [
+            conn
+            for conn in graph.mod_connections(osc_name)
+            if conn.param == "amp" and conn.source in envelope_names
+        ]
+        assert amp_conns, f"{osc_name} missing envelope amplitude"
+        for conn in amp_conns:
+            assert conn.channel == 0
+            assert conn.mode == "add"
+
+        reset_conns = [
+            conn
+            for conn in graph.mod_connections(osc_name)
+            if conn.source in envelope_names and conn.param == "reset"
+        ]
+        if getattr(oscillator, "accept_reset", False) and send_resets:
+            assert reset_conns, f"{osc_name} should receive reset pulses"
+            for conn in reset_conns:
+                assert conn.channel == 1
+                assert conn.mode == "add"
+        else:
+            assert not reset_conns
+
+def test_mod_sources_precede_oscillators_in_execution_order():
+    state = app_state.build_default_state(joy=DummyJoy(), pygame=_fake_pygame())
+    graph, envelope_names, amp_mod_names = app.build_runtime_graph(48000, state)
+
+    order = [node.name for node in graph.ordered_nodes]
+    for osc_name in ("osc1", "osc2", "osc3"):
+        if osc_name not in order:
+            continue
+        osc_idx = order.index(osc_name)
+        for conn in graph.mod_connections(osc_name):
+            source_idx = order.index(conn.source)
+            assert source_idx < osc_idx, (
+                f"Modulation source {conn.source} should execute before {osc_name}"
+            )

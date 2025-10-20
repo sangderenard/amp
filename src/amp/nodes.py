@@ -39,6 +39,9 @@ def _match_channels(data: np.ndarray, channels: int) -> np.ndarray:
 # =========================
 # Graph nodes
 # =========================
+#
+# Filters consume audio streams (`audio_in`) and transform them.
+# Modulators emit control-rate signals that downstream nodes treat as parameters.
 class Node:
     def __init__(self,name): self.name=name
     def process(self,frames,sr,audio_in,mods,params): raise NotImplementedError
@@ -192,8 +195,8 @@ class LFONode(Node):
                 out[:,:,i] = z[:,0]
         return out  # (B,1,F)
 
-class EnvelopeNode(Node):
-    """Multi-stage envelope generator with optional phase reset pulses."""
+class EnvelopeModulatorNode(Node):
+    """Multi-stage envelope generator that emits control signals."""
 
     _IDLE = 0
     _ATTACK = 1
@@ -272,7 +275,6 @@ class EnvelopeNode(Node):
 
         amp = np.zeros((B, F), dtype=RAW_DTYPE)
         reset = np.zeros((B, F), dtype=RAW_DTYPE)
-        count = np.zeros((B, F), dtype=RAW_DTYPE)
 
         for b in range(B):
             stage = self._stage[b]
@@ -386,7 +388,6 @@ class EnvelopeNode(Node):
 
                 value = max(0.0, value)
                 amp[b, i] = value
-                count[b, i] = float(activations)
 
             self._stage[b] = stage
             self._value[b] = value
@@ -395,7 +396,44 @@ class EnvelopeNode(Node):
             self._activation_count[b] = activations
             self._release_start[b] = release_start
 
-        out = np.stack([amp, reset, count], axis=1)
+        out = np.stack([amp, reset], axis=1)
+        return out
+
+
+class AmplifierModulatorNode(Node):
+    """Combine velocity and control modulators into an amplitude control signal."""
+
+    def __init__(self, name):
+        super().__init__(name)
+
+    def process(self, frames, sr, audio_in, mods, params):
+        batches = audio_in.shape[0] if audio_in is not None else 1
+        base_param = params.get("base")
+        control_param = params.get("control")
+        if base_param is None and control_param is not None:
+            control_bcf = assert_BCF(control_param, name=f"{self.name}.control")
+            base = np.zeros((control_bcf.shape[0], 1, frames), dtype=RAW_DTYPE)
+            control = np.clip(control_bcf, 0.0, 1.0, out=control_bcf.copy())
+        else:
+            base = (
+                np.zeros((batches, 1, frames), dtype=RAW_DTYPE)
+                if base_param is None
+                else assert_BCF(base_param, name=f"{self.name}.base")
+            )
+            if control_param is None:
+                control = np.ones((base.shape[0], 1, frames), dtype=RAW_DTYPE)
+            else:
+                control = assert_BCF(control_param, name=f"{self.name}.control")
+                if control.shape[1] != 1:
+                    control = control[:, :1, :]
+                control = np.clip(control, 0.0, 1.0, out=control.copy())
+        out = base * control
+        mod = params.get("mod")
+        if mod is not None:
+            mod = assert_BCF(mod, name=f"{self.name}.mod")
+            if mod.shape[1] != 1:
+                mod = mod[:, :1, :]
+            out = out * (1.0 + mod)
         return out
 
 
@@ -765,7 +803,9 @@ NODE_TYPES = {
     "sine_oscillator": SineOscillatorNode,
     "osc": OscNode,
     "oscillator": OscNode,
-    "envelope": EnvelopeNode,
+    "envelope": EnvelopeModulatorNode,
+    "envelope_modulator": EnvelopeModulatorNode,
+    "amplifier_modulator": AmplifierModulatorNode,
     "mix": MixNode,
     "safety": SafetyNode,
     "subharmonic_low_lifter": SubharmonicLowLifterNode,
@@ -778,7 +818,8 @@ __all__ = [
     "SilenceNode",
     "ConstantNode",
     "SineOscillatorNode",
-    "EnvelopeNode",
+    "EnvelopeModulatorNode",
+    "AmplifierModulatorNode",
     "OscNode",
     "MixNode",
     "SafetyNode",
