@@ -5,12 +5,74 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 import numpy as np
 
 from .graph import AudioGraph
 from . import menu, nodes, persistence, quantizer, state as app_state, utils
+
+
+CacheKey = tuple[str, str, tuple[int, int, int], str]
+
+
+class TextSurfaceCache:
+    """Cache rendered text surfaces keyed by node and content."""
+
+    def __init__(self) -> None:
+        self._cache: dict[CacheKey, Any] = {}
+        self._node_keys: dict[str, set[CacheKey]] = {}
+        self._frame_usage: dict[str, set[CacheKey]] = {}
+
+    def start_frame(self) -> None:
+        """Initialise tracking for a new frame."""
+
+        self._frame_usage = {}
+
+    def fetch(
+        self,
+        node_key: str,
+        text: str,
+        colour: tuple[int, int, int],
+        font_key: str,
+        renderer: Callable[[], Any],
+    ) -> Any:
+        """Return a cached surface, rendering when no cache entry exists."""
+
+        key = (node_key, text, colour, font_key)
+        surface = self._cache.get(key)
+        if surface is None:
+            surface = renderer()
+            self._cache[key] = surface
+        self._frame_usage.setdefault(node_key, set()).add(key)
+        return surface
+
+    def finish_frame(self) -> None:
+        """Drop cache entries no longer referenced this frame."""
+
+        for node_key, used in self._frame_usage.items():
+            previous = self._node_keys.get(node_key)
+            if previous:
+                for stale in previous - used:
+                    self._cache.pop(stale, None)
+            self._node_keys[node_key] = set(used)
+
+        stale_nodes = [node for node in self._node_keys if node not in self._frame_usage]
+        for node in stale_nodes:
+            for key in self._node_keys[node]:
+                self._cache.pop(key, None)
+            del self._node_keys[node]
+
+        self._frame_usage = {}
+
+    def invalidate(self, node_key: str) -> None:
+        """Remove cached entries for the given node."""
+
+        cached = self._node_keys.pop(node_key, None)
+        if not cached:
+            return
+        for key in cached:
+            self._cache.pop(key, None)
 
 
 def build_runtime_graph(
@@ -320,6 +382,13 @@ def run(
     font = pygame.font.SysFont("monospace", 16)
     font_small = pygame.font.SysFont("monospace", 12)
 
+    text_cache = TextSurfaceCache()
+    last_freq_target_display: float | None = None
+    last_velocity_target_display: float | None = None
+    last_node_levels_snapshot: dict[str, np.ndarray] = {}
+    status_signature_pending: tuple[Any, ...] | None = None
+    last_status_signature: tuple[Any, ...] | None = None
+
     if pygame.joystick.get_count() == 0:
         if not allow_no_joystick:
             print("No joystick. Connect controller and restart.")
@@ -582,236 +651,302 @@ def run(
         freq_target: float,
         velocity_target: float,
     ) -> None:
-        if screen is None:
-            return
+        nonlocal last_freq_target_display, last_velocity_target_display
+        nonlocal last_node_levels_snapshot, status_signature_pending, last_status_signature
 
-        screen.fill((10, 10, 16))
+        text_cache.start_frame()
+        try:
+            if screen is None:
+                return
 
-        nodes_in_graph = list(getattr(graph, "_nodes", {}).keys())
-        if not nodes_in_graph:
-            pygame.display.flip()
-            return
+            screen.fill((10, 10, 16))
 
-        node_levels = getattr(graph, "last_node_levels", {})
+            nodes_in_graph = list(getattr(graph, "_nodes", {}).keys())
+            if not nodes_in_graph:
+                pygame.display.flip()
+                return
 
-        width, height = screen.get_size()
-        margin = 32
-        tile_w = 280
-        tile_h = 210
+            pending_signature = status_signature_pending
+            if pending_signature is not None and pending_signature != last_status_signature:
+                text_cache.invalidate("__status__")
+                last_status_signature = pending_signature
 
-        grouped: dict[str, list[str]] = {}
-        for name in nodes_in_graph:
-            node = graph._nodes.get(name)
-            if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
-                grouped.setdefault(node.group, []).append(name)
+            node_levels = getattr(graph, "last_node_levels", {})
 
-        entries: list[dict[str, Any]] = []
-        seen_groups: set[str] = set()
-        for name in nodes_in_graph:
-            node = graph._nodes.get(name)
-            if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
-                group_name = node.group
-                if group_name in seen_groups:
+            freq_changed = (
+                last_freq_target_display is None
+                or not np.isclose(freq_target, last_freq_target_display, atol=1e-4)
+            )
+            vel_changed = (
+                last_velocity_target_display is None
+                or not np.isclose(velocity_target, last_velocity_target_display, atol=1e-4)
+            )
+            if freq_changed:
+                last_freq_target_display = freq_target
+            if vel_changed:
+                last_velocity_target_display = velocity_target
+            if freq_changed or vel_changed:
+                for name in nodes_in_graph:
+                    node = graph._nodes.get(name)
+                    if isinstance(node, nodes.OscNode):
+                        text_cache.invalidate(name)
+
+            updated_levels: dict[str, np.ndarray] = {}
+            changed_nodes: set[str] = set()
+            for name in nodes_in_graph:
+                levels = node_levels.get(name)
+                if isinstance(levels, np.ndarray):
+                    updated_levels[name] = np.array(levels, copy=True)
+                    prev = last_node_levels_snapshot.get(name)
+                    if prev is None or prev.shape != levels.shape or not np.allclose(prev, levels, atol=1e-4):
+                        changed_nodes.add(name)
+            for removed in set(last_node_levels_snapshot) - set(updated_levels):
+                changed_nodes.add(removed)
+            if changed_nodes:
+                for node_name in changed_nodes:
+                    text_cache.invalidate(node_name)
+            last_node_levels_snapshot = updated_levels
+
+            width, height = screen.get_size()
+            margin = 32
+            tile_w = 280
+            tile_h = 210
+
+            grouped: dict[str, list[str]] = {}
+            for name in nodes_in_graph:
+                node = graph._nodes.get(name)
+                if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
+                    grouped.setdefault(node.group, []).append(name)
+
+            entries: list[dict[str, Any]] = []
+            seen_groups: set[str] = set()
+            for name in nodes_in_graph:
+                node = graph._nodes.get(name)
+                if isinstance(node, nodes.EnvelopeModulatorNode) and getattr(node, "group", None):
+                    group_name = node.group
+                    if group_name in seen_groups:
+                        continue
+                    members = [member for member in grouped.get(group_name, []) if member in graph._nodes]
+                    if members:
+                        entries.append({"kind": "group", "group": group_name, "names": members})
+                    seen_groups.add(group_name)
+                else:
+                    entries.append({"kind": "single", "name": name})
+
+            display_count = len(entries)
+            cols = max(1, min(display_count, max(1, (width - margin) // (tile_w + margin))))
+            rows = (display_count + cols - 1) // cols
+            total_height = rows * (tile_h + margin) + margin
+            if total_height > height - 160:
+                available = max(height - 200, tile_h + margin)
+                tile_h = max(120, available // max(rows, 1) - margin)
+
+            layout: dict[str, pygame.Rect] = {}
+            entry_rects: list[tuple[dict[str, Any], pygame.Rect]] = []
+            for idx, entry in enumerate(entries):
+                row = idx // cols
+                col = idx % cols
+                x = margin + col * (tile_w + margin)
+                y = margin + row * (tile_h + margin)
+                rect = pygame.Rect(x, y, tile_w, tile_h)
+                entry_rects.append((entry, rect))
+                if entry["kind"] == "single":
+                    node_name = cast(str, entry["name"])
+                    layout[node_name] = rect
+                else:
+                    names = cast(list[str], entry["names"])
+                    if not names:
+                        continue
+                    header_h = font.get_height() + 12
+                    inner_top = rect.y + header_h
+                    inner_height = rect.height - header_h - 10
+                    inner_available = max(inner_height, 0)
+                    spacing = 6 if len(names) > 1 else 0
+                    min_slot = 48
+                    min_total = len(names) * min_slot + spacing * (len(names) - 1)
+                    effective_height = max(inner_available, min_total)
+                    slot_h = (effective_height - spacing * (len(names) - 1)) // len(names)
+                    slot_h = max(min_slot, slot_h)
+                    total_stack = len(names) * slot_h + spacing * (len(names) - 1)
+                    start_y = inner_top + max(0, (inner_available - total_stack) // 2)
+                    max_bottom = rect.bottom - 6
+                    if start_y + total_stack > max_bottom:
+                        start_y = max(inner_top, max_bottom - total_stack)
+                    for member in names:
+                        layout[member] = pygame.Rect(rect.x + 8, start_y, rect.width - 16, slot_h)
+                        start_y += slot_h + spacing
+
+            centres = {name: rect.center for name, rect in layout.items()}
+
+            audio_colour = (90, 160, 240)
+            mod_colour = (200, 140, 255)
+
+            group_visuals: list[tuple[str, pygame.Rect, int]] = []
+            for entry, rect in entry_rects:
+                if entry["kind"] == "group":
+                    names = cast(list[str], entry["names"])
+                    group_name = cast(str, entry["group"])
+                    member_count = len(names)
+                    pygame.draw.rect(screen, (36, 28, 64), rect, border_radius=14)
+                    pygame.draw.rect(screen, (210, 210, 235), rect, width=2, border_radius=14)
+                    group_visuals.append((group_name, rect, member_count))
+
+            for source, targets in getattr(graph, "_audio_successors", {}).items():
+                if source not in centres:
                     continue
-                members = [member for member in grouped.get(group_name, []) if member in graph._nodes]
-                if members:
-                    entries.append({"kind": "group", "group": group_name, "names": members})
-                seen_groups.add(group_name)
-            else:
-                entries.append({"kind": "single", "name": name})
+                start = centres[source]
+                for target in targets:
+                    if target not in centres:
+                        continue
+                    pygame.draw.line(screen, audio_colour, start, centres[target], 3)
 
-        display_count = len(entries)
-        cols = max(1, min(display_count, max(1, (width - margin) // (tile_w + margin))))
-        rows = (display_count + cols - 1) // cols
-        total_height = rows * (tile_h + margin) + margin
-        if total_height > height - 160:
-            available = max(height - 200, tile_h + margin)
-            tile_h = max(120, available // max(rows, 1) - margin)
-
-        layout: dict[str, pygame.Rect] = {}
-        entry_rects: list[tuple[dict[str, Any], pygame.Rect]] = []
-        for idx, entry in enumerate(entries):
-            row = idx // cols
-            col = idx % cols
-            x = margin + col * (tile_w + margin)
-            y = margin + row * (tile_h + margin)
-            rect = pygame.Rect(x, y, tile_w, tile_h)
-            entry_rects.append((entry, rect))
-            if entry["kind"] == "single":
-                node_name = cast(str, entry["name"])
-                layout[node_name] = rect
-            else:
-                names = cast(list[str], entry["names"])
-                if not names:
-                    continue
-                header_h = font.get_height() + 12
-                inner_top = rect.y + header_h
-                inner_height = rect.height - header_h - 10
-                inner_available = max(inner_height, 0)
-                spacing = 6 if len(names) > 1 else 0
-                min_slot = 48
-                min_total = len(names) * min_slot + spacing * (len(names) - 1)
-                effective_height = max(inner_available, min_total)
-                slot_h = (effective_height - spacing * (len(names) - 1)) // len(names)
-                slot_h = max(min_slot, slot_h)
-                total_stack = len(names) * slot_h + spacing * (len(names) - 1)
-                start_y = inner_top + max(0, (inner_available - total_stack) // 2)
-                max_bottom = rect.bottom - 6
-                if start_y + total_stack > max_bottom:
-                    start_y = max(inner_top, max_bottom - total_stack)
-                for member in names:
-                    layout[member] = pygame.Rect(rect.x + 8, start_y, rect.width - 16, slot_h)
-                    start_y += slot_h + spacing
-
-        centres = {name: rect.center for name, rect in layout.items()}
-
-        audio_colour = (90, 160, 240)
-        mod_colour = (200, 140, 255)
-
-        group_visuals: list[tuple[str, pygame.Rect, int]] = []
-        for entry, rect in entry_rects:
-            if entry["kind"] == "group":
-                names = cast(list[str], entry["names"])
-                group_name = cast(str, entry["group"])
-                member_count = len(names)
-                pygame.draw.rect(screen, (36, 28, 64), rect, border_radius=14)
-                pygame.draw.rect(screen, (210, 210, 235), rect, width=2, border_radius=14)
-                group_visuals.append((group_name, rect, member_count))
-
-        for source, targets in getattr(graph, "_audio_successors", {}).items():
-            if source not in centres:
-                continue
-            start = centres[source]
-            for target in targets:
+            for target, conns in getattr(graph, "_mod_inputs", {}).items():
                 if target not in centres:
                     continue
-                pygame.draw.line(screen, audio_colour, start, centres[target], 3)
+                end = centres[target]
+                for conn in conns:
+                    start = centres.get(conn.source)
+                    if start is None:
+                        continue
+                    pygame.draw.line(screen, mod_colour, start, end, 2)
 
-        for target, conns in getattr(graph, "_mod_inputs", {}).items():
-            if target not in centres:
-                continue
-            end = centres[target]
-            for conn in conns:
-                start = centres.get(conn.source)
-                if start is None:
-                    continue
-                pygame.draw.line(screen, mod_colour, start, end, 2)
+            def _brighten(colour: tuple[int, int, int], amount: int = 18) -> tuple[int, int, int]:
+                return tuple(min(255, max(0, c + amount)) for c in colour)
 
-        def _brighten(colour: tuple[int, int, int], amount: int = 18) -> tuple[int, int, int]:
-            return tuple(min(255, max(0, c + amount)) for c in colour)
-
-        def render_node_tile(name: str, rect: pygame.Rect, *, header: str | None = None, tint: bool = False) -> None:
-            node = graph._nodes.get(name)
-            if node is None:
-                return
-            colour = _node_colour(node)
-            if tint:
-                colour = _brighten(colour)
-            border_width = 1 if rect.height < 120 else 2
-            pygame.draw.rect(screen, colour, rect, border_radius=10)
-            pygame.draw.rect(screen, (220, 220, 220), rect, width=border_width, border_radius=10)
-
-            header_font = font if rect.height >= 140 else font_small
-            header_text = header or name
-            title = header_font.render(header_text, True, (250, 250, 250))
-            screen.blit(title, (rect.x + 10, rect.y + 6))
-
-            lines_to_render: list[str] = []
-            if isinstance(node, nodes.OscNode):
-                lines_to_render.extend(
-                    [
-                        f"wave={node.wave}",
-                        f"freq≈{freq_target:.1f}Hz",
-                        f"vel≈{velocity_target:.2f}",
-                    ]
-                )
-            else:
-                lines_to_render.extend(_extract_node_stats(node))
-
-            info_start_y = rect.y + header_font.get_height() + 8
-            max_lines = 5 if rect.height >= 160 else 3 if rect.height >= 120 else 2
-            rendered_lines = lines_to_render[:max_lines]
-            for idx_line, text_line in enumerate(rendered_lines):
-                text_surface = font_small.render(text_line, True, (240, 240, 240))
-                screen.blit(
-                    text_surface,
-                    (rect.x + 12, info_start_y + idx_line * (font_small.get_height() + 2)),
+            def _render_text(
+                node_key: str,
+                text: str,
+                colour: tuple[int, int, int],
+                font_obj,
+            ):
+                font_key = "large" if font_obj is font else "small"
+                return text_cache.fetch(
+                    node_key,
+                    text,
+                    colour,
+                    font_key,
+                    lambda: font_obj.render(text, True, colour),
                 )
 
-            levels = node_levels.get(name)
-            if isinstance(levels, np.ndarray) and levels.size:
-                vu_rows: list[tuple[str, float]] = []
-                for batch_idx in range(levels.shape[0]):
-                    for channel_idx in range(levels.shape[1]):
-                        label = f"B{batch_idx}C{channel_idx}"
-                        vu_rows.append((label, float(levels[batch_idx, channel_idx])))
-                if vu_rows:
-                    vu_bar_h = 12 if rect.height >= 140 else 10
-                    row_spacing = vu_bar_h + 4
-                    base_y = rect.bottom - (len(vu_rows) * row_spacing) - 8
-                    min_y = info_start_y + len(rendered_lines) * (font_small.get_height() + 2) + 4
-                    base_y = max(base_y, min_y)
-                    bar_x = rect.x + 12
-                    bar_w = rect.width - 24
-                    for idx_row, (label, value) in enumerate(vu_rows):
-                        row_y = base_y + idx_row * row_spacing
-                        label_surface = font_small.render(label, True, (210, 210, 210))
-                        screen.blit(label_surface, (bar_x, row_y))
-                        label_w = label_surface.get_width() + 6
-                        meter_w = max(24, bar_w - label_w)
-                        meter_rect = pygame.Rect(bar_x + label_w, row_y, meter_w, vu_bar_h)
-                        pygame.draw.rect(screen, (30, 30, 46), meter_rect, border_radius=4)
-                        level = max(0.0, value)
-                        colour_scale = min(1.0, level)
-                        if level > 1.0:
-                            vu_colour = (230, 60, 60)
-                        elif colour_scale > 0.85:
-                            vu_colour = (235, 180, 60)
-                        else:
-                            vu_colour = (90, 200, 120)
-                        fill_w = int(meter_w * min(1.0, colour_scale))
-                        if fill_w > 0:
-                            fill_rect = pygame.Rect(bar_x + label_w, row_y, fill_w, vu_bar_h)
-                            pygame.draw.rect(screen, vu_colour, fill_rect, border_radius=4)
-                        peak_text = font_small.render(f"{level:0.2f}", True, (190, 190, 190))
-                        peak_x = bar_x + label_w + meter_w + 4
-                        peak_x = min(peak_x, rect.right - peak_text.get_width() - 6)
-                        screen.blit(peak_text, (peak_x, row_y))
+            def render_node_tile(name: str, rect: pygame.Rect, *, header: str | None = None, tint: bool = False) -> None:
+                node = graph._nodes.get(name)
+                if node is None:
+                    return
+                colour = _node_colour(node)
+                if tint:
+                    colour = _brighten(colour)
+                border_width = 1 if rect.height < 120 else 2
+                pygame.draw.rect(screen, colour, rect, border_radius=10)
+                pygame.draw.rect(screen, (220, 220, 220), rect, width=border_width, border_radius=10)
 
-        for entry, rect in entry_rects:
-            if entry["kind"] == "group":
-                names = cast(list[str], entry["names"])
-                for member in names:
-                    render_node_tile(member, layout[member], tint=True)
-            else:
-                node_name = cast(str, entry["name"])
-                render_node_tile(node_name, layout[node_name])
+                header_font = font if rect.height >= 140 else font_small
+                header_text = header or name
+                title = _render_text(name, header_text, (250, 250, 250), header_font)
+                screen.blit(title, (rect.x + 10, rect.y + 6))
 
-        for group_name, rect, member_count in group_visuals:
-            header = font.render(f"{group_name} [{member_count}]", True, (235, 235, 245))
-            screen.blit(header, (rect.x + 12, rect.y + 8))
+                lines_to_render: list[str] = []
+                if isinstance(node, nodes.OscNode):
+                    lines_to_render.extend(
+                        [
+                            f"wave={node.wave}",
+                            f"freq≈{freq_target:.1f}Hz",
+                            f"vel≈{velocity_target:.2f}",
+                        ]
+                    )
+                else:
+                    lines_to_render.extend(_extract_node_stats(node))
 
-        legend_x = margin
-        legend_y = height - (len(lines) + 3) * (font.get_height() + 4)
-        if legend_y < rows * (tile_h + margin) + margin:
-            legend_y = rows * (tile_h + margin) + margin
+                info_start_y = rect.y + header_font.get_height() + 8
+                max_lines = 5 if rect.height >= 160 else 3 if rect.height >= 120 else 2
+                rendered_lines = lines_to_render[:max_lines]
+                for idx_line, text_line in enumerate(rendered_lines):
+                    text_surface = _render_text(name, text_line, (240, 240, 240), font_small)
+                    screen.blit(
+                        text_surface,
+                        (rect.x + 12, info_start_y + idx_line * (font_small.get_height() + 2)),
+                    )
 
-        pygame.draw.line(screen, audio_colour, (legend_x, legend_y), (legend_x + 24, legend_y), 3)
-        label_audio = font_small.render("audio", True, (200, 200, 200))
-        screen.blit(label_audio, (legend_x + 32, legend_y - font_small.get_height() // 2))
+                levels = node_levels.get(name)
+                if isinstance(levels, np.ndarray) and levels.size:
+                    vu_rows: list[tuple[str, float]] = []
+                    for batch_idx in range(levels.shape[0]):
+                        for channel_idx in range(levels.shape[1]):
+                            label = f"B{batch_idx}C{channel_idx}"
+                            vu_rows.append((label, float(levels[batch_idx, channel_idx])))
+                    if vu_rows:
+                        vu_bar_h = 12 if rect.height >= 140 else 10
+                        row_spacing = vu_bar_h + 4
+                        base_y = rect.bottom - (len(vu_rows) * row_spacing) - 8
+                        min_y = info_start_y + len(rendered_lines) * (font_small.get_height() + 2) + 4
+                        base_y = max(base_y, min_y)
+                        bar_x = rect.x + 12
+                        bar_w = rect.width - 24
+                        for idx_row, (label, value) in enumerate(vu_rows):
+                            row_y = base_y + idx_row * row_spacing
+                            label_surface = _render_text(name, label, (210, 210, 210), font_small)
+                            screen.blit(label_surface, (bar_x, row_y))
+                            label_w = label_surface.get_width() + 6
+                            meter_w = max(24, bar_w - label_w)
+                            meter_rect = pygame.Rect(bar_x + label_w, row_y, meter_w, vu_bar_h)
+                            pygame.draw.rect(screen, (30, 30, 46), meter_rect, border_radius=4)
+                            level = max(0.0, value)
+                            colour_scale = min(1.0, level)
+                            if level > 1.0:
+                                vu_colour = (230, 60, 60)
+                            elif colour_scale > 0.85:
+                                vu_colour = (235, 180, 60)
+                            else:
+                                vu_colour = (90, 200, 120)
+                            fill_w = int(meter_w * min(1.0, colour_scale))
+                            if fill_w > 0:
+                                fill_rect = pygame.Rect(bar_x + label_w, row_y, fill_w, vu_bar_h)
+                                pygame.draw.rect(screen, vu_colour, fill_rect, border_radius=4)
+                            peak_text = _render_text(name, f"{level:0.2f}", (190, 190, 190), font_small)
+                            peak_x = bar_x + label_w + meter_w + 4
+                            peak_x = min(peak_x, rect.right - peak_text.get_width() - 6)
+                            screen.blit(peak_text, (peak_x, row_y))
 
-        legend_y += font_small.get_height() + 8
-        pygame.draw.line(screen, mod_colour, (legend_x, legend_y), (legend_x + 24, legend_y), 2)
-        label_mod = font_small.render("mod", True, (200, 200, 200))
-        screen.blit(label_mod, (legend_x + 32, legend_y - font_small.get_height() // 2))
+            for entry, rect in entry_rects:
+                if entry["kind"] == "group":
+                    names = cast(list[str], entry["names"])
+                    for member in names:
+                        render_node_tile(member, layout[member], tint=True)
+                else:
+                    node_name = cast(str, entry["name"])
+                    render_node_tile(node_name, layout[node_name])
 
-        info_y = legend_y + font_small.get_height() + 12
-        for line in lines:
-            text = font.render(line, True, (255, 255, 255))
-            screen.blit(text, (margin, info_y))
-            info_y += font.get_height() + 4
+            for group_name, rect, member_count in group_visuals:
+                header = _render_text(
+                    f"group:{group_name}",
+                    f"{group_name} [{member_count}]",
+                    (235, 235, 245),
+                    font,
+                )
+                screen.blit(header, (rect.x + 12, rect.y + 8))
 
-        pygame.display.flip()
+            legend_x = margin
+            legend_y = height - (len(lines) + 3) * (font.get_height() + 4)
+            if legend_y < rows * (tile_h + margin) + margin:
+                legend_y = rows * (tile_h + margin) + margin
+
+            pygame.draw.line(screen, audio_colour, (legend_x, legend_y), (legend_x + 24, legend_y), 3)
+            label_audio = _render_text("__legend__", "audio", (200, 200, 200), font_small)
+            screen.blit(label_audio, (legend_x + 32, legend_y - font_small.get_height() // 2))
+
+            legend_y += font_small.get_height() + 8
+            pygame.draw.line(screen, mod_colour, (legend_x, legend_y), (legend_x + 24, legend_y), 2)
+            label_mod = _render_text("__legend__", "mod", (200, 200, 200), font_small)
+            screen.blit(label_mod, (legend_x + 32, legend_y - font_small.get_height() // 2))
+
+            info_y = legend_y + font_small.get_height() + 12
+            for line in lines:
+                text = _render_text("__status__", line, (255, 255, 255), font)
+                screen.blit(text, (margin, info_y))
+                info_y += font.get_height() + 4
+
+            pygame.display.flip()
+        finally:
+            text_cache.finish_frame()
 
     print(
         "Menu:'m'  LS=pitch/vel  RS=filter.  A=trigger  B=mode  X=wave  Y=cycle  N=source (osc/sampler)."
@@ -970,6 +1105,25 @@ def run(
 
             for i in range(len(prev_buttons)):
                 prev_buttons[i] = joy.get_button(i)
+
+            status_signature_pending = (
+                state["root_midi"],
+                float(freq_target),
+                float(velocity_target),
+                float(cutoff_target),
+                float(q_target),
+                state["filter_type"],
+                state["source_type"],
+                state["waves"][state["wave_idx"]],
+                envelope_mode,
+                state["mod_wave_types"][state["mod_wave_idx"]],
+                float(state["mod_rate_hz"]),
+                float(state["mod_depth"]),
+                bool(state["mod_use_input"]),
+                pitch_effective_token,
+                state["base_token"],
+                state["free_variant"],
+            )
 
             lines = [
                 f"Eff:{effective_token:<16} Base:{state['base_token']:<16} Free:{state['free_variant']:<10} Src:{state['source_type']}",
