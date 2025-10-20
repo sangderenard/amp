@@ -30,7 +30,7 @@ class _EnvelopeGroupState:
         self._assignments: dict[str, dict[str, np.ndarray]] = {}
         self._next_voice = 0
         self._block_token: int | None = None
-        self._latched_voice: list[int] = []
+        self._latched_voice: np.ndarray = np.empty(0, dtype=np.int32)
 
     def register(self, name: str) -> None:
         if name not in self.members:
@@ -39,7 +39,7 @@ class _EnvelopeGroupState:
     def reset(self) -> None:
         self._assignments.clear()
         self._block_token = None
-        self._latched_voice = []
+        self._latched_voice = np.empty(0, dtype=np.int32)
         self._next_voice = 0
 
     def _token(self, trigger: np.ndarray) -> int:
@@ -87,39 +87,55 @@ class _EnvelopeGroupState:
 
         member_count = len(self.members)
         if member_count:
-            if len(self._latched_voice) != B:
-                self._latched_voice = [-1] * B
+            if self._latched_voice.shape != (B,):
+                self._latched_voice = np.full(B, -1, dtype=np.int32)
+
+            triggers_active = trigger > 0.5
+            gate_active = gate > 0.0
+            drone_active = drone > 0.0
+            sustain_active = gate_active | drone_active
+
             idx = self._next_voice % member_count
+            flat_triggers = triggers_active.T.reshape(-1)
+            trigger_count = int(np.count_nonzero(flat_triggers))
+            trigger_voice_indices = np.full(flat_triggers.shape, -1, dtype=np.int32)
+            if trigger_count:
+                voice_sequence = (np.arange(trigger_count, dtype=np.int32) + idx) % member_count
+                trigger_voice_indices[flat_triggers] = voice_sequence
+            trigger_voice_indices = trigger_voice_indices.reshape(F, B).T
+
+            latched_history = np.empty((B, F), dtype=np.int32)
+            current_voice = self._latched_voice.copy()
             for frame in range(F):
-                for batch in range(B):
-                    trig_val = trigger[batch, frame] > 0.5
-                    gate_val = gate[batch, frame]
-                    drone_val = drone[batch, frame]
-                    vel_val = velocity[batch, frame]
-                    voice = self._latched_voice[batch]
+                new_voice = trigger_voice_indices[:, frame]
+                trig_frame = triggers_active[:, frame]
+                candidate_voice = np.where(trig_frame, new_voice, current_voice)
+                release_mask = (
+                    (~trig_frame)
+                    & (gate[:, frame] <= 0.5)
+                    & (drone[:, frame] <= 0.5)
+                )
+                current_voice = np.where(release_mask, -1, candidate_voice)
+                latched_history[:, frame] = current_voice
 
-                    if trig_val:
-                        voice = idx
-                        idx = (idx + 1) % member_count
-                        self._latched_voice[batch] = voice
-                        member = self.members[voice]
-                        assignments[member]["trigger"][batch, frame] = trigger[batch, frame]
-                        assignments[member]["velocity"][batch, frame] = vel_val
-                    elif voice >= 0:
-                        member = self.members[voice]
-                        if gate_val > 0.0 or drone_val > 0.0:
-                            assignments[member]["velocity"][batch, frame] = vel_val
+            trigger_voice_map = np.full((B, F), -1, dtype=np.int32)
+            trigger_voice_map[triggers_active] = trigger_voice_indices[triggers_active]
 
-                    if voice >= 0:
-                        member = self.members[voice]
-                        if gate_val > 0.0:
-                            assignments[member]["gate"][batch, frame] = gate_val
-                        if drone_val > 0.0:
-                            assignments[member]["drone"][batch, frame] = drone_val
-                        if (gate_val <= 0.5 and drone_val <= 0.5) and not trig_val:
-                            self._latched_voice[batch] = -1
+            for member_idx, member in enumerate(self.members):
+                latched_mask = latched_history == member_idx
+                trigger_mask = trigger_voice_map == member_idx
 
-            self._next_voice = idx
+                assignments[member]["trigger"][trigger_mask] = trigger[trigger_mask]
+                velocity_mask = trigger_mask | (latched_mask & sustain_active)
+                assignments[member]["velocity"][velocity_mask] = velocity[velocity_mask]
+                gate_mask = latched_mask & gate_active
+                assignments[member]["gate"][gate_mask] = gate[gate_mask]
+                drone_mask = latched_mask & drone_active
+                assignments[member]["drone"][drone_mask] = drone[drone_mask]
+
+            self._latched_voice = current_voice
+            self._next_voice = (idx + trigger_count) % member_count
+
         self._assignments = assignments
         self._block_token = token
 
