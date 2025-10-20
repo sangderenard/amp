@@ -31,6 +31,46 @@ def test_graph_render_shape() -> None:
     assert np.isfinite(data).all()
 
 
+def test_mod_connection_from_config_uses_named_channel() -> None:
+    runtime = RuntimeConfig(frames_per_chunk=64, output_channels=1)
+    graph_cfg = GraphConfig(
+        nodes=[
+            NodeConfig(
+                name="ctrl",
+                type="controller",
+                params={"outputs": {"amp": "signals['amp']"}},
+            ),
+            NodeConfig(name="osc", type="sine_oscillator", params={"frequency": 220.0, "amplitude": 0.2}),
+            NodeConfig(name="mix", type="mix", params={"channels": 1}),
+        ],
+        connections=[
+            ConnectionConfig(
+                source="ctrl",
+                target="osc",
+                kind="mod",
+                param="amplitude",
+                scale=0.5,
+                mode="add",
+                channel="amp",
+            ),
+            ConnectionConfig(source="osc", target="mix"),
+        ],
+        sink="mix",
+    )
+    config = AppConfig(sample_rate=48000, runtime=runtime, graph=graph_cfg)
+
+    graph = AudioGraph.from_config(config.graph, config.sample_rate, config.runtime.output_channels)
+    mods = graph.mod_connections("osc")
+    assert len(mods) == 1
+    entry = mods[0]
+    assert entry.source == "ctrl"
+    assert entry.target == "osc"
+    assert entry.param == "amplitude"
+    assert entry.mode == "add"
+    assert entry.scale == 0.5
+    assert entry.channel == 0
+
+
 def test_application_summary_contains_nodes() -> None:
     app = SynthApplication.from_config(simple_config())
     summary = app.summary()
