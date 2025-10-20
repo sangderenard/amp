@@ -1,7 +1,8 @@
 # quantizer.py
 import numpy as np
 import math
-from .state import RAW_DTYPE
+
+from .utils import _grid_sorted
 
 # =========================
 # Quantizer dictionaries
@@ -45,15 +46,6 @@ def is_free_mode_token(tok: str) -> bool:
     return tok == "FREE"
 
 # ----- Equal-distance grid warping (per-degree spacing uniform) -----
-def _grid_sorted(grid_cents):
-    g = np.asarray(sorted(grid_cents), dtype=RAW_DTYPE)
-    if g.size < 2:
-        # Safe fallback: chromatic 12TET one-octave grid
-        g = np.arange(12, dtype=RAW_DTYPE) * 100.0
-    # extend one point to close the octave
-    g_ext = np.concatenate([g, [g[0] + 1200.0]])
-    return g, g_ext
-
 def grid_warp_forward(cents, grid_cents):
     """
     Map cents -> u (degree units). Each adjacent degree occupies exactly 1 unit.
