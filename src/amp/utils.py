@@ -116,6 +116,31 @@ def as_BCF(x, B, C, F, *, name="tensor"):
         raise ValueError(f"{name}: got {a.shape}, expected {(B, C, F)}")
     return a
 
+
+def _grid_sorted(grid_cents):
+    """Return a sorted tuning grid and a one-octave extension.
+
+    Parameters
+    ----------
+    grid_cents:
+        Iterable of per-octave degree positions expressed in cents.
+
+    Returns
+    -------
+    (g, g_ext):
+        ``g`` is the sorted array of degree positions.  ``g_ext`` appends a
+        final element one octave above the first degree so callers can safely
+        index ``i+1`` when iterating over segments.
+    """
+
+    g = np.asarray(sorted(grid_cents), dtype=RAW_DTYPE)
+    if g.size < 2:
+        # Safe fallback: chromatic 12TET one-octave grid.
+        g = np.arange(12, dtype=RAW_DTYPE) * 100.0
+    g_ext = np.concatenate([g, [g[0] + 1200.0]])
+    return g, g_ext
+
+
 def assert_BCF(x, *, name="tensor"):
     a = np.asarray(x)
     if a.ndim != 3:
