@@ -317,9 +317,14 @@ class AudioGraph:
         self._plan_dirty = True
         self._execution_plan: Tuple[_NodeExecutionPlan, ...] = ()
         self._ordered_node_names: Tuple[str, ...] = ()
-        self._param_buffers: Dict[Tuple[str, str], np.ndarray] = {}
-        self._mod_buffers: Dict[Tuple[str, str, str, int | None], np.ndarray] = {}
+        self._param_buffers: Dict[
+            Tuple[str, str], Dict[Tuple[int, int, int], np.ndarray]
+        ] = {}
+        self._mod_buffers: Dict[
+            Tuple[str, str, str, int | None], Dict[Tuple[int, int, int], np.ndarray]
+        ] = {}
         self._merge_scratch: Dict[Tuple[int, int, int], np.ndarray] = {}
+        self._audio_workspaces: Dict[Tuple[int, int, int], np.ndarray] = {}
 
     @classmethod
     def from_config(cls, config: GraphConfig, sample_rate: int, output_channels: int) -> "AudioGraph":
@@ -481,7 +486,9 @@ class AudioGraph:
             plan.append(_NodeExecutionPlan(name, audio_inputs, tuple(groups)))
         if self._mod_buffers:
             self._mod_buffers = {
-                key: buf for key, buf in self._mod_buffers.items() if key in valid_mod_keys
+                key: buffers
+                for key, buffers in self._mod_buffers.items()
+                if key in valid_mod_keys
             }
         return tuple(plan)
 
@@ -496,10 +503,11 @@ class AudioGraph:
     ) -> np.ndarray:
         key = (node, param)
         target_shape = (batches, channels, frames)
-        buffer = self._param_buffers.get(key)
-        if buffer is None or buffer.shape != target_shape:
+        shape_buffers = self._param_buffers.setdefault(key, {})
+        buffer = shape_buffers.get(target_shape)
+        if buffer is None:
             buffer = np.empty(target_shape, dtype=RAW_DTYPE)
-            self._param_buffers[key] = buffer
+            shape_buffers[target_shape] = buffer
         array = np.asarray(value, dtype=RAW_DTYPE)
         self._copy_to_bcf(array, buffer, batches, channels, frames, name=f"{node}.{param}")
         return buffer
@@ -552,10 +560,11 @@ class AudioGraph:
     ) -> np.ndarray:
         key = (connection.source, target_node, param, connection.channel)
         target_shape = (batches, channels, frames)
-        buffer = self._mod_buffers.get(key)
-        if buffer is None or buffer.shape != target_shape:
+        shape_buffers = self._mod_buffers.setdefault(key, {})
+        buffer = shape_buffers.get(target_shape)
+        if buffer is None:
             buffer = np.empty(target_shape, dtype=RAW_DTYPE)
-            self._mod_buffers[key] = buffer
+            shape_buffers[target_shape] = buffer
         if connection.channel is not None:
             if connection.channel >= source_buffer.shape[1]:
                 raise ValueError(
@@ -572,6 +581,13 @@ class AudioGraph:
         if buffer is None or buffer.shape != shape:
             buffer = np.empty(shape, dtype=RAW_DTYPE)
             self._merge_scratch[shape] = buffer
+        return buffer
+
+    def _acquire_audio_workspace(self, shape: Tuple[int, int, int]) -> np.ndarray:
+        buffer = self._audio_workspaces.get(shape)
+        if buffer is None or buffer.shape != shape:
+            buffer = np.empty(shape, dtype=RAW_DTYPE)
+            self._audio_workspaces[shape] = buffer
         return buffer
 
     def render_block(
@@ -596,11 +612,26 @@ class AudioGraph:
             if audio_inputs:
                 batches = audio_inputs[0].shape[0]
                 frame_count = audio_inputs[0].shape[2]
-                for buf in audio_inputs[1:]:
-                    if buf.shape[0] != batches or buf.shape[2] != frame_count:
-                        raise ValueError(f"Shape mismatch in inputs to '{name}'")
-                audio_in = np.concatenate(audio_inputs, axis=1)
-                channels = audio_in.shape[1]
+                if len(audio_inputs) == 1:
+                    audio_in = audio_inputs[0]
+                    channels = audio_in.shape[1]
+                else:
+                    total_channels = audio_inputs[0].shape[1]
+                    for buf in audio_inputs[1:]:
+                        if buf.shape[0] != batches or buf.shape[2] != frame_count:
+                            raise ValueError(f"Shape mismatch in inputs to '{name}'")
+                        total_channels += buf.shape[1]
+                    workspace = self._acquire_audio_workspace(
+                        (batches, total_channels, frame_count)
+                    )
+                    offset = 0
+                    for buf in audio_inputs:
+                        channels_slice = buf.shape[1]
+                        target = workspace[:, offset : offset + channels_slice, :]
+                        np.copyto(target, buf)
+                        offset += channels_slice
+                    audio_in = workspace[:, :total_channels, :]
+                    channels = total_channels
             else:
                 audio_in = None
                 batches = int(base_params.get("_B", 1)) if base_params else 1
