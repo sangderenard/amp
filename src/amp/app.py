@@ -43,6 +43,38 @@ def build_runtime_graph(
         am_lfos.append(am_lfo)
 
     graph_obj = AudioGraph(fs, output_channels=2)
+
+    keyboard_ctrl = nodes.ControllerNode(
+        "keyboard_ctrl",
+        params={
+            "outputs": {
+                "trigger": "signals['trigger']",
+                "gate": "signals['gate']",
+                "drone": "signals['drone']",
+                "velocity": "signals['velocity']",
+            }
+        },
+    )
+    joystick_ctrl = nodes.ControllerNode(
+        "joystick_ctrl",
+        params={
+            "outputs": {
+                "trigger": "signals['trigger']",
+                "gate": "signals['gate']",
+                "drone": "signals['drone']",
+                "velocity": "signals['velocity']",
+                "cutoff": "signals['cutoff']",
+                "q": "signals['q']",
+                "pitch_input": "signals['pitch_input']",
+                "pitch_span": "signals['pitch_span']",
+                "pitch_root": "signals['pitch_root']",
+            }
+        },
+    )
+
+    graph_obj.add_node(keyboard_ctrl)
+    graph_obj.add_node(joystick_ctrl)
+
     for osc in osc_nodes:
         graph_obj.add_node(osc)
     for pan in pan_lfos:
@@ -77,6 +109,43 @@ def build_runtime_graph(
         )
         env_nodes.append(env)
         graph_obj.add_node(env)
+
+    controllers = (keyboard_ctrl, joystick_ctrl)
+
+    def _connect_controller(
+        controller: nodes.ControllerNode,
+        target: str,
+        param: str,
+        channel_name: str,
+        *,
+        scale: float = 1.0,
+        mode: str = "add",
+    ) -> None:
+        try:
+            channel = controller.output_index(channel_name)
+        except KeyError:
+            return
+        graph_obj.connect_mod(
+            controller.name,
+            target,
+            param,
+            scale=scale,
+            mode=mode,
+            channel=channel,
+        )
+
+    for env in env_nodes:
+        for controller in controllers:
+            _connect_controller(controller, env.name, "velocity", "velocity")
+            _connect_controller(controller, env.name, "gate", "gate")
+            _connect_controller(controller, env.name, "drone", "drone")
+            _connect_controller(controller, env.name, "trigger", "trigger")
+
+    if pitch_node is not None:
+        for controller in controllers:
+            _connect_controller(controller, pitch_node.name, "input", "pitch_input")
+            _connect_controller(controller, pitch_node.name, "span_oct", "pitch_span")
+            _connect_controller(controller, pitch_node.name, "root_midi", "pitch_root")
 
     for i, osc in enumerate(osc_nodes):
         env = env_nodes[i % len(env_nodes)] if env_nodes else None
@@ -348,17 +417,36 @@ def run(
         drone_signal = np.full(frames, 1.0 if drone_now else 0.0, dtype=utils.RAW_DTYPE)
 
         B, C = 1, 1
-        base_params = {
-            "_B": B,
-            "_C": C,
-            "source": {
-                "freq": utils.as_BCF(0.0, B, C, frames, name="freq"),
-                "amp": utils.as_BCF(v, B, C, frames, name="velocity"),
-            },
-            "filter": {
-                "cutoff": utils.as_BCF(c, B, C, frames, name="cutoff"),
-                "Q": utils.as_BCF(q, B, C, frames, name="Q"),
-            },
+        base_params: dict[str, dict[str, np.ndarray]] = {"_B": B, "_C": C}
+
+        zero_ctrl = utils.as_BCF(0.0, B, 1, frames, name="ctrl.zero")
+        base_params["keyboard_ctrl"] = {
+            "trigger": zero_ctrl,
+            "gate": zero_ctrl,
+            "drone": zero_ctrl,
+            "velocity": zero_ctrl,
+        }
+
+        trigger_bcf = utils.as_BCF(trigger_signal, B, 1, frames, name="ctrl.trigger")
+        gate_bcf = utils.as_BCF(gate_signal, B, 1, frames, name="ctrl.gate")
+        drone_bcf = utils.as_BCF(drone_signal, B, 1, frames, name="ctrl.drone")
+        velocity_bcf = utils.as_BCF(v, B, 1, frames, name="ctrl.velocity")
+        cutoff_bcf = utils.as_BCF(c, B, 1, frames, name="ctrl.cutoff")
+        q_bcf = utils.as_BCF(q, B, 1, frames, name="ctrl.q")
+        pitch_input_bcf = utils.as_BCF(pitch_input_value, B, 1, frames, name="ctrl.pitch_input")
+        pitch_span_bcf = utils.as_BCF(pitch_span_value, B, 1, frames, name="ctrl.pitch_span")
+        pitch_root_bcf = utils.as_BCF(root_midi_value, B, 1, frames, name="ctrl.pitch_root")
+
+        base_params["joystick_ctrl"] = {
+            "trigger": trigger_bcf,
+            "gate": gate_bcf,
+            "drone": drone_bcf,
+            "velocity": velocity_bcf,
+            "cutoff": cutoff_bcf,
+            "q": q_bcf,
+            "pitch_input": pitch_input_bcf,
+            "pitch_span": pitch_span_bcf,
+            "pitch_root": pitch_root_bcf,
         }
 
         pitch_ref = pitch_node
@@ -371,11 +459,6 @@ def run(
                 free_variant=pitch_free_variant,
                 span_oct=pitch_span_value,
             )
-            base_params[pitch_ref.name] = {
-                "input": utils.as_BCF(pitch_input_value, B, 1, frames, name="pitch.input"),
-                "root_midi": utils.as_BCF(root_midi_value, B, 1, frames, name="pitch.root"),
-                "span_oct": utils.as_BCF(pitch_span_value, B, 1, frames, name="pitch.span"),
-            }
 
         osc_names = [name for name in ("osc1", "osc2", "osc3") if name in graph._nodes]
         for name in osc_names:
@@ -385,10 +468,6 @@ def run(
             }
 
         if envelope_names:
-            vel_bcf = utils.as_BCF(v, B, 1, frames, name="env.velocity")
-            gate_bcf = utils.as_BCF(gate_signal, B, 1, frames, name="env.gate")
-            drone_bcf = utils.as_BCF(drone_signal, B, 1, frames, name="env.drone")
-            trigger_bcf = utils.as_BCF(trigger_signal, B, 1, frames, name="env.trigger")
             send_reset_flag = state.get("envelope_params", {}).get("send_resets", True)
             send_reset_bcf = utils.as_BCF(
                 1.0 if send_reset_flag else 0.0,
@@ -398,13 +477,7 @@ def run(
                 name="env.send_reset",
             )
             for env_name in envelope_names:
-                base_params[env_name] = {
-                    "velocity": vel_bcf,
-                    "gate": gate_bcf,
-                    "drone": drone_bcf,
-                    "trigger": trigger_bcf,
-                    "send_reset": send_reset_bcf,
-                }
+                base_params[env_name] = {"send_reset": send_reset_bcf}
 
         if amp_mod_names:
             amp_base = utils.as_BCF(v, B, 1, frames, name="amp_mod.base")
@@ -489,6 +562,8 @@ def run(
         return stats[:4]
 
     def _node_colour(node: nodes.Node) -> tuple[int, int, int]:
+        if isinstance(node, nodes.ControllerNode):
+            return (48, 140, 196)
         if isinstance(node, nodes.OscNode):
             return (48, 92, 180)
         if isinstance(node, nodes.LFONode):

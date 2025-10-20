@@ -93,9 +93,38 @@ class AudioGraph:
             node = node_cls(node_cfg.name, node_cfg.params)
             graph.add_node(node)
         for connection in config.connections:
-            if connection.kind != "audio":
-                raise ValueError(f"Unsupported connection kind '{connection.kind}' in configuration")
-            graph.connect_audio(connection.source, connection.target)
+            kind = connection.kind.lower()
+            if kind == "audio":
+                graph.connect_audio(connection.source, connection.target)
+                continue
+            if kind in {"mod", "modulation"}:
+                channel = connection.channel
+                if isinstance(channel, str):
+                    source_node = graph._nodes.get(connection.source)
+                    if source_node is None:
+                        raise ValueError(
+                            f"Mod connection references unknown source '{connection.source}'"
+                        )
+                    if not hasattr(source_node, "output_index"):
+                        raise ValueError(
+                            f"Source node '{connection.source}' does not expose named outputs"
+                        )
+                    try:
+                        channel = source_node.output_index(channel)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        raise ValueError(
+                            f"Source node '{connection.source}' has no output named '{connection.channel}'"
+                        ) from exc
+                graph.connect_mod(
+                    connection.source,
+                    connection.target,
+                    connection.param or "",
+                    scale=connection.scale,
+                    mode=connection.mode,
+                    channel=channel if channel is None else int(channel),
+                )
+                continue
+            raise ValueError(f"Unsupported connection kind '{connection.kind}' in configuration")
         graph.set_sink(config.sink)
         return graph
 
