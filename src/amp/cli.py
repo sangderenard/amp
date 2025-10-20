@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip initialising audio output (useful in CI or debugging)",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Render the configured graph without launching the interactive UI",
+    )
     return parser
 
 
@@ -31,12 +36,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from .app import run as run_app
 
-    allow_no_joystick = args.allow_no_joystick
-    no_audio = args.no_audio
-
     return run_app(
-        allow_no_joystick=allow_no_joystick,
-        no_audio=no_audio,
+        allow_no_joystick=args.allow_no_joystick,
+        no_audio=args.no_audio,
+        headless=args.headless,
         config_path=str(args.config),
     )
 

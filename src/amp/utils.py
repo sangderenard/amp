@@ -11,6 +11,50 @@ RAW_DTYPE = np.float64
 MAX_FRAMES = 4096
 
 # =========================
+# Scratch buffers
+# =========================
+
+
+class _ScratchBuffers:
+    """Reusable scratch space for intermediate render buffers.
+
+    The interactive application allocates several temporary buffers every time it
+    schedules a ramp.  Reusing numpy arrays avoids a flood of short-lived
+    allocations during realtime rendering.
+    """
+
+    __slots__ = ("capacity", "tmp", "f", "a", "c", "q")
+
+    def __init__(self) -> None:
+        self.capacity = 0
+        self.tmp = np.empty(0, RAW_DTYPE)
+        self.f = np.empty(0, RAW_DTYPE)
+        self.a = np.empty(0, RAW_DTYPE)
+        self.c = np.empty(0, RAW_DTYPE)
+        self.q = np.empty(0, RAW_DTYPE)
+
+    def ensure(self, frames: int) -> None:
+        """Guarantee buffers large enough for ``frames`` samples."""
+
+        if frames <= 0:
+            return
+
+        if frames <= self.capacity:
+            return
+
+        # Round up to the next power of two so reallocation costs are amortised.
+        new_capacity = 1 << max(0, frames - 1).bit_length()
+        self.tmp = np.empty(new_capacity, RAW_DTYPE)
+        self.f = np.empty(new_capacity, RAW_DTYPE)
+        self.a = np.empty(new_capacity, RAW_DTYPE)
+        self.c = np.empty(new_capacity, RAW_DTYPE)
+        self.q = np.empty(new_capacity, RAW_DTYPE)
+        self.capacity = new_capacity
+
+
+_scratch = _ScratchBuffers()
+
+# =========================
 # Persistence
 # =========================
 MAPPINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mappings.json")
@@ -88,6 +132,7 @@ def cubic_ramp(y0,y1,n,out=None):
 _dc_prev=0.0; _prev_in=0.0
 def dc_block(sig,a=0.995):
     global _dc_prev,_prev_in
+    _scratch.ensure(len(sig))
     y=_scratch.tmp[:len(sig)]
     x_prev=_prev_in; y_prev=_dc_prev
     for i,x in enumerate(sig):
