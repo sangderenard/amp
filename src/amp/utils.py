@@ -157,13 +157,42 @@ def cubic_ramp(y0,y1,n,out=None):
 _dc_prev=0.0; _prev_in=0.0
 def dc_block(sig,a=0.995):
     global _dc_prev,_prev_in
-    _scratch.ensure(len(sig))
-    y=_scratch.tmp[:len(sig)]
-    x_prev=_prev_in; y_prev=_dc_prev
-    for i,x in enumerate(sig):
-        y_prev=a*y_prev + x - x_prev
-        x_prev=x; y[i]=y_prev
-    _dc_prev,_prev_in=y_prev,x_prev
+    sig=np.asarray(sig,dtype=RAW_DTYPE)
+    n=sig.shape[0]
+    _scratch.ensure(n)
+    y=_scratch.tmp[:n]
+    if n==0:
+        return y
+
+    if a==0.0:
+        diffs=_scratch.a[:n]
+        diffs[0]=sig[0]-_prev_in
+        if n>1:
+            np.subtract(sig[1:],sig[:-1],out=diffs[1:])
+        y[:]=diffs
+        _dc_prev=float(y[-1])
+        _prev_in=float(sig[-1])
+        return y
+
+    diffs=_scratch.a[:n]
+    diffs[0]=sig[0]-_prev_in
+    if n>1:
+        np.subtract(sig[1:],sig[:-1],out=diffs[1:])
+
+    powers=_scratch.f[:n]
+    powers[0]=1.0
+    if n>1:
+        powers[1:]=a
+        np.multiply.accumulate(powers,out=powers)
+
+    accum=_scratch.c[:n]
+    np.divide(diffs,powers,out=accum)
+    np.add.accumulate(accum,out=accum)
+    accum+=a*_dc_prev
+    np.multiply(accum,powers,out=y)
+
+    _dc_prev=float(y[-1])
+    _prev_in=float(sig[-1])
     return y
 
 def soft_clip(sig,drive=1.2):
