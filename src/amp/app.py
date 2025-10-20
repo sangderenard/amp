@@ -544,6 +544,32 @@ def run(
     producer_stop_event = threading.Event()
     producer_thread_obj: threading.Thread | None = None
 
+    control_tensors: dict[str, np.ndarray] = {}
+
+    def _control_view(key: str, frames: int) -> np.ndarray:
+        buffer = control_tensors.get(key)
+        if buffer is None or buffer.shape[2] < frames:
+            new_frames = 1 << max(0, frames - 1).bit_length()
+            buffer = np.zeros((1, 1, new_frames), dtype=utils.RAW_DTYPE)
+            control_tensors[key] = buffer
+        return buffer[:, :, :frames]
+
+    def _assign_control(key: str, frames: int, value: float | np.ndarray) -> np.ndarray:
+        view = _control_view(key, frames)
+        array = np.asarray(value, dtype=utils.RAW_DTYPE)
+        if array.ndim == 0:
+            view.fill(float(array))
+            return view
+        if array.ndim == 1:
+            if array.shape[0] != frames:
+                raise ValueError(f"{key}: expected {frames} samples, got {array.shape[0]}")
+            view[0, 0, :frames] = array
+            return view
+        if array.ndim == 3 and array.shape[0] == 1 and array.shape[1] == 1 and array.shape[2] >= frames:
+            view[...] = array[:, :, :frames]
+            return view
+        raise ValueError(f"Unsupported control shape for '{key}': {array.shape}")
+
     def _render_audio_frames(frames: int) -> tuple[np.ndarray, dict[str, Any]]:
         nonlocal sample_rate, freq_current, freq_target, velocity_current, cutoff_current, q_current, graph
         nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger, amp_mod_names
@@ -573,32 +599,27 @@ def run(
             trigger_now = True
 
         gate_now = mode == "hold" and momentary_now
-        trigger_signal = np.zeros(frames, dtype=utils.RAW_DTYPE)
-        if trigger_now:
-            trigger_signal[0] = 1.0
-        gate_signal = np.full(frames, 1.0 if gate_now else 0.0, dtype=utils.RAW_DTYPE)
-        drone_signal = np.full(frames, 1.0 if drone_now else 0.0, dtype=utils.RAW_DTYPE)
-
         B, C = 1, 1
         base_params: dict[str, dict[str, np.ndarray]] = {"_B": B, "_C": C}
 
-        zero_ctrl = utils.as_BCF(0.0, B, 1, frames, name="ctrl.zero")
         base_params["keyboard_ctrl"] = {
-            "trigger": zero_ctrl,
-            "gate": zero_ctrl,
-            "drone": zero_ctrl,
-            "velocity": zero_ctrl,
+            "trigger": _assign_control("keyboard.trigger", frames, 0.0),
+            "gate": _assign_control("keyboard.gate", frames, 0.0),
+            "drone": _assign_control("keyboard.drone", frames, 0.0),
+            "velocity": _assign_control("keyboard.velocity", frames, 0.0),
         }
 
-        trigger_bcf = utils.as_BCF(trigger_signal, B, 1, frames, name="ctrl.trigger")
-        gate_bcf = utils.as_BCF(gate_signal, B, 1, frames, name="ctrl.gate")
-        drone_bcf = utils.as_BCF(drone_signal, B, 1, frames, name="ctrl.drone")
-        velocity_bcf = utils.as_BCF(v, B, 1, frames, name="ctrl.velocity")
-        cutoff_bcf = utils.as_BCF(c, B, 1, frames, name="ctrl.cutoff")
-        q_bcf = utils.as_BCF(q, B, 1, frames, name="ctrl.q")
-        pitch_input_bcf = utils.as_BCF(pitch_input_value, B, 1, frames, name="ctrl.pitch_input")
-        pitch_span_bcf = utils.as_BCF(pitch_span_value, B, 1, frames, name="ctrl.pitch_span")
-        pitch_root_bcf = utils.as_BCF(root_midi_value, B, 1, frames, name="ctrl.pitch_root")
+        trigger_bcf = _assign_control("joystick.trigger", frames, 0.0)
+        if trigger_now:
+            trigger_bcf[0, 0, 0] = 1.0
+        gate_bcf = _assign_control("joystick.gate", frames, 1.0 if gate_now else 0.0)
+        drone_bcf = _assign_control("joystick.drone", frames, 1.0 if drone_now else 0.0)
+        velocity_bcf = _assign_control("joystick.velocity", frames, v)
+        cutoff_bcf = _assign_control("joystick.cutoff", frames, c)
+        q_bcf = _assign_control("joystick.q", frames, q)
+        pitch_input_bcf = _assign_control("joystick.pitch_input", frames, pitch_input_value)
+        pitch_span_bcf = _assign_control("joystick.pitch_span", frames, pitch_span_value)
+        pitch_root_bcf = _assign_control("joystick.pitch_root", frames, root_midi_value)
 
         base_params["joystick_ctrl"] = {
             "trigger": trigger_bcf,
@@ -626,24 +647,22 @@ def run(
         osc_names = [name for name in ("osc1", "osc2", "osc3") if name in graph._nodes]
         for name in osc_names:
             base_params[name] = {
-                "freq": utils.as_BCF(0.0, B, 1, frames, name=f"{name}.freq"),
-                "amp": utils.as_BCF(0.0, B, 1, frames, name=f"{name}.amp"),
+                "freq": _assign_control(f"{name}.freq", frames, 0.0),
+                "amp": _assign_control(f"{name}.amp", frames, 0.0),
             }
 
         if envelope_names:
             send_reset_flag = state.get("envelope_params", {}).get("send_resets", True)
-            send_reset_bcf = utils.as_BCF(
-                1.0 if send_reset_flag else 0.0,
-                B,
-                1,
+            send_reset_bcf = _assign_control(
+                "envelope.send_reset",
                 frames,
-                name="env.send_reset",
+                1.0 if send_reset_flag else 0.0,
             )
             for env_name in envelope_names:
                 base_params[env_name] = {"send_reset": send_reset_bcf}
 
         if amp_mod_names:
-            amp_base = utils.as_BCF(v, B, 1, frames, name="amp_mod.base")
+            amp_base = _assign_control("amp_mod.base", frames, v)
             for name in amp_mod_names:
                 base_params[name] = {"base": amp_base}
 
