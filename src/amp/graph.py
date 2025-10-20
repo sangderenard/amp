@@ -1,4 +1,4 @@
-"""Unified audio graph runtime shared by the interactive and headless flows."""
+"""Unified audio graph runtime used across the application."""
 
 from __future__ import annotations
 

@@ -22,35 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip initialising audio output (useful in CI or debugging)",
     )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run without pygame/audio output; uses a neutral virtual joystick",
-    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    if args.headless:
-        from .application import SynthApplication
-        from .config import load_configuration
-
-        config = load_configuration(args.config)
-        app = SynthApplication.from_config(config)
-        print(app.summary())
-        buffer = app.render()
-        peak = float(buffer.max())
-        trough = float(buffer.min())
-        print(
-            f"Rendered {buffer.shape[1]} frames @ {config.sample_rate} Hz "
-            f"(peak {peak:.3f}, trough {trough:.3f})"
-        )
-        if app.joystick_error and not app.joystick:
-            print(f"Warning: {app.joystick_error}")
-        return 0
 
     from .app import run as run_app
 
@@ -60,7 +37,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     return run_app(
         allow_no_joystick=allow_no_joystick,
         no_audio=no_audio,
-        headless=False,
         config_path=str(args.config),
     )
 

@@ -49,7 +49,7 @@ def _axes_index_or_default(joy: Any, candidate: int, default: int) -> int:
 
 
 def build_default_state(*, joy: Any, pygame: ModuleType) -> Dict[str, Any]:
-    """Return the default interactive application state.
+    """Return the default application state.
 
     Parameters
     ----------

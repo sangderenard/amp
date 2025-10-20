@@ -1,4 +1,4 @@
-"""Joystick-controlled interactive synthesiser."""
+"""Joystick-controlled synthesiser application."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import numpy as np
 
 from .graph import AudioGraph
 from . import menu, nodes, persistence, quantizer, state as app_state, utils
+from .config import DEFAULT_CONFIG_PATH, load_configuration
 
 
 class _NullJoystick:
@@ -69,10 +70,9 @@ def run(
     *,
     allow_no_joystick: bool = False,
     no_audio: bool = False,
-    headless: bool = False,
     config_path: str | None = None,
 ) -> int:
-    """Launch the original joystick-driven player.
+    """Launch the synthesiser.
 
     Parameters
     ----------
@@ -82,19 +82,27 @@ def run(
     no_audio:
         Skip initialising the sounddevice output stream.  Useful for CI where no
         PortAudio backend is available.
-    headless:
-        Run the graph without creating a pygame window.  This uses the
-        configuration system to render a single buffer for verification.
     config_path:
-        Optional configuration override when running in headless mode.
+        Optional configuration override used when the application needs to
+        fall back to a summary render (for example when pygame is unavailable).
     """
 
-    if headless:
-        from .application import SynthApplication
-        from .config import DEFAULT_CONFIG_PATH, load_configuration
+    cfg_path = config_path or str(DEFAULT_CONFIG_PATH)
 
-        cfg = load_configuration(config_path or DEFAULT_CONFIG_PATH)
+    def render_summary(reason: str, *, cleanup: bool = False) -> int:
+        from .application import SynthApplication
+
+        if cleanup:
+            try:  # pragma: no cover - depends on pygame availability
+                import pygame as _pygame
+
+                _pygame.quit()
+            except Exception:
+                pass
+
+        cfg = load_configuration(cfg_path)
         app = SynthApplication.from_config(cfg)
+        print(reason)
         print(app.summary())
         buffer = app.render()
         peak = float(buffer.max())
@@ -110,14 +118,15 @@ def run(
     try:
         import pygame
     except ImportError as exc:  # pragma: no cover - exercised only when pygame missing
-        print(f"pygame is required for the interactive application: {exc}")
-        return 1
+        return render_summary(f"pygame unavailable, running summary instead: {exc}")
 
-    try:
-        import sounddevice as sd
-    except ImportError as exc:  # pragma: no cover - exercised only when sounddevice missing
-        print(f"sounddevice is required for the interactive application: {exc}")
-        return 1
+    if no_audio:
+        sd = None
+    else:
+        try:
+            import sounddevice as sd
+        except ImportError as exc:  # pragma: no cover - exercised only when sounddevice missing
+            return render_summary(f"sounddevice unavailable, running summary instead: {exc}")
 
     pygame.init()
     pygame.joystick.init()
@@ -217,7 +226,7 @@ def run(
     button_last_press: dict[int, float] = {}
     button_latch: dict[int, bool] = {}
 
-    utils._scratch.ensure(config.MAX_FRAMES)
+    utils._scratch.ensure(app_state.MAX_FRAMES)
 
     def audio_callback(outdata, frames, time_info, status):
         nonlocal sample_rate, freq_current, amp_current, cutoff_current, q_current, graph
@@ -259,34 +268,43 @@ def run(
         q_current = float(q[-1])
 
     running = True
+    audio_failures: list[Exception] = []
 
-    def audio_thread():
-        nonlocal sample_rate, graph, running
+    if sd is None:
+        print("[Audio] Skipping output initialisation (no-audio mode).")
+    else:
         try:
             dev_index, dev_sr = _pick_output_device_and_rate(sd)
-            sample_rate = dev_sr
-            sd.default.device = (None, dev_index)
-            print(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz")
-            graph = build_graph(sample_rate, state)
-            with sd.OutputStream(
-                device=dev_index,
-                channels=2,
-                dtype="float32",
-                samplerate=sample_rate,
-                blocksize=256,
-                latency="low",
-                callback=audio_callback,
-            ):
-                while running:
-                    time.sleep(0.002)
-        except sd.PortAudioError as exc:
-            print("[Audio] Start failed:", exc)
-            raise
+        except Exception as exc:
+            return render_summary(
+                f"Audio initialisation failed, running summary instead: {exc}",
+                cleanup=True,
+            )
 
-    if not no_audio:
+        sample_rate = dev_sr
+        sd.default.device = (None, dev_index)
+        print(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz")
+        graph = build_graph(sample_rate, state)
+
+        def audio_thread() -> None:
+            nonlocal running
+            try:
+                with sd.OutputStream(
+                    device=dev_index,
+                    channels=2,
+                    dtype="float32",
+                    samplerate=sample_rate,
+                    blocksize=256,
+                    latency="low",
+                    callback=audio_callback,
+                ):
+                    while running:
+                        time.sleep(0.002)
+            except Exception as exc:  # pragma: no cover - depends on audio backend
+                audio_failures.append(exc)
+                running = False
+
         threading.Thread(target=audio_thread, daemon=True).start()
-    else:
-        print("[Audio] Skipping output initialisation (no-audio mode).")
 
     clock = pygame.time.Clock()
 
@@ -305,6 +323,12 @@ def run(
 
     try:
         while True:
+            if audio_failures:
+                pygame.quit()
+                return render_summary(
+                    f"Audio initialisation failed, running summary instead: {audio_failures[0]}",
+                    cleanup=False,
+                )
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
