@@ -1,5 +1,9 @@
 # nodes.py
+from __future__ import annotations
+
 import math
+from collections.abc import Mapping, Sequence
+
 import numpy as np
 
 from .utils import (
@@ -443,23 +447,217 @@ class OscNode(Node):
         self.wave = wave
         self.phase = None
         self.accept_reset = bool(accept_reset)
+        self._freq_state: np.ndarray | None = None
+        self._voice_phase: dict[str, np.ndarray] = {}
+        self._arp_step: np.ndarray | None = None
+        self._arp_timer: np.ndarray | None = None
+        self._last_arp_offsets: np.ndarray | None = None
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    def _ensure_array(self, key: str, data, batches: int, frames: int) -> np.ndarray:
+        return as_BCF(data, batches, 1, frames, name=key)[:, 0, :]
+
+    def _parse_voice_spec(self, spec, name: str) -> list[tuple[float, float]]:
+        if spec is None:
+            return []
+        offsets: Sequence[float] | None = None
+        mixes: Sequence[float] | None = None
+        if isinstance(spec, Mapping):
+            offsets = spec.get("offsets") or spec.get("voices") or ()
+            mixes = spec.get("mix") or spec.get("mixes") or ()
+        elif isinstance(spec, Sequence) and not isinstance(spec, (str, bytes)):
+            if len(spec) == 0:
+                return []
+            offsets = spec[0] if len(spec) > 0 else ()
+            mixes = spec[1] if len(spec) > 1 else ()
+        else:
+            raise TypeError(f"{name}: unsupported specification type {type(spec)!r}")
+
+        offsets_array = [] if offsets is None else list(np.asarray(offsets, dtype=RAW_DTYPE).ravel())
+        mixes_array = [] if mixes is None else list(np.asarray(mixes, dtype=RAW_DTYPE).ravel())
+        if not offsets_array:
+            return []
+        if not mixes_array:
+            mixes_array = [1.0] * len(offsets_array)
+        if len(mixes_array) < len(offsets_array):
+            mixes_array.extend([mixes_array[-1]] * (len(offsets_array) - len(mixes_array)))
+
+        voices: list[tuple[float, float]] = []
+        for idx, offset in enumerate(offsets_array):
+            try:
+                off = float(offset)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name}: invalid offset {offset!r}") from exc
+            try:
+                mix = float(mixes_array[idx])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name}: invalid mix {mixes_array[idx]!r}") from exc
+            if abs(mix) <= 1e-12:
+                continue
+            ratio = float(np.power(2.0, off / 1200.0))
+            voices.append((ratio, mix))
+        return voices
+
+    def _advance_phase(self, key: str, dphi: np.ndarray) -> np.ndarray:
+        batches, frames = dphi.shape
+        state = self._voice_phase.get(key)
+        if state is None or state.shape[0] != batches:
+            state = np.zeros(batches, dtype=RAW_DTYPE)
+        ph = np.empty((batches, frames), dtype=RAW_DTYPE)
+        current = state.copy()
+        for i in range(frames):
+            current = (current + dphi[:, i]) % 1.0
+            ph[:, i] = current
+        self._voice_phase[key] = current
+        return ph
+
+    def _render_wave(self, phase: np.ndarray, dphi: np.ndarray) -> np.ndarray:
+        if self.wave == "sine":
+            return np.sin(2 * np.pi * phase, dtype=RAW_DTYPE)
+        if self.wave == "saw":
+            return osc_saw_blep(phase, dphi)
+        if self.wave == "square":
+            return osc_square_blep(phase, dphi)
+        if self.wave == "triangle":
+            return osc_triangle_blep(phase, dphi)
+        return np.zeros_like(phase)
+
+    def _parse_arp_plan(self, plan, frames: int, sr: int) -> tuple[list[float], int] | None:
+        if plan is None:
+            return None
+        sequence: Sequence[float] | None = None
+        rate_hz = None
+        frames_per_step = None
+        if isinstance(plan, Mapping):
+            sequence = plan.get("sequence") or plan.get("pattern") or plan.get("steps")
+            rate_hz = plan.get("rate_hz") or plan.get("rate")
+            frames_per_step = plan.get("frames_per_step") or plan.get("step_frames")
+        elif isinstance(plan, Sequence) and not isinstance(plan, (str, bytes)):
+            if len(plan) == 0:
+                sequence = []
+            elif len(plan) == 1:
+                sequence = plan[0]
+            else:
+                sequence = plan[0]
+                frames_per_step = plan[1]
+        else:
+            raise TypeError("arp: unsupported plan specification")
+
+        seq_vals = list(np.asarray(sequence if sequence is not None else [0.0], dtype=RAW_DTYPE).ravel())
+        if not seq_vals:
+            seq_vals = [0.0]
+        if frames_per_step is not None:
+            try:
+                fps = int(frames_per_step)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("arp: frames_per_step must be numeric") from exc
+            fps = max(1, fps)
+        else:
+            try:
+                rate = float(rate_hz) if rate_hz is not None else 0.0
+            except (TypeError, ValueError) as exc:
+                raise ValueError("arp: rate_hz must be numeric") from exc
+            if rate <= 0.0:
+                fps = frames
+            else:
+                fps = max(1, int(round(sr / rate)))
+        return seq_vals, fps
+
+    # ------------------------------------------------------------------
     def process(self, frames, sr, audio_in, mods, params):
         B = audio_in.shape[0] if audio_in is not None else 1
         C = 1
         F = frames
 
-        f = as_BCF(params.get("freq", 0.0), B, C, F, name="osc.freq")[:, 0, :]
-        a = as_BCF(params.get("amp", 1.0), B, C, F, name="osc.amp")[:, 0, :]
-        reset = None
-        if self.accept_reset and "reset" in params:
-            reset = as_BCF(params.get("reset", 0.0), B, C, F, name="osc.reset")[:, 0, :]
+        f = self._ensure_array("osc.freq", params.get("freq", 0.0), B, F)
+        a = self._ensure_array("osc.amp", params.get("amp", 1.0), B, F)
 
-        dphi = f / float(sr)
+        pan = params.get("pan")
+        pan_arr = None
+        if pan is not None:
+            pan_arr = np.clip(self._ensure_array("osc.pan", pan, B, F), -1.0, 1.0)
+
+        port = params.get("port")
+        port_arr = None
+        if port is not None:
+            port_arr = self._ensure_array("osc.port", port, B, F) > 0.5
+
+        slide_time = np.zeros((B, F), dtype=RAW_DTYPE)
+        slide_damp = np.zeros((B, F), dtype=RAW_DTYPE)
+        slide_spec = params.get("slide")
+        if slide_spec is not None:
+            if isinstance(slide_spec, Sequence) and not isinstance(slide_spec, (str, bytes)) and len(slide_spec) >= 1:
+                slide_time = self._ensure_array("osc.slide_time", slide_spec[0], B, F)
+                if len(slide_spec) > 1:
+                    slide_damp = self._ensure_array("osc.slide_damp", slide_spec[1], B, F)
+            else:
+                slide_arr = as_BCF(slide_spec, B, 2, F, name="osc.slide")
+                slide_time = slide_arr[:, 0, :]
+                if slide_arr.shape[1] > 1:
+                    slide_damp = slide_arr[:, 1, :]
+
+        chord_voices = self._parse_voice_spec(params.get("chord"), "chord")
+        subharmonic_voices = self._parse_voice_spec(params.get("subharmonic"), "subharmonic")
+
+        arp_plan = self._parse_arp_plan(params.get("arp"), F, sr) if "arp" in params else None
+        freq_target = f.copy()
+        if arp_plan is not None:
+            seq_vals, fps = arp_plan
+            if self._arp_step is None or self._arp_step.shape[0] != B:
+                self._arp_step = np.zeros(B, dtype=np.int64)
+                self._arp_timer = np.zeros(B, dtype=np.int64)
+            assert self._arp_timer is not None
+            offsets = np.zeros((B, F), dtype=RAW_DTYPE)
+            step = self._arp_step.copy()
+            timer = self._arp_timer.copy()
+            seq_arr = np.asarray(seq_vals, dtype=RAW_DTYPE)
+            seq_len = seq_arr.size if seq_arr.size > 0 else 1
+            if seq_len == 0:
+                seq_arr = np.array([0.0], dtype=RAW_DTYPE)
+                seq_len = 1
+            for i in range(F):
+                idx = step % seq_len
+                offsets[:, i] = seq_arr[idx]
+                timer += 1
+                reached = timer >= fps
+                if np.any(reached):
+                    timer[reached] = 0
+                    step[reached] = (step[reached] + 1) % seq_len
+            self._arp_step = step
+            self._arp_timer = timer
+            self._last_arp_offsets = offsets
+            freq_target = freq_target * np.power(2.0, offsets / 1200.0)
+        else:
+            self._last_arp_offsets = None
+
+        if port_arr is not None and np.any(port_arr):
+            if self._freq_state is None or self._freq_state.shape[0] != B:
+                self._freq_state = freq_target[:, 0].copy()
+            current = self._freq_state.copy()
+            smoothed = np.empty_like(freq_target)
+            for i in range(F):
+                target = freq_target[:, i]
+                active = port_arr[:, i] if port_arr is not None else np.zeros(B, dtype=bool)
+                frames_const = np.maximum(slide_time[:, i] * float(sr), 1.0)
+                alpha = np.exp(-1.0 / frames_const)
+                alpha = alpha ** (1.0 + np.clip(slide_damp[:, i], 0.0, 4.0))
+                current = np.where(active, alpha * current + (1.0 - alpha) * target, target)
+                smoothed[:, i] = current
+            self._freq_state = current
+            freq_target = smoothed
+        else:
+            self._freq_state = freq_target[:, -1].copy()
+
+        dphi = freq_target / float(sr)
         if self.phase is None or self.phase.shape[0] != B:
             self.phase = np.zeros(B, RAW_DTYPE)
 
-        ph = np.empty((B, F), dtype=RAW_DTYPE)
+        reset = None
+        if self.accept_reset and "reset" in params:
+            reset = self._ensure_array("osc.reset", params.get("reset", 0.0), B, F)
+
+        ph_base = np.empty((B, F), dtype=RAW_DTYPE)
         current = self.phase.copy()
         for i in range(F):
             if reset is not None:
@@ -467,22 +665,33 @@ class OscNode(Node):
                 if np.any(mask):
                     current = np.where(mask, 0.0, current)
             current = (current + dphi[:, i]) % 1.0
-            ph[:, i] = current
-
+            ph_base[:, i] = current
         self.phase = current
 
-        if self.wave == "sine":
-            w = np.sin(2 * np.pi * ph, dtype=RAW_DTYPE)
-        elif self.wave == "saw":
-            w = osc_saw_blep(ph, dphi)
-        elif self.wave == "square":
-            w = osc_square_blep(ph, dphi)
-        elif self.wave == "triangle":
-            w = osc_triangle_blep(ph, dphi)
-        else:
-            w = np.zeros_like(ph)
+        wave = self._render_wave(ph_base, dphi)
 
-        return (w * a)[:, None, :]
+        for idx, (ratio, mix) in enumerate(chord_voices):
+            dphi_voice = dphi * ratio
+            ph_voice = self._advance_phase(f"chord{idx}", dphi_voice)
+            wave += self._render_wave(ph_voice, dphi_voice) * mix
+
+        for idx, (ratio, mix) in enumerate(subharmonic_voices):
+            dphi_voice = dphi * ratio
+            ph_voice = self._advance_phase(f"sub{idx}", dphi_voice)
+            wave += self._render_wave(ph_voice, dphi_voice) * mix
+
+        signal = wave * a
+
+        if pan_arr is None:
+            return signal[:, None, :]
+
+        angle = (pan_arr + 1.0) * (math.pi / 4.0)
+        left = signal * np.cos(angle)
+        right = signal * np.sin(angle)
+        out = np.empty((B, 2, F), dtype=RAW_DTYPE)
+        out[:, 0, :] = left
+        out[:, 1, :] = right
+        return out
 
 class SamplerNode(Node):
     def __init__(self, name, sampler):
