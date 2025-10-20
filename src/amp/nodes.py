@@ -2,7 +2,16 @@
 import math
 import numpy as np
 
-from .utils import as_BCF, assert_BCF, dc_block, soft_clip, make_wave_hq
+from .utils import (
+    as_BCF,
+    assert_BCF,
+    dc_block,
+    make_wave_hq,
+    osc_saw_blep,
+    osc_square_blep,
+    osc_triangle_blep,
+    soft_clip,
+)
 from .state import RAW_DTYPE, MAX_FRAMES
 
 
