@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -15,6 +17,71 @@ from . import menu, nodes, persistence, quantizer, state as app_state, utils
 
 
 CacheKey = tuple[str, str, tuple[int, int, int], str]
+
+
+class AsyncThrottledPrinter:
+    """Background printer that rate limits console output."""
+
+    def __init__(
+        self,
+        *,
+        window_seconds: float = 0.75,
+        max_messages: int = 8,
+    ) -> None:
+        self._queue: "queue.Queue[tuple[str, str] | None]" = queue.Queue()
+        self._history: deque[float] = deque()
+        self._history_window = window_seconds
+        self._max_messages = max_messages
+        self._history_lock = threading.Lock()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                break
+            text, end = item
+            try:
+                sys.stdout.write(text)
+                sys.stdout.write(end)
+                sys.stdout.flush()
+            finally:
+                self._queue.task_done()
+
+    def _prune_history(self, now: float) -> None:
+        while self._history and now - self._history[0] > self._history_window:
+            self._history.popleft()
+
+    def emit(self, message: str, *, end: str = "\n", force: bool = False) -> bool:
+        """Queue *message* for printing when under the rate limit.
+
+        Returns ``True`` when the message is enqueued for output."""
+
+        now = time.monotonic()
+        with self._history_lock:
+            self._prune_history(now)
+            if not force and len(self._history) >= self._max_messages:
+                return False
+            self._history.append(now)
+        self._queue.put((message, end))
+        return True
+
+    def flush(self) -> None:
+        """Block until queued messages have been printed."""
+
+        self._queue.join()
+
+    def close(self) -> None:
+        """Stop the worker thread after flushing pending messages."""
+
+        self.flush()
+        self._queue.put(None)
+        self._queue.join()
+
+
+STATUS_PRINTER = AsyncThrottledPrinter()
 
 
 class TextSurfaceCache:
@@ -282,14 +349,20 @@ class _NullJoystick:
 def _load_sampler(state: dict) -> Optional[nodes.Sampler]:
     path = state.get("sample_file")
     if not path or not os.path.isfile(path):
-        print("[Sampler] sample.wav not found (sampler available after you add a file).")
+        STATUS_PRINTER.emit(
+            "[Sampler] sample.wav not found (sampler available after you add a file).",
+            force=True,
+        )
         return None
     try:
         sampler = nodes.Sampler(path, loop=True)
-        print(f"[Sampler] Loaded '{os.path.basename(path)}' at {sampler.file_sr} Hz")
+        STATUS_PRINTER.emit(
+            f"[Sampler] Loaded '{os.path.basename(path)}' at {sampler.file_sr} Hz",
+            force=True,
+        )
         return sampler
     except Exception as exc:  # pragma: no cover - depends on local files
-        print(f"[Sampler] Disabled: {exc}")
+        STATUS_PRINTER.emit(f"[Sampler] Disabled: {exc}", force=True)
         return None
 
 
@@ -345,17 +418,19 @@ def run(
 
         cfg = load_configuration(cfg_path)
         app = SynthApplication.from_config(cfg)
-        print(reason)
-        print(app.summary())
+        STATUS_PRINTER.emit(reason, force=True)
+        STATUS_PRINTER.emit(app.summary(), force=True)
         buffer = app.render()
         peak = float(buffer.max())
         trough = float(buffer.min())
-        print(
+        STATUS_PRINTER.emit(
             f"Rendered {buffer.shape[1]} frames @ {cfg.sample_rate} Hz "
-            f"(peak {peak:.3f}, trough {trough:.3f})"
+            f"(peak {peak:.3f}, trough {trough:.3f})",
+            force=True,
         )
         if app.joystick_error and not app.joystick:
-            print(f"Warning: {app.joystick_error}")
+            STATUS_PRINTER.emit(f"Warning: {app.joystick_error}", force=True)
+        STATUS_PRINTER.flush()
         return 0
 
     if headless:
@@ -389,13 +464,18 @@ def run(
     last_node_levels_snapshot: dict[str, np.ndarray] = {}
     status_signature_pending: tuple[Any, ...] | None = None
     last_status_signature: tuple[Any, ...] | None = None
+    last_console_signature: tuple[Any, ...] | None = None
+    last_timing_alert: bool | None = None
 
     if pygame.joystick.get_count() == 0:
         if not allow_no_joystick:
-            print("No joystick. Connect controller and restart.")
+            STATUS_PRINTER.emit("No joystick. Connect controller and restart.", force=True)
             return 1
         joy = _NullJoystick()
-        print("[Joystick] Running with virtual controller (all controls neutral).")
+        STATUS_PRINTER.emit(
+            "[Joystick] Running with virtual controller (all controls neutral).",
+            force=True,
+        )
     else:
         joy = pygame.joystick.Joystick(0)
         joy.init()
@@ -440,7 +520,7 @@ def run(
             pending_trigger = True
         elif envelope_mode == "hold" and gate_momentary:
             pending_trigger = True
-        print(f"Envelope mode → {envelope_mode.title()}")
+        STATUS_PRINTER.emit(f"Envelope mode → {envelope_mode.title()}")
         menu_instance.draw()
 
     prev_buttons = [0] * joy.get_numbuttons()
@@ -609,7 +689,7 @@ def run(
     audio_failures: list[Exception] = []
 
     if sd is None:
-        print("[Audio] Skipping output initialisation (no-audio mode).")
+        STATUS_PRINTER.emit("[Audio] Skipping output initialisation (no-audio mode).", force=True)
     else:
         try:
             dev_index, dev_sr = _pick_output_device_and_rate(sd)
@@ -621,7 +701,7 @@ def run(
 
         sample_rate = dev_sr
         sd.default.device = (None, dev_index)
-        print(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz")
+        STATUS_PRINTER.emit(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz", force=True)
         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
         pitch_node = graph._nodes.get("pitch")
 
@@ -983,11 +1063,15 @@ def run(
         finally:
             text_cache.finish_frame()
 
-    print(
-        "Menu:'m'  LS=pitch/vel  RS=filter.  A=trigger  B=mode  X=wave  Y=cycle  N=source (osc/sampler)."
+    STATUS_PRINTER.emit(
+        "Menu:'m'  LS=pitch/vel  RS=filter.  A=trigger  B=mode  X=wave  Y=cycle  N=source (osc/sampler).",
+        force=True,
     )
-    print("Bumpers: hold=momentary, double-tap=latch. RB default FREE; LB default 12tet/full.")
-    print("Z cycles FREE variant. </> root down/up, / resets root.")
+    STATUS_PRINTER.emit(
+        "Bumpers: hold=momentary, double-tap=latch. RB default FREE; LB default 12tet/full.",
+        force=True,
+    )
+    STATUS_PRINTER.emit("Z cycles FREE variant. </> root down/up, / resets root.", force=True)
 
     try:
         while True:
@@ -1010,36 +1094,36 @@ def run(
                         state["source_type"] = "sampler" if state["source_type"] == "osc" else "osc"
                         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                         pitch_node = graph._nodes.get("pitch")
-                        print(f"Source → {state['source_type'].upper()}")
+                        STATUS_PRINTER.emit(f"Source → {state['source_type'].upper()}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("wave_next", pygame.K_x):
                         state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
                         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                         pitch_node = graph._nodes.get("pitch")
-                        print(f"Waveform → {state['waves'][state['wave_idx']]}")
+                        STATUS_PRINTER.emit(f"Waveform → {state['waves'][state['wave_idx']]}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("free_variant_next", pygame.K_z):
                         i = quantizer.FREE_VARIANTS.index(state["free_variant"])
                         state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
                         pitch_free_variant = state["free_variant"]
-                        print(f"FREE variant → {state['free_variant']}")
+                        STATUS_PRINTER.emit(f"FREE variant → {state['free_variant']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("drone_toggle", pygame.K_b):
                         cycle_envelope_mode()
                     elif event.key == state["keymap"].get("root_up", pygame.K_PERIOD):
                         state["root_midi"] = min(127, state["root_midi"] + 1)
                         root_midi_value = state["root_midi"]
-                        print(f"Root MIDI → {state['root_midi']}")
+                        STATUS_PRINTER.emit(f"Root MIDI → {state['root_midi']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("root_down", pygame.K_COMMA):
                         state["root_midi"] = max(0, state["root_midi"] - 1)
                         root_midi_value = state["root_midi"]
-                        print(f"Root MIDI → {state['root_midi']}")
+                        STATUS_PRINTER.emit(f"Root MIDI → {state['root_midi']}")
                         menu_instance.draw()
                     elif event.key == state["keymap"].get("root_reset", pygame.K_SLASH):
                         state["root_midi"] = 60
                         root_midi_value = state["root_midi"]
-                        print("Root MIDI → 60 (C4)")
+                        STATUS_PRINTER.emit("Root MIDI → 60 (C4)")
                         menu_instance.draw()
 
             pygame.event.pump()
@@ -1051,7 +1135,7 @@ def run(
                     i = quantizer.FREE_VARIANTS.index(state["free_variant"])
                     state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
                     pitch_free_variant = state["free_variant"]
-                    print(f"FREE variant → {state['free_variant']}")
+                    STATUS_PRINTER.emit(f"FREE variant → {state['free_variant']}")
                     menu_instance.draw()
 
             nowt = time.time()
@@ -1064,7 +1148,9 @@ def run(
                     last_t = button_last_press.get(btn_idx, 0.0)
                     if nowt - last_t <= state["double_tap_window"]:
                         button_latch[btn_idx] = not button_latch.get(btn_idx, False)
-                        print(f"Latch[{btn_idx}] → {'ON' if button_latch[btn_idx] else 'OFF'}  ({cfg['token']})")
+                        STATUS_PRINTER.emit(
+                            f"Latch[{btn_idx}] → {'ON' if button_latch[btn_idx] else 'OFF'}  ({cfg['token']})"
+                        )
                         menu_instance.draw()
                     button_last_press[btn_idx] = nowt
 
@@ -1111,7 +1197,7 @@ def run(
                 state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
                 graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                 pitch_node = graph._nodes.get("pitch")
-                print(f"Waveform → {state['waves'][state['wave_idx']]}")
+                STATUS_PRINTER.emit(f"Waveform → {state['waves'][state['wave_idx']]}")
                 menu_instance.draw()
 
             bY = joy.get_button(3)
@@ -1124,7 +1210,7 @@ def run(
                     state["base_token"] = f"12tet/{m2}"
                     graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                     pitch_node = graph._nodes.get("pitch")
-                    print(f"Base token → {state['base_token']}")
+                    STATUS_PRINTER.emit(f"Base token → {state['base_token']}")
                     menu_instance.draw()
                 else:
                     et = ["12tet/full", "19tet/full", "31tet/full", "53tet/full"]
@@ -1135,7 +1221,7 @@ def run(
                         state["base_token"] = et[0]
                     graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                     pitch_node = graph._nodes.get("pitch")
-                    print(f"Base token  {state['base_token']}")
+                    STATUS_PRINTER.emit(f"Base token  {state['base_token']}")
                     menu_instance.draw()
 
             for i in range(len(prev_buttons)):
@@ -1159,36 +1245,25 @@ def run(
                     period_peak_ms = max(period_values) * 1000.0
                 underrun_recent = any(entry.get("underrun") for entry in timing_snapshot)
 
-            timing_signature = None
-            if timing_snapshot:
-                timing_signature = (
-                    round(render_mean_ms, 4),
-                    round(render_peak_ms, 4),
-                    round(allotted_ms, 4),
-                    round(period_mean_ms, 4),
-                    round(period_peak_ms, 4),
-                    underrun_recent,
-                )
-
-            status_signature_pending = (
-                state["root_midi"],
-                float(freq_target),
-                float(velocity_target),
-                float(cutoff_target),
-                float(q_target),
+            current_status_signature = (
+                int(state["root_midi"]),
+                round(float(freq_target), 3),
+                round(float(velocity_target), 3),
+                round(float(cutoff_target), 2),
+                round(float(q_target), 3),
                 state["filter_type"],
                 state["source_type"],
                 state["waves"][state["wave_idx"]],
                 envelope_mode,
                 state["mod_wave_types"][state["mod_wave_idx"]],
-                float(state["mod_rate_hz"]),
-                float(state["mod_depth"]),
+                round(float(state["mod_rate_hz"]), 3),
+                round(float(state["mod_depth"]), 3),
                 bool(state["mod_use_input"]),
                 pitch_effective_token,
                 state["base_token"],
                 state["free_variant"],
-                timing_signature,
             )
+            status_signature_pending = current_status_signature
 
             base_line_colour = (255, 255, 255)
             lines_with_colour: list[tuple[str, tuple[int, int, int]]] = [
@@ -1225,13 +1300,27 @@ def run(
             screen = pygame.display.get_surface()
             if screen:
                 draw_visualisation(screen, lines_with_colour, freq_target, velocity_target)
-            print("\r" + " | ".join(console_lines), end="")
+            should_emit = False
+            if (
+                last_console_signature is None
+                or current_status_signature != last_console_signature
+            ):
+                should_emit = True
+            elif last_timing_alert is None or underrun_recent != last_timing_alert:
+                should_emit = True
+
+            if should_emit:
+                STATUS_PRINTER.emit("\r" + " | ".join(console_lines), end="")
+
+            last_console_signature = current_status_signature
+            last_timing_alert = underrun_recent
 
             clock.tick(120)
     finally:
         running = False
         if hasattr(joy, "quit"):
             joy.quit()
+        STATUS_PRINTER.flush()
 
     return 0
 
