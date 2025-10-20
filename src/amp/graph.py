@@ -96,11 +96,28 @@ class AudioGraph:
         self._audio_inputs.setdefault(target, []).append(source)
         self._audio_successors.setdefault(source, []).append(target)
 
-    def connect_mod(self, source: str, target: str, param: str, *, scale: float = 1.0, mode: str = "add") -> None:
+    def connect_mod(
+        self,
+        source: str,
+        target: str,
+        param: str,
+        *,
+        scale: float = 1.0,
+        mode: str = "add",
+        channel: int | None = None,
+    ) -> None:
         if source not in self._nodes or target not in self._nodes:
             raise ValueError("Mod connections must reference defined nodes")
+        if channel is not None and channel < 0:
+            raise ValueError("Mod channel index must be non-negative")
         self._mod_inputs.setdefault(target, []).append(
-            {"source": source, "target_param": param, "scale": float(scale), "mode": mode}
+            {
+                "source": source,
+                "target_param": param,
+                "scale": float(scale),
+                "mode": mode,
+                "channel": int(channel) if channel is not None else None,
+            }
         )
 
     def set_sink(self, name: str) -> None:
@@ -169,9 +186,23 @@ class AudioGraph:
                 if buffer is None:
                     continue
                 target_param = entry.get("target_param", "value")
+                buf = _assert_bcf(buffer, name=f"{entry['source']}.out")
+                channel = entry.get("channel")
+                if channel is not None:
+                    if channel >= buf.shape[1]:
+                        raise ValueError(
+                            f"Mod channel {channel} out of range for '{entry['source']}'"
+                        )
+                    buf = buf[:, channel : channel + 1, :]
                 mods.setdefault(target_param, []).append(
                     (
-                        _as_bcf(buffer, batches, channels, frame_count, name=f"mod {entry['source']}->{name}"),
+                        _as_bcf(
+                            buf,
+                            batches,
+                            channels,
+                            frame_count,
+                            name=f"mod {entry['source']}->{name}",
+                        ),
                         entry.get("scale", 1.0),
                         entry.get("mode", "add"),
                     )
