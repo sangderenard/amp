@@ -1,6 +1,6 @@
 # persistence.py
 import os, json, copy
-from .config import MAPPINGS_FILE, MAX_UNDO
+from .state import MAPPINGS_FILE, MAX_UNDO
 
 def load_mappings(state):
     if os.path.exists(MAPPINGS_FILE):

@@ -1,0 +1,44 @@
+{
+  "sample_rate": 44100,
+  "runtime": {
+    "frames_per_chunk": 512,
+    "output_channels": 2,
+    "joystick": {
+      "enabled": false,
+      "axes": {},
+      "buttons": {}
+    },
+    "log_summary": true
+  },
+  "graph": {
+    "nodes": [
+      {
+        "name": "carrier",
+        "type": "sine_oscillator",
+        "params": {
+          "frequency": 220.0,
+          "amplitude": 0.2
+        }
+      },
+      {
+        "name": "mixer",
+        "type": "mix",
+        "params": {
+          "channels": 2
+        }
+      },
+      {
+        "name": "safety",
+        "type": "safety",
+        "params": {
+          "channels": 2
+        }
+      }
+    ],
+    "connections": [
+      {"source": "carrier", "target": "mixer"},
+      {"source": "mixer", "target": "safety"}
+    ],
+    "sink": "safety"
+  }
+}

@@ -1,7 +1,7 @@
 # quantizer.py
 import numpy as np
 import math
-from .config import RAW_DTYPE
+from .state import RAW_DTYPE
 
 # =========================
 # Quantizer dictionaries
