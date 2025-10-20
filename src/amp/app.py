@@ -536,12 +536,19 @@ def run(
     callback_timing_lock = threading.Lock()
     last_callback_started = 0.0
 
-    def audio_callback(outdata, frames, time_info, status):
+    pcm_queue: queue.Queue[tuple[np.ndarray, dict[str, Any]]] | None = None
+    queue_capacity = 0
+    queue_depth_display = 0
+    audio_blocksize = 256
+    producer_batch_blocks = 4
+    producer_stop_event = threading.Event()
+    producer_thread_obj: threading.Thread | None = None
+
+    def _render_audio_frames(frames: int) -> tuple[np.ndarray, dict[str, Any]]:
         nonlocal sample_rate, freq_current, freq_target, velocity_current, cutoff_current, q_current, graph
         nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger, amp_mod_names
         nonlocal pitch_node, pitch_input_value, pitch_span_value, pitch_effective_token
         nonlocal root_midi_value, pitch_free_variant
-        nonlocal last_callback_started
 
         sr = sample_rate
         start_time = time.perf_counter()
@@ -640,14 +647,12 @@ def run(
             for name in amp_mod_names:
                 base_params[name] = {"base": amp_base}
 
-        y = graph.render(frames, sr, base_params)
+        y = graph.render_block(frames, sr, base_params)
         y = utils.assert_BCF(y, name="sink")
-        if y.shape[0] != 1 or y.shape[1] not in (1, outdata.shape[1]):
-            raise RuntimeError(f"Device expects (1,{outdata.shape[1]},F), got {y.shape}")
+        if y.shape[0] != 1:
+            raise RuntimeError(f"Device expects single batch output, got {y.shape}")
 
-        chans = min(outdata.shape[1], y.shape[1])
-        for ch in range(chans):
-            outdata[:, ch] = y[0, ch].astype(np.float32, copy=False)
+        buffer = np.swapaxes(y[0], 0, 1).astype(np.float32, copy=True)
 
         if pitch_ref is not None:
             last = pitch_ref.last_output
@@ -662,24 +667,89 @@ def run(
         momentary_prev = momentary_now
         drone_prev = drone_now
 
+        render_duration = time.perf_counter() - start_time
+        allotted_time = (frames / sr) if sr else 0.0
+
+        meta = {
+            "render_duration": render_duration,
+            "allotted_time": allotted_time,
+        }
+
+        return buffer, meta
+
+    def audio_callback(outdata, frames, time_info, status):
+        nonlocal sample_rate, graph, last_callback_started, pcm_queue, queue_depth_display, audio_blocksize, queue_capacity
+
+        sr = sample_rate
+        start_time = time.perf_counter()
+        audio_blocksize = frames
+
+        chunk: np.ndarray | None = None
+        meta: dict[str, Any] | None = None
+        queue_underflow = False
+
+        if pcm_queue is not None:
+            try:
+                chunk, meta = pcm_queue.get_nowait()
+            except queue.Empty:
+                queue_underflow = True
+            else:
+                queue_depth_display = pcm_queue.qsize()
+
+        if chunk is None:
+            chunk, meta = _render_audio_frames(frames)
+            meta = dict(meta)
+            if queue_underflow:
+                meta["queue_underflow"] = True
+        else:
+            meta = dict(meta)
+            meta.setdefault("queue_underflow", False)
+
+        if chunk.shape[0] != frames:
+            if pcm_queue is not None:
+                try:
+                    while True:
+                        pcm_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            chunk, meta = _render_audio_frames(frames)
+            meta = dict(meta)
+            meta["queue_underflow"] = True
+            queue_underflow = True
+
+        queue_underflow = queue_underflow or bool(meta.get("queue_underflow"))
+
+        outdata.fill(0.0)
+        chans = min(outdata.shape[1], chunk.shape[1])
+        outdata[:, :chans] = chunk[:, :chans]
+
+        if pcm_queue is not None:
+            queue_depth_display = pcm_queue.qsize()
+        else:
+            queue_depth_display = 0
+
         end_time = time.perf_counter()
-        render_duration = end_time - start_time
         period = 0.0
         if last_callback_started:
             period = start_time - last_callback_started
         last_callback_started = start_time
-        allotted_time = (frames / sr) if sr else 0.0
+
         status_obj = status or 0
         underrun = bool(
             getattr(status_obj, "output_underflow", False)
             or getattr(status_obj, "input_underflow", False)
         )
+        if queue_underflow:
+            underrun = True
 
         sample = {
-            "render_duration": render_duration,
+            "render_duration": meta.get("render_duration", end_time - start_time),
             "callback_period": period,
-            "allotted_time": allotted_time,
+            "allotted_time": meta.get("allotted_time", (frames / sr) if sr else 0.0),
             "underrun": underrun,
+            "queue_depth": queue_depth_display,
+            "queue_capacity": queue_capacity,
+            "queue_underflow": queue_underflow,
         }
 
         with callback_timing_lock:
@@ -704,6 +774,44 @@ def run(
         STATUS_PRINTER.emit(f"\n[Audio] Device #{dev_index} @ {sample_rate} Hz", force=True)
         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
         pitch_node = graph._nodes.get("pitch")
+
+        pcm_queue = queue.Queue[tuple[np.ndarray, dict[str, Any]]](maxsize=16)
+        queue_capacity = pcm_queue.maxsize
+        producer_stop_event.clear()
+
+        def producer_thread() -> None:
+            nonlocal running, audio_blocksize
+            try:
+                while running and not producer_stop_event.is_set():
+                    block_frames = max(1, audio_blocksize)
+                    total_frames = block_frames * producer_batch_blocks
+                    buffer, meta = _render_audio_frames(total_frames)
+                    chunk_count = max(1, total_frames // block_frames)
+                    per_chunk_duration = meta["render_duration"] / chunk_count
+                    allotted_per_chunk = meta["allotted_time"] / chunk_count if chunk_count else meta["allotted_time"]
+                    for idx in range(chunk_count):
+                        start = idx * block_frames
+                        end = start + block_frames
+                        chunk = buffer[start:end].copy()
+                        chunk_meta = {
+                            "render_duration": per_chunk_duration,
+                            "allotted_time": allotted_per_chunk,
+                            "queue_underflow": False,
+                        }
+                        while running and not producer_stop_event.is_set():
+                            try:
+                                pcm_queue.put((chunk, chunk_meta), timeout=0.05)
+                                break
+                            except queue.Full:
+                                time.sleep(0.001)
+                        if not running or producer_stop_event.is_set():
+                            break
+            except Exception as exc:  # pragma: no cover - depends on audio backend
+                audio_failures.append(exc)
+                running = False
+
+        producer_thread_obj = threading.Thread(target=producer_thread, name="AudioProducer", daemon=True)
+        producer_thread_obj.start()
 
         def audio_thread() -> None:
             nonlocal running
@@ -1243,6 +1351,8 @@ def run(
                 if period_values:
                     period_mean_ms = sum(period_values) / len(period_values) * 1000.0
                     period_peak_ms = max(period_values) * 1000.0
+                queue_depth_recent = timing_snapshot[-1].get("queue_depth", 0)
+                queue_capacity_recent = timing_snapshot[-1].get("queue_capacity", 0)
                 underrun_recent = any(entry.get("underrun") for entry in timing_snapshot)
 
             current_status_signature = (
@@ -1292,8 +1402,11 @@ def run(
                 period_text = ""
                 if period_mean_ms or period_peak_ms:
                     period_text = f" period {period_mean_ms:5.2f}/{period_peak_ms:5.2f}ms"
+                queue_text = ""
+                if queue_capacity_recent:
+                    queue_text = f" queue {queue_depth_recent}/{queue_capacity_recent}"
                 underrun_text = " UNDERRUN" if underrun_recent else ""
-                timing_text = budget_text + period_text + underrun_text
+                timing_text = budget_text + period_text + queue_text + underrun_text
                 timing_colour = (240, 120, 120) if underrun_recent else (180, 220, 255)
                 lines_with_colour.append((timing_text, timing_colour))
                 console_lines.append(timing_text)
@@ -1318,6 +1431,15 @@ def run(
             clock.tick(120)
     finally:
         running = False
+        producer_stop_event.set()
+        if producer_thread_obj is not None:
+            producer_thread_obj.join(timeout=1.0)
+        if pcm_queue is not None:
+            try:
+                while True:
+                    pcm_queue.get_nowait()
+            except queue.Empty:
+                pass
         if hasattr(joy, "quit"):
             joy.quit()
         STATUS_PRINTER.flush()
