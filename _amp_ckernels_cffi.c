@@ -750,6 +750,12 @@ void envelope_process(
     double* amp_out,
     double* reset_out
 ) {
+    if (reset_out != NULL) {
+        int total = B * F;
+        for (int i = 0; i < total; ++i) {
+            reset_out[i] = 0.0;
+        }
+    }
     for (int b = 0; b < B; ++b) {
         int st = stage[b];
         double val = value[b];
@@ -763,7 +769,6 @@ void envelope_process(
             int trig = trigger[idx] > 0.5 ? 1 : 0;
             int gate_on = gate[idx] > 0.5 ? 1 : 0;
             int drone_on = drone[idx] > 0.5 ? 1 : 0;
-            int send_reset_line = send_resets ? (reset_out != NULL && reset_out[idx]) : 0; // placeholder, will handle below
 
             if (trig) {
                 st = 1; // ATTACK
