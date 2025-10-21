@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 
 from . import envelope, quantizer, utils
+from .block_pool import BlockLease, BlockPool
 from .utils import (
     as_BCF,
     assert_BCF,
@@ -170,8 +171,42 @@ def _match_channels(data: np.ndarray, channels: int) -> np.ndarray:
 # Filters consume audio streams (`audio_in`) and transform them.
 # Modulators emit control-rate signals that downstream nodes treat as parameters.
 class Node:
-    def __init__(self,name): self.name=name
-    def process(self,frames,sr,audio_in,mods,params): raise NotImplementedError
+    """Base class providing pooled CFFI-backed buffers for graph nodes."""
+
+    __slots__ = ("name", "_block_pool", "_leases")
+
+    def __init__(self, name: str, *, block_pool: BlockPool | None = None) -> None:
+        self.name = name
+        self._block_pool = block_pool or BlockPool()
+        self._leases: list[BlockLease] = []
+
+    def allocate_block(
+        self,
+        batches: int,
+        channels: int,
+        frames: int,
+        *,
+        tag: str = "out",
+        zero: bool = False,
+    ) -> np.ndarray:
+        """Return a reusable buffer shaped ``(B, C, F)`` for writing output."""
+
+        lease = self._block_pool.acquire((int(batches), int(channels), int(frames)), tag=tag)
+        self._leases.append(lease)
+        buffer = lease.view
+        if zero:
+            buffer.fill(0.0)
+        return buffer
+
+    def recycle_blocks(self) -> None:
+        """Return any leased blocks to the pool for reuse."""
+
+        for lease in self._leases:
+            lease.release()
+        self._leases.clear()
+
+    def process(self, frames, sr, audio_in, mods, params):
+        raise NotImplementedError
 
 
 class ConfigNode(Node):
@@ -409,7 +444,7 @@ class SilenceNode(ConfigNode):
 
     def process(self, frames, sr, audio_in, mods, params):
         _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
-        return np.zeros((batches, self.channels, frames), dtype=RAW_DTYPE)
+        return self.allocate_block(batches, self.channels, frames, zero=True)
 
 
 class ConstantNode(ConfigNode):
@@ -420,7 +455,8 @@ class ConstantNode(ConfigNode):
 
     def process(self, frames, sr, audio_in, mods, params):
         _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
-        buffer = np.full((batches, self.channels, frames), self.value, dtype=RAW_DTYPE)
+        buffer = self.allocate_block(batches, self.channels, frames, zero=False)
+        buffer.fill(self.value)
         return buffer
 
 
@@ -455,8 +491,10 @@ class SineOscillatorNode(ConfigNode):
         dphi = freq / float(sr)
         phase = (self._phase[..., None] + np.cumsum(dphi, axis=2)) % 1.0
         self._phase = phase[..., -1]
-        wave = np.sin(2.0 * np.pi * phase, dtype=RAW_DTYPE)
-        return wave * amp
+        wave = self.allocate_block(batches, channels, frames, tag="sine")
+        np.sin(2.0 * np.pi * phase, out=wave)
+        np.multiply(wave, amp, out=wave)
+        return wave
 
 
 class SafetyNode(ConfigNode):
@@ -466,25 +504,23 @@ class SafetyNode(ConfigNode):
         self.dc_alpha = float(self.params.get("dc_alpha", 0.995))
         # persistent per-batch/state array (B, C). Start empty; _ensure will size it.
         self._state: np.ndarray = np.zeros((0, self.channels), dtype=RAW_DTYPE)
-        self._buffer: np.ndarray = np.zeros((0, self.channels, 0), dtype=RAW_DTYPE)
 
     def process(self, frames, sr, audio_in, mods, params):
         audio, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
+        out = self.allocate_block(batches, self.channels, frames, tag="safety", zero=False)
         if audio is None:
-            data = np.zeros((batches, self.channels, frames), dtype=RAW_DTYPE)
-        else:
-            data = _match_channels(audio, self.channels)
+            out.fill(0.0)
+            return out
+        data = _match_channels(audio, self.channels)
         data = np.require(data, dtype=RAW_DTYPE, requirements=("C",))
         # Use C kernel when available; fallback to Python implementation inside c_kernels
         # Ensure state array is sized for current batches
         if not isinstance(self._state, np.ndarray) or self._state.shape != (batches, self.channels):
             self._state = np.zeros((batches, self.channels), dtype=RAW_DTYPE)
-        if self._buffer.shape != (batches, self.channels, frames):
-            self._buffer = np.zeros((batches, self.channels, frames), dtype=RAW_DTYPE)
         try:
-            out = c_kernels.dc_block_c(data, float(self.dc_alpha), self._state, out=self._buffer)
+            c_kernels.dc_block_c(data, float(self.dc_alpha), self._state, out=out)
         except Exception:
-            out = c_kernels.dc_block_py(data, float(self.dc_alpha), self._state, out=self._buffer)
+            c_kernels.dc_block_py(data, float(self.dc_alpha), self._state, out=out)
         np.clip(out, -1.0, 1.0, out=out)
         return out
 
@@ -501,11 +537,14 @@ class DelayNode(Node):
             self.w   = np.zeros((B, C), dtype=int)
 
     def process(self, frames, sr, audio_in, mods, params):
-        x = np.zeros((1,1,frames), RAW_DTYPE) if audio_in is None else assert_BCF(audio_in, name="delay.in")
+        if audio_in is None:
+            x = self.allocate_block(1, 1, frames, tag="delay_in", zero=True)
+        else:
+            x = assert_BCF(audio_in, name="delay.in")
         B, C, F = x.shape
         self._ensure(B, C)
 
-        out = np.empty_like(x)
+        out = self.allocate_block(B, C, F, tag="delay_out")
         idxs = (self.w[..., None] + np.arange(F)[None, None, :]) % self.delay  # (B,C,F)
         out[:] = self.buf.take(idxs, axis=2, mode='wrap')
         self.buf[np.arange(B)[:,None,None], np.arange(C)[None,:,None], idxs] = x
