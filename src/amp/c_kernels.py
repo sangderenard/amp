@@ -563,7 +563,31 @@ except Exception as exc:
     )
 
 
-def lfo_slew_c(x: np.ndarray, r: float, alpha: float, z0: Optional[np.ndarray]) -> np.ndarray:
+def _require_ctypes_ready(arr: np.ndarray, dtype: np.dtype, *, writable: bool) -> np.ndarray:
+    """Validate that ``arr`` can be passed directly to a C kernel."""
+
+    if arr.dtype != dtype:
+        raise TypeError(f"expected dtype {dtype}, got {arr.dtype}")
+    if not arr.flags.c_contiguous:
+        raise ValueError("arrays passed to C kernels must be C-contiguous")
+    if writable and not arr.flags.writeable:
+        raise ValueError("writable arrays passed to C kernels must be writeable")
+    return arr
+
+
+DTYPE_FLOAT = np.dtype(np.float64)
+DTYPE_INT32 = np.dtype(np.int32)
+DTYPE_INT64 = np.dtype(np.int64)
+
+
+def lfo_slew_c(
+    x: np.ndarray,
+    r: float,
+    alpha: float,
+    z0: Optional[np.ndarray],
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     """Call the compiled C kernel to compute exponential smoothing.
 
     x: (B, F) contiguous C-order array of doubles
@@ -576,44 +600,54 @@ def lfo_slew_c(x: np.ndarray, r: float, alpha: float, z0: Optional[np.ndarray]) 
     """
     if not AVAILABLE or _impl is None:
         raise RuntimeError("C kernel not available")
-    if not x.flags['C_CONTIGUOUS']:
-        x = np.ascontiguousarray(x)
-    B, F = x.shape
-    out = np.empty_like(x)
-    zbuf = None
+    x_buf = _require_ctypes_ready(np.asarray(x), DTYPE_FLOAT, writable=False)
+    B, F = x_buf.shape
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for lfo_slew_c")
+        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
+
     if z0 is not None:
-        if z0.shape[0] != B:
+        if z0.shape != (B,):
             raise ValueError("z0 must have shape (B,)")
-        if not z0.flags['C_CONTIGUOUS']:
-            z0 = np.ascontiguousarray(z0)
-        zbuf = z0
-    # get C pointers
-    x_ptr = ffi.cast("const double *", x.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    if zbuf is not None:
-        z_ptr = ffi.cast("double *", zbuf.ctypes.data)
+        z_buf = _require_ctypes_ready(z0, DTYPE_FLOAT, writable=True)
+        z_ptr = ffi.cast("double *", z_buf.ctypes.data)
     else:
         z_ptr = ffi.cast("double *", ffi.NULL)
+
+    x_ptr = ffi.cast("const double *", x_buf.ctypes.data)
+    out_ptr = ffi.cast("double *", out.ctypes.data)
     _impl.lib.lfo_slew(x_ptr, out_ptr, int(B), int(F), float(r), float(alpha), z_ptr)
-    # if zbuf provided, copy back into original z0
-    if zbuf is not None and z0 is not zbuf:
-        z0[:] = zbuf
     return out
 
 
-def lfo_slew_py(x: np.ndarray, r: float, alpha: float, z0: Optional[np.ndarray]) -> np.ndarray:
+def lfo_slew_py(
+    x: np.ndarray,
+    r: float,
+    alpha: float,
+    z0: Optional[np.ndarray],
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     """Pure-Python sample-sequential fallback (fast with numpy per-row ops).
 
     Semantics: iterative recurrence z[n] = r*z[n-1] + alpha * x[n].
     """
-    B, F = x.shape
-    out = np.empty_like(x)
-    if z0 is None:
-        z = np.zeros(B, dtype=x.dtype)
+    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
+    B, F = x_buf.shape
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
     else:
-        z = z0.copy()
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for lfo_slew_py")
+    if z0 is None:
+        z = np.zeros(B, dtype=DTYPE_FLOAT)
+    else:
+        z = np.asarray(z0, dtype=DTYPE_FLOAT)
     for i in range(F):
-        xi = x[:, i]
+        xi = x_buf[:, i]
         z = r * z + alpha * xi
         out[:, i] = z
     if z0 is not None:
@@ -621,75 +655,116 @@ def lfo_slew_py(x: np.ndarray, r: float, alpha: float, z0: Optional[np.ndarray])
     return out
 
 
-def lfo_slew_vector(x: np.ndarray, r: float, alpha: float, z0: Optional[np.ndarray]) -> np.ndarray:
+def lfo_slew_vector(
+    x: np.ndarray,
+    r: float,
+    alpha: float,
+    z0: Optional[np.ndarray],
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     """Vectorized closed-form solution equivalent to iterative recurrence.
 
     z[n] = r^n * z0 + alpha * r^n * sum_{k=0..n} r^{-k} * x[k]
     Implemented using np.cumsum on axis 1.
     """
-    B, F = x.shape
-    idx = np.arange(F, dtype=x.dtype)
+    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
+    B, F = x_buf.shape
+    idx = np.arange(F, dtype=DTYPE_FLOAT)
     r_pow = r ** idx
     # handle r==0
     with np.errstate(divide='ignore', invalid='ignore'):
         r_inv = np.where(r == 0.0, 0.0, r ** (-idx))
-    accum = np.cumsum(x * r_inv[None, :], axis=1)
-    out = (r_pow[None, :] * (alpha * accum))
+    accum = np.cumsum(x_buf * r_inv[None, :], axis=1)
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for lfo_slew_vector")
+    out[:] = r_pow[None, :] * (alpha * accum)
     if z0 is not None:
-        out = out + (r_pow[None, :] * z0[:, None])
+        out += r_pow[None, :] * z0[:, None]
         z0[:] = out[:, -1]
     return out
 
 
-def safety_filter_c(x: np.ndarray, a: float, prev_in: Optional[np.ndarray], prev_dc: Optional[np.ndarray]) -> np.ndarray:
-    """Call compiled safety_filter kernel. x shape (B,C,F) -> returns y (B,C,F)
-    prev_in and prev_dc are optional (B,C) arrays and will be updated in-place if provided.
-    """
+def safety_filter_c(
+    x: np.ndarray,
+    a: float,
+    prev_in: Optional[np.ndarray],
+    prev_dc: Optional[np.ndarray],
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    """Call compiled ``safety_filter`` kernel without intermediate copies."""
+
     if not AVAILABLE or _impl is None:
         raise RuntimeError("C kernel not available")
-    B, C, F = x.shape
-    out = np.empty_like(x)
-    xb = np.ascontiguousarray(x)
-    outb = np.ascontiguousarray(out)
-    prev_in_buf = None
-    prev_dc_buf = None
+
+    x_buf = _require_ctypes_ready(np.asarray(x), DTYPE_FLOAT, writable=False)
+    B, C, F = x_buf.shape
+    if out is None:
+        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, C, F):
+            raise ValueError("out has incorrect shape for safety_filter_c")
+        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
+
     if prev_in is not None:
-        prev_in_buf = np.ascontiguousarray(prev_in)
+        if prev_in.shape != (B, C):
+            raise ValueError("prev_in must have shape (B, C)")
+        prev_in_buf = _require_ctypes_ready(prev_in, DTYPE_FLOAT, writable=True)
+        prev_in_ptr = ffi.cast("double *", prev_in_buf.ctypes.data)
+    else:
+        prev_in_ptr = ffi.cast("double *", ffi.NULL)
+
     if prev_dc is not None:
-        prev_dc_buf = np.ascontiguousarray(prev_dc)
-    x_ptr = ffi.cast("const double *", xb.ctypes.data)
-    y_ptr = ffi.cast("double *", outb.ctypes.data)
-    prev_in_ptr = ffi.cast("double *", prev_in_buf.ctypes.data) if prev_in_buf is not None else ffi.cast("double *", ffi.NULL)
-    prev_dc_ptr = ffi.cast("double *", prev_dc_buf.ctypes.data) if prev_dc_buf is not None else ffi.cast("double *", ffi.NULL)
-    _impl.lib.safety_filter(x_ptr, y_ptr, int(B), int(C), int(F), float(a), prev_in_ptr, prev_dc_ptr)
-    if prev_in_buf is not None and prev_in is not prev_in_buf:
-        prev_in[:] = prev_in_buf
-    if prev_dc_buf is not None and prev_dc is not prev_dc_buf:
-        prev_dc[:] = prev_dc_buf
-    return outb
+        if prev_dc.shape != (B, C):
+            raise ValueError("prev_dc must have shape (B, C)")
+        prev_dc_buf = _require_ctypes_ready(prev_dc, DTYPE_FLOAT, writable=True)
+        prev_dc_ptr = ffi.cast("double *", prev_dc_buf.ctypes.data)
+    else:
+        prev_dc_ptr = ffi.cast("double *", ffi.NULL)
+
+    x_ptr = ffi.cast("const double *", x_buf.ctypes.data)
+    out_ptr = ffi.cast("double *", out.ctypes.data)
+    _impl.lib.safety_filter(x_ptr, out_ptr, int(B), int(C), int(F), float(a), prev_in_ptr, prev_dc_ptr)
+    return out
 
 
-def safety_filter_py(x: np.ndarray, a: float, prev_in: Optional[np.ndarray], prev_dc: Optional[np.ndarray]) -> np.ndarray:
-    B, C, F = x.shape
-    out = np.empty_like(x)
-    pi = np.zeros((B, C), dtype=x.dtype) if prev_in is None else prev_in.copy()
-    pd = np.zeros((B, C), dtype=x.dtype) if prev_dc is None else prev_dc.copy()
+def safety_filter_py(
+    x: np.ndarray,
+    a: float,
+    prev_in: Optional[np.ndarray],
+    prev_dc: Optional[np.ndarray],
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
+    B, C, F = x_buf.shape
+    if out is None:
+        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, C, F):
+            raise ValueError("out has incorrect shape for safety_filter_py")
+    pi = np.zeros((B, C), dtype=DTYPE_FLOAT) if prev_in is None else np.asarray(prev_in, dtype=DTYPE_FLOAT)
+    pd = np.zeros((B, C), dtype=DTYPE_FLOAT) if prev_dc is None else np.asarray(prev_dc, dtype=DTYPE_FLOAT)
     for b in range(B):
         for c in range(C):
             if F <= 0:
                 continue
             # compute diffs
-            diffs = np.empty(F, dtype=x.dtype)
-            diffs[0] = x[b, c, 0] - pi[b, c]
+            diffs = np.empty(F, dtype=DTYPE_FLOAT)
+            diffs[0] = x_buf[b, c, 0] - pi[b, c]
             if F > 1:
-                diffs[1:] = x[b, c, 1:] - x[b, c, :-1]
-            powers = a ** np.arange(F, dtype=x.dtype)
+                diffs[1:] = x_buf[b, c, 1:] - x_buf[b, c, :-1]
+            powers = a ** np.arange(F, dtype=DTYPE_FLOAT)
             with np.errstate(divide='ignore', invalid='ignore'):
                 inv_p = 1.0 / powers
             accum = np.cumsum(diffs * inv_p) + (a * pd[b, c])
             y = accum * powers
             out[b, c, :] = y
-            pi[b, c] = x[b, c, -1]
+            pi[b, c] = x_buf[b, c, -1]
             pd[b, c] = y[-1]
     if prev_in is not None:
         prev_in[:] = pi
@@ -698,34 +773,59 @@ def safety_filter_py(x: np.ndarray, a: float, prev_in: Optional[np.ndarray], pre
     return out
 
 
-def dc_block_c(x: np.ndarray, a: float, state: Optional[np.ndarray]) -> np.ndarray:
+def dc_block_c(
+    x: np.ndarray,
+    a: float,
+    state: Optional[np.ndarray],
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     if not AVAILABLE or _impl is None:
         raise RuntimeError("C kernel not available")
-    B, C, F = x.shape
-    out = np.empty_like(x)
-    xb = np.ascontiguousarray(x)
-    outb = np.ascontiguousarray(out)
-    state_buf = None
+
+    x_buf = _require_ctypes_ready(np.asarray(x), DTYPE_FLOAT, writable=False)
+    B, C, F = x_buf.shape
+    if out is None:
+        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, C, F):
+            raise ValueError("out has incorrect shape for dc_block_c")
+        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
+
     if state is not None:
-        state_buf = np.ascontiguousarray(state)
-    x_ptr = ffi.cast("const double *", xb.ctypes.data)
-    out_ptr = ffi.cast("double *", outb.ctypes.data)
-    state_ptr = ffi.cast("double *", state_buf.ctypes.data) if state_buf is not None else ffi.cast("double *", ffi.NULL)
+        if state.shape != (B, C):
+            raise ValueError("state must have shape (B, C)")
+        state_buf = _require_ctypes_ready(state, DTYPE_FLOAT, writable=True)
+        state_ptr = ffi.cast("double *", state_buf.ctypes.data)
+    else:
+        state_ptr = ffi.cast("double *", ffi.NULL)
+
+    x_ptr = ffi.cast("const double *", x_buf.ctypes.data)
+    out_ptr = ffi.cast("double *", out.ctypes.data)
     _impl.lib.dc_block(x_ptr, out_ptr, int(B), int(C), int(F), float(a), state_ptr)
-    if state_buf is not None and state is not state_buf:
-        state[:] = state_buf
-    return outb
+    return out
 
 
-def dc_block_py(x: np.ndarray, a: float, state: Optional[np.ndarray]) -> np.ndarray:
-    B, C, F = x.shape
-    out = np.empty_like(x)
-    st = np.zeros((B, C), dtype=x.dtype) if state is None else state.copy()
+def dc_block_py(
+    x: np.ndarray,
+    a: float,
+    state: Optional[np.ndarray],
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
+    B, C, F = x_buf.shape
+    if out is None:
+        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, C, F):
+            raise ValueError("out has incorrect shape for dc_block_py")
+    st = np.zeros((B, C), dtype=DTYPE_FLOAT) if state is None else np.asarray(state, dtype=DTYPE_FLOAT)
     for b in range(B):
         for c in range(C):
             dc = st[b, c]
             for i in range(F):
-                xi = x[b, c, i]
+                xi = x_buf[b, c, i]
                 dc = a * dc + (1.0 - a) * xi
                 out[b, c, i] = xi - dc
             st[b, c] = dc
@@ -926,71 +1026,175 @@ def subharmonic_process_py(
     return y
 
 
-def phase_advance_c(dphi: np.ndarray, reset: np.ndarray | None, phase_state: np.ndarray | None) -> np.ndarray:
+def phase_advance_c(
+    dphi: np.ndarray,
+    reset: np.ndarray | None,
+    phase_state: np.ndarray | None,
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     if not AVAILABLE or _impl is None:
         raise RuntimeError("C kernel not available")
-    if not dphi.flags['C_CONTIGUOUS']:
-        dphi = np.ascontiguousarray(dphi)
-    B, F = dphi.shape
-    out = np.empty_like(dphi)
-    dphi_ptr = ffi.cast("const double *", dphi.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    state_ptr = ffi.cast("double *", np.ascontiguousarray(phase_state).ctypes.data) if phase_state is not None else ffi.cast("double *", ffi.NULL)
-    reset_buf = np.ascontiguousarray(reset) if reset is not None else None
-    reset_ptr = ffi.cast("const double *", reset_buf.ctypes.data) if reset_buf is not None else ffi.cast("const double *", ffi.NULL)
-    _impl.lib.phase_advance(dphi_ptr, out_ptr, int(B), int(F), state_ptr, reset_ptr)
+
+    dphi_buf = _require_ctypes_ready(np.asarray(dphi), DTYPE_FLOAT, writable=False)
+    B, F = dphi_buf.shape
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for phase_advance_c")
+        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
+
     if phase_state is not None:
-        phase_state[:] = np.ascontiguousarray(state_ptr)[:B]
+        if phase_state.shape != (B,):
+            raise ValueError("phase_state must have shape (B,)")
+        phase_buf = _require_ctypes_ready(phase_state, DTYPE_FLOAT, writable=True)
+        state_ptr = ffi.cast("double *", phase_buf.ctypes.data)
+    else:
+        state_ptr = ffi.cast("double *", ffi.NULL)
+
+    if reset is not None:
+        reset_buf = _require_ctypes_ready(np.asarray(reset), DTYPE_FLOAT, writable=False)
+        if reset_buf.shape != (B, F):
+            raise ValueError("reset must have shape (B, F)")
+        reset_ptr = ffi.cast("const double *", reset_buf.ctypes.data)
+    else:
+        reset_ptr = ffi.cast("const double *", ffi.NULL)
+
+    dphi_ptr = ffi.cast("const double *", dphi_buf.ctypes.data)
+    out_ptr = ffi.cast("double *", out.ctypes.data)
+    _impl.lib.phase_advance(dphi_ptr, out_ptr, int(B), int(F), state_ptr, reset_ptr)
     return out
 
 
-def phase_advance_py(dphi: np.ndarray, reset: np.ndarray | None, phase_state: np.ndarray | None) -> np.ndarray:
-    B, F = dphi.shape
-    out = np.empty_like(dphi)
-    if phase_state is None:
-        cur = np.zeros(B, dtype=dphi.dtype)
+def phase_advance_py(
+    dphi: np.ndarray,
+    reset: np.ndarray | None,
+    phase_state: np.ndarray | None,
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    dphi_buf = np.asarray(dphi, dtype=DTYPE_FLOAT)
+    B, F = dphi_buf.shape
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
     else:
-        cur = phase_state.copy()
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for phase_advance_py")
+    if phase_state is None:
+        cur = np.zeros(B, dtype=DTYPE_FLOAT)
+    else:
+        cur = np.asarray(phase_state, dtype=DTYPE_FLOAT)
+    if reset is not None:
+        reset_buf = np.asarray(reset, dtype=DTYPE_FLOAT)
+    else:
+        reset_buf = None
     for i in range(F):
-        if reset is not None:
-            mask = reset[:, i] > 0.5
+        if reset_buf is not None:
+            mask = reset_buf[:, i] > 0.5
             if np.any(mask):
                 cur = np.where(mask, 0.0, cur)
-        cur = (cur + dphi[:, i]) % 1.0
+        cur = (cur + dphi_buf[:, i]) % 1.0
         out[:, i] = cur
     if phase_state is not None:
         phase_state[:] = cur
     return out
 
 
-def portamento_smooth_c(freq_target: np.ndarray, port_mask: np.ndarray | None, slide_time: np.ndarray | None, slide_damp: np.ndarray | None, sr: int, freq_state: np.ndarray | None) -> np.ndarray:
+def portamento_smooth_c(
+    freq_target: np.ndarray,
+    port_mask: np.ndarray | None,
+    slide_time: np.ndarray | None,
+    slide_damp: np.ndarray | None,
+    sr: int,
+    freq_state: np.ndarray | None,
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     if not AVAILABLE or _impl is None:
         raise RuntimeError("C kernel not available")
-    B, F = freq_target.shape
-    out = np.empty_like(freq_target)
-    ft_ptr = ffi.cast("const double *", np.ascontiguousarray(freq_target).ctypes.data)
-    port_ptr = ffi.cast("const double *", np.ascontiguousarray(port_mask).ctypes.data) if port_mask is not None else ffi.cast("const double *", ffi.NULL)
-    st_ptr = ffi.cast("const double *", np.ascontiguousarray(slide_time).ctypes.data) if slide_time is not None else ffi.cast("const double *", ffi.NULL)
-    sd_ptr = ffi.cast("const double *", np.ascontiguousarray(slide_damp).ctypes.data) if slide_damp is not None else ffi.cast("const double *", ffi.NULL)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    state_ptr = ffi.cast("double *", np.ascontiguousarray(freq_state).ctypes.data) if freq_state is not None else ffi.cast("double *", ffi.NULL)
-    _impl.lib.portamento_smooth(ft_ptr, port_ptr, st_ptr, sd_ptr, int(B), int(F), int(sr), state_ptr, out_ptr)
+
+    freq_buf = _require_ctypes_ready(np.asarray(freq_target), DTYPE_FLOAT, writable=False)
+    B, F = freq_buf.shape
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for portamento_smooth_c")
+        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
+
+    if port_mask is not None:
+        port_buf = _require_ctypes_ready(np.asarray(port_mask), DTYPE_FLOAT, writable=False)
+        if port_buf.shape != (B, F):
+            raise ValueError("port_mask must have shape (B, F)")
+        port_ptr = ffi.cast("const double *", port_buf.ctypes.data)
+    else:
+        port_ptr = ffi.cast("const double *", ffi.NULL)
+
+    if slide_time is not None:
+        st_buf = _require_ctypes_ready(np.asarray(slide_time), DTYPE_FLOAT, writable=False)
+        if st_buf.shape != (B, F):
+            raise ValueError("slide_time must have shape (B, F)")
+        st_ptr = ffi.cast("const double *", st_buf.ctypes.data)
+    else:
+        st_ptr = ffi.cast("const double *", ffi.NULL)
+
+    if slide_damp is not None:
+        sd_buf = _require_ctypes_ready(np.asarray(slide_damp), DTYPE_FLOAT, writable=False)
+        if sd_buf.shape != (B, F):
+            raise ValueError("slide_damp must have shape (B, F)")
+        sd_ptr = ffi.cast("const double *", sd_buf.ctypes.data)
+    else:
+        sd_ptr = ffi.cast("const double *", ffi.NULL)
+
     if freq_state is not None:
-        freq_state[:] = np.ascontiguousarray(state_ptr)[:B]
+        if freq_state.shape != (B,):
+            raise ValueError("freq_state must have shape (B,)")
+        state_buf = _require_ctypes_ready(freq_state, DTYPE_FLOAT, writable=True)
+        state_ptr = ffi.cast("double *", state_buf.ctypes.data)
+    else:
+        state_ptr = ffi.cast("double *", ffi.NULL)
+
+    ft_ptr = ffi.cast("const double *", freq_buf.ctypes.data)
+    out_ptr = ffi.cast("double *", out.ctypes.data)
+    _impl.lib.portamento_smooth(ft_ptr, port_ptr, st_ptr, sd_ptr, int(B), int(F), int(sr), state_ptr, out_ptr)
     return out
 
 
-def portamento_smooth_py(freq_target: np.ndarray, port_mask: np.ndarray | None, slide_time: np.ndarray | None, slide_damp: np.ndarray | None, sr: int, freq_state: np.ndarray | None) -> np.ndarray:
-    B, F = freq_target.shape
-    out = np.empty_like(freq_target)
-    cur = np.zeros(B, dtype=freq_target.dtype) if freq_state is None else freq_state.copy()
+def portamento_smooth_py(
+    freq_target: np.ndarray,
+    port_mask: np.ndarray | None,
+    slide_time: np.ndarray | None,
+    slide_damp: np.ndarray | None,
+    sr: int,
+    freq_state: np.ndarray | None,
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    freq_buf = np.asarray(freq_target, dtype=DTYPE_FLOAT)
+    B, F = freq_buf.shape
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for portamento_smooth_py")
+    if freq_state is None:
+        cur = np.zeros(B, dtype=DTYPE_FLOAT)
+    else:
+        cur = np.asarray(freq_state, dtype=DTYPE_FLOAT)
+    port_buf = None if port_mask is None else np.asarray(port_mask, dtype=DTYPE_FLOAT)
+    st_buf = None if slide_time is None else np.asarray(slide_time, dtype=DTYPE_FLOAT)
+    sd_buf = None if slide_damp is None else np.asarray(slide_damp, dtype=DTYPE_FLOAT)
     for i in range(F):
-        target = freq_target[:, i]
-        active = port_mask[:, i] if port_mask is not None else np.zeros(B, dtype=bool)
-        frames_const = np.maximum(slide_time[:, i] * float(sr) if slide_time is not None else 1.0, 1.0)
+        target = freq_buf[:, i]
+        if port_buf is not None:
+            active = port_buf[:, i] > 0.5
+        else:
+            active = np.zeros(B, dtype=bool)
+        frames_const = np.maximum(st_buf[:, i] * float(sr) if st_buf is not None else 1.0, 1.0)
         alpha = np.exp(-1.0 / frames_const)
-        if slide_damp is not None:
-            alpha = alpha ** (1.0 + np.clip(slide_damp[:, i], 0.0, None))
+        if sd_buf is not None:
+            alpha = alpha ** (1.0 + np.clip(sd_buf[:, i], 0.0, None))
         cur = np.where(active, alpha * cur + (1.0 - alpha) * target, target)
         out[:, i] = cur
     if freq_state is not None:
@@ -998,31 +1202,65 @@ def portamento_smooth_py(freq_target: np.ndarray, port_mask: np.ndarray | None, 
     return out
 
 
-def arp_advance_c(seq: np.ndarray, seq_len: int, B: int, F: int, step_state: np.ndarray, timer_state: np.ndarray, fps: int) -> np.ndarray:
+def arp_advance_c(
+    seq: np.ndarray,
+    seq_len: int,
+    B: int,
+    F: int,
+    step_state: np.ndarray,
+    timer_state: np.ndarray,
+    fps: int,
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
     if not AVAILABLE or _impl is None:
         raise RuntimeError("C kernel not available")
-    seq_buf = np.ascontiguousarray(seq.astype(np.float64))
-    out = np.empty((B, F), dtype=np.float64)
+
+    seq_buf = _require_ctypes_ready(np.asarray(seq), DTYPE_FLOAT, writable=False)
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for arp_advance_c")
+        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
+
+    step_buf = _require_ctypes_ready(np.asarray(step_state), DTYPE_INT32, writable=True)
+    timer_buf = _require_ctypes_ready(np.asarray(timer_state), DTYPE_INT32, writable=True)
+
     seq_ptr = ffi.cast("const double *", seq_buf.ctypes.data)
     out_ptr = ffi.cast("double *", out.ctypes.data)
-    step_ptr = ffi.cast("int *", np.ascontiguousarray(step_state).ctypes.data)
-    timer_ptr = ffi.cast("int *", np.ascontiguousarray(timer_state).ctypes.data)
+    step_ptr = ffi.cast("int *", step_buf.ctypes.data)
+    timer_ptr = ffi.cast("int *", timer_buf.ctypes.data)
     _impl.lib.arp_advance(seq_ptr, int(seq_len), out_ptr, int(B), int(F), step_ptr, timer_ptr, int(fps))
-    step_state[:] = np.ascontiguousarray(step_ptr)[:B]
-    timer_state[:] = np.ascontiguousarray(timer_ptr)[:B]
     return out
 
 
-def arp_advance_py(seq: np.ndarray, seq_len: int, B: int, F: int, step_state: np.ndarray, timer_state: np.ndarray, fps: int) -> np.ndarray:
-    out = np.empty((B, F), dtype=float)
-    seq_list = list(np.asarray(seq, dtype=float).ravel())
+def arp_advance_py(
+    seq: np.ndarray,
+    seq_len: int,
+    B: int,
+    F: int,
+    step_state: np.ndarray,
+    timer_state: np.ndarray,
+    fps: int,
+    *,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    if out is None:
+        out = np.empty((B, F), dtype=DTYPE_FLOAT)
+    else:
+        if out.shape != (B, F):
+            raise ValueError("out has incorrect shape for arp_advance_py")
+        out.fill(0.0)
+    seq_list = list(np.asarray(seq, dtype=DTYPE_FLOAT).ravel())
     if len(seq_list) == 0:
         seq_list = [0.0]
-    step = step_state.copy()
-    timer = timer_state.copy()
+    seq_vals = np.asarray(seq_list, dtype=DTYPE_FLOAT)
+    step = np.asarray(step_state, dtype=DTYPE_INT32)
+    timer = np.asarray(timer_state, dtype=DTYPE_INT32)
     for i in range(F):
-        idx = step % (len(seq_list) if len(seq_list) > 0 else 1)
-        out[:, i] = np.asarray(seq_list)[idx]
+        idx = step % seq_vals.size
+        out[:, i] = seq_vals[idx]
         timer += 1
         reached = timer >= fps
         if np.any(reached):
@@ -1114,8 +1352,6 @@ def _polyblep_arr_py(t: np.ndarray, dt: np.ndarray) -> np.ndarray:
         out[m] = x * x + x + x + 1.0
     return out
 
-
-
 def envelope_process_c(
     trigger: np.ndarray,
     gate: np.ndarray,
@@ -1134,23 +1370,42 @@ def envelope_process_c(
     vel_state: np.ndarray,
     activations: np.ndarray,
     release_start: np.ndarray,
+    *,
+    out_amp: np.ndarray | None = None,
+    out_reset: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not AVAILABLE or _impl is None:
         raise RuntimeError("C kernel not available")
     B = trigger.shape[0]
     F = trigger.shape[1]
-    out_amp = np.zeros((B, F), dtype=trigger.dtype)
-    out_reset = np.zeros((B, F), dtype=trigger.dtype)
-    trig_b = np.ascontiguousarray(trigger)
-    gate_b = np.ascontiguousarray(gate)
-    drone_b = np.ascontiguousarray(drone)
-    vel_b = np.ascontiguousarray(velocity)
-    stage_b = np.ascontiguousarray(stage.astype(np.int32))
-    value_b = np.ascontiguousarray(value.astype(np.float64))
-    timer_b = np.ascontiguousarray(timer.astype(np.float64))
-    vel_state_b = np.ascontiguousarray(vel_state.astype(np.float64))
-    activ_b = np.ascontiguousarray(activations.astype(np.int64))
-    rel_b = np.ascontiguousarray(release_start.astype(np.float64))
+    dtype_float = np.dtype(np.float64)
+    dtype_stage = np.dtype(np.int32)
+    dtype_acts = np.dtype(np.int64)
+
+    trig_b = _require_ctypes_ready(trigger, dtype_float, writable=False)
+    gate_b = _require_ctypes_ready(gate, dtype_float, writable=False)
+    drone_b = _require_ctypes_ready(drone, dtype_float, writable=False)
+    vel_b = _require_ctypes_ready(velocity, dtype_float, writable=False)
+    stage_b = _require_ctypes_ready(stage, dtype_stage, writable=True)
+    value_b = _require_ctypes_ready(value, dtype_float, writable=True)
+    timer_b = _require_ctypes_ready(timer, dtype_float, writable=True)
+    vel_state_b = _require_ctypes_ready(vel_state, dtype_float, writable=True)
+    activ_b = _require_ctypes_ready(activations, dtype_acts, writable=True)
+    rel_b = _require_ctypes_ready(release_start, dtype_float, writable=True)
+
+    if out_amp is None:
+        out_amp = np.empty((B, F), dtype=dtype_float)
+    else:
+        if out_amp.shape != (B, F):
+            raise ValueError("out_amp has incorrect shape")
+        _require_ctypes_ready(out_amp, dtype_float, writable=True)
+    if out_reset is None:
+        out_reset = np.empty((B, F), dtype=dtype_float)
+    else:
+        if out_reset.shape != (B, F):
+            raise ValueError("out_reset has incorrect shape")
+        _require_ctypes_ready(out_reset, dtype_float, writable=True)
+
     amp_ptr = ffi.cast("double *", out_amp.ctypes.data)
     reset_ptr = ffi.cast("double *", out_reset.ctypes.data)
     trig_ptr = ffi.cast("const double *", trig_b.ctypes.data)
@@ -1188,13 +1443,6 @@ def envelope_process_c(
         reset_ptr,
     )
 
-    # copy back mutable states
-    stage[:] = stage_b
-    value[:] = value_b
-    timer[:] = timer_b
-    vel_state[:] = vel_state_b
-    activations[:] = activ_b
-    release_start[:] = rel_b
     return out_amp, out_reset
 
 
@@ -1216,10 +1464,25 @@ def envelope_process_py(
     vel_state: np.ndarray,
     activations: np.ndarray,
     release_start: np.ndarray,
+    *,
+    out_amp: np.ndarray | None = None,
+    out_reset: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     B, F = trigger.shape
-    amp = np.zeros((B, F), dtype=float)
-    reset = np.zeros((B, F), dtype=float)
+    if out_amp is None:
+        amp = np.zeros((B, F), dtype=float)
+    else:
+        if out_amp.shape != (B, F):
+            raise ValueError("out_amp has incorrect shape")
+        amp = out_amp
+        amp.fill(0.0)
+    if out_reset is None:
+        reset = np.zeros((B, F), dtype=float)
+    else:
+        if out_reset.shape != (B, F):
+            raise ValueError("out_reset has incorrect shape")
+        reset = out_reset
+        reset.fill(0.0)
     for b in range(B):
         st = int(stage[b])
         val = float(value[b])
