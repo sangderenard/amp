@@ -529,11 +529,88 @@ def run(
         STATUS_PRINTER.emit(f"Envelope mode → {envelope_mode.title()}")
         menu_instance.draw()
 
-    prev_buttons = [0] * joy.get_numbuttons()
-    button_last_press: dict[int, float] = {}
+    prev_buttons = [False] * joy.get_numbuttons()
     button_latch: dict[int, bool] = {}
+    button_press_events: dict[int, deque[float]] = {}
+    record_last_axes: list[float] | None = None
+    record_last_buttons: list[bool] | None = None
+    processed_button_state: list[bool] | None = None
+    last_processed_event_time = float("-inf")
 
     utils._scratch.ensure(app_state.MAX_FRAMES)
+
+    def _record_control_history(axes_state: list[float], buttons_state: list[bool]) -> None:
+        nonlocal record_last_axes, record_last_buttons
+
+        axes_changed = False
+        buttons_changed = False
+        if record_last_axes is None or len(record_last_axes) != len(axes_state):
+            axes_changed = True
+        elif axes_state and not np.allclose(record_last_axes, axes_state, atol=1e-4):
+            axes_changed = True
+        if record_last_buttons is None or len(record_last_buttons) != len(buttons_state):
+            buttons_changed = True
+        elif any(prev != curr for prev, curr in zip(record_last_buttons, buttons_state)):
+            buttons_changed = True
+        if not axes_changed and not buttons_changed:
+            return
+
+        timestamp = time.perf_counter()
+        extras = {
+            "axes": np.asarray(axes_state, dtype=utils.RAW_DTYPE),
+            "buttons": np.asarray(buttons_state, dtype=utils.RAW_DTYPE),
+        }
+        graph.record_control_event(
+            timestamp,
+            pitch=np.zeros(1, dtype=utils.RAW_DTYPE),
+            envelope=np.zeros(1, dtype=utils.RAW_DTYPE),
+            extras=extras,
+        )
+        record_last_axes = list(axes_state)
+        record_last_buttons = list(buttons_state)
+
+    def _process_control_history() -> None:
+        nonlocal processed_button_state, last_processed_event_time
+
+        events = graph.control_delay.events
+        if not events:
+            return
+
+        for event in events:
+            if event.timestamp <= last_processed_event_time:
+                continue
+            buttons_array = None
+            if event.extras:
+                buttons_array = event.extras.get("buttons")
+            if buttons_array is None:
+                last_processed_event_time = event.timestamp
+                continue
+            flat = np.asarray(buttons_array).reshape(-1)
+            current = [bool(value) for value in flat.tolist()]
+            previous = processed_button_state or [False] * len(current)
+            if len(previous) < len(current):
+                previous = previous + [False] * (len(current) - len(previous))
+            for idx, pressed in enumerate(current):
+                was_pressed = previous[idx]
+                if pressed and not was_pressed:
+                    cfg = state["buttonmap"].get(idx)
+                    if not cfg:
+                        continue
+                    delay = time.perf_counter() - event.timestamp
+                    if delay > 0.1:
+                        STATUS_PRINTER.emit(
+                            f"[History] Button {idx} replayed after {delay:.3f}s",
+                        )
+                    presses = button_press_events.setdefault(idx, deque(maxlen=2))
+                    presses.append(event.timestamp)
+                    if len(presses) == 2 and presses[-1] - presses[0] <= state["double_tap_window"]:
+                        button_latch[idx] = not button_latch.get(idx, False)
+                        STATUS_PRINTER.emit(
+                            f"Latch[{idx}] → {'ON' if button_latch[idx] else 'OFF'}  ({cfg['token']})"
+                        )
+                        menu_instance.draw()
+            processed_button_state = list(current)
+            last_processed_event_time = event.timestamp
 
     momentary_prev = False
     drone_prev = False
@@ -1288,9 +1365,15 @@ def run(
 
             pygame.event.pump()
 
+            axes_current = [float(joy.get_axis(i)) for i in range(joy.get_numaxes())]
+            buttons_current = [bool(joy.get_button(i)) for i in range(len(prev_buttons))]
+
+            _record_control_history(axes_current, buttons_current)
+            _process_control_history()
+
             fvb = state.get("free_variant_button", 6)
             if fvb < len(prev_buttons):
-                pressed = bool(joy.get_button(fvb))
+                pressed = buttons_current[fvb]
                 if pressed and not prev_buttons[fvb]:
                     i = quantizer.FREE_VARIANTS.index(state["free_variant"])
                     state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
@@ -1298,28 +1381,12 @@ def run(
                     STATUS_PRINTER.emit(f"FREE variant → {state['free_variant']}")
                     menu_instance.draw()
 
-            nowt = time.time()
-            for btn_idx, cfg in state["buttonmap"].items():
-                if btn_idx >= len(prev_buttons):
-                    continue
-                pressed_now = bool(joy.get_button(btn_idx))
-                pressed_prev = prev_buttons[btn_idx]
-                if pressed_now and not pressed_prev:
-                    last_t = button_last_press.get(btn_idx, 0.0)
-                    if nowt - last_t <= state["double_tap_window"]:
-                        button_latch[btn_idx] = not button_latch.get(btn_idx, False)
-                        STATUS_PRINTER.emit(
-                            f"Latch[{btn_idx}] → {'ON' if button_latch[btn_idx] else 'OFF'}  ({cfg['token']})"
-                        )
-                        menu_instance.draw()
-                    button_last_press[btn_idx] = nowt
-
             effective_token = state["base_token"]
             for b in state.get("bumper_priority", [4, 5]):
                 cfg = state["buttonmap"].get(b)
                 if not cfg:
                     continue
-                if b < len(prev_buttons) and joy.get_button(b):
+                if b < len(prev_buttons) and buttons_current[b]:
                     effective_token = cfg["token"]
                     break
             else:
@@ -1328,11 +1395,12 @@ def run(
                         effective_token = state["buttonmap"][b]["token"]
                         break
 
-            lx, ly = joy.get_axis(0), joy.get_axis(1)
+            lx = axes_current[0] if len(axes_current) > 0 else 0.0
+            ly = axes_current[1] if len(axes_current) > 1 else 0.0
             ax_cut = state.get("filter_axis_cutoff", 3)
             ax_q = state.get("filter_axis_q", 4)
-            rx_val = joy.get_axis(ax_cut) if ax_cut < joy.get_numaxes() else 0.0
-            ry_val = joy.get_axis(ax_q) if ax_q < joy.get_numaxes() else 0.0
+            rx_val = axes_current[ax_cut] if ax_cut < len(axes_current) else 0.0
+            ry_val = axes_current[ax_q] if ax_q < len(axes_current) else 0.0
             rx01 = (rx_val + 1.0) * 0.5
             ry01 = (1.0 - ry_val) * 0.5
             cutoff_target = utils.expo_map(rx01, 80.0, 8000.0)
@@ -1348,20 +1416,20 @@ def run(
 
             velocity_target = max(0.0, 1.0 - (ly + 1.0) / 2.0)
 
-            gate_momentary = bool(joy.get_button(0))
-            bB = joy.get_button(1)
-            if bB and not prev_buttons[1]:
+            gate_momentary = buttons_current[0] if len(buttons_current) > 0 else False
+            bB = buttons_current[1] if len(buttons_current) > 1 else False
+            if bB and (len(prev_buttons) > 1 and not prev_buttons[1]):
                 cycle_envelope_mode()
-            bX = joy.get_button(2)
-            if bX and not prev_buttons[2]:
+            bX = buttons_current[2] if len(buttons_current) > 2 else False
+            if bX and (len(prev_buttons) > 2 and not prev_buttons[2]):
                 state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
                 graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
                 pitch_node = graph._nodes.get("pitch")
                 STATUS_PRINTER.emit(f"Waveform → {state['waves'][state['wave_idx']]}")
                 menu_instance.draw()
 
-            bY = joy.get_button(3)
-            if bY and not prev_buttons[3]:
+            bY = buttons_current[3] if len(buttons_current) > 3 else False
+            if bY and (len(prev_buttons) > 3 and not prev_buttons[3]):
                 t, m = quantizer.token_to_tuning_mode(state["base_token"])
                 if t == "12tet":
                     names = list(quantizer.Quantizer.DIATONIC_MODES.keys())
@@ -1385,7 +1453,7 @@ def run(
                     menu_instance.draw()
 
             for i in range(len(prev_buttons)):
-                prev_buttons[i] = joy.get_button(i)
+                prev_buttons[i] = buttons_current[i]
 
             with callback_timing_lock:
                 timing_snapshot = list(callback_timing_samples)
