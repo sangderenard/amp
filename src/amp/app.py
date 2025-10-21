@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import sys
@@ -546,9 +547,21 @@ def run(
     queue_capacity = 0
     queue_depth_display = 0
     audio_blocksize = 256
-    producer_batch_blocks = 4
+    producer_batch_blocks = 8
+    producer_max_batch_blocks = 16
+    producer_fill_target = 0.75
     producer_stop_event = threading.Event()
     producer_thread_obj: threading.Thread | None = None
+
+    queue_stats_lock = threading.Lock()
+    queue_stats = {
+        "min_depth": float("inf"),
+        "sum_depth": 0.0,
+        "samples": 0,
+        "underflows": 0,
+        "last_report": time.monotonic(),
+        "interval": 5.0,
+    }
 
     control_tensors: dict[str, np.ndarray] = {}
 
@@ -756,6 +769,37 @@ def run(
         else:
             queue_depth_display = 0
 
+        now_monotonic = time.monotonic()
+        with queue_stats_lock:
+            queue_stats["min_depth"] = min(queue_stats["min_depth"], queue_depth_display)
+            queue_stats["sum_depth"] += float(queue_depth_display)
+            queue_stats["samples"] += 1
+            if queue_underflow:
+                queue_stats["underflows"] += 1
+            interval = queue_stats.get("interval", 5.0)
+            should_report = (
+                queue_capacity
+                and queue_stats["samples"]
+                and now_monotonic - queue_stats["last_report"] >= interval
+            )
+            if should_report:
+                min_depth = queue_stats["min_depth"]
+                if math.isinf(min_depth):
+                    min_depth = queue_depth_display
+                avg_depth = queue_stats["sum_depth"] / max(1, queue_stats["samples"])
+                STATUS_PRINTER.emit(
+                    (
+                        f"[Audio] Queue stats: min={int(min_depth)}/{queue_capacity} "
+                        f"avg={avg_depth:.1f} underflows={queue_stats['underflows']}"
+                    ),
+                    force=True,
+                )
+                queue_stats["min_depth"] = float("inf")
+                queue_stats["sum_depth"] = 0.0
+                queue_stats["samples"] = 0
+                queue_stats["underflows"] = 0
+                queue_stats["last_report"] = now_monotonic
+
         end_time = time.perf_counter()
         period = 0.0
         if last_callback_started:
@@ -806,7 +850,7 @@ def run(
         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
         pitch_node = graph._nodes.get("pitch")
 
-        pcm_queue = queue.Queue[tuple[np.ndarray, dict[str, Any]]](maxsize=16)
+        pcm_queue = queue.Queue[tuple[np.ndarray, dict[str, Any]]](maxsize=32)
         queue_capacity = pcm_queue.maxsize
         producer_stop_event.clear()
 
@@ -815,7 +859,23 @@ def run(
             try:
                 while running and not producer_stop_event.is_set():
                     block_frames = max(1, audio_blocksize)
-                    total_frames = block_frames * producer_batch_blocks
+                    batch_blocks = producer_batch_blocks
+                    if pcm_queue is not None and queue_capacity:
+                        try:
+                            backlog = pcm_queue.qsize()
+                        except NotImplementedError:
+                            backlog = 0
+                        target_fill = max(
+                            producer_batch_blocks,
+                            int(queue_capacity * producer_fill_target),
+                        )
+                        if backlog < target_fill:
+                            deficit = max(1, target_fill - backlog)
+                            batch_blocks = min(
+                                producer_max_batch_blocks,
+                                max(producer_batch_blocks, deficit),
+                            )
+                    total_frames = block_frames * max(1, batch_blocks)
                     buffer, meta = _render_audio_frames(total_frames)
                     chunk_count = max(1, total_frames // block_frames)
                     per_chunk_duration = meta["render_duration"] / chunk_count
