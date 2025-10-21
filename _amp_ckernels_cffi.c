@@ -574,6 +574,65 @@ static void (*_cffi_call_python_org)(struct _cffi_externpy_s *, char *);
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int *boundaries;
+    int *trig_indices;
+    int8_t *gate_bool;
+    int8_t *drone_bool;
+    size_t boundary_cap;
+    size_t trig_cap;
+    size_t bool_cap;
+} envelope_scratch_t;
+
+static envelope_scratch_t envelope_scratch = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+
+static int envelope_reserve_scratch(int F) {
+    size_t needed_boundaries = (size_t)(4 * F + 4);
+    size_t needed_trig = (size_t)(F > 0 ? F : 1);
+    size_t needed_bool = (size_t)(F > 0 ? F : 1);
+
+    if (envelope_scratch.boundary_cap < needed_boundaries) {
+        int *new_boundaries = (int *)realloc(envelope_scratch.boundaries, needed_boundaries * sizeof(int));
+        if (new_boundaries == NULL) {
+            return 0;
+        }
+        envelope_scratch.boundaries = new_boundaries;
+        envelope_scratch.boundary_cap = needed_boundaries;
+    }
+
+    if (envelope_scratch.trig_cap < needed_trig) {
+        int *new_trig = (int *)realloc(envelope_scratch.trig_indices, needed_trig * sizeof(int));
+        if (new_trig == NULL) {
+            return 0;
+        }
+        envelope_scratch.trig_indices = new_trig;
+        envelope_scratch.trig_cap = needed_trig;
+    }
+
+    if (envelope_scratch.bool_cap < needed_bool) {
+        int8_t *gate_ptr = envelope_scratch.gate_bool;
+        int8_t *drone_ptr = envelope_scratch.drone_bool;
+        int8_t *new_gate = (int8_t *)realloc(gate_ptr, needed_bool * sizeof(int8_t));
+        int8_t *new_drone = (int8_t *)realloc(drone_ptr, needed_bool * sizeof(int8_t));
+        if (new_gate == NULL || new_drone == NULL) {
+            if (new_gate != NULL) {
+                envelope_scratch.gate_bool = new_gate;
+            }
+            if (new_drone != NULL) {
+                envelope_scratch.drone_bool = new_drone;
+            }
+            return 0;
+        }
+        envelope_scratch.gate_bool = new_gate;
+        envelope_scratch.drone_bool = new_drone;
+        envelope_scratch.bool_cap = needed_bool;
+    }
+
+    return 1;
+}
+
 void lfo_slew(const double* x, double* out, int B, int F, double r, double alpha, double* z0) {
     for (int b = 0; b < B; ++b) {
         double state = 0.0;
@@ -919,25 +978,14 @@ void envelope_process(
     double* reset_out
 ) {
     if (reset_out != NULL) {
-        int total = B * F;
-        for (int i = 0; i < total; ++i) {
-            reset_out[i] = 0.0;
-        }
+        size_t total = (size_t)B * (size_t)F;
+        memset(reset_out, 0, total * sizeof(double));
     }
     if (B <= 0 || F <= 0) {
         return;
     }
 
-    int boundary_capacity = 4 * F + 4;
-    int* boundaries = (int*)malloc(sizeof(int) * boundary_capacity);
-    int* trig_indices = (int*)malloc(sizeof(int) * (F > 0 ? F : 1));
-    int* gate_bool = (int*)malloc(sizeof(int) * (F > 0 ? F : 1));
-    int* drone_bool = (int*)malloc(sizeof(int) * (F > 0 ? F : 1));
-    if (boundaries == NULL || trig_indices == NULL || gate_bool == NULL || drone_bool == NULL) {
-        if (boundaries != NULL) free(boundaries);
-        if (trig_indices != NULL) free(trig_indices);
-        if (gate_bool != NULL) free(gate_bool);
-        if (drone_bool != NULL) free(drone_bool);
+    if (!envelope_reserve_scratch(F)) {
         envelope_process_simple(
             trigger,
             gate,
@@ -963,6 +1011,11 @@ void envelope_process(
         );
         return;
     }
+
+    int* boundaries = envelope_scratch.boundaries;
+    int* trig_indices = envelope_scratch.trig_indices;
+    int8_t* gate_bool = envelope_scratch.gate_bool;
+    int8_t* drone_bool = envelope_scratch.drone_bool;
 
     for (int b = 0; b < B; ++b) {
         int st = stage[b];
@@ -1060,7 +1113,7 @@ void envelope_process(
 
             int t = start;
             while (t < stop) {
-                int gate_on = gate_bool[t] || drone_bool[t];
+                int gate_on = (gate_bool[t] != 0) || (drone_bool[t] != 0);
 
                 int changed = 1;
                 while (changed) {
@@ -1332,11 +1385,6 @@ void envelope_process(
         activations[b] = acts;
         release_start[b] = rel_start;
     }
-
-    free(boundaries);
-    free(trig_indices);
-    free(gate_bool);
-    free(drone_bool);
 }
 
 // Advance phase per frame with optional reset line. dphi and phase_state are arrays of length B*F and B respectively
