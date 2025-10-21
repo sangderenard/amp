@@ -13,6 +13,7 @@ dependencies = [
     "networkx",
     "cffi>=2.0.0",
     "setuptools>=65",
+    "pandas",
 ]
 
 [project.scripts]
