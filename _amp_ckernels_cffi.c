@@ -573,6 +573,7 @@ static void (*_cffi_call_python_org)(struct _cffi_externpy_s *, char *);
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 void lfo_slew(const double* x, double* out, int B, int F, double r, double alpha, double* z0) {
     for (int b = 0; b < B; ++b) {
         double state = 0.0;
@@ -727,6 +728,173 @@ void subharmonic_process(
     }
 }
 
+static void envelope_start_attack(
+    int index,
+    const double* velocity,
+    int send_resets,
+    double* reset_line,
+    int* stage,
+    double* timer,
+    double* value,
+    double* vel_state,
+    double* release_start,
+    int64_t* activations
+) {
+    double vel = velocity[index];
+    if (vel < 0.0) vel = 0.0;
+    *stage = 1;
+    *timer = 0.0;
+    *value = 0.0;
+    *vel_state = vel;
+    *release_start = vel;
+    *activations += 1;
+    if (send_resets && reset_line != NULL) {
+        reset_line[index] = 1.0;
+    }
+}
+
+static void envelope_process_simple(
+    const double* trigger,
+    const double* gate,
+    const double* drone,
+    const double* velocity,
+    int B,
+    int F,
+    int atk_frames,
+    int hold_frames,
+    int dec_frames,
+    int sus_frames,
+    int rel_frames,
+    double sustain_level,
+    int send_resets,
+    int* stage,
+    double* value,
+    double* timer,
+    double* vel_state,
+    int64_t* activations,
+    double* release_start,
+    double* amp_out,
+    double* reset_out
+) {
+    for (int b = 0; b < B; ++b) {
+        int st = stage[b];
+        double val = value[b];
+        double tim = timer[b];
+        double vel = vel_state[b];
+        int64_t acts = activations[b];
+        double rel_start = release_start[b];
+        int base = b * F;
+        for (int i = 0; i < F; ++i) {
+            int idx = base + i;
+            int trig = trigger[idx] > 0.5 ? 1 : 0;
+            int gate_on = gate[idx] > 0.5 ? 1 : 0;
+            int drone_on = drone[idx] > 0.5 ? 1 : 0;
+
+            if (trig) {
+                envelope_start_attack(i, velocity + base, send_resets, reset_out != NULL ? reset_out + base : NULL, &st, &tim, &val, &vel, &rel_start, &acts);
+            } else if (st == 0 && (gate_on || drone_on)) {
+                envelope_start_attack(i, velocity + base, send_resets, reset_out != NULL ? reset_out + base : NULL, &st, &tim, &val, &vel, &rel_start, &acts);
+            }
+
+            if (st == 1) {
+                if (atk_frames <= 0) {
+                    val = vel;
+                    if (hold_frames > 0) st = 2;
+                    else if (dec_frames > 0) st = 3;
+                    else st = 4;
+                    tim = 0.0;
+                } else {
+                    val += vel / (double)(atk_frames > 0 ? atk_frames : 1);
+                    if (val > vel) val = vel;
+                    tim += 1.0;
+                    if (tim >= atk_frames) {
+                        val = vel;
+                        if (hold_frames > 0) st = 2;
+                        else if (dec_frames > 0) st = 3;
+                        else st = 4;
+                        tim = 0.0;
+                    }
+                }
+            } else if (st == 2) {
+                val = vel;
+                if (hold_frames <= 0) {
+                    if (dec_frames > 0) st = 3;
+                    else st = 4;
+                    tim = 0.0;
+                } else {
+                    tim += 1.0;
+                    if (tim >= hold_frames) {
+                        if (dec_frames > 0) st = 3;
+                        else st = 4;
+                        tim = 0.0;
+                    }
+                }
+            } else if (st == 3) {
+                double target = vel * sustain_level;
+                if (dec_frames <= 0) {
+                    val = target;
+                    st = 4;
+                    tim = 0.0;
+                } else {
+                    double delta = (vel - target) / (double)(dec_frames > 0 ? dec_frames : 1);
+                    double candidate = val - delta;
+                    if (candidate < target) candidate = target;
+                    val = candidate;
+                    tim += 1.0;
+                    if (tim >= dec_frames) {
+                        val = target;
+                        st = 4;
+                        tim = 0.0;
+                    }
+                }
+            } else if (st == 4) {
+                val = vel * sustain_level;
+                if (sus_frames > 0) {
+                    tim += 1.0;
+                    if (tim >= sus_frames) {
+                        st = 5;
+                        rel_start = val;
+                        tim = 0.0;
+                    }
+                } else if (!gate_on && !drone_on) {
+                    st = 5;
+                    rel_start = val;
+                    tim = 0.0;
+                }
+            } else if (st == 5) {
+                if (rel_frames <= 0) {
+                    val = 0.0;
+                    st = 0;
+                    tim = 0.0;
+                } else {
+                    double step = rel_start / (double)(rel_frames > 0 ? rel_frames : 1);
+                    double candidate = val - step;
+                    if (candidate < 0.0) candidate = 0.0;
+                    val = candidate;
+                    tim += 1.0;
+                    if (tim >= rel_frames) {
+                        val = 0.0;
+                        st = 0;
+                        tim = 0.0;
+                    }
+                }
+                if (gate_on || drone_on) {
+                    envelope_start_attack(i, velocity + base, send_resets, reset_out != NULL ? reset_out + base : NULL, &st, &tim, &val, &vel, &rel_start, &acts);
+                }
+            }
+
+            if (val < 0.0) val = 0.0;
+            amp_out[idx] = val;
+        }
+        stage[b] = st;
+        value[b] = val;
+        timer[b] = tim;
+        vel_state[b] = vel;
+        activations[b] = acts;
+        release_start[b] = rel_start;
+    }
+}
+
 void envelope_process(
     const double* trigger,
     const double* gate,
@@ -756,6 +924,46 @@ void envelope_process(
             reset_out[i] = 0.0;
         }
     }
+    if (B <= 0 || F <= 0) {
+        return;
+    }
+
+    int boundary_capacity = 4 * F + 4;
+    int* boundaries = (int*)malloc(sizeof(int) * boundary_capacity);
+    int* trig_indices = (int*)malloc(sizeof(int) * (F > 0 ? F : 1));
+    int* gate_bool = (int*)malloc(sizeof(int) * (F > 0 ? F : 1));
+    int* drone_bool = (int*)malloc(sizeof(int) * (F > 0 ? F : 1));
+    if (boundaries == NULL || trig_indices == NULL || gate_bool == NULL || drone_bool == NULL) {
+        if (boundaries != NULL) free(boundaries);
+        if (trig_indices != NULL) free(trig_indices);
+        if (gate_bool != NULL) free(gate_bool);
+        if (drone_bool != NULL) free(drone_bool);
+        envelope_process_simple(
+            trigger,
+            gate,
+            drone,
+            velocity,
+            B,
+            F,
+            atk_frames,
+            hold_frames,
+            dec_frames,
+            sus_frames,
+            rel_frames,
+            sustain_level,
+            send_resets,
+            stage,
+            value,
+            timer,
+            vel_state,
+            activations,
+            release_start,
+            amp_out,
+            reset_out
+        );
+        return;
+    }
+
     for (int b = 0; b < B; ++b) {
         int st = stage[b];
         double val = value[b];
@@ -763,89 +971,360 @@ void envelope_process(
         double vel = vel_state[b];
         int64_t acts = activations[b];
         double rel_start = release_start[b];
-        int base = b * F;
-        for (int i = 0; i < F; ++i) {
-            int idx = base + i;
-            int trig = trigger[idx] > 0.5 ? 1 : 0;
-            int gate_on = gate[idx] > 0.5 ? 1 : 0;
-            int drone_on = drone[idx] > 0.5 ? 1 : 0;
 
-            if (trig) {
-                st = 1; // ATTACK
-                tim = 0.0;
-                val = 0.0;
-                vel = velocity[idx] > 0.0 ? velocity[idx] : 0.0;
-                rel_start = vel;
-                acts += 1;
-                if (send_resets && reset_out != NULL) reset_out[idx] = 1.0;
-            } else if (st == 0 && (gate_on || drone_on)) {
-                st = 1;
-                tim = 0.0;
-                val = 0.0;
-                vel = velocity[idx] > 0.0 ? velocity[idx] : 0.0;
-                rel_start = vel;
-                acts += 1;
-                if (send_resets && reset_out != NULL) reset_out[idx] = 1.0;
+        const double* trig_line = trigger + b * F;
+        const double* gate_line = gate + b * F;
+        const double* drone_line = drone + b * F;
+        const double* vel_line = velocity + b * F;
+        double* amp_line = amp_out + b * F;
+        double* reset_line = reset_out != NULL ? reset_out + b * F : NULL;
+
+        int trig_count = 0;
+        for (int i = 0; i < F; ++i) {
+            if (trig_line[i] > 0.5) {
+                trig_indices[trig_count++] = i;
+            }
+            gate_bool[i] = gate_line[i] > 0.5 ? 1 : 0;
+            drone_bool[i] = drone_line[i] > 0.5 ? 1 : 0;
+        }
+
+        int boundary_count = 0;
+        boundaries[boundary_count++] = 0;
+        boundaries[boundary_count++] = F;
+        for (int i = 0; i < trig_count; ++i) {
+            boundaries[boundary_count++] = trig_indices[i];
+        }
+        for (int i = 1; i < F; ++i) {
+            if (gate_bool[i] != gate_bool[i - 1]) {
+                boundaries[boundary_count++] = i;
+            }
+            if (drone_bool[i] != drone_bool[i - 1]) {
+                boundaries[boundary_count++] = i;
+            }
+        }
+
+        for (int i = 1; i < boundary_count; ++i) {
+            int key = boundaries[i];
+            int j = i - 1;
+            while (j >= 0 && boundaries[j] > key) {
+                boundaries[j + 1] = boundaries[j];
+                --j;
+            }
+            boundaries[j + 1] = key;
+        }
+
+        int unique_count = 0;
+        for (int i = 0; i < boundary_count; ++i) {
+            int val_b = boundaries[i];
+            if (val_b < 0) val_b = 0;
+            if (val_b > F) val_b = F;
+            if (unique_count == 0 || boundaries[unique_count - 1] != val_b) {
+                boundaries[unique_count++] = val_b;
+            }
+        }
+        if (unique_count < 2) {
+            boundaries[0] = 0;
+            boundaries[1] = F;
+            unique_count = 2;
+        }
+
+        int trig_ptr = 0;
+        for (int seg = 0; seg < unique_count - 1; ++seg) {
+            int start = boundaries[seg];
+            int stop = boundaries[seg + 1];
+            if (start >= F) {
+                break;
+            }
+            if (stop > F) {
+                stop = F;
+            }
+            if (stop <= start) {
+                continue;
             }
 
-            if (st == 1) { // ATTACK
-                if (atk_frames <= 0) {
-                    val = vel;
-                    if (hold_frames > 0) st = 2; else if (dec_frames > 0) st = 3; else st = 4;
-                    tim = 0.0;
-                } else {
-                    val += vel / (double)atk_frames;
-                    if (val > vel) val = vel;
-                    tim += 1.0;
-                    if (tim >= atk_frames) {
+            while (trig_ptr < trig_count && trig_indices[trig_ptr] == start) {
+                envelope_start_attack(
+                    start,
+                    vel_line,
+                    send_resets,
+                    reset_line,
+                    &st,
+                    &tim,
+                    &val,
+                    &vel,
+                    &rel_start,
+                    &acts
+                );
+                trig_ptr++;
+            }
+
+            int t = start;
+            while (t < stop) {
+                int gate_on = gate_bool[t] || drone_bool[t];
+
+                int changed = 1;
+                while (changed) {
+                    changed = 0;
+                    if (st == 1 && atk_frames <= 0) {
                         val = vel;
-                        if (hold_frames > 0) st = 2; else if (dec_frames > 0) st = 3; else st = 4;
+                        if (hold_frames > 0) st = 2;
+                        else if (dec_frames > 0) st = 3;
+                        else st = 4;
                         tim = 0.0;
+                        changed = 1;
+                        continue;
+                    }
+                    if (st == 2 && hold_frames <= 0) {
+                        if (dec_frames > 0) st = 3;
+                        else st = 4;
+                        tim = 0.0;
+                        changed = 1;
+                        continue;
+                    }
+                    if (st == 3 && dec_frames <= 0) {
+                        val = vel * sustain_level;
+                        st = 4;
+                        tim = 0.0;
+                        changed = 1;
+                        continue;
+                    }
+                    if (st == 5 && rel_frames <= 0) {
+                        val = 0.0;
+                        st = 0;
+                        tim = 0.0;
+                        changed = 1;
+                        continue;
                     }
                 }
-            } else if (st == 2) { // HOLD
-                val = vel;
-                if (hold_frames <= 0) {
-                    if (dec_frames > 0) st = 3; else st = 4;
-                    tim = 0.0;
-                } else {
-                    tim += 1.0;
-                    if (tim >= hold_frames) { if (dec_frames > 0) st = 3; else st = 4; tim = 0.0; }
-                }
-            } else if (st == 3) { // DECAY
-                double target = vel * sustain_level;
-                if (dec_frames <= 0) { val = target; st = 4; tim = 0.0; }
-                else {
-                    double delta = (vel - target) / (double)(dec_frames > 0 ? dec_frames : 1);
-                    if (val - delta < target) val = target; else val = val - delta;
-                    tim += 1.0;
-                    if (tim >= dec_frames) { val = target; st = 4; tim = 0.0; }
-                }
-            } else if (st == 4) { // SUSTAIN
-                val = vel * sustain_level;
-                if (sus_frames > 0) {
-                    tim += 1.0;
-                    if (tim >= sus_frames) { st = 5; rel_start = val; tim = 0.0; }
-                } else if (!gate_on && !drone_on) {
-                    st = 5; rel_start = val; tim = 0.0;
-                }
-            } else if (st == 5) { // RELEASE
-                if (rel_frames <= 0) { val = 0.0; st = 0; tim = 0.0; }
-                else {
-                    double step = rel_start / (double)(rel_frames > 0 ? rel_frames : 1);
-                    if (val - step < 0.0) val = 0.0; else val = val - step;
-                    tim += 1.0;
-                    if (tim >= rel_frames) { val = 0.0; st = 0; tim = 0.0; }
-                }
-                if (gate_on || drone_on) {
-                    st = 1; tim = 0.0; val = 0.0; vel = velocity[idx] > 0.0 ? velocity[idx] : 0.0; rel_start = vel; acts += 1;
-                    if (send_resets && reset_out != NULL) reset_out[idx] = 1.0;
-                }
-            }
 
-            if (val < 0.0) val = 0.0;
-            amp_out[idx] = val;
+                if (st == 0) {
+                    if (gate_on) {
+                        envelope_start_attack(
+                            t,
+                            vel_line,
+                            send_resets,
+                            reset_line,
+                            &st,
+                            &tim,
+                            &val,
+                            &vel,
+                            &rel_start,
+                            &acts
+                        );
+                        continue;
+                    }
+                    int seg_len = stop - t;
+                    for (int k = 0; k < seg_len; ++k) {
+                        amp_line[t + k] = 0.0;
+                    }
+                    val = 0.0;
+                    tim = 0.0;
+                    t = stop;
+                    continue;
+                }
+
+                if (st == 1) {
+                    if (atk_frames <= 0) {
+                        continue;
+                    }
+                    int remaining = atk_frames - (int)tim;
+                    if (remaining <= 0) remaining = 1;
+                    int seg_len = stop - t;
+                    if (seg_len > remaining) seg_len = remaining;
+                    if (seg_len <= 0) {
+                        t = stop;
+                        continue;
+                    }
+                    double step = vel / (atk_frames > 0 ? (double)atk_frames : 1.0);
+                    for (int k = 0; k < seg_len; ++k) {
+                        double sample = val + step * (double)(k + 1);
+                        if (vel >= 0.0 && sample > vel) sample = vel;
+                        if (sample < 0.0) sample = 0.0;
+                        amp_line[t + k] = sample;
+                    }
+                    val = amp_line[t + seg_len - 1];
+                    tim += (double)seg_len;
+                    if (atk_frames > 0 && tim >= atk_frames) {
+                        val = vel;
+                        if (hold_frames > 0) st = 2;
+                        else if (dec_frames > 0) st = 3;
+                        else st = 4;
+                        tim = 0.0;
+                    }
+                    t += seg_len;
+                    continue;
+                }
+
+                if (st == 2) {
+                    if (hold_frames <= 0) {
+                        continue;
+                    }
+                    int remaining = hold_frames - (int)tim;
+                    if (remaining <= 0) remaining = 1;
+                    int seg_len = stop - t;
+                    if (seg_len > remaining) seg_len = remaining;
+                    if (seg_len <= 0) {
+                        t = stop;
+                        continue;
+                    }
+                    for (int k = 0; k < seg_len; ++k) {
+                        amp_line[t + k] = vel;
+                    }
+                    val = vel;
+                    tim += (double)seg_len;
+                    if (tim >= hold_frames) {
+                        if (dec_frames > 0) st = 3;
+                        else st = 4;
+                        tim = 0.0;
+                    }
+                    t += seg_len;
+                    continue;
+                }
+
+                if (st == 3) {
+                    if (dec_frames <= 0) {
+                        continue;
+                    }
+                    int remaining = dec_frames - (int)tim;
+                    if (remaining <= 0) remaining = 1;
+                    int seg_len = stop - t;
+                    if (seg_len > remaining) seg_len = remaining;
+                    if (seg_len <= 0) {
+                        t = stop;
+                        continue;
+                    }
+                    double target = vel * sustain_level;
+                    double delta = (vel - target) / (dec_frames > 0 ? (double)dec_frames : 1.0);
+                    for (int k = 0; k < seg_len; ++k) {
+                        double sample = val - delta * (double)(k + 1);
+                        if (sample < target) sample = target;
+                        if (sample < 0.0) sample = 0.0;
+                        amp_line[t + k] = sample;
+                    }
+                    val = amp_line[t + seg_len - 1];
+                    tim += (double)seg_len;
+                    if (tim >= dec_frames) {
+                        val = target;
+                        st = 4;
+                        tim = 0.0;
+                    }
+                    t += seg_len;
+                    continue;
+                }
+
+                if (st == 4) {
+                    double sustain_val = vel * sustain_level;
+                    if (sus_frames > 0) {
+                        int remaining = sus_frames - (int)tim;
+                        if (remaining <= 0) remaining = 1;
+                        int seg_len = stop - t;
+                        if (seg_len > remaining) seg_len = remaining;
+                        if (seg_len <= 0) {
+                            t = stop;
+                            continue;
+                        }
+                        for (int k = 0; k < seg_len; ++k) {
+                            amp_line[t + k] = sustain_val;
+                        }
+                        val = sustain_val;
+                        tim += (double)seg_len;
+                        if (tim >= sus_frames) {
+                            st = 5;
+                            rel_start = val;
+                            tim = 0.0;
+                        }
+                        t += seg_len;
+                        continue;
+                    } else {
+                        int seg_len = stop - t;
+                        if (!gate_on && seg_len > 1) {
+                            seg_len = 1;
+                        }
+                        if (seg_len <= 0) {
+                            seg_len = 1;
+                            if (t + seg_len > stop) seg_len = stop - t;
+                        }
+                        if (seg_len <= 0) {
+                            break;
+                        }
+                        for (int k = 0; k < seg_len; ++k) {
+                            amp_line[t + k] = sustain_val;
+                        }
+                        val = sustain_val;
+                        if (!gate_on) {
+                            st = 5;
+                            rel_start = val;
+                            tim = 0.0;
+                        } else {
+                            tim = 0.0;
+                        }
+                        t += seg_len;
+                        continue;
+                    }
+                }
+
+                if (st == 5) {
+                    if (gate_on) {
+                        amp_line[t] = 0.0;
+                        envelope_start_attack(
+                            t,
+                            vel_line,
+                            send_resets,
+                            reset_line,
+                            &st,
+                            &tim,
+                            &val,
+                            &vel,
+                            &rel_start,
+                            &acts
+                        );
+                        t += 1;
+                        continue;
+                    }
+                    if (rel_frames <= 0) {
+                        continue;
+                    }
+                    int remaining = rel_frames - (int)tim;
+                    if (remaining <= 0) remaining = 1;
+                    int seg_len = stop - t;
+                    if (seg_len > remaining) seg_len = remaining;
+                    if (seg_len <= 0) {
+                        seg_len = remaining;
+                        if (seg_len <= 0) seg_len = 1;
+                        if (t + seg_len > stop) seg_len = stop - t;
+                        if (seg_len <= 0) {
+                            break;
+                        }
+                    }
+                    double step = rel_start / (rel_frames > 0 ? (double)rel_frames : 1.0);
+                    for (int k = 0; k < seg_len; ++k) {
+                        double sample = val - step * (double)(k + 1);
+                        if (sample < 0.0) sample = 0.0;
+                        amp_line[t + k] = sample;
+                    }
+                    val = amp_line[t + seg_len - 1];
+                    tim += (double)seg_len;
+                    if (tim >= rel_frames) {
+                        val = 0.0;
+                        st = 0;
+                        tim = 0.0;
+                    }
+                    t += seg_len;
+                    continue;
+                }
+
+                // Unknown stage -> silence and exit segment.
+                for (int k = t; k < stop; ++k) {
+                    amp_line[k] = 0.0;
+                }
+                val = 0.0;
+                tim = 0.0;
+                st = 0;
+                t = stop;
+            }
         }
+
+        if (val < 0.0) val = 0.0;
         stage[b] = st;
         value[b] = val;
         timer[b] = tim;
@@ -853,6 +1332,11 @@ void envelope_process(
         activations[b] = acts;
         release_start[b] = rel_start;
     }
+
+    free(boundaries);
+    free(trig_indices);
+    free(gate_bool);
+    free(drone_bool);
 }
 
 // Advance phase per frame with optional reset line. dphi and phase_state are arrays of length B*F and B respectively

@@ -582,7 +582,6 @@ class EnvelopeModulatorNode(Node):
     _DECAY = 3
     _SUSTAIN = 4
     _RELEASE = 5
-
     def __init__(
         self,
         name,
@@ -688,27 +687,51 @@ class EnvelopeModulatorNode(Node):
         reset = out[:, 1, :]
 
         send_reset_flag = bool(send_reset.mean() > 0.5)
-        amp, reset = c_kernels.envelope_process_c(
-            trigger,
-            gate,
-            drone,
-            velocity,
-            atk_frames,
-            hold_frames,
-            dec_frames,
-            sus_frames,
-            rel_frames,
-            self.sustain_level,
-            send_reset_flag,
-            self._stage,
-            self._value,
-            self._timer,
-            self._velocity,
-            self._activation_count,
-            self._release_start,
-            out_amp=amp,
-            out_reset=reset,
-        )
+
+        try:
+            amp, reset = c_kernels.envelope_process_c(
+                trigger,
+                gate,
+                drone,
+                velocity,
+                atk_frames,
+                hold_frames,
+                dec_frames,
+                sus_frames,
+                rel_frames,
+                self.sustain_level,
+                send_reset_flag,
+                self._stage,
+                self._value,
+                self._timer,
+                self._velocity,
+                self._activation_count,
+                self._release_start,
+                out_amp=amp,
+                out_reset=reset,
+            )
+        except RuntimeError:
+            amp, reset = c_kernels.envelope_process_py(
+                trigger,
+                gate,
+                drone,
+                velocity,
+                atk_frames,
+                hold_frames,
+                dec_frames,
+                sus_frames,
+                rel_frames,
+                self.sustain_level,
+                send_reset_flag,
+                self._stage,
+                self._value,
+                self._timer,
+                self._velocity,
+                self._activation_count,
+                self._release_start,
+                out_amp=amp,
+                out_reset=reset,
+            )
 
         np.copyto(self._gate_state, gate_active[:, -1], casting="no")
         np.copyto(self._drone_state, drone_active[:, -1], casting="no")
