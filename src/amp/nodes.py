@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from . import quantizer, utils
+from . import envelope, quantizer, utils
 from .utils import (
     as_BCF,
     assert_BCF,
