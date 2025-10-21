@@ -605,6 +605,10 @@ class AudioGraph:
         plan = self._ensure_execution_plan()
         caches: Dict[str, np.ndarray | None] = {name: None for name in self._nodes}
         node_timings: Dict[str, float] = {}
+        for node in self._nodes.values():
+            recycle = getattr(node, "recycle_blocks", None)
+            if recycle is not None:
+                recycle()
         for entry in plan:
             name = entry.name
             audio_inputs: List[np.ndarray] = []
