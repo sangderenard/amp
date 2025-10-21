@@ -87,6 +87,7 @@ def test_controller_polls_values(monkeypatch):
 
     controller = JoystickController.create(JoystickConfig(enabled=True, axes={"x": 0}, buttons={"trigger": 0}))
     state = controller.poll()
+    assert state.timestamp > 0.0
     assert state.axes == {"x": 0.5}
     assert state.buttons == {"trigger": True}
     controller.close()
@@ -116,6 +117,7 @@ def test_application_with_stubbed_joystick(monkeypatch):
     assert app.joystick_error is None
     state = app.poll_joystick()
     assert state is not None
+    assert state.timestamp > 0.0
     assert state.axes["x"] == 0.5
     assert state.buttons["trigger"] is True
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
+from time import perf_counter
 from types import ModuleType
 from typing import Dict, Mapping
 
@@ -18,6 +19,7 @@ class JoystickUnavailableError(RuntimeError):
 class JoystickState:
     """Snapshot of the current joystick inputs."""
 
+    timestamp: float
     axes: Dict[str, float]
     buttons: Dict[str, bool]
 
@@ -63,7 +65,7 @@ class JoystickController:
             self._pygame.event.pump()
         axes = {name: float(self._device.get_axis(index)) for name, index in self._axes.items()}
         buttons = {name: bool(self._device.get_button(index)) for name, index in self._buttons.items()}
-        return JoystickState(axes=axes, buttons=buttons)
+        return JoystickState(timestamp=perf_counter(), axes=axes, buttons=buttons)
 
     def close(self) -> None:
         if hasattr(self._device, "quit"):
