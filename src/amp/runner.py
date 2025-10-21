@@ -150,6 +150,7 @@ def render_audio_block(
         envelope_names,
         amp_mod_names,
         joystick_curves,
+        start_time=start_time,
     )
     audio_block = graph.render_block(frames, sample_rate, base_params)
     meta = {
