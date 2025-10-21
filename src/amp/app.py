@@ -334,6 +334,8 @@ def build_base_params(
     envelope_names: list[str],
     amp_mod_names: list[str],
     joystick_curves: dict,
+    *,
+    start_time: float | None = None,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Construct the base parameter dict used for rendering blocks.
 
@@ -343,8 +345,13 @@ def build_base_params(
 
 
     # All controller data must be sourced from the control history (via AudioGraph/ControlDelay)
-    # Sample the control history for the current block
-    sampled = graph.sample_control_tensor(getattr(graph, 'latest_time', 0.0), frames)
+    # Sample the control history for the current block using the caller-supplied timestamp.
+    sample_start = (
+        start_time
+        if start_time is not None
+        else getattr(getattr(graph, "control_delay", None), "latest_time", 0.0)
+    )
+    sampled = graph.sample_control_tensor(sample_start, frames)
     sampled_extras = sampled.get("extras", {})
 
     # Keyboard controller (if present in history/extras)
@@ -593,17 +600,61 @@ def run(
     # Build the graph before starting ControllerMonitor so it can be passed as control_history
     graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
 
+    axis_map = {
+        "momentary": 2,
+        "drone": 5,
+        "velocity": 2,
+        "pitch_input": 0,
+        "cutoff": int(state.get("filter_axis_cutoff", 3)),
+        "q": int(state.get("filter_axis_q", 4)),
+    }
+    button_map = {"momentary": 0, "drone_toggle": 1}
+
+    def _poll_controller_state() -> tuple[list[float], list[float]]:
+        try:
+            if hasattr(pygame, "event") and hasattr(pygame.event, "pump"):
+                pygame.event.pump()
+        except Exception:
+            pass
+
+        axes: list[float] = []
+        buttons: list[float] = []
+
+        try:
+            axis_count = int(getattr(joy, "get_numaxes", lambda: 0)())
+        except Exception:
+            axis_count = 0
+        for idx in range(max(0, axis_count)):
+            try:
+                axes.append(float(joy.get_axis(idx)))
+            except Exception:
+                axes.append(0.0)
+
+        try:
+            button_count = int(getattr(joy, "get_numbuttons", lambda: 0)())
+        except Exception:
+            button_count = 0
+        for idx in range(max(0, button_count)):
+            try:
+                buttons.append(float(joy.get_button(idx)))
+            except Exception:
+                buttons.append(0.0)
+
+        return axes, buttons
+
     # All controller input is now handled by ControllerMonitor, which writes to control history.
     # No direct polling or caching of controller state outside the history-backed thread.
     controller_monitor = ControllerMonitor(
-        poll_fn=None,  # Actual polling is handled inside ControllerMonitor
+        poll_fn=_poll_controller_state,
         control_history=graph,
         poll_interval=controller_poll_interval,
         audio_frame_rate=sample_rate,
+        state=state,
+        axis_map=axis_map,
+        button_map=button_map,
     )
     controller_monitor.start()
 
-    sample_rate = 44100
     freq_target = 220.0
     freq_current = 220.0
     velocity_target = 0.0
@@ -623,7 +674,6 @@ def run(
     envelope_mode_idx = 0
     envelope_mode = envelope_modes[envelope_mode_idx]
 
-    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
     pitch_node = graph._nodes.get("pitch")
     menu_instance = menu.Menu(state)
     menu_instance.toggle()
@@ -708,6 +758,9 @@ def run(
     from .controls import _assign_control as _assign_control_cache
 
     def _render_audio_frames(frames: int) -> tuple[np.ndarray, dict[str, Any]]:
+        nonlocal velocity_target, velocity_current, cutoff_target, cutoff_current
+        nonlocal q_target, q_current, gate_momentary
+        nonlocal pitch_input_value, pitch_span_value, root_midi_value
         # All controller state is now handled by ControllerMonitor and control history.
 
         sr = sample_rate
@@ -747,6 +800,25 @@ def run(
             "pitch_span": sampled_extras.get("pitch_span", float(pitch_span_value)),
             "pitch_root": sampled_extras.get("pitch_root", float(root_midi_value)),
         }
+
+        def _curve_latest(value: np.ndarray | float | int, fallback: float) -> float:
+            array = np.asarray(value, dtype=float)
+            if array.ndim == 0:
+                return float(array)
+            if array.size == 0:
+                return fallback
+            return float(array.reshape(-1)[-1])
+
+        velocity_target = _curve_latest(joystick_curves["velocity"], velocity_target)
+        velocity_current = velocity_target
+        cutoff_target = _curve_latest(joystick_curves["cutoff"], cutoff_target)
+        cutoff_current = cutoff_target
+        q_target = _curve_latest(joystick_curves["q"], q_target)
+        q_current = q_target
+        pitch_input_value = _curve_latest(joystick_curves["pitch_input"], pitch_input_value)
+        pitch_span_value = _curve_latest(joystick_curves["pitch_span"], pitch_span_value)
+        root_midi_value = _curve_latest(joystick_curves["pitch_root"], root_midi_value)
+        gate_momentary = _curve_latest(joystick_curves["gate"], 1.0 if gate_momentary else 0.0) >= 0.5
 
         # Use shared runner for rendering
         from .runner import render_audio_block
@@ -1833,11 +1905,11 @@ def run(
 
 
             # All controller input is now handled by ControllerMonitor and written to control history.
-            # If UI needs to know the latest state, it can query controller_monitor.get_latest_curves(),
+            # If UI needs to know the latest state, it can query controller_monitor.get_latest_snapshot(),
             # but all graph and node access must use the history.
 
             # All controller state for graph/nodes is now sourced from control history.
-            # If UI needs to display the latest controller state, use controller_monitor.get_latest_curves().
+            # If UI needs to display the latest controller state, use controller_monitor.get_latest_snapshot().
             # Remove all direct access to axes_current, buttons_current, prev_buttons, etc.
 
             with callback_timing_lock:
@@ -2072,6 +2144,10 @@ def run(
     finally:
         running = False
         producer_stop_event.set()
+        try:
+            controller_monitor.stop()
+        except Exception:
+            pass
         if producer_thread_obj is not None:
             producer_thread_obj.join(timeout=1.0)
         if pcm_queue is not None:
