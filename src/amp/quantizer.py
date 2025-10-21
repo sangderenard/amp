@@ -2,7 +2,7 @@
 import numpy as np
 import math
 
-from .utils import _grid_sorted
+from .utils import RAW_DTYPE, _grid_sorted
 
 # =========================
 # Quantizer dictionaries
@@ -47,36 +47,50 @@ def is_free_mode_token(tok: str) -> bool:
 
 # ----- Equal-distance grid warping (per-degree spacing uniform) -----
 def grid_warp_forward(cents, grid_cents):
-    """
-    Map cents -> u (degree units). Each adjacent degree occupies exactly 1 unit.
-    u increases by N (len(grid)) per octave.
-    """
-    g, g_ext = _grid_sorted(grid_cents)
-    N = g.size
-    c_mod = cents % 1200.0
-    octs = math.floor(cents / 1200.0)
+    """Map cents -> fractional degree units."""
 
-    # find segment i with g_ext[i] <= c_mod <= g_ext[i+1]
-    i = int(np.searchsorted(g_ext, c_mod, side='right') - 1)
-    i = max(0, min(i, N - 1))
-    denom = max(g_ext[i+1] - g_ext[i], 1e-9)
-    t = (c_mod - g_ext[i]) / denom  # local fraction within the step
-    u_mod = i + t
-    return octs * N + u_mod
+    g, g_ext = _grid_sorted(grid_cents)
+    N = int(g.size)
+    cents_arr = np.asarray(cents, dtype=RAW_DTYPE)
+    scalar = np.isscalar(cents) or cents_arr.ndim == 0
+
+    c_mod = np.mod(cents_arr, 1200.0)
+    octs = np.floor(cents_arr / 1200.0)
+
+    idx = np.searchsorted(g_ext, c_mod, side="right") - 1
+    idx = np.clip(idx, 0, N - 1)
+    lower = g_ext[idx]
+    upper = g_ext[idx + 1]
+    denom = np.maximum(upper - lower, 1e-9)
+    t = (c_mod - lower) / denom
+    u_mod = idx + t
+    out = octs * N + u_mod
+
+    if scalar:
+        return float(np.asarray(out, dtype=RAW_DTYPE).reshape(-1)[0])
+    return out.astype(RAW_DTYPE, copy=False)
 
 def grid_warp_inverse(u, grid_cents):
-    """
-    Map u (degree units) -> cents. Inverse of grid_warp_forward.
-    """
+    """Map degree units -> cents."""
+
     g, g_ext = _grid_sorted(grid_cents)
-    N = g.size
-    octs = math.floor(u / N)
-    u_mod = u - octs * N
-    i = int(math.floor(u_mod))
-    i = max(0, min(i, N - 1))
-    t = u_mod - i
-    c_mod = g_ext[i] + t * (g_ext[i+1] - g_ext[i])
-    return octs * 1200.0 + c_mod
+    N = int(g.size)
+    u_arr = np.asarray(u, dtype=RAW_DTYPE)
+    scalar = np.isscalar(u) or u_arr.ndim == 0
+
+    octs = np.floor(u_arr / N)
+    u_mod = u_arr - octs * N
+    idx = np.floor(u_mod).astype(np.intp)
+    idx = np.clip(idx, 0, N - 1)
+    frac = u_mod - idx
+    lower = g_ext[idx]
+    upper = g_ext[idx + 1]
+    c_mod = lower + frac * (upper - lower)
+    out = octs * 1200.0 + c_mod
+
+    if scalar:
+        return float(np.asarray(out, dtype=RAW_DTYPE).reshape(-1)[0])
+    return out.astype(RAW_DTYPE, copy=False)
 
 def token_to_tuning_mode(token: str):
     """Return (tuning, mode) or ('FREE', None).

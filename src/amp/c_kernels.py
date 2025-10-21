@@ -263,6 +263,12 @@ void envelope_process(
     double* amp_out,
     double* reset_out
 ) {
+    if (reset_out != NULL) {
+        int total = B * F;
+        for (int i = 0; i < total; ++i) {
+            reset_out[i] = 0.0;
+        }
+    }
     for (int b = 0; b < B; ++b) {
         int st = stage[b];
         double val = value[b];
@@ -276,7 +282,6 @@ void envelope_process(
             int trig = trigger[idx] > 0.5 ? 1 : 0;
             int gate_on = gate[idx] > 0.5 ? 1 : 0;
             int drone_on = drone[idx] > 0.5 ? 1 : 0;
-            int send_reset_line = send_resets ? (reset_out != NULL && reset_out[idx]) : 0; // placeholder, will handle below
 
             if (trig) {
                 st = 1; // ATTACK
@@ -1444,162 +1449,6 @@ def envelope_process_c(
     )
 
     return out_amp, out_reset
-
-
-def envelope_process_py(
-    trigger: np.ndarray,
-    gate: np.ndarray,
-    drone: np.ndarray,
-    velocity: np.ndarray,
-    atk_frames: int,
-    hold_frames: int,
-    dec_frames: int,
-    sus_frames: int,
-    rel_frames: int,
-    sustain_level: float,
-    send_resets: bool,
-    stage: np.ndarray,
-    value: np.ndarray,
-    timer: np.ndarray,
-    vel_state: np.ndarray,
-    activations: np.ndarray,
-    release_start: np.ndarray,
-    *,
-    out_amp: np.ndarray | None = None,
-    out_reset: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    B, F = trigger.shape
-    if out_amp is None:
-        amp = np.zeros((B, F), dtype=float)
-    else:
-        if out_amp.shape != (B, F):
-            raise ValueError("out_amp has incorrect shape")
-        amp = out_amp
-        amp.fill(0.0)
-    if out_reset is None:
-        reset = np.zeros((B, F), dtype=float)
-    else:
-        if out_reset.shape != (B, F):
-            raise ValueError("out_reset has incorrect shape")
-        reset = out_reset
-        reset.fill(0.0)
-    for b in range(B):
-        st = int(stage[b])
-        val = float(value[b])
-        tim = float(timer[b])
-        vel = float(vel_state[b])
-        acts = int(activations[b])
-        rel_start = float(release_start[b])
-        trig_line = trigger[b] > 0.5
-        gate_line = gate[b] > 0.5
-        drone_line = drone[b] > 0.5
-        for i in range(F):
-            trig = bool(trig_line[i])
-            gate_on = bool(gate_line[i])
-            drone_on = bool(drone_line[i])
-            if trig:
-                st = 1
-                tim = 0.0
-                val = 0.0
-                vel = max(0.0, float(velocity[b, i]))
-                rel_start = vel
-                acts += 1
-                if send_resets:
-                    reset[b, i] = 1.0
-            elif st == 0 and (gate_on or drone_on):
-                st = 1
-                tim = 0.0
-                val = 0.0
-                vel = max(0.0, float(velocity[b, i]))
-                rel_start = vel
-                acts += 1
-                if send_resets:
-                    reset[b, i] = 1.0
-
-            if st == 1:
-                if atk_frames <= 0:
-                    val = vel
-                    st = 2 if hold_frames > 0 else (3 if dec_frames > 0 else 4)
-                    tim = 0.0
-                else:
-                    val += vel / max(atk_frames, 1)
-                    if val > vel:
-                        val = vel
-                    tim += 1.0
-                    if tim >= atk_frames:
-                        val = vel
-                        st = 2 if hold_frames > 0 else (3 if dec_frames > 0 else 4)
-                        tim = 0.0
-            elif st == 2:
-                val = vel
-                if hold_frames <= 0:
-                    st = 3 if dec_frames > 0 else 4
-                    tim = 0.0
-                else:
-                    tim += 1.0
-                    if tim >= hold_frames:
-                        st = 3 if dec_frames > 0 else 4
-                        tim = 0.0
-            elif st == 3:
-                target = vel * sustain_level
-                if dec_frames <= 0:
-                    val = target
-                    st = 4
-                    tim = 0.0
-                else:
-                    delta = (vel - target) / max(dec_frames, 1)
-                    val = max(target, val - delta)
-                    tim += 1.0
-                    if tim >= dec_frames:
-                        val = target
-                        st = 4
-                        tim = 0.0
-            elif st == 4:
-                val = vel * sustain_level
-                if sus_frames > 0:
-                    tim += 1.0
-                    if tim >= sus_frames:
-                        st = 5
-                        rel_start = val
-                        tim = 0.0
-                elif not gate_on and not drone_on:
-                    st = 5
-                    rel_start = val
-                    tim = 0.0
-            elif st == 5:
-                if rel_frames <= 0:
-                    val = 0.0
-                    st = 0
-                    tim = 0.0
-                else:
-                    step = rel_start / max(rel_frames, 1)
-                    val = max(0.0, val - step)
-                    tim += 1.0
-                    if tim >= rel_frames:
-                        val = 0.0
-                        st = 0
-                        tim = 0.0
-                if gate_on or drone_on:
-                    st = 1
-                    tim = 0.0
-                    val = 0.0
-                    vel = max(0.0, float(velocity[b, i]))
-                    rel_start = vel
-                    acts += 1
-                    if send_resets:
-                        reset[b, i] = 1.0
-
-            val = max(0.0, val)
-            amp[b, i] = val
-
-        stage[b] = st
-        value[b] = val
-        timer[b] = tim
-        vel_state[b] = vel
-        activations[b] = acts
-        release_start[b] = rel_start
-
-    return amp, reset
 
 
 

@@ -636,182 +636,6 @@ class EnvelopeModulatorNode(Node):
         if self._drone_state is None or self._drone_state.shape[0] != B:
             self._drone_state = np.zeros(B, dtype=bool)
 
-    def _process_quiescent(
-        self,
-        atk_frames: int,
-        hold_frames: int,
-        dec_frames: int,
-        sus_frames: int,
-        rel_frames: int,
-        sustain_level: float,
-        frames: int,
-        amp: np.ndarray,
-        reset: np.ndarray,
-    ) -> None:
-        B = self._stage.shape[0]
-        amp.fill(0.0)
-        reset.fill(0.0)
-
-        next_attack_stage = (
-            self._HOLD
-            if hold_frames > 0
-            else (self._DECAY if dec_frames > 0 else self._SUSTAIN)
-        )
-        next_hold_stage = self._DECAY if dec_frames > 0 else self._SUSTAIN
-
-        for b in range(B):
-            st = int(self._stage[b])
-            val = float(self._value[b])
-            tim = float(self._timer[b])
-            vel = float(self._velocity[b])
-            rel_start = float(self._release_start[b])
-            frame = 0
-
-            while frame < frames:
-                if st == self._IDLE:
-                    amp[b, frame:] = 0.0
-                    val = 0.0
-                    tim = 0.0
-                    frame = frames
-                elif st == self._ATTACK:
-                    if atk_frames <= 0:
-                        val = vel
-                        tim = 0.0
-                        st = next_attack_stage
-                        continue
-                    remaining = max(atk_frames - int(tim), 0)
-                    if remaining <= 0:
-                        tim = 0.0
-                        val = vel
-                        st = next_attack_stage
-                        continue
-                    seg = min(frames - frame, remaining)
-                    if seg <= 0:
-                        break
-                    step = vel / max(atk_frames, 1)
-                    idx = np.arange(1, seg + 1, dtype=RAW_DTYPE)
-                    seg_vals = np.minimum(vel, val + step * idx)
-                    amp[b, frame : frame + seg] = seg_vals
-                    val = float(seg_vals[-1])
-                    tim += seg
-                    frame += seg
-                    if tim >= atk_frames:
-                        tim = 0.0
-                        val = vel
-                        st = next_attack_stage
-                    continue
-                elif st == self._HOLD:
-                    val = vel
-                    if hold_frames <= 0:
-                        tim = 0.0
-                        st = next_hold_stage
-                        continue
-                    remaining = max(hold_frames - int(tim), 0)
-                    if remaining <= 0:
-                        tim = 0.0
-                        st = next_hold_stage
-                        continue
-                    seg = min(frames - frame, remaining)
-                    if seg <= 0:
-                        break
-                    amp[b, frame : frame + seg] = val
-                    frame += seg
-                    tim += seg
-                    if tim >= hold_frames:
-                        tim = 0.0
-                        st = next_hold_stage
-                    continue
-                elif st == self._DECAY:
-                    target = vel * sustain_level
-                    if dec_frames <= 0:
-                        val = target
-                        tim = 0.0
-                        st = self._SUSTAIN
-                        continue
-                    remaining = max(dec_frames - int(tim), 0)
-                    if remaining <= 0:
-                        val = target
-                        tim = 0.0
-                        st = self._SUSTAIN
-                        continue
-                    seg = min(frames - frame, remaining)
-                    if seg <= 0:
-                        break
-                    delta = (vel - target) / max(dec_frames, 1)
-                    idx = np.arange(1, seg + 1, dtype=RAW_DTYPE)
-                    seg_vals = np.maximum(target, val - delta * idx)
-                    amp[b, frame : frame + seg] = seg_vals
-                    val = float(seg_vals[-1])
-                    tim += seg
-                    frame += seg
-                    if tim >= dec_frames:
-                        tim = 0.0
-                        val = target
-                        st = self._SUSTAIN
-                    continue
-                elif st == self._SUSTAIN:
-                    val = vel * sustain_level
-                    if sus_frames > 0:
-                        remaining = max(sus_frames - int(tim), 0)
-                        if remaining <= 0:
-                            tim = 0.0
-                            rel_start = val
-                            st = self._RELEASE
-                            continue
-                        seg = min(frames - frame, remaining)
-                        if seg <= 0:
-                            break
-                        amp[b, frame : frame + seg] = val
-                        frame += seg
-                        tim += seg
-                        if tim >= sus_frames:
-                            tim = 0.0
-                            rel_start = val
-                            st = self._RELEASE
-                    else:
-                        amp[b, frame:] = val
-                        frame = frames
-                    continue
-                elif st == self._RELEASE:
-                    if rel_frames <= 0:
-                        val = 0.0
-                        tim = 0.0
-                        st = self._IDLE
-                        continue
-                    remaining = max(rel_frames - int(tim), 0)
-                    if remaining <= 0:
-                        val = 0.0
-                        tim = 0.0
-                        st = self._IDLE
-                        continue
-                    seg = min(frames - frame, remaining)
-                    if seg <= 0:
-                        break
-                    step = rel_start / max(rel_frames, 1)
-                    idx = np.arange(1, seg + 1, dtype=RAW_DTYPE)
-                    seg_vals = np.maximum(0.0, val - step * idx)
-                    amp[b, frame : frame + seg] = seg_vals
-                    val = float(seg_vals[-1])
-                    tim += seg
-                    frame += seg
-                    if tim >= rel_frames:
-                        tim = 0.0
-                        val = 0.0
-                        st = self._IDLE
-                else:
-                    amp[b, frame:] = 0.0
-                    val = 0.0
-                    tim = 0.0
-                    frame = frames
-
-            self._stage[b] = st
-            self._value[b] = RAW_DTYPE(val)
-            self._timer[b] = RAW_DTYPE(tim)
-            self._velocity[b] = RAW_DTYPE(vel)
-            self._release_start[b] = RAW_DTYPE(rel_start)
-
-        return None
-
     def _stage_frames(self, ms: float, sr: int) -> int:
         if ms <= 0.0:
             return 0
@@ -863,77 +687,28 @@ class EnvelopeModulatorNode(Node):
         amp = out[:, 0, :]
         reset = out[:, 1, :]
 
-        eventful = (
-            np.any(trigger_active)
-            or np.any(gate_active[:, 0] != self._gate_state)
-            or np.any(drone_active[:, 0] != self._drone_state)
-            or np.any(gate_active[:, 1:] != gate_active[:, :-1])
-            or np.any(drone_active[:, 1:] != drone_active[:, :-1])
+        send_reset_flag = bool(send_reset.mean() > 0.5)
+        amp, reset = c_kernels.envelope_process_c(
+            trigger,
+            gate,
+            drone,
+            velocity,
+            atk_frames,
+            hold_frames,
+            dec_frames,
+            sus_frames,
+            rel_frames,
+            self.sustain_level,
+            send_reset_flag,
+            self._stage,
+            self._value,
+            self._timer,
+            self._velocity,
+            self._activation_count,
+            self._release_start,
+            out_amp=amp,
+            out_reset=reset,
         )
-
-        if not eventful:
-            self._process_quiescent(
-                atk_frames,
-                hold_frames,
-                dec_frames,
-                sus_frames,
-                rel_frames,
-                self.sustain_level,
-                F,
-                amp,
-                reset,
-            )
-        else:
-            # Prefer C kernel for the sequential envelope state machine; fall back to Python
-            send_reset_flag = (
-                bool(send_reset.mean() > 0.5)
-                if isinstance(send_reset, np.ndarray)
-                else bool(self.send_resets)
-            )
-            try:
-                amp, reset = c_kernels.envelope_process_c(
-                    trigger,
-                    gate,
-                    drone,
-                    velocity,
-                    atk_frames,
-                    hold_frames,
-                    dec_frames,
-                    sus_frames,
-                    rel_frames,
-                    self.sustain_level,
-                    send_reset_flag,
-                    self._stage,
-                    self._value,
-                    self._timer,
-                    self._velocity,
-                    self._activation_count,
-                    self._release_start,
-                    out_amp=amp,
-                    out_reset=reset,
-                )
-            except Exception:
-                amp, reset = c_kernels.envelope_process_py(
-                    trigger,
-                    gate,
-                    drone,
-                    velocity,
-                    atk_frames,
-                    hold_frames,
-                    dec_frames,
-                    sus_frames,
-                    rel_frames,
-                    self.sustain_level,
-                    send_reset_flag,
-                    self._stage,
-                    self._value,
-                    self._timer,
-                    self._velocity,
-                    self._activation_count,
-                    self._release_start,
-                    out_amp=amp,
-                    out_reset=reset,
-                )
 
         np.copyto(self._gate_state, gate_active[:, -1], casting="no")
         np.copyto(self._drone_state, drone_active[:, -1], casting="no")
@@ -970,22 +745,6 @@ class PitchQuantizerNode(Node):
     def _midi_to_freq(midi: np.ndarray) -> np.ndarray:
         return 440.0 * np.power(2.0, (midi - 69.0) / 12.0, dtype=RAW_DTYPE)
 
-    def _compute_cents(self, value: float, span: float, grid_cents: Sequence[float]) -> float:
-        token = self.effective_token
-        if quantizer.is_free_mode_token(token):
-            grid = utils._grid_sorted(grid_cents)[0]
-            N = max(1, len(grid))
-            variant = self.free_variant
-            if variant == "continuous":
-                return value * span * 1200.0
-            u = value * span * N
-            if variant == "weighted":
-                return quantizer.grid_warp_inverse(u, grid_cents)
-            return quantizer.grid_warp_inverse(round(u), grid_cents)
-        cents_unq = value * span * 1200.0
-        u = quantizer.grid_warp_forward(cents_unq, grid_cents)
-        return quantizer.grid_warp_inverse(round(u), grid_cents)
-
     @property
     def last_output(self) -> np.ndarray | None:
         return None if self._last_output is None else self._last_output.copy()
@@ -1007,14 +766,22 @@ class PitchQuantizerNode(Node):
         grid = quantizer.get_reference_grid_cents(self.state, token)
         root_freq = self._midi_to_freq(root_midi)
 
-        freq_target = np.empty((B, F), dtype=RAW_DTYPE)
-        # Vectorised computation of target frequency via cents mapping.
-        # Flatten inputs, compute cents per-sample using numpy.vectorize wrapper
-        flat_ctrl = ctrl.ravel()
-        flat_span = span_arr.ravel()
-        vfunc = np.vectorize(lambda v, s: self._compute_cents(float(v), float(s), grid), otypes=[RAW_DTYPE])
-        cents_flat = vfunc(flat_ctrl, flat_span)
-        cents = cents_flat.reshape(B, F)
+        ctrl_scaled = ctrl * span_arr
+        if quantizer.is_free_mode_token(token):
+            grid_arr, _ = utils._grid_sorted(grid)
+            N = max(1, int(grid_arr.size))
+            variant = self.free_variant
+            if variant == "continuous":
+                cents = ctrl_scaled * 1200.0
+            elif variant == "weighted":
+                cents = quantizer.grid_warp_inverse(ctrl_scaled * N, grid)
+            else:
+                cents = quantizer.grid_warp_inverse(np.rint(ctrl_scaled * N), grid)
+        else:
+            cents_unq = ctrl_scaled * 1200.0
+            u = quantizer.grid_warp_forward(cents_unq, grid)
+            cents = quantizer.grid_warp_inverse(np.rint(u), grid)
+
         freq_target = root_freq * np.power(2.0, cents / 1200.0)
 
         if not self.slew:
