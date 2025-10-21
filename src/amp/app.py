@@ -579,6 +579,16 @@ def run(
     sampler = _load_sampler(state)
 
     # --- ControllerMonitor setup ---
+    # Select output device and sample rate before building the graph and ControllerMonitor
+    if sd is not None:
+        dev_index, dev_sr = _pick_output_device_and_rate(sd)
+        sample_rate = dev_sr
+    else:
+        sample_rate = 44100  # fallback default
+
+    # Build the graph before starting ControllerMonitor so it can be passed as control_history
+    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
+
     # All controller input is now handled by ControllerMonitor, which writes to control history.
     # No direct polling or caching of controller state outside the history-backed thread.
     controller_monitor = ControllerMonitor(
@@ -608,7 +618,6 @@ def run(
     envelope_modes = ("envelope", "drone", "hold")
     envelope_mode_idx = 0
     envelope_mode = envelope_modes[envelope_mode_idx]
-    pending_trigger = False
 
     graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
     pitch_node = graph._nodes.get("pitch")
@@ -617,14 +626,11 @@ def run(
     menu_instance.draw()
 
     def cycle_envelope_mode() -> None:
-        nonlocal envelope_mode_idx, envelope_mode, pending_trigger
+        nonlocal envelope_mode_idx, envelope_mode
 
         envelope_mode_idx = (envelope_mode_idx + 1) % len(envelope_modes)
         envelope_mode = envelope_modes[envelope_mode_idx]
-        if envelope_mode == "drone":
-            pending_trigger = True
-        elif envelope_mode == "hold" and gate_momentary:
-            pending_trigger = True
+        # pending_trigger logic removed: all controller state is now handled via history
         STATUS_PRINTER.emit(f"Envelope mode → {envelope_mode.title()}")
         menu_instance.draw()
 
@@ -712,16 +718,7 @@ def run(
         momentary_now = gate_momentary
         drone_now = mode == "drone"
 
-        trigger_now = False
-        if pending_trigger:
-            trigger_now = True
-            pending_trigger = False
-
-        if mode in ("envelope", "hold") and momentary_now and not momentary_prev:
-            trigger_now = True
-        elif mode == "drone" and drone_now and not drone_prev:
-            trigger_now = True
-
+        # pending_trigger and trigger_now logic removed: all controller state is now handled via history
         gate_now = mode == "hold" and momentary_now
         # Delegate construction of base_params to the shared function so the
         # interactive path uses identical shaping to headless runs. Pass the
@@ -1914,7 +1911,7 @@ def run(
                 round(float(state["mod_rate_hz"]), 3),
                 round(float(state["mod_depth"]), 3),
                 bool(state["mod_use_input"]),
-                pitch_effective_token,
+                state["base_token"],
                 state["base_token"],
                 state["free_variant"],
             )
@@ -1923,7 +1920,7 @@ def run(
             base_line_colour = (255, 255, 255)
             lines_with_colour: list[tuple[str, tuple[int, int, int]]] = [
                 (
-                    f"Eff:{effective_token:<16} Base:{state['base_token']:<16} Free:{state['free_variant']:<10} Src:{state['source_type']}",
+                    f"Eff:{state['base_token']:<16} Base:{state['base_token']:<16} Free:{state['free_variant']:<10} Src:{state['source_type']}",
                     base_line_colour,
                 ),
                 (
