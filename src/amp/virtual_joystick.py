@@ -1,62 +1,26 @@
-#!/usr/bin/env python3
-"""Headless benchmarking helper for AMP agents.
+"""Virtual joystick performer and prewritten script loader.
 
-This script renders the default controller graph without initialising the UI or
-sounddevice backend.  It repeatedly renders the runtime graph, collects the
-per-node timings exported by :class:`amp.graph.AudioGraph` and exposes slow
-moving averages so agents can spot long term regressions without staring at the
-interactive HUD.  A virtual joystick performs smooth, expressive gestures so
-agents can observe how controller-driven modulation affects performance.
+This module exposes a deterministic virtual controller used by the
+headless benchmark.  Extracting it from the script makes it reusable by the
+interactive application and other tooling.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import pathlib
-import sys
-import time
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Sequence
-
-SRC_ROOT = pathlib.Path(__file__).resolve().parents[1] / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+from typing import Any, Dict
 
 import numpy as np
-import pandas as pd
 
-from amp import app as amp_app
-from amp import state as app_state
-from amp import utils
-from amp.graph import AudioGraph
-from amp.system import benchmark_default_graph
-from amp.virtual_joystick import VirtualJoystickPerformer, _load_prewritten_script
-
-
-class _StubPygame:
-    """Minimal subset of pygame keycodes required by ``build_default_state``."""
-
-    K_m = ord("m")
-    K_k = ord("k")
-    K_x = ord("x")
-    K_y = ord("y")
-    K_b = ord("b")
-    K_n = ord("n")
-    K_z = ord("z")
-    K_PERIOD = ord(".")
-    K_COMMA = ord(",")
-    K_SLASH = ord("/")
+from . import utils
 
 
 @dataclass(frozen=True)
 class _ControlTrack:
-    """Piecewise automation used by :class:`PrewrittenJoystickScript`."""
-
     times: np.ndarray
     values: np.ndarray
-    mode: str  # ``"linear"`` or ``"step"``
+    mode: str
 
     def sample(self, *, start: float, duration: float, frames: int) -> np.ndarray:
         if frames <= 0:
@@ -79,8 +43,6 @@ class _ControlTrack:
 
 
 class PrewrittenJoystickScript:
-    """Replay deterministic joystick gestures described by a JSON script."""
-
     def __init__(self, *, controls: Dict[str, _ControlTrack], mode: str | None) -> None:
         self._controls = controls
         self._mode = mode
@@ -89,20 +51,14 @@ class PrewrittenJoystickScript:
     def mode(self) -> str | None:
         return self._mode
 
-    def sample_block(
-        self,
-        *,
-        start_time: float,
-        duration: float,
-        frames: int,
-    ) -> Dict[str, np.ndarray]:
+    def sample_block(self, *, start_time: float, duration: float, frames: int) -> Dict[str, np.ndarray]:
         block: Dict[str, np.ndarray] = {}
         for name, track in self._controls.items():
             block[name] = track.sample(start=start_time, duration=duration, frames=frames)
         return block
 
 
-def _load_prewritten_script(path: pathlib.Path) -> PrewrittenJoystickScript:
+def _load_prewritten_script(path) -> PrewrittenJoystickScript:
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
         raise ValueError("Joystick script must contain a JSON object")
@@ -122,13 +78,13 @@ def _load_prewritten_script(path: pathlib.Path) -> PrewrittenJoystickScript:
 
         if mode not in {"linear", "step"}:
             raise ValueError(f"Control '{name}' has unsupported mode '{mode}'")
-        if not isinstance(events, Sequence) or not events:
+        if not isinstance(events, (list, tuple)) or not events:
             raise ValueError(f"Control '{name}' must define a non-empty sequence of events")
 
         times: list[float] = []
         values: list[float] = []
         for entry in events:
-            if isinstance(entry, Mapping):
+            if isinstance(entry, dict):
                 if "time" not in entry:
                     raise ValueError(f"Control '{name}' event missing 'time'")
                 value = entry.get("value", entry.get("v"))
@@ -136,13 +92,11 @@ def _load_prewritten_script(path: pathlib.Path) -> PrewrittenJoystickScript:
                     raise ValueError(f"Control '{name}' event missing 'value'")
                 time_val = float(entry["time"])
                 value_val = float(value)
-            elif isinstance(entry, Sequence) and len(entry) == 2:
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
                 time_val = float(entry[0])
                 value_val = float(entry[1])
             else:
-                raise ValueError(
-                    "Control events must be dicts with 'time'/'value' or 2-item sequences"
-                )
+                raise ValueError("Control events must be dicts with 'time'/'value' or 2-item sequences")
             times.append(time_val)
             values.append(value_val)
 
@@ -210,6 +164,8 @@ class VirtualJoystickPerformer:
         self._pitch_span = 2.0
         self._pitch_root = 60.0
 
+    # The rest of the implementation mirrors the benchmark script and is
+    # intentionally kept unchanged to preserve deterministic behaviour.
     def _schedule_next_momentary(self) -> None:
         self._next_momentary = self._time + float(self._rng.uniform(0.65, 1.35))
 
@@ -251,14 +207,7 @@ class VirtualJoystickPerformer:
             self._axis_remaining[name] = max(0.0, self._axis_remaining[name] - duration)
         return curves
 
-    def _render_axis_curves(
-        self,
-        *,
-        frames: int,
-        momentary_curve: np.ndarray,
-        drone_curve: np.ndarray,
-        prev_momentary: float,
-    ) -> Dict[str, np.ndarray]:
+    def _render_axis_curves(self, *, frames: int, momentary_curve: np.ndarray, drone_curve: np.ndarray, prev_momentary: float) -> Dict[str, np.ndarray]:
         if momentary_curve.shape[0] != frames or drone_curve.shape[0] != frames:
             raise ValueError("Axis curves must match the requested frame count")
 
@@ -293,12 +242,7 @@ class VirtualJoystickPerformer:
         else:
             self._velocity_target = max(0.45, self._velocity_target - 0.02)
 
-        velocity_curve = np.linspace(
-            self._velocity_value,
-            self._velocity_target,
-            frames,
-            dtype=utils.RAW_DTYPE,
-        )
+        velocity_curve = np.linspace(self._velocity_value, self._velocity_target, frames, dtype=utils.RAW_DTYPE)
         if frames:
             self._velocity_value = float(velocity_curve[-1])
 
@@ -378,18 +322,8 @@ class VirtualJoystickPerformer:
 
         prev_momentary = self._momentary_axis
 
-        momentary_curve = np.linspace(
-            self._momentary_axis,
-            self._momentary_axis_target,
-            frames,
-            dtype=utils.RAW_DTYPE,
-        )
-        drone_curve = np.linspace(
-            self._drone_axis,
-            self._drone_axis_target,
-            frames,
-            dtype=utils.RAW_DTYPE,
-        )
+        momentary_curve = np.linspace(self._momentary_axis, self._momentary_axis_target, frames, dtype=utils.RAW_DTYPE)
+        drone_curve = np.linspace(self._drone_axis, self._drone_axis_target, frames, dtype=utils.RAW_DTYPE)
 
         if frames:
             self._momentary_axis = float(momentary_curve[-1])
@@ -397,29 +331,18 @@ class VirtualJoystickPerformer:
         self._momentary_axis_remaining = max(0.0, self._momentary_axis_remaining - duration)
         self._drone_axis_remaining = max(0.0, self._drone_axis_remaining - duration)
 
-        axis_output = self._render_axis_curves(
-            frames=frames,
-            momentary_curve=momentary_curve,
-            drone_curve=drone_curve,
-            prev_momentary=prev_momentary,
-        )
+        axis_output = self._render_axis_curves(frames=frames, momentary_curve=momentary_curve, drone_curve=drone_curve, prev_momentary=prev_momentary)
         axis_curves = self._advance_axes(frames)
-        axis_output.update(
-            {
-                "cutoff": axis_curves["cutoff"],
-                "q": axis_curves["q"],
-                "pitch_input": axis_curves["pitch_input"],
-                "pitch_span": float(self._pitch_span),
-                "pitch_root": float(self._pitch_root),
-            }
-        )
+        axis_output.update({
+            "cutoff": axis_curves["cutoff"],
+            "q": axis_curves["q"],
+            "pitch_input": axis_curves["pitch_input"],
+            "pitch_span": float(self._pitch_span),
+            "pitch_root": float(self._pitch_root),
+        })
         return axis_output
 
-    def _apply_script_block(
-        self,
-        frames: int,
-        block: Dict[str, np.ndarray],
-    ) -> Dict[str, np.ndarray | float]:
+    def _apply_script_block(self, frames: int, block: Dict[str, np.ndarray]) -> Dict[str, np.ndarray | float]:
         result: Dict[str, np.ndarray | float] = {}
 
         axis_curves = self._advance_axes(frames)
@@ -438,12 +361,7 @@ class VirtualJoystickPerformer:
             if frames:
                 self._momentary_axis = float(momentary_curve[-1])
                 self._drone_axis = float(drone_curve[-1])
-            axis_output = self._render_axis_curves(
-                frames=frames,
-                momentary_curve=momentary_curve,
-                drone_curve=drone_curve,
-                prev_momentary=prev_momentary,
-            )
+            axis_output = self._render_axis_curves(frames=frames, momentary_curve=momentary_curve, drone_curve=drone_curve, prev_momentary=prev_momentary)
 
         def _control_array(name: str, source: Any) -> np.ndarray:
             array = np.asarray(source, dtype=utils.RAW_DTYPE)
@@ -481,16 +399,10 @@ class VirtualJoystickPerformer:
         return result
 
     def generate(self, frames: int) -> Dict[str, np.ndarray | float]:
-        """Return simulated joystick control curves for a render block."""
-
         block_duration = frames / self._sample_rate
 
         if self._script is not None:
-            script_block = self._script.sample_block(
-                start_time=self._time,
-                duration=block_duration,
-                frames=frames,
-            )
+            script_block = self._script.sample_block(start_time=self._time, duration=block_duration, frames=frames)
             curves = self._apply_script_block(frames, script_block)
         elif self._mode == "axis":
             curves = self._advance_axis_controls(frames)
@@ -501,265 +413,4 @@ class VirtualJoystickPerformer:
         return curves
 
 
-def _control_view(cache: Dict[str, np.ndarray], key: str, frames: int) -> np.ndarray:
-    view = cache.get(key)
-    if view is None or view.shape[2] < frames:
-        new_frames = 1 << max(0, frames - 1).bit_length()
-        view = np.zeros((1, 1, new_frames), dtype=utils.RAW_DTYPE)
-        cache[key] = view
-    return view[:, :, :frames]
-
-
-def _assign_control(
-    cache: Dict[str, np.ndarray], key: str, frames: int, value: float | np.ndarray
-) -> np.ndarray:
-    view = _control_view(cache, key, frames)
-    array = np.asarray(value, dtype=utils.RAW_DTYPE)
-    if array.ndim == 0:
-        view.fill(float(array))
-        return view
-    if array.ndim == 1:
-        if array.shape[0] != frames:
-            raise ValueError(f"{key}: expected {frames} samples, got {array.shape[0]}")
-        view[0, 0, :frames] = array
-        return view
-    if array.ndim == 3 and array.shape[0] == 1 and array.shape[1] == 1 and array.shape[2] >= frames:
-        view[...] = array[:, :, :frames]
-        return view
-    raise ValueError(f"Unsupported control shape for '{key}': {array.shape}")
-
-
-def _build_base_params(
-    graph: AudioGraph,
-    state: Dict[str, Any],
-    frames: int,
-    cache: Dict[str, np.ndarray],
-    envelope_names: list[str],
-    amp_mod_names: list[str],
-    joystick_curves: Mapping[str, np.ndarray | float],
-) -> Dict[str, Dict[str, np.ndarray]]:
-    # Delegate to the shared implementation in the application module to
-    # ensure benchmark and interactive runs use identical parameter shaping.
-    return amp_app.build_base_params(
-        graph,
-        state,
-        frames,
-        cache,
-        envelope_names,
-        amp_mod_names,
-        dict(joystick_curves),
-    )
-
-
-def benchmark_default_graph(
-    *,
-    frames: int,
-    iterations: int,
-    sample_rate: float,
-    ema_alpha: float,
-    warmup: int,
-    joystick_mode: str,
-    joystick_script: pathlib.Path | None,
-    ) -> pd.DataFrame:
-    state = app_state.build_default_state(joy=None, pygame=_StubPygame())
-    graph, envelope_names, amp_mod_names = amp_app.build_runtime_graph(sample_rate, state)
-
-    control_cache: Dict[str, np.ndarray] = {}
-    ema: Dict[str, float] = {}
-    peaks: Dict[str, float] = defaultdict(float)
-    totals: Dict[str, float] = defaultdict(float)
-    count: Dict[str, int] = defaultdict(int)
-    if joystick_script is not None:
-        try:
-            script = _load_prewritten_script(joystick_script)
-        except ValueError as exc:
-            raise SystemExit(f"Failed to load joystick script: {exc}") from exc
-    else:
-        script = None
-    virtual_joystick = VirtualJoystickPerformer(sample_rate, mode=joystick_mode, script=script)
-
-    timeline_records: list[Dict[str, Any]] = []
-    timeline_start = time.perf_counter()
-    playhead_time = 0.0
-    buffer_ahead = 0.0
-    cumulative_gap = 0.0
-
-    for iteration in range(iterations + warmup):
-        joystick_curves = virtual_joystick.generate(frames)
-        params = _build_base_params(
-            graph,
-            state,
-            frames,
-            control_cache,
-            envelope_names,
-            amp_mod_names,
-            joystick_curves,
-        )
-        block_start_time = time.perf_counter()
-        audio_block = graph.render_block(frames, sample_rate, params)
-        block_end_time = time.perf_counter()
-
-        render_duration = block_end_time - block_start_time
-        block_duration = frames / sample_rate
-        buffer_ahead += block_duration
-        buffer_ahead -= render_duration
-        underrun_gap = 0.0
-        if buffer_ahead < 0.0:
-            underrun_gap = -buffer_ahead
-            cumulative_gap += underrun_gap
-            buffer_ahead = 0.0
-
-        scheduled_start = playhead_time
-        scheduled_end = scheduled_start + block_duration
-        realised_start = scheduled_start + cumulative_gap
-        realised_end = realised_start + block_duration
-        playhead_time = scheduled_end
-
-        timings = graph.last_node_timings
-        if timings:
-            for name, duration in timings.items():
-                peaks[name] = max(peaks[name], duration)
-                totals[name] += duration
-                count[name] += 1
-                if iteration >= warmup:
-                    previous = ema.get(name)
-                    ema[name] = (
-                        duration
-                        if previous is None
-                        else previous + ema_alpha * (duration - previous)
-                    )
-
-        audio_abs = np.abs(audio_block)
-        audio_peak = float(np.max(audio_abs)) if audio_abs.size else 0.0
-        audio_rms = float(np.sqrt(np.mean(np.square(audio_block)))) if audio_abs.size else 0.0
-        channel_peaks: list[float] = []
-        channel_rms: list[float] = []
-        if audio_abs.size:
-            per_channel_peaks = np.max(audio_abs, axis=2)
-            per_channel_rms = np.sqrt(np.mean(np.square(audio_block), axis=2))
-            channel_peaks = per_channel_peaks.flatten().tolist()
-            channel_rms = per_channel_rms.flatten().tolist()
-
-        wall_start = block_start_time - timeline_start
-        wall_end = block_end_time - timeline_start
-
-        def _curve_mean(value: Any) -> float:
-            array = np.asarray(value, dtype=np.float64)
-            if array.size == 0:
-                return 0.0
-            return float(np.mean(array))
-
-        def _curve_max(value: Any) -> float:
-            array = np.asarray(value, dtype=np.float64)
-            if array.size == 0:
-                return 0.0
-            return float(np.max(array))
-
-        gate_curve = joystick_curves.get("gate", 0.0)
-        drone_curve = joystick_curves.get("drone", 0.0)
-        velocity_curve = joystick_curves.get("velocity", 0.0)
-        pitch_curve = joystick_curves.get("pitch_input", 0.0)
-
-        record: Dict[str, Any] = {
-            "iteration": iteration,
-            "is_warmup": iteration < warmup,
-            "scheduled_start_ms": scheduled_start * 1000.0,
-            "scheduled_end_ms": scheduled_end * 1000.0,
-            "realised_start_ms": realised_start * 1000.0,
-            "realised_end_ms": realised_end * 1000.0,
-            "wall_start_ms": wall_start * 1000.0,
-            "wall_end_ms": wall_end * 1000.0,
-            "render_ms": render_duration * 1000.0,
-            "block_ms": block_duration * 1000.0,
-            "buffer_ahead_ms": buffer_ahead * 1000.0,
-            "underrun_gap_ms": underrun_gap * 1000.0,
-            "cumulative_gap_ms": cumulative_gap * 1000.0,
-            "audio_peak": audio_peak,
-            "audio_rms": audio_rms,
-            "audio_channel_peaks": channel_peaks,
-            "audio_channel_rms": channel_rms,
-            "momentary_active": bool(_curve_max(gate_curve) >= 0.5),
-            "drone_active": bool(_curve_max(drone_curve) >= 0.5),
-            "velocity_mean": _curve_mean(velocity_curve),
-            "pitch_mean": _curve_mean(pitch_curve),
-            "start_sample": iteration * frames,
-            "end_sample": (iteration + 1) * frames,
-        }
-
-        for name, duration in timings.items():
-            record[f"node_{name}_ms"] = duration * 1000.0
-
-        timeline_records.append(record)
-
-    produced_ms = frames / sample_rate * 1000.0
-    print(f"Rendered {iterations} iterations of {frames} frames ({produced_ms:.2f} ms per block)")
-    print()
-    print(f"Moving averages (alpha={ema_alpha:.3f}) sorted by descending cost:")
-    ordered = sorted(ema.items(), key=lambda item: item[1], reverse=True)
-    for name, avg in ordered:
-        peak = peaks.get(name, 0.0) * 1000.0
-        mean = (totals[name] / max(1, count[name])) * 1000.0
-        print(f"  {name:<24} avg {mean:7.3f} ms  ema {avg * 1000.0:7.3f} ms  peak {peak:7.3f} ms")
-
-    timeline_df = pd.DataFrame.from_records(timeline_records)
-    if not timeline_df.empty:
-        warmup_df = timeline_df.loc[~timeline_df["is_warmup"]]
-        underrun_count = int((warmup_df["underrun_gap_ms"] > 0.0).sum()) if not warmup_df.empty else 0
-        total_gap = float(warmup_df["underrun_gap_ms"].sum()) if not warmup_df.empty else 0.0
-        print()
-        print(
-            "Real-time timeline summary:"
-            f" {len(warmup_df)} measured blocks, {underrun_count} underruns"
-            f" totalling {total_gap:.3f} ms"
-        )
-        preview_count = min(6, len(timeline_df))
-        print()
-        print("Timeline preview (first rows):")
-        preview = timeline_df.head(preview_count)
-        with pd.option_context("display.max_columns", None, "display.width", 180):
-            print(preview.to_string(index=False, float_format=lambda x: f"{x:0.3f}"))
-
-    return timeline_df
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark the default AMP controller graph headlessly")
-    parser.add_argument("--frames", type=int, default=256, help="Frames per render block")
-    parser.add_argument("--iterations", type=int, default=512, help="Number of benchmark iterations (excluding warmup)")
-    parser.add_argument("--warmup", type=int, default=32, help="Warmup iterations to discard from EMA")
-    parser.add_argument("--rate", type=float, default=44100.0, help="Sample rate in Hz")
-    parser.add_argument("--alpha", type=float, default=0.02, help="EMA smoothing factor (0-1)")
-    parser.add_argument(
-        "--joystick-mode",
-        choices=("switch", "axis"),
-        default="switch",
-        help="Virtual joystick style: 'switch' uses on/off buttons, 'axis' emulates analog strikes",
-    )
-    parser.add_argument(
-        "--joystick-script",
-        type=pathlib.Path,
-        help="Optional JSON file containing prewritten joystick automation",
-    )
-    args = parser.parse_args()
-
-    if args.frames <= 0:
-        raise SystemExit("Frames must be positive")
-    if not (0.0 < args.alpha <= 1.0):
-        raise SystemExit("EMA alpha must be in the interval (0, 1]")
-    if args.iterations <= 0:
-        raise SystemExit("Iterations must be positive")
-
-    benchmark_default_graph(
-        frames=args.frames,
-        iterations=args.iterations,
-        sample_rate=args.rate,
-        ema_alpha=args.alpha,
-        warmup=max(0, args.warmup),
-        joystick_mode=args.joystick_mode,
-        joystick_script=args.joystick_script,
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+__all__ = ["VirtualJoystickPerformer", "PrewrittenJoystickScript", "_load_prewritten_script"]

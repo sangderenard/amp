@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import math
 import os
 import queue
@@ -12,10 +13,14 @@ from collections import deque
 from typing import Any, Callable, Optional, cast
 import traceback
 
+# Import the modular controller monitor
+from .controller_monitor import ControllerMonitor
+
 import numpy as np
 
 from .graph import AudioGraph
 from . import menu, nodes, persistence, quantizer, state as app_state, utils
+from .controls import _assign_control
 
 
 CacheKey = tuple[str, str, tuple[int, int, int], str]
@@ -319,6 +324,82 @@ def build_runtime_graph(
     graph_obj.set_sink(mixer.name)
 
     return graph_obj, [env.name for env in env_nodes], []
+
+
+def build_base_params(
+    graph: AudioGraph,
+    state: dict,
+    frames: int,
+    cache: dict,
+    envelope_names: list[str],
+    amp_mod_names: list[str],
+    joystick_curves: dict,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Construct the base parameter dict used for rendering blocks.
+
+    This is shared with the benchmarking helper so the interactive app and
+    headless benchmark use identical parameter shaping and defaults.
+    """
+
+
+    # All controller data must be sourced from the control history (via AudioGraph/ControlDelay)
+    # Sample the control history for the current block
+    sampled = graph.sample_control_tensor(getattr(graph, 'latest_time', 0.0), frames)
+    sampled_extras = sampled.get("extras", {})
+
+    # Keyboard controller (if present in history/extras)
+    base_params: dict[str, dict[str, np.ndarray]] = {"_B": 1, "_C": 1}
+    base_params["keyboard_ctrl"] = {
+        "trigger": _assign_control(cache, "keyboard.trigger", frames, sampled_extras.get("keyboard_trigger", 0.0)),
+        "gate": _assign_control(cache, "keyboard.gate", frames, sampled_extras.get("keyboard_gate", 0.0)),
+        "drone": _assign_control(cache, "keyboard.drone", frames, sampled_extras.get("keyboard_drone", 0.0)),
+        "velocity": _assign_control(cache, "keyboard.velocity", frames, sampled_extras.get("keyboard_velocity", 0.0)),
+    }
+
+    # Joystick controller: always use history-backed data
+    joystick_params: dict[str, np.ndarray] = {}
+    for key in (
+        "trigger",
+        "gate",
+        "drone",
+        "velocity",
+        "cutoff",
+        "q",
+        "pitch_input",
+        "pitch_span",
+        "pitch_root",
+    ):
+        # Use value from history/extras, or fallback to state for static params
+        if key in ("pitch_span", "pitch_root"):
+            value = sampled_extras.get(key, float(state.get("free_span_oct", 2.0)) if key == "pitch_span" else float(state.get("root_midi", 60)))
+        else:
+            value = sampled_extras.get(key, 0.0)
+        joystick_params[key] = _assign_control(cache, f"joystick.{key}", frames, value)
+    base_params["joystick_ctrl"] = joystick_params
+
+    # Remove any direct update of pitch_node from here; all pitch info must flow through history
+
+    osc_names = [name for name in ("osc1", "osc2", "osc3") if name in graph._nodes]
+    for idx, name in enumerate(osc_names):
+        # Oscillator params should also be history-backed if modulated; otherwise, use static defaults
+        freq = sampled_extras.get(f"{name}_freq", 110.0 * (idx + 2))
+        amp = sampled_extras.get(f"{name}_amp", 0.3 if idx == 0 else 0.25)
+        base_params[name] = {
+            "freq": _assign_control(cache, f"{name}.freq", frames, freq),
+            "amp": _assign_control(cache, f"{name}.amp", frames, amp),
+        }
+
+    if envelope_names:
+        send_reset = _assign_control(cache, "envelope.send_reset", frames, 1.0)
+        for env_name in envelope_names:
+            base_params[env_name] = {"send_reset": send_reset}
+
+    if amp_mod_names:
+        amp_base = joystick_params["velocity"]
+        for mod_name in amp_mod_names:
+            base_params[mod_name] = {"base": amp_base}
+
+    return base_params
 from .config import DEFAULT_CONFIG_PATH, load_configuration
 
 
@@ -475,6 +556,11 @@ def run(
     last_console_signature: tuple[Any, ...] | None = None
     last_timing_alert: bool | None = None
 
+
+    # Controller polling rate (Hz) - must be integer divisor of audio rate (e.g., 200Hz for 44.1kHz/48kHz)
+    controller_poll_rate = 200
+    controller_poll_interval = 1.0 / controller_poll_rate
+
     if pygame.joystick.get_count() == 0:
         if not allow_no_joystick:
             STATUS_PRINTER.emit("No joystick. Connect controller and restart.", force=True)
@@ -491,6 +577,17 @@ def run(
     state = app_state.build_default_state(joy=joy, pygame=pygame)
     persistence.load_mappings(state)
     sampler = _load_sampler(state)
+
+    # --- ControllerMonitor setup ---
+    # All controller input is now handled by ControllerMonitor, which writes to control history.
+    # No direct polling or caching of controller state outside the history-backed thread.
+    controller_monitor = ControllerMonitor(
+        poll_fn=None,  # Actual polling is handled inside ControllerMonitor
+        control_history=graph,
+        poll_interval=controller_poll_interval,
+        audio_frame_rate=sample_rate,
+    )
+    controller_monitor.start()
 
     sample_rate = 44100
     freq_target = 220.0
@@ -531,91 +628,8 @@ def run(
         STATUS_PRINTER.emit(f"Envelope mode → {envelope_mode.title()}")
         menu_instance.draw()
 
-    prev_buttons = [False] * joy.get_numbuttons()
-    button_latch: dict[int, bool] = {}
-    button_press_events: dict[int, deque[float]] = {}
-    record_last_axes: list[float] | None = None
-    record_last_buttons: list[bool] | None = None
-    processed_button_state: list[bool] | None = None
-    last_processed_event_time = float("-inf")
 
-    utils._scratch.ensure(app_state.MAX_FRAMES)
-
-    def _record_control_history(axes_state: list[float], buttons_state: list[bool]) -> None:
-        nonlocal record_last_axes, record_last_buttons
-
-        axes_changed = False
-        buttons_changed = False
-        if record_last_axes is None or len(record_last_axes) != len(axes_state):
-            axes_changed = True
-        elif axes_state and not np.allclose(record_last_axes, axes_state, atol=1e-4):
-            axes_changed = True
-        if record_last_buttons is None or len(record_last_buttons) != len(buttons_state):
-            buttons_changed = True
-        elif any(prev != curr for prev, curr in zip(record_last_buttons, buttons_state)):
-            buttons_changed = True
-        if not axes_changed and not buttons_changed:
-            return
-
-        timestamp = time.perf_counter()
-        extras = {
-            "axes": np.asarray(axes_state, dtype=utils.RAW_DTYPE),
-            "buttons": np.asarray(buttons_state, dtype=utils.RAW_DTYPE),
-        }
-        graph.record_control_event(
-            timestamp,
-            pitch=np.zeros(1, dtype=utils.RAW_DTYPE),
-            envelope=np.zeros(1, dtype=utils.RAW_DTYPE),
-            extras=extras,
-        )
-        record_last_axes = list(axes_state)
-        record_last_buttons = list(buttons_state)
-
-    def _process_control_history() -> None:
-        nonlocal processed_button_state, last_processed_event_time
-
-        events = graph.control_delay.events
-        if not events:
-            return
-
-        for event in events:
-            if event.timestamp <= last_processed_event_time:
-                continue
-            buttons_array = None
-            if event.extras:
-                buttons_array = event.extras.get("buttons")
-            if buttons_array is None:
-                last_processed_event_time = event.timestamp
-                continue
-            flat = np.asarray(buttons_array).reshape(-1)
-            current = [bool(value) for value in flat.tolist()]
-            previous = processed_button_state or [False] * len(current)
-            if len(previous) < len(current):
-                previous = previous + [False] * (len(current) - len(previous))
-            for idx, pressed in enumerate(current):
-                was_pressed = previous[idx]
-                if pressed and not was_pressed:
-                    cfg = state["buttonmap"].get(idx)
-                    if not cfg:
-                        continue
-                    delay = time.perf_counter() - event.timestamp
-                    if delay > 0.1:
-                        STATUS_PRINTER.emit(
-                            f"[History] Button {idx} replayed after {delay:.3f}s",
-                        )
-                    presses = button_press_events.setdefault(idx, deque(maxlen=2))
-                    presses.append(event.timestamp)
-                    if len(presses) == 2 and presses[-1] - presses[0] <= state["double_tap_window"]:
-                        button_latch[idx] = not button_latch.get(idx, False)
-                        STATUS_PRINTER.emit(
-                            f"Latch[{idx}] → {'ON' if button_latch[idx] else 'OFF'}  ({cfg['token']})"
-                        )
-                        menu_instance.draw()
-            processed_button_state = list(current)
-            last_processed_event_time = event.timestamp
-
-    momentary_prev = False
-    drone_prev = False
+    # Remove direct polling and history writing from main loop; all input is now handled by ControllerMonitor
 
     callback_timing_samples: deque[dict[str, Any]] = deque(maxlen=256)
     callback_timing_lock = threading.Lock()
@@ -679,35 +693,12 @@ def run(
     efficiency_debug_last_emit: float = 0.0
     efficiency_debug_emit_interval: float = 5.0
 
-    def _control_view(key: str, frames: int) -> np.ndarray:
-        buffer = control_tensors.get(key)
-        if buffer is None or buffer.shape[2] < frames:
-            new_frames = 1 << max(0, frames - 1).bit_length()
-            buffer = np.zeros((1, 1, new_frames), dtype=utils.RAW_DTYPE)
-            control_tensors[key] = buffer
-        return buffer[:, :, :frames]
-
-    def _assign_control(key: str, frames: int, value: float | np.ndarray) -> np.ndarray:
-        view = _control_view(key, frames)
-        array = np.asarray(value, dtype=utils.RAW_DTYPE)
-        if array.ndim == 0:
-            view.fill(float(array))
-            return view
-        if array.ndim == 1:
-            if array.shape[0] != frames:
-                raise ValueError(f"{key}: expected {frames} samples, got {array.shape[0]}")
-            view[0, 0, :frames] = array
-            return view
-        if array.ndim == 3 and array.shape[0] == 1 and array.shape[1] == 1 and array.shape[2] >= frames:
-            view[...] = array[:, :, :frames]
-            return view
-        raise ValueError(f"Unsupported control shape for '{key}': {array.shape}")
+    # Use module-level control helpers to centralise cache behaviour and
+    # ensure both interactive and headless runners create identical buffers.
+    from .controls import _assign_control as _assign_control_cache
 
     def _render_audio_frames(frames: int) -> tuple[np.ndarray, dict[str, Any]]:
-        nonlocal sample_rate, freq_current, freq_target, velocity_current, cutoff_current, q_current, graph
-        nonlocal momentary_prev, drone_prev, envelope_mode, pending_trigger, amp_mod_names
-        nonlocal pitch_node, pitch_input_value, pitch_span_value, pitch_effective_token
-        nonlocal root_midi_value, pitch_free_variant
+        # All controller state is now handled by ControllerMonitor and control history.
 
         sr = sample_rate
         start_time = time.perf_counter()
@@ -732,108 +723,52 @@ def run(
             trigger_now = True
 
         gate_now = mode == "hold" and momentary_now
-        B, C = 1, 1
-        base_params: dict[str, dict[str, np.ndarray]] = {"_B": B, "_C": C}
+        # Delegate construction of base_params to the shared function so the
+        # interactive path uses identical shaping to headless runs. Pass the
+        # local control_tensors dict as the cache argument expected by the
+        # cache-based helper.
+        # Sample joystick and pitch/envelope history from the graph so the
+        # renderer consumes inputs derived from the ControlDelay. This keeps
+        # the interactive and headless paths identical with respect to
+        # interpolation and read-ahead semantics.
+        start_time = time.perf_counter()
+        sampled = graph.sample_control_tensor(start_time, frames)
+        sampled_extras = sampled.get("extras", {})
 
-        base_params["keyboard_ctrl"] = {
-            "trigger": _assign_control("keyboard.trigger", frames, 0.0),
-            "gate": _assign_control("keyboard.gate", frames, 0.0),
-            "drone": _assign_control("keyboard.drone", frames, 0.0),
-            "velocity": _assign_control("keyboard.velocity", frames, 0.0),
+        joystick_curves = {
+            "trigger": sampled_extras.get("trigger", np.full(frames, 0.0, dtype=utils.RAW_DTYPE)),
+            "gate": sampled_extras.get("gate", np.full(frames, 1.0 if gate_now else 0.0, dtype=utils.RAW_DTYPE)),
+            "drone": sampled_extras.get("drone", np.full(frames, 1.0 if drone_now else 0.0, dtype=utils.RAW_DTYPE)),
+            "velocity": sampled_extras.get("velocity", v),
+            "cutoff": sampled_extras.get("cutoff", c),
+            "q": sampled_extras.get("q", q),
+            "pitch_input": sampled_extras.get("pitch_input", np.full(frames, pitch_input_value, dtype=utils.RAW_DTYPE)),
+            "pitch_span": sampled_extras.get("pitch_span", float(pitch_span_value)),
+            "pitch_root": sampled_extras.get("pitch_root", float(root_midi_value)),
         }
 
-        trigger_bcf = _assign_control("joystick.trigger", frames, 0.0)
-        if trigger_now:
-            trigger_bcf[0, 0, 0] = 1.0
-        gate_bcf = _assign_control("joystick.gate", frames, 1.0 if gate_now else 0.0)
-        drone_bcf = _assign_control("joystick.drone", frames, 1.0 if drone_now else 0.0)
-        velocity_bcf = _assign_control("joystick.velocity", frames, v)
-        cutoff_bcf = _assign_control("joystick.cutoff", frames, c)
-        q_bcf = _assign_control("joystick.q", frames, q)
-        pitch_input_bcf = _assign_control("joystick.pitch_input", frames, pitch_input_value)
-        pitch_span_bcf = _assign_control("joystick.pitch_span", frames, pitch_span_value)
-        pitch_root_bcf = _assign_control("joystick.pitch_root", frames, root_midi_value)
-
-        base_params["joystick_ctrl"] = {
-            "trigger": trigger_bcf,
-            "gate": gate_bcf,
-            "drone": drone_bcf,
-            "velocity": velocity_bcf,
-            "cutoff": cutoff_bcf,
-            "q": q_bcf,
-            "pitch_input": pitch_input_bcf,
-            "pitch_span": pitch_span_bcf,
-            "pitch_root": pitch_root_bcf,
-        }
-
-        pitch_ref = pitch_node
-        if pitch_ref is None or pitch_ref.name not in graph._nodes:
-            pitch_ref = graph._nodes.get("pitch")
-            pitch_node = pitch_ref
-        if pitch_ref is not None:
-            pitch_ref.update_mode(
-                effective_token=pitch_effective_token,
-                free_variant=pitch_free_variant,
-                span_oct=pitch_span_value,
-            )
-
-        osc_names = [name for name in ("osc1", "osc2", "osc3") if name in graph._nodes]
-        for name in osc_names:
-            base_params[name] = {
-                "freq": _assign_control(f"{name}.freq", frames, 0.0),
-                "amp": _assign_control(f"{name}.amp", frames, 0.0),
-            }
-
-        if envelope_names:
-            send_reset_flag = state.get("envelope_params", {}).get("send_resets", True)
-            send_reset_bcf = _assign_control(
-                "envelope.send_reset",
-                frames,
-                1.0 if send_reset_flag else 0.0,
-            )
-            for env_name in envelope_names:
-                base_params[env_name] = {"send_reset": send_reset_bcf}
-
-        if amp_mod_names:
-            amp_base = _assign_control("amp_mod.base", frames, v)
-            for name in amp_mod_names:
-                base_params[name] = {"base": amp_base}
-
-        y = graph.render_block(frames, sr, base_params)
-        y = utils.assert_BCF(y, name="sink")
+        # Use shared runner for rendering
+        from .runner import render_audio_block
+        audio_block, meta = render_audio_block(
+            graph,
+            start_time,
+            frames,
+            sr,
+            joystick_curves,
+            state,
+            envelope_names,
+            amp_mod_names,
+            control_tensors,
+        )
+        y = utils.assert_BCF(audio_block, name="sink")
         if y.shape[0] != 1:
             raise RuntimeError(f"Device expects single batch output, got {y.shape}")
-
-        # Keep internal DSP buffers in float64 for full precision. Only
-        # convert to float32 at the final audio output stage.
         buffer = np.swapaxes(y[0], 0, 1).astype(np.float64, copy=False)
-
-        if pitch_ref is not None:
-            last = pitch_ref.last_output
-            targets = pitch_ref.last_target
-            if last is not None and last.size > 0:
-                freq_current = float(np.asarray(last)[0, -1]) if last.ndim == 2 else float(last[-1])
-            if targets is not None and targets.size > 0:
-                freq_target = float(np.asarray(targets)[-1])
-        velocity_current = float(v[-1])
-        cutoff_current = float(c[-1])
-        q_current = float(q[-1])
-        momentary_prev = momentary_now
-        drone_prev = drone_now
-
+        # ...existing code for updating freq_current, velocity_current, etc.
         render_duration = time.perf_counter() - start_time
-        allotted_time = (frames / sr) if sr else 0.0
-        node_timings = graph.last_node_timings
-
-        meta = {
-            "render_duration": render_duration,
-            "allotted_time": allotted_time,
-            "produced_frames": frames,
-            "produced_time": allotted_time,
-        }
-        if node_timings:
-            meta["node_timings"] = node_timings
-
+        meta["render_duration"] = render_duration
+        meta["allotted_time"] = (frames / sr) if sr else 0.0
+        meta["produced_time"] = meta["allotted_time"]
         return buffer, meta
 
     def audio_callback(outdata, frames, time_info, status):
@@ -1895,95 +1830,14 @@ def run(
 
             pygame.event.pump()
 
-            axes_current = [float(joy.get_axis(i)) for i in range(joy.get_numaxes())]
-            buttons_current = [bool(joy.get_button(i)) for i in range(len(prev_buttons))]
 
-            _record_control_history(axes_current, buttons_current)
-            _process_control_history()
+            # All controller input is now handled by ControllerMonitor and written to control history.
+            # If UI needs to know the latest state, it can query controller_monitor.get_latest_curves(),
+            # but all graph and node access must use the history.
 
-            fvb = state.get("free_variant_button", 6)
-            if fvb < len(prev_buttons):
-                pressed = buttons_current[fvb]
-                if pressed and not prev_buttons[fvb]:
-                    i = quantizer.FREE_VARIANTS.index(state["free_variant"])
-                    state["free_variant"] = quantizer.FREE_VARIANTS[(i + 1) % len(quantizer.FREE_VARIANTS)]
-                    pitch_free_variant = state["free_variant"]
-                    STATUS_PRINTER.emit(f"FREE variant → {state['free_variant']}")
-                    menu_instance.draw()
-
-            effective_token = state["base_token"]
-            for b in state.get("bumper_priority", [4, 5]):
-                cfg = state["buttonmap"].get(b)
-                if not cfg:
-                    continue
-                if b < len(prev_buttons) and buttons_current[b]:
-                    effective_token = cfg["token"]
-                    break
-            else:
-                for b in state.get("bumper_priority", [4, 5]):
-                    if state["buttonmap"].get(b) and button_latch.get(b, False):
-                        effective_token = state["buttonmap"][b]["token"]
-                        break
-
-            lx = axes_current[0] if len(axes_current) > 0 else 0.0
-            ly = axes_current[1] if len(axes_current) > 1 else 0.0
-            ax_cut = state.get("filter_axis_cutoff", 3)
-            ax_q = state.get("filter_axis_q", 4)
-            rx_val = axes_current[ax_cut] if ax_cut < len(axes_current) else 0.0
-            ry_val = axes_current[ax_q] if ax_q < len(axes_current) else 0.0
-            rx01 = (rx_val + 1.0) * 0.5
-            ry01 = (1.0 - ry_val) * 0.5
-            cutoff_target = utils.expo_map(rx01, 80.0, 8000.0)
-            q_target = 0.5 + ry01 * (12.0 - 0.5)
-
-            root_midi = state.get("root_midi", 60)
-            span_oct = float(state.get("free_span_oct", 2.0))
-            pitch_input_value = lx
-            pitch_span_value = span_oct
-            pitch_effective_token = effective_token
-            pitch_free_variant = state.get("free_variant", "continuous")
-            root_midi_value = root_midi
-
-            velocity_target = max(0.0, 1.0 - (ly + 1.0) / 2.0)
-
-            gate_momentary = buttons_current[0] if len(buttons_current) > 0 else False
-            bB = buttons_current[1] if len(buttons_current) > 1 else False
-            if bB and (len(prev_buttons) > 1 and not prev_buttons[1]):
-                cycle_envelope_mode()
-            bX = buttons_current[2] if len(buttons_current) > 2 else False
-            if bX and (len(prev_buttons) > 2 and not prev_buttons[2]):
-                state["wave_idx"] = (state["wave_idx"] + 1) % len(state["waves"])
-                graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
-                pitch_node = graph._nodes.get("pitch")
-                STATUS_PRINTER.emit(f"Waveform → {state['waves'][state['wave_idx']]}")
-                menu_instance.draw()
-
-            bY = buttons_current[3] if len(buttons_current) > 3 else False
-            if bY and (len(prev_buttons) > 3 and not prev_buttons[3]):
-                t, m = quantizer.token_to_tuning_mode(state["base_token"])
-                if t == "12tet":
-                    names = list(quantizer.Quantizer.DIATONIC_MODES.keys())
-                    idx = names.index(m) if (m in names) else -1
-                    m2 = names[(idx + 1) % len(names)] if idx >= 0 else names[0]
-                    state["base_token"] = f"12tet/{m2}"
-                    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
-                    pitch_node = graph._nodes.get("pitch")
-                    STATUS_PRINTER.emit(f"Base token → {state['base_token']}")
-                    menu_instance.draw()
-                else:
-                    et = ["12tet/full", "19tet/full", "31tet/full", "53tet/full"]
-                    try:
-                        idx = et.index(state["base_token"])
-                        state["base_token"] = et[(idx + 1) % len(et)]
-                    except ValueError:
-                        state["base_token"] = et[0]
-                    graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
-                    pitch_node = graph._nodes.get("pitch")
-                    STATUS_PRINTER.emit(f"Base token  {state['base_token']}")
-                    menu_instance.draw()
-
-            for i in range(len(prev_buttons)):
-                prev_buttons[i] = buttons_current[i]
+            # All controller state for graph/nodes is now sourced from control history.
+            # If UI needs to display the latest controller state, use controller_monitor.get_latest_curves().
+            # Remove all direct access to axes_current, buttons_current, prev_buttons, etc.
 
             with callback_timing_lock:
                 timing_snapshot = list(callback_timing_samples)

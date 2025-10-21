@@ -206,12 +206,50 @@ class ControlDelay:
         timestamps = times[:, None]
         controls = np.concatenate([pitch, envelope, timestamps], axis=1)
         pcm = self._gather_pcm(start_time, frames)
+
+        # Provide a simple sampling of any extras attached to the latest
+        # control event at or before the requested start_time. Headless
+        # benchmarks record per-block arrays into event.extras, so this
+        # returns those arrays unchanged when available. For interactive
+        # inputs that record instantaneous snapshots, callers should
+        # continue to provide fallbacks (this function avoids aggressive
+        # interpretation and only returns a best-effort extras mapping).
+        extras_out: dict[str, np.ndarray] = {}
+        if self._events:
+            # Prefer the most-recent event at or before start_time
+            candidates = [e for e in self._events if e.timestamp <= start_time]
+            latest = candidates[-1] if candidates else self._events[0]
+            if latest.extras:
+                for key, val in latest.extras.items():
+                    arr = np.asarray(val, dtype=RAW_DTYPE)
+                    # If the extras entry is a scalar, broadcast to frames
+                    if arr.ndim == 0:
+                        extras_out[key] = np.full(frames, float(arr), dtype=RAW_DTYPE)
+                    elif arr.ndim == 1:
+                        if arr.shape[0] == frames:
+                            extras_out[key] = arr.copy()
+                        elif arr.shape[0] == 1:
+                            extras_out[key] = np.full(frames, float(arr[0]), dtype=RAW_DTYPE)
+                        elif arr.shape[0] > frames:
+                            # If the recorded extras contains a longer array,
+                            # slice to the requested block length.
+                            extras_out[key] = arr[:frames].copy()
+                        else:
+                            # Pad with the final value when shorter than frames.
+                            pad = np.full(frames - arr.shape[0], float(arr[-1]), dtype=RAW_DTYPE)
+                            extras_out[key] = np.concatenate([arr, pad])
+                    else:
+                        # For higher-rank extras, pass through as-is (caller
+                        # must handle shape). Convert to RAW_DTYPE.
+                        extras_out[key] = arr.copy()
+
         return {
             "times": times,
             "pitch": pitch,
             "envelope": envelope,
             "control_tensor": controls,
             "pcm": pcm,
+            "extras": extras_out,
         }
 
     def lookahead_events(self, start_time: float) -> Tuple[ControlEvent, ...]:

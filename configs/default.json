@@ -1,7 +1,7 @@
 {
   "sample_rate": 44100,
   "runtime": {
-    "frames_per_chunk": 512,
+  "frames_per_chunk": 1024,
     "output_channels": 2,
     "joystick": {
       "enabled": false,

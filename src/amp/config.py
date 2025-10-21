@@ -29,7 +29,8 @@ class JoystickConfig:
     buttons: Mapping[str, int] = field(default_factory=dict)
 
 
-DEFAULT_FRAMES_PER_CHUNK = 512
+DEFAULT_FRAMES_PER_BLOCK = 1024  # Use this everywhere for block size
+DEFAULT_FRAMES_PER_CHUNK = DEFAULT_FRAMES_PER_BLOCK
 DEFAULT_OUTPUT_CHANNELS = 2
 
 
