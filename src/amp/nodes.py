@@ -513,14 +513,20 @@ class SafetyNode(ConfigNode):
             return out
         data = _match_channels(audio, self.channels)
         data = np.require(data, dtype=RAW_DTYPE, requirements=("C",))
-        # Use C kernel when available; fallback to Python implementation inside c_kernels
-        # Ensure state array is sized for current batches
+        # There is no acceptable Python fallback path for runtime nodes: the
+        # compiled CFFI kernel must run or we refuse to proceed.
         if not isinstance(self._state, np.ndarray) or self._state.shape != (batches, self.channels):
             self._state = np.zeros((batches, self.channels), dtype=RAW_DTYPE)
+        if not c_kernels.AVAILABLE:
+            raise RuntimeError(
+                "SafetyNode requires compiled C kernels; Python fallbacks are forbidden."
+            )
         try:
             c_kernels.dc_block_c(data, float(self.dc_alpha), self._state, out=out)
-        except Exception:
-            c_kernels.dc_block_py(data, float(self.dc_alpha), self._state, out=out)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "SafetyNode must execute the CFFI dc_block kernel; Python fallback is unacceptable."
+            ) from exc
         np.clip(out, -1.0, 1.0, out=out)
         return out
 
@@ -552,14 +558,21 @@ class DelayNode(Node):
         return out
 
 class LFONode(Node):
-    def __init__(self,name,wave="sine",rate_hz=4.0,depth=0.5,use_input=False,slew_ms=0.0, slew_backend: str = "vector"):
+    def __init__(self,name,wave="sine",rate_hz=4.0,depth=0.5,use_input=False,slew_ms=0.0, slew_backend: str | None = None):
         super().__init__(name)
         self.wave=wave; self.rate=rate_hz; self.depth=depth
         self.use_input=use_input; self.slew_ms=slew_ms
         self.phase=0.0
-        # slew_backend: 'vector' (numpy closed-form), 'iter' (python loop), 'c' (cffi kernel if available)
-        self.slew_backend = str(slew_backend)
-        # state for iterative/backed implementations
+        # slew processing must execute in C; there is no sanctioned Python fallback.
+        backend = "auto" if slew_backend is None else str(slew_backend)
+        if backend not in {"auto", "c"}:
+            raise ValueError("LFONode only supports the CFFI slew backend")
+        if not c_kernels.AVAILABLE:
+            raise RuntimeError(
+                "LFONode requires compiled C kernels; Python fallbacks are forbidden."
+            )
+        self.slew_backend = "c"
+        # state for C-backed implementations
         self._slew_z0: np.ndarray | None = None
     def _make(self,ph):
         if self.wave=="sine": return np.sin(2*np.pi*ph,dtype=RAW_DTYPE)
@@ -593,17 +606,12 @@ class LFONode(Node):
                 # ensure z0 exists for iterative backends
                 if self._slew_z0 is None or self._slew_z0.shape[0] != plane.shape[0]:
                     self._slew_z0 = np.zeros(plane.shape[0], dtype=RAW_DTYPE)
-                if self.slew_backend == "c":
-                    try:
-                        c_kernels.lfo_slew_c(plane, r, alpha, self._slew_z0, out=plane)
-                    except Exception:
-                        # fallback to python fallback
-                        c_kernels.lfo_slew_py(plane, r, alpha, self._slew_z0, out=plane)
-                elif self.slew_backend == "iter":
-                    c_kernels.lfo_slew_py(plane, r, alpha, self._slew_z0, out=plane)
-                else:
-                    # vector closed form
-                    c_kernels.lfo_slew_vector(plane, r, alpha, self._slew_z0, out=plane)
+                try:
+                    c_kernels.lfo_slew_c(plane, r, alpha, self._slew_z0, out=plane)
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        "LFONode must execute the CFFI slew kernel; Python fallback is unacceptable."
+                    ) from exc
         return out  # (B,1,F)
 
 class EnvelopeModulatorNode(Node):
@@ -980,11 +988,17 @@ class OscNode(Node):
         buf = self._voice_phase_out.get(key)
         if buf is None or buf.shape != (batches, frames):
             buf = np.zeros((batches, frames), dtype=RAW_DTYPE)
-        # Prefer C kernel for phase advance; fallback to Python implementation
+        # Phase advance must run via CFFI; abandoning to Python is disallowed.
+        if not c_kernels.AVAILABLE:
+            raise RuntimeError(
+                "OscNode requires compiled C kernels; Python fallbacks are forbidden."
+            )
         try:
             ph = c_kernels.phase_advance_c(dphi, None, state, out=buf)
-        except Exception:
-            ph = c_kernels.phase_advance_py(dphi, None, state, out=buf)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "OscNode must execute the CFFI phase_advance kernel; Python fallback is unacceptable."
+            ) from exc
         # state is updated in-place by the kernel
         self._voice_phase[key] = state
         self._voice_phase_out[key] = ph
@@ -1103,7 +1117,7 @@ class OscNode(Node):
                     int(fps),
                     out=self._arp_offsets_buf,
                 )
-            except Exception:
+            except RuntimeError:
                 offsets = c_kernels.arp_advance_py(
                     seq_arr,
                     int(seq_arr.size),
@@ -1122,6 +1136,10 @@ class OscNode(Node):
         if port_mask is not None and np.any(port_mask > 0.5):
             if self._freq_state is None or self._freq_state.shape[0] != B:
                 self._freq_state = freq_target[:, 0].copy()
+            freq_target = np.require(freq_target, dtype=RAW_DTYPE, requirements=("C",))
+            port_mask = np.require(port_mask, dtype=RAW_DTYPE, requirements=("C",))
+            slide_time = np.require(slide_time, dtype=RAW_DTYPE, requirements=("C",))
+            slide_damp = np.require(slide_damp, dtype=RAW_DTYPE, requirements=("C",))
             try:
                 smoothed = c_kernels.portamento_smooth_c(
                     freq_target,
@@ -1132,7 +1150,7 @@ class OscNode(Node):
                     self._freq_state,
                     out=freq_target,
                 )
-            except Exception:
+            except RuntimeError:
                 smoothed = c_kernels.portamento_smooth_py(
                     freq_target,
                     port_mask,
@@ -1163,7 +1181,7 @@ class OscNode(Node):
 
         try:
             ph_base = c_kernels.phase_advance_c(dphi, reset, self.phase, out=self._phase_buffer)
-        except Exception:
+        except RuntimeError:
             ph_base = c_kernels.phase_advance_py(dphi, reset, self.phase, out=self._phase_buffer)
 
         wave = self._render_wave(ph_base, dphi)
@@ -1315,7 +1333,7 @@ class SafetyFilterNode(Node):
         x = np.require(x, dtype=RAW_DTYPE, requirements=("C",))
         try:
             y = c_kernels.safety_filter_c(x, float(self.a), self.prev_in, self.prev_dc, out=self._buffer)
-        except Exception:
+        except RuntimeError:
             y = c_kernels.safety_filter_py(x, float(self.a), self.prev_in, self.prev_dc, out=self._buffer)
         return y
 
@@ -1450,8 +1468,11 @@ class SubharmonicLowLifterNode(Node):
         a_env_release = self._alpha_lp(5.0, sr)
         a_hp_out = self._alpha_hp(out_hp, sr)
 
+        if not c_kernels.AVAILABLE:
+            raise RuntimeError(
+                "SubharmonicLowLifterNode requires compiled C kernels; Python fallbacks are forbidden."
+            )
         y = np.empty_like(x)
-        # Try C kernel for the heavy sequential per-sample logic; fallback to Python implementation
         try:
             y = c_kernels.subharmonic_process_c(
                 x,
@@ -1478,58 +1499,10 @@ class SubharmonicLowLifterNode(Node):
                 self.hp_out_y,
                 self.hp_out_x,
             )
-        except Exception:
-            # fallback to existing Python loop
-            for t in range(F):
-                xt = x[:, :, t]
-
-                # Bandpass driver: simple HP then LP
-                self.hp_y = a_hp_in * (self.hp_y + xt - self.prev)
-                self.prev = xt
-                bp = self.lp_y + a_lp_in * (self.hp_y - self.lp_y)
-                self.lp_y = bp
-
-                abs_bp = np.abs(bp)
-                self.env = np.where(
-                    abs_bp > self.env,
-                    self.env + a_env_attack * (abs_bp - self.env),
-                    self.env + a_env_release * (abs_bp - self.env),
-                )
-
-                prev_sign = self.sign
-                sign_now = (bp > 0.0).astype(np.int8) * 2 - 1
-                pos_zc = (prev_sign < 0) & (sign_now > 0)
-                self.sign = sign_now
-
-                self.ff2 = np.where(pos_zc, -self.ff2, self.ff2)
-
-                if self.use_div4:
-                    self.ff4_count = np.where(pos_zc, self.ff4_count + 1, self.ff4_count)
-                    toggle4 = pos_zc & (self.ff4_count >= 2)
-                    self.ff4 = np.where(toggle4, -self.ff4, self.ff4)
-                    self.ff4_count = np.where(toggle4, 0, self.ff4_count)
-
-                sq2 = self.ff2.astype(RAW_DTYPE)
-                self.sub2_lp = self.sub2_lp + a_sub2 * (sq2 - self.sub2_lp)
-                sub = self.sub2_lp
-
-                if self.use_div4 and self.sub4_lp is not None and self.ff4 is not None:
-                    sq4 = self.ff4.astype(RAW_DTYPE)
-                    self.sub4_lp = self.sub4_lp + a_sub4 * (sq4 - self.sub4_lp)
-                    sub = sub + 0.6 * self.sub4_lp
-
-                sub = np.tanh(drive * sub) * (self.env + 1e-6)
-
-                dry = xt
-                wet = sub
-                out_t = (1.0 - mix) * dry + mix * wet
-
-                y_prev = self.hp_out_y
-                x_prev = self.hp_out_x
-                hp = a_hp_out * (y_prev + out_t - x_prev)
-                self.hp_out_y = hp
-                self.hp_out_x = out_t
-                y[:, :, t] = hp
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "SubharmonicLowLifterNode must execute the CFFI subharmonic kernel; Python fallback is unacceptable."
+            ) from exc
 
         return y
 
