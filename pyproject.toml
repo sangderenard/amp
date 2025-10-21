@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 amp = "amp.cli:main"
+amp-benchmark-nodes = "amp.node_benchmarks:main"
 
 [project.optional-dependencies]
 interactive = [
