@@ -13,7 +13,8 @@ def test_run_node_benchmarks_smoke():
         seed=123,
     )
     assert "silence" in results
-    stats = results["silence"][1]
+    assert 32 in results["silence"]
+    stats = results["silence"][32][1]
     assert stats.mean_seconds >= 0.0
     assert stats.max_seconds >= stats.min_seconds
 
