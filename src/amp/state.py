@@ -6,10 +6,13 @@ import os
 from types import ModuleType
 from typing import Any, Dict
 
+import numpy as np
+
 # =========================
 # Settings / fidelity
 # =========================
-RAW_DTYPE = "float64"
+
+RAW_DTYPE = np.float64
 MAX_FRAMES = 4096
 
 # =========================
