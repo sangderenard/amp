@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from . import quantizer, utils
+from . import envelope, quantizer, utils
 from .utils import (
     as_BCF,
     assert_BCF,
@@ -582,6 +582,14 @@ class EnvelopeModulatorNode(Node):
     _DECAY = 3
     _SUSTAIN = 4
     _RELEASE = 5
+    _STAGE_CONSTANTS = {
+        "idle": _IDLE,
+        "attack": _ATTACK,
+        "hold": _HOLD,
+        "decay": _DECAY,
+        "sustain": _SUSTAIN,
+        "release": _RELEASE,
+    }
 
     def __init__(
         self,
@@ -688,24 +696,29 @@ class EnvelopeModulatorNode(Node):
         reset = out[:, 1, :]
 
         send_reset_flag = bool(send_reset.mean() > 0.5)
-        amp, reset = c_kernels.envelope_process_c(
+        params_obj = envelope.EnvelopeParams(
+            attack_frames=atk_frames,
+            hold_frames=hold_frames,
+            decay_frames=dec_frames,
+            sustain_frames=sus_frames,
+            release_frames=rel_frames,
+            sustain_level=self.sustain_level,
+            send_resets=send_reset_flag,
+        )
+
+        amp, reset = envelope.envelope_process_block(
             trigger,
             gate,
             drone,
             velocity,
-            atk_frames,
-            hold_frames,
-            dec_frames,
-            sus_frames,
-            rel_frames,
-            self.sustain_level,
-            send_reset_flag,
-            self._stage,
-            self._value,
-            self._timer,
-            self._velocity,
-            self._activation_count,
-            self._release_start,
+            params=params_obj,
+            stage=self._stage,
+            value=self._value,
+            timer=self._timer,
+            vel_state=self._velocity,
+            activations=self._activation_count,
+            release_start=self._release_start,
+            stage_constants=self._STAGE_CONSTANTS,
             out_amp=amp,
             out_reset=reset,
         )
