@@ -10,6 +10,7 @@ import threading
 import time
 from collections import deque
 from typing import Any, Callable, Optional, cast
+import traceback
 
 import numpy as np
 
@@ -623,14 +624,30 @@ def run(
     render_ema: float | None = None
     produced_ema: float | None = None
     period_ema: float | None = None
+    # HUD-level slow EMAs (milliseconds) to ensure display changes slowly.
+    # Use a time-constant based EMA so smoothing is stable regardless of frame rate.
+    # HUD smoothing time constants (set long so EMAs update very slowly)
+    hud_time_constant_node = 30.0
+    hud_time_constant_global = 30.0
+    hud_last_update = time.perf_counter()
+    hud_render_ms: float | None = None
+    hud_produced_ms: float | None = None
+    hud_period_ms: float | None = None
+    # Per-node HUD EMAs (milliseconds)
+    hud_node_timings: dict[str, float] = {}
 
     pcm_queue: queue.Queue[tuple[np.ndarray, dict[str, Any]]] | None = None
+    # Holds chunks that couldn't be enqueued immediately so we never
+    # silently drop producer data. A background requeue daemon will
+    # attempt to push these back into `pcm_queue` and emit warnings.
+    stashed_chunks: deque[tuple[np.ndarray, dict[str, Any]]] = deque()
     queue_capacity = 0
     queue_depth_display = 0
     audio_blocksize = 256
     producer_batch_blocks = 8
-    producer_max_batch_blocks = 16
-    producer_fill_target = 0.75
+    producer_max_batch_blocks = 64
+    # Aim to fill the queue fully when possible (aggressive pre-rendering).
+    producer_fill_target = 1.0
     producer_stop_event = threading.Event()
     producer_thread_obj: threading.Thread | None = None
 
@@ -644,7 +661,23 @@ def run(
         "interval": 5.0,
     }
 
+    # Accumulate repeated underrun messages so the UI/logs are not flooded.
+    audio_underrun_accum: int = 0
+    audio_underrun_last_emit: float = 0.0
+    # How often (seconds) to flush accumulated underrun messages
+    audio_underrun_flush_interval: float = 2.0
+
     control_tensors: dict[str, np.ndarray] = {}
+
+    # Efficiency exploration data (producer records these)
+    efficiency_lock = threading.Lock()
+    # deque of tuples: (batch_blocks, measured_efficiency)
+    efficiency_points: deque[tuple[int, float]] = deque(maxlen=4096)
+    # Snapshot of the current preferred batch size for UI
+    preferred_batch_snapshot: int | None = None
+    # Debug throttling for STATUS_PRINTER emits
+    efficiency_debug_last_emit: float = 0.0
+    efficiency_debug_emit_interval: float = 5.0
 
     def _control_view(key: str, frames: int) -> np.ndarray:
         buffer = control_tensors.get(key)
@@ -771,7 +804,9 @@ def run(
         if y.shape[0] != 1:
             raise RuntimeError(f"Device expects single batch output, got {y.shape}")
 
-        buffer = np.swapaxes(y[0], 0, 1).astype(np.float32, copy=True)
+        # Keep internal DSP buffers in float64 for full precision. Only
+        # convert to float32 at the final audio output stage.
+        buffer = np.swapaxes(y[0], 0, 1).astype(np.float64, copy=False)
 
         if pitch_ref is not None:
             last = pitch_ref.last_output
@@ -804,6 +839,7 @@ def run(
     def audio_callback(outdata, frames, time_info, status):
         nonlocal sample_rate, graph, last_callback_started, pcm_queue, queue_depth_display, audio_blocksize, queue_capacity
         nonlocal render_ema, produced_ema, period_ema
+        nonlocal audio_underrun_accum, audio_underrun_last_emit, audio_underrun_flush_interval
 
         sr = sample_rate
         start_time = time.perf_counter()
@@ -818,35 +854,74 @@ def run(
                 chunk, meta = pcm_queue.get_nowait()
             except queue.Empty:
                 queue_underflow = True
+                chunk = None
+                meta = None
             else:
                 queue_depth_display = pcm_queue.qsize()
 
         if chunk is None:
-            chunk, meta = _render_audio_frames(frames)
-            meta = dict(meta)
-            if queue_underflow:
-                meta["queue_underflow"] = True
-        else:
-            meta = dict(meta)
-            meta.setdefault("queue_underflow", False)
+            # Graceful underrun handling: do not crash the app. Instead,
+            # synthesize silence for this callback and accumulate a collapsed
+            # log message to avoid flooding the logs/UI. Emit the accumulated
+            # message at most once per `audio_underrun_flush_interval` seconds.
+            now = time.monotonic()
+            audio_underrun_accum += 1
+            if now - audio_underrun_last_emit >= audio_underrun_flush_interval:
+                if audio_underrun_accum > 1:
+                    STATUS_PRINTER.emit(
+                        f"[AudioCallback] Audio callback: PCM queue empty when data expected x{audio_underrun_accum}",
+                        force=True,
+                    )
+                else:
+                    STATUS_PRINTER.emit(
+                        "[AudioCallback] Audio callback: PCM queue empty when data expected",
+                        force=True,
+                    )
+                audio_underrun_accum = 0
+                audio_underrun_last_emit = now
 
+            # Produce silent chunk matching the expected frames and channel count
+            try:
+                chans = outdata.shape[1]
+            except Exception:
+                chans = 2
+            chunk = np.zeros((frames, chans), dtype=np.float32)
+            # Provide minimal metadata so downstream logic can still operate
+            meta = {
+                "render_duration": 0.0,
+                "allotted_time": (frames / sample_rate) if sample_rate else 0.0,
+                "produced_frames": frames,
+                "produced_time": (frames / sample_rate) if sample_rate else 0.0,
+                "batch_blocks": 1,
+                "batch_index": 0,
+                "queue_underflow": True,
+            }
+
+        # If chunk length mismatches the callback frames, do NOT silently
+        # pad/truncate. This indicates a producer/renderer bug which must be
+        # diagnosed at source. Surface as an error.
         if chunk.shape[0] != frames:
-            if pcm_queue is not None:
-                try:
-                    while True:
-                        pcm_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            chunk, meta = _render_audio_frames(frames)
-            meta = dict(meta)
-            meta["queue_underflow"] = True
-            queue_underflow = True
+            tb = (
+                f"Audio callback: chunk length {chunk.shape[0]} does not match "
+                f"callback frames {frames}"
+            )
+            STATUS_PRINTER.emit(f"[AudioCallback] {tb}", force=True)
+            exc = RuntimeError(tb)
+            audio_failures.append(exc)
+            running = False
+            return
 
         queue_underflow = queue_underflow or bool(meta.get("queue_underflow"))
 
         outdata.fill(0.0)
         chans = min(outdata.shape[1], chunk.shape[1])
-        outdata[:, :chans] = chunk[:, :chans]
+        # Convert to float32 only at the audio output boundary to preserve
+        # higher internal precision throughout the DSP pipeline.
+        if chunk.dtype != np.float32:
+            chunk_to_write = chunk.astype(np.float32, copy=False)
+        else:
+            chunk_to_write = chunk
+        outdata[:, :chans] = chunk_to_write[:, :chans]
 
         if pcm_queue is not None:
             queue_depth_display = pcm_queue.qsize()
@@ -898,10 +973,26 @@ def run(
         if queue_underflow:
             underrun = True
 
-        render_duration = float(meta.get("render_duration", end_time - start_time))
-        produced_frames = int(meta.get("produced_frames", frames))
-        produced_time = float(meta.get("produced_time", (produced_frames / sr) if sr else 0.0))
-        allotted_time = float(meta.get("allotted_time", produced_time))
+        # Do NOT accept missing metadata silently. Require the producer to
+        # supply authoritative timing information for each chunk.
+        if meta is None:
+            tb = "Audio callback: missing metadata for dequeued chunk"
+            STATUS_PRINTER.emit(f"[AudioCallback] {tb}", force=True)
+            exc = RuntimeError(tb)
+            audio_failures.append(exc)
+            running = False
+            return
+        if "render_duration" not in meta or "produced_frames" not in meta or "produced_time" not in meta or "allotted_time" not in meta:
+            tb = f"Audio callback: incomplete metadata keys: {list(meta.keys())}"
+            STATUS_PRINTER.emit(f"[AudioCallback] {tb}", force=True)
+            exc = RuntimeError(tb)
+            audio_failures.append(exc)
+            running = False
+            return
+        render_duration = float(meta["render_duration"])
+        produced_frames = int(meta["produced_frames"])
+        produced_time = float(meta["produced_time"])
+        allotted_time = float(meta["allotted_time"])
 
         def _ema(previous: float | None, value: float) -> float:
             if previous is None:
@@ -912,8 +1003,16 @@ def run(
         produced_ema = _ema(produced_ema, produced_time)
         period_ema = _ema(period_ema, period)
 
-        batch_blocks = int(meta.get("batch_blocks", 1))
-        batch_index = int(meta.get("batch_index", 0))
+        # Require explicit batch metadata rather than falling back to 1.
+        if "batch_blocks" not in meta or "batch_index" not in meta:
+            tb = f"Audio callback: missing batch metadata: {list(meta.keys())}"
+            STATUS_PRINTER.emit(f"[AudioCallback] {tb}", force=True)
+            exc = RuntimeError(tb)
+            audio_failures.append(exc)
+            running = False
+            return
+        batch_blocks = int(meta["batch_blocks"])
+        batch_index = int(meta["batch_index"])
 
         sample = {
             "render_duration": render_duration,
@@ -958,37 +1057,184 @@ def run(
         graph, envelope_names, amp_mod_names = build_runtime_graph(sample_rate, state)
         pitch_node = graph._nodes.get("pitch")
 
-        pcm_queue = queue.Queue[tuple[np.ndarray, dict[str, Any]]](maxsize=32)
+        # Larger queue to allow more aggressive pre-rendering.
+        pcm_queue = queue.Queue[tuple[np.ndarray, dict[str, Any]]](maxsize=128)
         queue_capacity = pcm_queue.maxsize
         producer_stop_event.clear()
 
         def producer_thread() -> None:
             nonlocal running, audio_blocksize
             try:
+                # Adaptive backoff used when the queue is full. This starts
+                # very small (low-latency retry) and exponentially backs off
+                # to avoid busy spinning if the consumer lags.
+                put_backoff = 0.0001
+                put_backoff_max = 0.05
+                # Preferred batch size driven by real renders (never probe).
+                preferred_batch_blocks = producer_batch_blocks
+                # EMA for measured efficiency = produced_time / render_duration
+                efficiency_ema: float | None = None
+                efficiency_alpha = 0.2
+                # Maintain an EMA of the estimated gradient (d efficiency / d batch)
+                grad_ema: float | None = None
+                grad_alpha = 0.4
+                # Keep a tiny recent map of measured efficiencies by batch
+                # size so we can compute a centered finite-difference using
+                # the +1 / -1 neighbourhood (hyperlocal landscape). This
+                # materialises local landscape without doing dedicated
+                # probe renders — we alternate small perturbations so each
+                # render is still a real render that will be consumed.
+                last_eff_map: dict[int, float] = {}
+                # Probe cycle: 0 (preferred), +1, -1, repeat. This ensures
+                # we sample both neighbours frequently to form a centre
+                # difference estimate.
+                probe_sequence = (0, 1, -1)
+                probe_idx = 0
+                # Greedy ascent: render at the current preferred size and
+                # rely on the finite-difference gradient EMA to step the
+                # preferred size. No explicit trials or perturbations are
+                # performed — we do not render solely to probe.
+                # Minimum significant gradient threshold to avoid thrash.
+                grad_threshold = 1e-6
+
                 while running and not producer_stop_event.is_set():
                     block_frames = max(1, audio_blocksize)
-                    batch_blocks = producer_batch_blocks
-                    if pcm_queue is not None and queue_capacity:
-                        try:
-                            backlog = pcm_queue.qsize()
-                        except NotImplementedError:
-                            backlog = 0
-                        target_fill = max(
-                            producer_batch_blocks,
-                            int(queue_capacity * producer_fill_target),
-                        )
-                        if backlog < target_fill:
-                            deficit = max(1, target_fill - backlog)
-                            batch_blocks = min(
-                                producer_max_batch_blocks,
-                                max(producer_batch_blocks, deficit),
-                            )
+                    # Batch selection MUST be independent of cache occupancy.
+                    # Always render according to the learned
+                    # `preferred_batch_blocks` with a small alternating
+                    # perturbation to estimate the gradient. Do NOT change
+                    # the candidate based on queue backlog; the enqueue
+                    # loop will briefly back off if the queue is full.
+                    # Conservative candidate selection:
+                    # - If in cooldown, keep the preferred size.
+                    # - Otherwise, occasionally perform a one-block *upwards*
+                    #   trial to measure whether larger batches improve
+                    #   efficiency. Trials happen infrequently (trial_interval)
+                    #   and are not alternated every render, avoiding the
+                    #   previously-observed every-other-single behaviour.
+                    # Greedy candidate: always render at the integer
+                    # preferred batch size. No perturbation or trial is
+                    # performed; preferred_batch_blocks is adjusted only by
+                    # the gradient-EMA logic below when evidence supports
+                    # an increase or decrease.
+                    # Choose a candidate batch that is a small hyperlocal
+                    # perturbation around the preferred size. We cycle
+                    # through preferred, +1, -1 so we get neighbour
+                    # measurements for a centered gradient estimate.
+                    base_pref = int(preferred_batch_blocks)
+                    probe = probe_sequence[probe_idx]
+                    probe_idx = (probe_idx + 1) % len(probe_sequence)
+                    candidate = base_pref + probe
+                    # Clamp to allowed range.
+                    candidate = min(producer_max_batch_blocks, max(producer_batch_blocks, candidate))
+                    batch_blocks = candidate
                     total_frames = block_frames * max(1, batch_blocks)
+                    # Render exactly once for the chosen batch size. Do NOT
+                    # perform additional probe renders — every render must be
+                    # a real render that will be consumed. Choose the largest
+                    # batch required to fill the queue target (as calculated
+                    # above) and render it in one go.
                     buffer, meta = _render_audio_frames(total_frames)
-                    chunk_count = max(1, total_frames // block_frames)
-                    per_chunk_duration = meta["render_duration"] / chunk_count
-                    allotted_per_chunk = meta["allotted_time"] / chunk_count if chunk_count else meta["allotted_time"]
-                    for idx in range(chunk_count):
+
+                    # Update batching policy from the actual measured efficiency
+                    # Require producer metadata to be present and trust the
+                    # renderer to return the requested number of frames.
+                    # Warn (do not crash) if the renderer did not provide
+                    # expected metadata or honoured the requested frames.
+                    if meta is None:
+                        STATUS_PRINTER.emit(
+                            "[AudioProducer] warning: renderer returned no metadata",
+                            force=True,
+                        )
+                        meta = {}
+                    if "produced_time" not in meta or "render_duration" not in meta:
+                        STATUS_PRINTER.emit(
+                            f"[AudioProducer] warning: incomplete renderer metadata: {list(meta.keys())}",
+                            force=True,
+                        )
+                    produced_time = float(meta.get("produced_time", (buffer.shape[0] / sample_rate) if sample_rate else 0.0))
+                    render_duration = float(meta.get("render_duration", 0.0))
+                    if buffer.shape[0] != total_frames:
+                        STATUS_PRINTER.emit(
+                            f"[AudioProducer] warning: renderer returned {buffer.shape[0]} frames but {total_frames} were requested",
+                            force=True,
+                        )
+                    efficiency = float("inf") if render_duration <= 0.0 else (produced_time / render_duration)
+
+                    # Do not record per-render here; record per-chunk when chunks
+                    # are actually enqueued below so the x value matches the
+                    # chunk metadata (chunk_meta['batch_blocks']).
+
+                    # Smooth the observed efficiency (useful for display and
+                    # to reduce noise before computing finite differences).
+                    if efficiency_ema is None:
+                        efficiency_ema = efficiency
+                    else:
+                        efficiency_ema = efficiency_ema + efficiency_alpha * (efficiency - efficiency_ema)
+
+                    # Record this measurement in the small recent map so we
+                    # can compute centred finite differences over the ±1
+                    # neighbourhood. Keep the map tiny to avoid memory use.
+                    try:
+                        last_eff_map[int(batch_blocks)] = float(efficiency)
+                        # Keep only the most recent few sizes (e.g. 9)
+                        if len(last_eff_map) > 9:
+                            # drop the oldest entry (arbitrary eviction)
+                            oldest = sorted(last_eff_map.keys())[0]
+                            del last_eff_map[oldest]
+                    except Exception:
+                        pass
+
+                    # Compute a hyperlocal gradient estimate around the
+                    # current integer preferred size using a centred
+                    # difference when both neighbours are present.
+                    grad: float | None = None
+                    p = int(preferred_batch_blocks)
+                    eff_p = last_eff_map.get(p)
+                    eff_p_plus = last_eff_map.get(p + 1)
+                    eff_p_minus = last_eff_map.get(p - 1)
+                    if eff_p_plus is not None and eff_p_minus is not None:
+                        # centred difference (per-block)
+                        grad = (eff_p_plus - eff_p_minus) / 2.0
+                    elif eff_p_plus is not None and eff_p is not None:
+                        grad = (eff_p_plus - eff_p) / 1.0
+                    elif eff_p_minus is not None and eff_p is not None:
+                        grad = (eff_p - eff_p_minus) / 1.0
+
+                    if grad is not None:
+                        if grad_ema is None:
+                            grad_ema = grad
+                        else:
+                            grad_ema = grad_ema + grad_alpha * (grad - grad_ema)
+
+                    # Move preferred size by one block in the direction
+                    # of increasing efficiency if the EMA'd gradient is
+                    # significantly non-zero. This yields gradual,
+                    # stable steps instead of jumping to bounds.
+                    if grad_ema is not None:
+                        if grad_ema > grad_threshold:
+                            preferred_batch_blocks = min(producer_max_batch_blocks, preferred_batch_blocks + 1)
+                        elif grad_ema < -grad_threshold:
+                            preferred_batch_blocks = max(producer_batch_blocks, preferred_batch_blocks - 1)
+
+                    # Split the returned buffer into full blocks and a final
+                    # partial remainder (if any). Do NOT drop or mutate
+                    # frames; emit warnings for mismatches.
+                    total_samples = buffer.shape[0]
+                    full_blocks = total_samples // block_frames
+                    remainder = total_samples % block_frames
+                    slices = full_blocks + (1 if remainder else 0)
+                    if slices == 0:
+                        # Nothing produced; warn and skip.
+                        STATUS_PRINTER.emit(
+                            "[AudioProducer] warning: renderer produced zero frames",
+                            force=True,
+                        )
+                        continue
+                    per_chunk_duration = float(render_duration) / float(slices) if slices else 0.0
+                    allotted_per_chunk = float(meta.get("allotted_time", (total_samples / sample_rate) if sample_rate else 0.0)) / float(slices)
+                    # Emit full-block slices
+                    for idx in range(full_blocks):
                         start = idx * block_frames
                         end = start + block_frames
                         chunk = buffer[start:end].copy()
@@ -996,28 +1242,122 @@ def run(
                             "render_duration": per_chunk_duration,
                             "allotted_time": allotted_per_chunk,
                             "produced_frames": block_frames,
-                            "produced_time": block_frames / sr if sr else 0.0,
-                            "batch_blocks": chunk_count,
+                            "produced_time": block_frames / sample_rate if sample_rate else 0.0,
+                            "batch_blocks": full_blocks + (1 if remainder else 0),
                             "batch_index": idx,
                             "queue_underflow": False,
                         }
                         node_timings_meta = meta.get("node_timings") if idx == 0 else None
                         if node_timings_meta:
                             chunk_meta["node_timings"] = dict(node_timings_meta)
-                        while running and not producer_stop_event.is_set():
+                        # Aggressive non-blocking put with adaptive sleep/backoff
+                        # if the queue is full. Use put_nowait to avoid the
+                        # 50ms timeout and allow fast retries while backing off
+                        # if the queue remains saturated.
+                        try:
+                            pcm_queue.put_nowait((chunk, chunk_meta))
+                            # Record per-chunk efficiency point for UI
                             try:
-                                pcm_queue.put((chunk, chunk_meta), timeout=0.05)
-                                break
-                            except queue.Full:
-                                time.sleep(0.001)
+                                with efficiency_lock:
+                                    # Record the producer's chosen batch size (candidate)
+                                    efficiency_points.append((int(batch_blocks), float(efficiency)))
+                                    preferred_batch_snapshot = int(preferred_batch_blocks)
+                            except Exception:
+                                pass
+                        except queue.Full:
+                            STATUS_PRINTER.emit(
+                                "[AudioProducer] PCM queue full: stashing chunk for requeue",
+                                force=True,
+                            )
+                            stashed_chunks.append((chunk, chunk_meta))
+                            break
+                    # Handle the remainder partial chunk, if any
+                    if remainder:
+                        start = full_blocks * block_frames
+                        end = start + remainder
+                        chunk = buffer[start:end].copy()
+                        chunk_meta = {
+                            "render_duration": per_chunk_duration,
+                            "allotted_time": allotted_per_chunk,
+                            "produced_frames": remainder,
+                            "produced_time": remainder / sample_rate if sample_rate else 0.0,
+                            "batch_blocks": 1,
+                            "batch_index": full_blocks,
+                            "queue_underflow": False,
+                        }
+                        node_timings_meta = meta.get("node_timings") if full_blocks == 0 else None
+                        if node_timings_meta:
+                            chunk_meta["node_timings"] = dict(node_timings_meta)
+                        try:
+                            pcm_queue.put_nowait((chunk, chunk_meta))
+                            try:
+                                with efficiency_lock:
+                                    # Record the producer's chosen batch size (candidate)
+                                    efficiency_points.append((int(batch_blocks), float(efficiency)))
+                                    preferred_batch_snapshot = int(preferred_batch_blocks)
+                            except Exception:
+                                pass
+                        except queue.Full:
+                            STATUS_PRINTER.emit(
+                                "[AudioProducer] PCM queue full: stashing remainder chunk for requeue",
+                                force=True,
+                            )
+                            stashed_chunks.append((chunk, chunk_meta))
                         if not running or producer_stop_event.is_set():
                             break
             except Exception as exc:  # pragma: no cover - depends on audio backend
+                # Capture full traceback for diagnostics
+                tb = traceback.format_exc()
+                STATUS_PRINTER.emit(f"[AudioProducer] Exception:\n{tb}", force=True)
                 audio_failures.append(exc)
                 running = False
 
         producer_thread_obj = threading.Thread(target=producer_thread, name="AudioProducer", daemon=True)
         producer_thread_obj.start()
+
+        def _requeue_daemon() -> None:
+            """Background helper that attempts to move stashed chunks
+            back into `pcm_queue`. Emits warnings when queue remains
+            saturated. Runs as a daemon so it does not block shutdown.
+            """
+            try:
+                while running:
+                    try:
+                        item = None
+                        # Pop leftmost stashed chunk if available
+                        if stashed_chunks:
+                            item = stashed_chunks.popleft()
+                        if item is None:
+                            time.sleep(0.01)
+                            continue
+                        chunk, chunk_meta = item
+                        # Block briefly while attempting to put so we do not
+                        # spin or lose data. If the queue is still full after
+                        # a short timeout, emit a warning and retry.
+                        try:
+                            # Put the full (chunk, meta) item back into the queue.
+                            # Use a blocking put with a short timeout so the daemon
+                            # does not spin if the consumer is briefly saturated.
+                            pcm_queue.put((chunk, chunk_meta), block=True, timeout=0.1)
+                        except Exception:
+                            # Could not place it; re-stash and back off.
+                            STATUS_PRINTER.emit(
+                                "[RequeueDaemon] warning: pcm_queue still full, will retry",
+                                force=True,
+                            )
+                            stashed_chunks.appendleft(item)
+                            time.sleep(0.05)
+                    except Exception:
+                        # Ensure the daemon doesn't die silently.
+                        STATUS_PRINTER.emit(
+                            f"[RequeueDaemon] exception: {traceback.format_exc()}",
+                            force=True,
+                        )
+                        time.sleep(0.1)
+            except Exception:
+                STATUS_PRINTER.emit(f"[RequeueDaemon] fatal: {traceback.format_exc()}", force=True)
+
+        threading.Thread(target=_requeue_daemon, name="RequeueDaemon", daemon=True).start()
 
         def audio_thread() -> None:
             nonlocal running
@@ -1034,6 +1374,8 @@ def run(
                     while running:
                         time.sleep(0.002)
             except Exception as exc:  # pragma: no cover - depends on audio backend
+                tb = traceback.format_exc()
+                STATUS_PRINTER.emit(f"[AudioThread] Exception:\n{tb}", force=True)
                 audio_failures.append(exc)
                 running = False
 
@@ -1285,8 +1627,14 @@ def run(
 
                 lines_to_render: list[str] = []
                 node_time = node_timings.get(name)
-                if node_time is not None:
-                    lines_to_render.append(f"time={node_time * 1000.0:.3f}ms")
+                # Prefer the HUD per-node EMA (ms) for display when available so
+                # per-node timing boxes don't jump every frame.
+                hud_node_time = hud_node_timings.get(name)
+                # Do NOT fall back to instantaneous values — display only the
+                # HUD-smoothed per-node EMA when available. This prevents noisy
+                # instant timings from showing up in the GUI.
+                if hud_node_time is not None:
+                    lines_to_render.append(f"time={hud_node_time:0.3f}ms")
                 if isinstance(node, nodes.OscNode):
                     lines_to_render.extend(
                         [
@@ -1390,6 +1738,93 @@ def run(
                 text = _render_text("__status__", text_value, colour, font)
                 screen.blit(text, (margin, info_y))
                 info_y += font.get_height() + 4
+
+            # Efficiency exploration scatter inset (UI telemetry)
+            try:
+                with efficiency_lock:
+                    points = list(efficiency_points)
+                    pref = preferred_batch_snapshot
+            except Exception:
+                points = []
+                pref = None
+
+            if points:
+                inset_w = 220
+                inset_h = 120
+                inset_x = width - inset_w - margin
+                inset_y = margin
+                pygame.draw.rect(screen, (18, 18, 24), (inset_x, inset_y, inset_w, inset_h), border_radius=6)
+                pygame.draw.rect(screen, (120, 120, 140), (inset_x, inset_y, inset_w, inset_h), width=1, border_radius=6)
+
+                # Use exact numeric batch sizes on the x axis (no jitter).
+                batches = [float(p[0]) for p in points]
+                effs = [p[1] for p in points]
+
+                orig_min_b = float(min(batches))
+                orig_max_b = float(max(batches))
+                span = orig_max_b - orig_min_b
+                # Use the exact data range for scaling. If there's no span,
+                # expand a bit so the axis is not degenerate.
+                if span <= 0.0:
+                    min_b = orig_min_b - 1.0
+                    max_b = orig_max_b + 1.0
+                else:
+                    min_b = orig_min_b
+                    max_b = orig_max_b
+
+                min_e, max_e = min(effs), max(effs)
+                if abs(max_e - min_e) < 1e-6:
+                    min_e = 0.0
+                    max_e = max_e + 1.0
+
+                def x_of(b: float) -> int:
+                    return int(inset_x + 8 + (inset_w - 16) * ((b - min_b) / (max_b - min_b)))
+
+                def y_of(e: float) -> int:
+                    return int(inset_y + inset_h - 8 - (inset_h - 16) * ((e - min_e) / (max_e - min_e)))
+
+                label = _render_text("__eff_title__", f"efficiency explorer", (200, 200, 200), font_small)
+                screen.blit(label, (inset_x + 8, inset_y + 4))
+
+                # Debug overlay: show computed x-range and a few batch values
+                try:
+                    dbg_lines = []
+                    dbg_lines.append(f"count={len(points)}")
+                    dbg_lines.append(f"min={min_b:.3f}")
+                    dbg_lines.append(f"max={max_b:.3f}")
+                    sample_batches = ",".join(str(int(x)) for x in batches[:6])
+                    if len(batches) > 6:
+                        sample_batches += ",.."
+                    dbg_lines.append(f"b:{sample_batches}")
+                    dbg_text = " | ".join(dbg_lines)
+                    dbg_surf = _render_text("__eff_dbg__", dbg_text, (200, 200, 160), font_small)
+                    screen.blit(dbg_surf, (inset_x + 8, inset_y + inset_h - dbg_surf.get_height() - 6))
+                except Exception:
+                    pass
+
+                # Occasional log of sampled batches for debugging
+                try:
+                    nowt = time.monotonic()
+                    if nowt - efficiency_debug_last_emit >= efficiency_debug_emit_interval:
+                        sample_batches = ",".join(str(int(x)) for x in batches[:8])
+                        if len(batches) > 8:
+                            sample_batches += ",.."
+                        STATUS_PRINTER.emit(f"[EffDebug] count={len(points)} batches={sample_batches}")
+                        efficiency_debug_last_emit = nowt
+                except Exception:
+                    pass
+
+                # plot last N points to avoid excessive draw cost
+                subset = list(zip(batches, effs))[-512:]
+                for b, e in subset:
+                    try:
+                        px = x_of(b)
+                        py = y_of(e)
+                        pygame.draw.circle(screen, (120, 220, 120), (px, py), 2)
+                    except Exception:
+                        continue
+
+                # autoscaled scatter only; no extra ticks or labels
 
             pygame.display.flip()
         finally:
@@ -1556,6 +1991,7 @@ def run(
             render_mean_ms = render_peak_ms = allotted_ms = 0.0
             produced_mean_ms = produced_peak_ms = produced_latest_ms = 0.0
             period_mean_ms = period_peak_ms = 0.0
+            # Smooth (slow-changing) EMAs are provided by the audio callback samples.
             render_ema_ms = produced_ema_ms = period_ema_ms = 0.0
             underrun_recent = False
             if timing_snapshot:
@@ -1564,21 +2000,42 @@ def run(
                 render_peak_ms = max(render_values) * 1000.0
                 allotted_ms = timing_snapshot[-1]["allotted_time"] * 1000.0
 
-                produced_values = [
+                # Exclude samples that were silence produced due to underrun
+                produced_values_all = [
                     entry["produced_time"]
                     for entry in timing_snapshot
                     if entry.get("produced_time") is not None
                 ]
+                produced_values = [
+                    entry["produced_time"]
+                    for entry in timing_snapshot
+                    if entry.get("produced_time") is not None and not entry.get("queue_underflow", False)
+                ]
                 if produced_values:
                     produced_mean_ms = sum(produced_values) / len(produced_values) * 1000.0
                     produced_peak_ms = max(produced_values) * 1000.0
-                    produced_latest_ms = timing_snapshot[-1].get("produced_time", 0.0) * 1000.0
+                    # Use the most recent non-underrun sample if available
+                    produced_latest_ms = next((e.get("produced_time") for e in reversed(timing_snapshot) if e.get("produced_time") is not None and not e.get("queue_underflow", False)), 0.0) * 1000.0
+                else:
+                    # No valid non-underrun produced samples; keep produced_* at 0
+                    produced_mean_ms = 0.0
+                    produced_peak_ms = 0.0
+                    produced_latest_ms = 0.0
 
                 period_values = [entry["callback_period"] for entry in timing_snapshot if entry["callback_period"] > 0.0]
                 if period_values:
                     period_mean_ms = sum(period_values) / len(period_values) * 1000.0
                     period_peak_ms = max(period_values) * 1000.0
-                batch_blocks = max(1, int(timing_snapshot[-1].get("batch_blocks", 1)))
+                # For display purposes prefer the most-recent non-underrun
+                # timing sample's batch size. This prevents a silent
+                # underrun-produced chunk (which reports batch_blocks=1)
+                # from causing the UI to show a single produced batch when
+                # the producer had been rendering larger batches.
+                last_non_underrun = next((e for e in reversed(timing_snapshot) if not e.get("queue_underflow", False)), None)
+                if last_non_underrun is not None:
+                    batch_blocks = max(1, int(last_non_underrun.get("batch_blocks", 1)))
+                else:
+                    batch_blocks = max(1, int(timing_snapshot[-1].get("batch_blocks", 1)))
                 if timing_snapshot[-1].get("render_ema") is not None:
                     render_ema_ms = timing_snapshot[-1]["render_ema"] * 1000.0
                 if timing_snapshot[-1].get("produced_ema") is not None:
@@ -1632,25 +2089,68 @@ def run(
             console_lines = [entry[0] for entry in lines_with_colour]
 
             if timing_snapshot:
-                render_text = (
-                    f"render avg {render_mean_ms:5.2f}ms pk {render_peak_ms:5.2f}ms"
-                )
-                if render_ema_ms:
-                    render_text += f" ema {render_ema_ms:5.2f}ms"
-                audio_text = (
-                    f"audio {produced_latest_ms:5.2f}ms"
-                    if produced_latest_ms
-                    else "audio 0.00ms"
-                )
-                if batch_blocks > 1:
-                    audio_text += f" ({batch_blocks}×)"
+                # Use instantaneous aggregated measures (ms) to update HUD EMAs
+                inst_render_ms = render_mean_ms
+                # Prefer the latest non-underrun produced time, fall back to mean
+                inst_produced_ms = produced_latest_ms if produced_latest_ms else produced_mean_ms
+                inst_period_ms = period_mean_ms
+
+                # Compute time-based alphas for HUD EMAs from loop dt -> alpha = 1 - exp(-dt / tau)
+                now_t = time.perf_counter()
+                dt = now_t - hud_last_update if now_t > hud_last_update else 0.0
+                # clamp dt to a very small maximum to avoid large alpha spikes when UI stalls
+                dt = max(1e-6, min(0.02, dt))
+                hud_last_update = now_t
+
+                hud_alpha_global = 1.0 - math.exp(-dt / hud_time_constant_global)
+                hud_alpha_node = 1.0 - math.exp(-dt / hud_time_constant_node)
+
+                def _hud_update(prev: float | None, value: float, alpha: float) -> float:
+                    if prev is None:
+                        # seed new EMAs with the first observed value
+                        return value
+                    return prev + alpha * (value - prev)
+
+                # Update global EMAs with the global alpha
+                hud_render_ms = _hud_update(hud_render_ms, float(inst_render_ms or 0.0), hud_alpha_global)
+                hud_produced_ms = _hud_update(hud_produced_ms, float(inst_produced_ms or 0.0), hud_alpha_global)
+                hud_period_ms = _hud_update(hud_period_ms, float(inst_period_ms or 0.0), hud_alpha_global)
+
+                render_display = hud_render_ms or 0.0
+                produced_display = hud_produced_ms or 0.0
+                period_display = hud_period_ms or 0.0
+
+                render_text = f"render {render_display:5.2f}ms pk {render_peak_ms:5.2f}ms"
+                # Only show produced audio stats when we have at least one
+                # non-underrun produced sample. Silence produced due to
+                # underrun should not be displayed as completed audio.
+                audio_section = ""
+                if produced_mean_ms or produced_peak_ms or produced_latest_ms:
+                    audio_section = f"audio {produced_display:5.2f}ms"
+                    if batch_blocks > 1:
+                        audio_section += f" ({batch_blocks}×)"
+
+                # Build a stable `audio_text` variable. When there are no
+                # non-underrun produced samples, avoid attaching numeric
+                # produced-time stats but still display a minimal placeholder
+                # (e.g. "audio") so the UI shows an audio section during an
+                # underrun period.
+                if audio_section:
+                    audio_text = audio_section
+                else:
+                    audio_text = "audio" if underrun_recent else ""
+
+                # Append aggregate numbers only when we actually have
+                # non-underrun produced measurements.
                 if produced_mean_ms or produced_peak_ms:
                     audio_text += f" avg {produced_mean_ms:5.2f}ms pk {produced_peak_ms:5.2f}ms"
                 if produced_ema_ms:
                     audio_text += f" ema {produced_ema_ms:5.2f}ms"
-                budget_text = (
-                    f"Audio: {render_text} | {audio_text} | budget {allotted_ms:5.2f}ms"
-                )
+
+                if audio_text:
+                    budget_text = f"Audio: {render_text} | {audio_text} | budget {allotted_ms:5.2f}ms"
+                else:
+                    budget_text = f"Audio: {render_text} | budget {allotted_ms:5.2f}ms"
                 period_text = ""
                 if period_mean_ms or period_peak_ms or period_ema_ms:
                     period_text = (
@@ -1664,15 +2164,33 @@ def run(
                 underrun_text = " UNDERRUN" if underrun_recent else ""
                 timing_text = budget_text + period_text + queue_text + underrun_text
                 timing_colour = (240, 120, 120) if underrun_recent else (180, 220, 255)
-                lines_with_colour.append((timing_text, timing_colour))
-                console_lines.append(timing_text)
+                # Strict rule: if the most-recent dequeued chunk was an
+                # underrun / silence produced by the callback (queue_underflow
+                # or underrun), do NOT print the bottom timing line. This
+                # ensures we don't report produced silence. Leave other UI
+                # elements unchanged.
+                last_sample = timing_snapshot[-1] if timing_snapshot else {}
+                last_was_underrun = bool(last_sample.get("queue_underflow") or last_sample.get("underrun"))
+                # If the most-recent dequeued chunk was silence produced by
+                # the callback (queue_underflow/underrun), do not print the
+                # bottom timing line at all. This strictly avoids reporting
+                # produced silence. All other UI output remains unchanged.
+                if not last_was_underrun:
+                    lines_with_colour.append((timing_text, timing_colour))
+                    console_lines.append(timing_text)
                 latest_node_timings = timing_snapshot[-1].get("node_timings") or {}
+                # Update per-node HUD EMAs from the latest node timings (convert to ms)
                 if latest_node_timings:
+                    for name, duration in latest_node_timings.items():
+                        value_ms = float(duration) * 1000.0
+                        prev = hud_node_timings.get(name)
+                        hud_node_timings[name] = _hud_update(prev, value_ms, hud_alpha_node)
+
                     sorted_nodes = sorted(
                         latest_node_timings.items(), key=lambda item: item[1], reverse=True
                     )
                     top_entries = ", ".join(
-                        f"{name}:{duration * 1000.0:0.2f}ms" for name, duration in sorted_nodes[:3]
+                        f"{name}:{hud_node_timings.get(name, duration * 1000.0):0.2f}ms" for name, duration in sorted_nodes[:3]
                     )
                     nodes_text = f"Nodes: {top_entries}"
                     lines_with_colour.append((nodes_text, (200, 210, 255)))
