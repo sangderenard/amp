@@ -2,19 +2,34 @@
 
 from __future__ import annotations
 
+import json
 from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
 from threading import Lock
-from typing import Deque, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import TYPE_CHECKING, Deque, Dict, Iterable, List, Mapping, Sequence, Tuple
+import struct
 import time
+import zlib
 
 import numpy as np
 
 from .config import GraphConfig
 from .nodes import NODE_TYPES, Node as AudioNode
 
+if TYPE_CHECKING:
+    from .graph_edge_runner import CffiEdgeRunner
+
 RAW_DTYPE = np.float64
+
+
+_NODE_DESCRIPTOR_HEADER = struct.Struct("<IIIIIIII")
+_MOD_DESCRIPTOR_HEADER = struct.Struct("<IIIfi")
+_PARAM_DESCRIPTOR_HEADER = struct.Struct("<IIIIQ")
+_CONTROL_SAMPLE_HEADER = struct.Struct("<IIIII dd QQQQQQQ")
+_EXTRA_ENTRY_HEADER = struct.Struct("<IIQ")
+
+_MODE_CODES: dict[str, int] = {"add": 0, "mul": 1}
 
 
 def _as_bcf(value, batches: int, channels: int, frames: int, *, name: str) -> np.ndarray:
@@ -252,6 +267,87 @@ class ControlDelay:
             "extras": extras_out,
         }
 
+    def export_sample_block(
+        self,
+        start_time: float,
+        frames: int,
+        *,
+        update_hz: float | None = None,
+    ) -> bytes:
+        """Serialize a sampled control block into a C-compatible layout."""
+
+        block = self.sample(start_time, frames, update_hz=update_hz)
+        times = np.ascontiguousarray(block["times"], dtype=RAW_DTYPE)
+        pitch = np.ascontiguousarray(block["pitch"], dtype=RAW_DTYPE)
+        envelope = np.ascontiguousarray(block["envelope"], dtype=RAW_DTYPE)
+        control_tensor = np.ascontiguousarray(block["control_tensor"], dtype=RAW_DTYPE)
+        pcm = np.ascontiguousarray(block["pcm"], dtype=RAW_DTYPE)
+
+        pitch_dim = int(pitch.shape[1]) if pitch.ndim == 2 else 0
+        envelope_dim = int(envelope.shape[1]) if envelope.ndim == 2 else 0
+        extras = block.get("extras", {}) or {}
+        pcm_channels = int(pcm.shape[0]) if pcm.ndim == 2 else 0
+
+        payload = bytearray(_CONTROL_SAMPLE_HEADER.size)
+        offset = _CONTROL_SAMPLE_HEADER.size
+
+        def _append_array(array: np.ndarray) -> tuple[int, int]:
+            nonlocal offset
+            if array.size == 0:
+                return 0, 0
+            data = array.tobytes(order="C")
+            start = offset
+            payload.extend(data)
+            offset += len(data)
+            return start, len(data)
+
+        times_offset, _ = _append_array(times)
+        pitch_offset, _ = _append_array(pitch)
+        envelope_offset, _ = _append_array(envelope)
+        control_offset, _ = _append_array(control_tensor)
+        pcm_offset, _ = _append_array(pcm)
+
+        extras_offset = offset
+        payload.extend(struct.pack("<I", len(extras)))
+        offset += 4
+        for key, value in extras.items():
+            key_bytes = key.encode("utf-8")
+            array = np.ascontiguousarray(value, dtype=RAW_DTYPE)
+            rank = array.ndim
+            dims = array.shape
+            data = array.tobytes(order="C")
+            payload.extend(_EXTRA_ENTRY_HEADER.pack(len(key_bytes), rank, len(data)))
+            offset += _EXTRA_ENTRY_HEADER.size
+            payload.extend(key_bytes)
+            offset += len(key_bytes)
+            if rank:
+                payload.extend(struct.pack(f"<{rank}I", *dims))
+                offset += rank * 4
+            payload.extend(data)
+            offset += len(data)
+
+        total_size = len(payload)
+
+        _CONTROL_SAMPLE_HEADER.pack_into(
+            payload,
+            0,
+            int(frames),
+            pitch_dim,
+            envelope_dim,
+            len(extras),
+            pcm_channels,
+            float(start_time),
+            float(update_hz or self.sample_rate),
+            times_offset,
+            pitch_offset,
+            envelope_offset,
+            control_offset,
+            pcm_offset,
+            extras_offset,
+            total_size,
+        )
+        return bytes(payload)
+
     def lookahead_events(self, start_time: float) -> Tuple[ControlEvent, ...]:
         window_end = start_time + self.lookahead_seconds
         return tuple(event for event in self._events if start_time <= event.timestamp <= window_end)
@@ -366,6 +462,7 @@ class AudioGraph:
         self._merge_scratch: Dict[Tuple[int, int, int], np.ndarray] = {}
         self._audio_workspaces: Dict[Tuple[int, int, int], np.ndarray] = {}
         self._last_node_timings: Dict[str, float] = {}
+        self._edge_runner: "CffiEdgeRunner" | None = None
 
     @classmethod
     def from_config(cls, config: GraphConfig, sample_rate: int, output_channels: int) -> "AudioGraph":
@@ -475,6 +572,7 @@ class AudioGraph:
 
     def _invalidate_plan(self) -> None:
         self._plan_dirty = True
+        self._edge_runner = None
 
     def _ensure_execution_plan(self) -> Tuple[_NodeExecutionPlan, ...]:
         if not self._plan_dirty:
@@ -631,6 +729,15 @@ class AudioGraph:
             self._audio_workspaces[shape] = buffer
         return buffer
 
+    def _ensure_edge_runner(self) -> "CffiEdgeRunner":
+        if self._edge_runner is None:
+            try:
+                from .graph_edge_runner import CffiEdgeRunner
+            except Exception as exc:  # pragma: no cover - defensive import guard
+                raise RuntimeError("cffi edge runner is required for graph rendering") from exc
+            self._edge_runner = CffiEdgeRunner(self)
+        return self._edge_runner
+
     def render_block(
         self,
         frames: int,
@@ -641,114 +748,27 @@ class AudioGraph:
             raise RuntimeError("Sink node has not been configured")
         sr = int(sample_rate or self.sample_rate)
         plan = self._ensure_execution_plan()
-        caches: Dict[str, np.ndarray | None] = {name: None for name in self._nodes}
+        payload = dict(base_params) if base_params is not None else {}
+        runner = self._ensure_edge_runner()
+        runner.begin_block(frames, sample_rate=sr, base_params=payload)
         node_timings: Dict[str, float] = {}
         for node in self._nodes.values():
             recycle = getattr(node, "recycle_blocks", None)
             if recycle is not None:
                 recycle()
         for entry in plan:
-            name = entry.name
-            audio_inputs: List[np.ndarray] = []
-            for predecessor in entry.audio_inputs:
-                buffer = caches.get(predecessor)
-                if buffer is None:
-                    continue
-                audio_inputs.append(_assert_bcf(buffer, name=f"{predecessor}.out"))
-            if audio_inputs:
-                batches = audio_inputs[0].shape[0]
-                frame_count = audio_inputs[0].shape[2]
-                if len(audio_inputs) == 1:
-                    audio_in = audio_inputs[0]
-                    channels = audio_in.shape[1]
-                else:
-                    total_channels = audio_inputs[0].shape[1]
-                    for buf in audio_inputs[1:]:
-                        if buf.shape[0] != batches or buf.shape[2] != frame_count:
-                            raise ValueError(f"Shape mismatch in inputs to '{name}'")
-                        total_channels += buf.shape[1]
-                    workspace = self._acquire_audio_workspace(
-                        (batches, total_channels, frame_count)
-                    )
-                    offset = 0
-                    for buf in audio_inputs:
-                        channels_slice = buf.shape[1]
-                        target = workspace[:, offset : offset + channels_slice, :]
-                        np.copyto(target, buf)
-                        offset += channels_slice
-                    audio_in = workspace[:, :total_channels, :]
-                    channels = total_channels
-            else:
-                audio_in = None
-                batches = int(base_params.get("_B", 1)) if base_params else 1
-                frame_count = frames
-                channels = int(base_params.get("_C", 1)) if base_params else 1
-            node_params: Dict[str, np.ndarray] = {}
-            if base_params and name in base_params:
-                for key, value in base_params[name].items():
-                    node_params[key] = self._prepare_param_buffer(
-                        name,
-                        key,
-                        value,
-                        batches,
-                        channels,
-                        frame_count,
-                    )
-            mods: Dict[str, List[tuple[np.ndarray, float, str]]] = {}
-            for group in entry.mod_groups:
-                signals: List[tuple[np.ndarray, float, str]] = []
-                for connection in group.connections:
-                    buffer = caches.get(connection.source)
-                    if buffer is None:
-                        continue
-                    source_buf = _assert_bcf(buffer, name=f"{connection.source}.out")
-                    mod_signal = self._prepare_mod_buffer(
-                        name,
-                        group.param,
-                        connection,
-                        source_buf,
-                        batches,
-                        channels,
-                        frame_count,
-                    )
-                    signals.append((mod_signal, connection.scale, connection.mode))
-                if signals:
-                    mods[group.param] = signals
-            merged_params: Dict[str, np.ndarray] = dict(node_params)
-            if mods:
-                shape = (batches, channels, frame_count)
-                scratch = self._acquire_merge_scratch(shape)
-                for param_name, entries in mods.items():
-                    base = merged_params.get(
-                        param_name,
-                        self._prepare_param_buffer(
-                            name,
-                            param_name,
-                            0.0,
-                            batches,
-                            channels,
-                            frame_count,
-                        ),
-                    )
-                    for signal, scale, mode in entries:
-                        if mode == "add":
-                            if scale == 0.0:
-                                continue
-                            if scale == 1.0:
-                                np.add(base, signal, out=base)
-                            else:
-                                np.multiply(signal, scale, out=scratch)
-                                np.add(base, scratch, out=base)
-                        else:
-                            np.multiply(signal, scale, out=scratch)
-                            np.add(scratch, 1.0, out=scratch)
-                            np.multiply(base, scratch, out=base)
-                    merged_params[param_name] = base
-            node = self._nodes[name]
+            node = self._nodes[entry.name]
+            handle = runner.gather_to(entry.name)
+            params = handle.params
+            audio_in = handle.audio
             start = time.perf_counter()
-            output = node.process(frame_count, sr, audio_in, mods, merged_params)
-            node_timings[name] = time.perf_counter() - start
-            caches[name] = _assert_bcf(output, name=f"{name}.out")
+            output = node.process(handle.frames, sr, audio_in, {}, params)
+            node_timings[entry.name] = time.perf_counter() - start
+            runner.set_node_output(entry.name, output)
+        caches = {name: runner.get_cached_output(name) for name in runner.ordered_nodes}
+        sink_output = caches.get(self.sink)
+        if sink_output is None:
+            raise RuntimeError(f"Sink node '{self.sink}' produced no data")
         with self._levels_lock:
             self._last_node_levels = {
                 name: np.max(np.abs(buf), axis=2)
@@ -756,9 +776,6 @@ class AudioGraph:
                 if buf is not None
             }
             self._last_node_timings = dict(node_timings)
-        sink_output = caches[self.sink]
-        if sink_output is None:
-            raise RuntimeError(f"Sink node '{self.sink}' produced no data")
         return sink_output
 
     def render(
@@ -779,6 +796,98 @@ class AudioGraph:
             elif channels > self.output_channels:
                 data = data[: self.output_channels]
         return data
+
+    def serialize_node_descriptors(self) -> bytes:
+        """Serialize the graph topology and parameter buffers for C tooling."""
+
+        plan = self._ensure_execution_plan()
+        payload = bytearray(struct.pack("<I", len(plan)))
+        for entry in plan:
+            node = self._nodes[entry.name]
+            type_name = type(node).__name__
+            type_bytes = type_name.encode("utf-8")
+            name_bytes = entry.name.encode("utf-8")
+            type_id = zlib.crc32(type_bytes) & 0xFFFFFFFF
+
+            audio_inputs = tuple(self._audio_inputs.get(entry.name, ()))
+            mod_connections = list(self._mod_inputs.get(entry.name, ()))
+
+            params_json = json.dumps(getattr(node, "params", {}), sort_keys=True).encode("utf-8")
+
+            param_buffers: list[tuple[str, tuple[int, int, int], bytes]] = []
+            for (node_name, param), buffers in self._param_buffers.items():
+                if node_name != entry.name:
+                    continue
+                for shape, array in buffers.items():
+                    if array is None:
+                        continue
+                    contiguous = np.ascontiguousarray(array, dtype=RAW_DTYPE)
+                    param_buffers.append((param, tuple(map(int, shape)), contiguous.tobytes(order="C")))
+
+            buffer_shapes: set[tuple[int, int, int]] = {shape for _, shape, _ in param_buffers}
+            for (source, target, _param, _channel), buffers in self._mod_buffers.items():
+                if target != entry.name:
+                    continue
+                for shape in buffers:
+                    buffer_shapes.add(tuple(map(int, shape)))
+
+            payload.extend(
+                _NODE_DESCRIPTOR_HEADER.pack(
+                    type_id,
+                    len(name_bytes),
+                    len(type_bytes),
+                    len(audio_inputs),
+                    len(mod_connections),
+                    len(param_buffers),
+                    len(buffer_shapes),
+                    len(params_json),
+                )
+            )
+            payload.extend(name_bytes)
+            payload.extend(type_bytes)
+
+            for source in audio_inputs:
+                src_bytes = source.encode("utf-8")
+                payload.extend(struct.pack("<I", len(src_bytes)))
+                payload.extend(src_bytes)
+
+            for connection in mod_connections:
+                source_bytes = connection.source.encode("utf-8")
+                param_bytes = (connection.param or "").encode("utf-8")
+                mode_code = _MODE_CODES.get(connection.mode, 0xFFFFFFFF)
+                channel = connection.channel if connection.channel is not None else -1
+                payload.extend(
+                    _MOD_DESCRIPTOR_HEADER.pack(
+                        len(source_bytes),
+                        len(param_bytes),
+                        mode_code,
+                        float(connection.scale),
+                        int(channel),
+                    )
+                )
+                payload.extend(source_bytes)
+                payload.extend(param_bytes)
+
+            for param_name, shape, blob in param_buffers:
+                name_bytes = param_name.encode("utf-8")
+                payload.extend(
+                    _PARAM_DESCRIPTOR_HEADER.pack(
+                        len(name_bytes),
+                        int(shape[0]) if shape else 0,
+                        int(shape[1]) if len(shape) > 1 else 0,
+                        int(shape[2]) if len(shape) > 2 else 0,
+                        len(blob),
+                    )
+                )
+                payload.extend(name_bytes)
+                payload.extend(blob)
+
+            for shape in sorted(buffer_shapes):
+                payload.extend(struct.pack("<III", *shape))
+
+            payload.extend(params_json)
+
+        return bytes(payload)
 
     @property
     def last_node_levels(self) -> Dict[str, np.ndarray]:

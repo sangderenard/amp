@@ -14,7 +14,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from amp.config import DEFAULT_FRAMES_PER_BLOCK
 from amp.agent_benchmark_viz import create_timeline_figure
-from scripts.agent_benchmark import benchmark_default_graph
+from amp.system import benchmark_default_graph
 
 def main():
     import argparse

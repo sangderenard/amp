@@ -383,7 +383,11 @@ def build_base_params(
     for idx, name in enumerate(osc_names):
         # Oscillator params should also be history-backed if modulated; otherwise, use static defaults
         freq = sampled_extras.get(f"{name}_freq", 110.0 * (idx + 2))
-        amp = sampled_extras.get(f"{name}_amp", 0.3 if idx == 0 else 0.25)
+        has_amp_mod = any(
+            connection.param == "amp" for connection in graph.mod_connections(name)
+        )
+        amp_default = 0.0 if has_amp_mod else (0.3 if idx == 0 else 0.25)
+        amp = sampled_extras.get(f"{name}_amp", amp_default)
         base_params[name] = {
             "freq": _assign_control(cache, f"{name}.freq", frames, freq),
             "amp": _assign_control(cache, f"{name}.amp", frames, amp),
