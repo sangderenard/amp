@@ -619,6 +619,10 @@ def run(
     callback_timing_samples: deque[dict[str, Any]] = deque(maxlen=256)
     callback_timing_lock = threading.Lock()
     last_callback_started = 0.0
+    ema_alpha = 0.05
+    render_ema: float | None = None
+    produced_ema: float | None = None
+    period_ema: float | None = None
 
     pcm_queue: queue.Queue[tuple[np.ndarray, dict[str, Any]]] | None = None
     queue_capacity = 0
@@ -789,6 +793,8 @@ def run(
         meta = {
             "render_duration": render_duration,
             "allotted_time": allotted_time,
+            "produced_frames": frames,
+            "produced_time": allotted_time,
         }
         if node_timings:
             meta["node_timings"] = node_timings
@@ -797,6 +803,7 @@ def run(
 
     def audio_callback(outdata, frames, time_info, status):
         nonlocal sample_rate, graph, last_callback_started, pcm_queue, queue_depth_display, audio_blocksize, queue_capacity
+        nonlocal render_ema, produced_ema, period_ema
 
         sr = sample_rate
         start_time = time.perf_counter()
@@ -891,10 +898,34 @@ def run(
         if queue_underflow:
             underrun = True
 
+        render_duration = float(meta.get("render_duration", end_time - start_time))
+        produced_frames = int(meta.get("produced_frames", frames))
+        produced_time = float(meta.get("produced_time", (produced_frames / sr) if sr else 0.0))
+        allotted_time = float(meta.get("allotted_time", produced_time))
+
+        def _ema(previous: float | None, value: float) -> float:
+            if previous is None:
+                return value
+            return previous + ema_alpha * (value - previous)
+
+        render_ema = _ema(render_ema, render_duration)
+        produced_ema = _ema(produced_ema, produced_time)
+        period_ema = _ema(period_ema, period)
+
+        batch_blocks = int(meta.get("batch_blocks", 1))
+        batch_index = int(meta.get("batch_index", 0))
+
         sample = {
-            "render_duration": meta.get("render_duration", end_time - start_time),
+            "render_duration": render_duration,
             "callback_period": period,
-            "allotted_time": meta.get("allotted_time", (frames / sr) if sr else 0.0),
+            "allotted_time": allotted_time,
+            "produced_frames": produced_frames,
+            "produced_time": produced_time,
+            "render_ema": render_ema,
+            "produced_ema": produced_ema,
+            "period_ema": period_ema,
+            "batch_blocks": batch_blocks,
+            "batch_index": batch_index,
             "underrun": underrun,
             "queue_depth": queue_depth_display,
             "queue_capacity": queue_capacity,
@@ -964,6 +995,10 @@ def run(
                         chunk_meta = {
                             "render_duration": per_chunk_duration,
                             "allotted_time": allotted_per_chunk,
+                            "produced_frames": block_frames,
+                            "produced_time": block_frames / sr if sr else 0.0,
+                            "batch_blocks": chunk_count,
+                            "batch_index": idx,
                             "queue_underflow": False,
                         }
                         node_timings_meta = meta.get("node_timings") if idx == 0 else None
@@ -1519,7 +1554,9 @@ def run(
                 timing_snapshot = list(callback_timing_samples)
 
             render_mean_ms = render_peak_ms = allotted_ms = 0.0
+            produced_mean_ms = produced_peak_ms = produced_latest_ms = 0.0
             period_mean_ms = period_peak_ms = 0.0
+            render_ema_ms = produced_ema_ms = period_ema_ms = 0.0
             underrun_recent = False
             if timing_snapshot:
                 render_values = [entry["render_duration"] for entry in timing_snapshot]
@@ -1527,10 +1564,27 @@ def run(
                 render_peak_ms = max(render_values) * 1000.0
                 allotted_ms = timing_snapshot[-1]["allotted_time"] * 1000.0
 
+                produced_values = [
+                    entry["produced_time"]
+                    for entry in timing_snapshot
+                    if entry.get("produced_time") is not None
+                ]
+                if produced_values:
+                    produced_mean_ms = sum(produced_values) / len(produced_values) * 1000.0
+                    produced_peak_ms = max(produced_values) * 1000.0
+                    produced_latest_ms = timing_snapshot[-1].get("produced_time", 0.0) * 1000.0
+
                 period_values = [entry["callback_period"] for entry in timing_snapshot if entry["callback_period"] > 0.0]
                 if period_values:
                     period_mean_ms = sum(period_values) / len(period_values) * 1000.0
                     period_peak_ms = max(period_values) * 1000.0
+                batch_blocks = max(1, int(timing_snapshot[-1].get("batch_blocks", 1)))
+                if timing_snapshot[-1].get("render_ema") is not None:
+                    render_ema_ms = timing_snapshot[-1]["render_ema"] * 1000.0
+                if timing_snapshot[-1].get("produced_ema") is not None:
+                    produced_ema_ms = timing_snapshot[-1]["produced_ema"] * 1000.0
+                if timing_snapshot[-1].get("period_ema"):
+                    period_ema_ms = timing_snapshot[-1]["period_ema"] * 1000.0
                 queue_depth_recent = timing_snapshot[-1].get("queue_depth", 0)
                 queue_capacity_recent = timing_snapshot[-1].get("queue_capacity", 0)
                 underrun_recent = any(entry.get("underrun") for entry in timing_snapshot)
@@ -1578,10 +1632,32 @@ def run(
             console_lines = [entry[0] for entry in lines_with_colour]
 
             if timing_snapshot:
-                budget_text = f"Audio: render {render_mean_ms:5.2f}/{render_peak_ms:5.2f}ms budget {allotted_ms:5.2f}ms"
+                render_text = (
+                    f"render avg {render_mean_ms:5.2f}ms pk {render_peak_ms:5.2f}ms"
+                )
+                if render_ema_ms:
+                    render_text += f" ema {render_ema_ms:5.2f}ms"
+                audio_text = (
+                    f"audio {produced_latest_ms:5.2f}ms"
+                    if produced_latest_ms
+                    else "audio 0.00ms"
+                )
+                if batch_blocks > 1:
+                    audio_text += f" ({batch_blocks}×)"
+                if produced_mean_ms or produced_peak_ms:
+                    audio_text += f" avg {produced_mean_ms:5.2f}ms pk {produced_peak_ms:5.2f}ms"
+                if produced_ema_ms:
+                    audio_text += f" ema {produced_ema_ms:5.2f}ms"
+                budget_text = (
+                    f"Audio: {render_text} | {audio_text} | budget {allotted_ms:5.2f}ms"
+                )
                 period_text = ""
-                if period_mean_ms or period_peak_ms:
-                    period_text = f" period {period_mean_ms:5.2f}/{period_peak_ms:5.2f}ms"
+                if period_mean_ms or period_peak_ms or period_ema_ms:
+                    period_text = (
+                        f" period {period_mean_ms:5.2f}/{period_peak_ms:5.2f}ms"
+                    )
+                    if period_ema_ms:
+                        period_text += f" ema {period_ema_ms:5.2f}ms"
                 queue_text = ""
                 if queue_capacity_recent:
                     queue_text = f" queue {queue_depth_recent}/{queue_capacity_recent}"
