@@ -106,3 +106,70 @@ def test_edge_runner_compiled_plan_metadata(simple_graph):
     ordered = runner.ordered_nodes
     assert tuple(node["name"] for node in plan["nodes"]) == ordered
     assert all("params" in node for node in plan["nodes"])
+
+
+def test_controller_history_fallback_populates_params():
+    frames = 6
+    graph = AudioGraph(sample_rate=48000)
+    controller = nodes.ControllerNode(
+        "controller",
+        params={
+            "outputs": {
+                "trigger": "signals['trigger']",
+                "gate": "signals['gate']",
+            }
+        },
+    )
+    graph.add_node(controller)
+
+    runner = CffiEdgeRunner(graph)
+    runner.begin_block(frames, sample_rate=48000, base_params={"_B": 1, "_C": 1})
+
+    timestamp = 0.0
+    trigger_curve = np.linspace(0.0, 1.0, frames, dtype=np.float64)
+    gate_curve = np.linspace(0.5, 0.6, frames, dtype=np.float64)
+    graph.record_control_event(
+        timestamp,
+        pitch=np.zeros(1, dtype=np.float64),
+        envelope=np.zeros(1, dtype=np.float64),
+        extras={"trigger": trigger_curve, "gate": gate_curve},
+    )
+    blob = graph.control_delay.export_control_history_blob(
+        timestamp, timestamp + frames / 48000.0 + 0.001
+    )
+
+    lib = runner._ensure_c_kernel()
+    handle = runner.gather_to("controller")
+    descriptor = runner._descriptor_by_name["controller"]
+    desc_struct, keepalive = runner._build_descriptor_struct(descriptor)
+    out_ptr = runner.ffi.new("double **")
+    out_channels = runner.ffi.new("int *")
+    state_ptr = runner.ffi.new("void **", runner.ffi.NULL)
+    history_buf = runner.ffi.new("uint8_t[]", blob)
+    history_handle = lib.amp_load_control_history(history_buf, len(blob), frames)
+    assert history_handle != runner.ffi.NULL
+    try:
+        status = lib.amp_run_node(
+            desc_struct,
+            handle.cdata,
+            int(handle.batches),
+            int(handle.channels),
+            int(handle.frames),
+            float(runner._sample_rate),
+            out_ptr,
+            out_channels,
+            state_ptr,
+            history_handle,
+        )
+        assert status == 0
+        assert int(out_channels[0]) == 2
+        total = frames * int(out_channels[0])
+        buffer = runner.ffi.buffer(out_ptr[0], total * 8)
+        array = np.frombuffer(buffer, dtype=np.float64).reshape(1, int(out_channels[0]), frames)
+        np.testing.assert_allclose(array[0, 0], trigger_curve)
+        np.testing.assert_allclose(array[0, 1], gate_curve)
+    finally:
+        lib.amp_release_control_history(history_handle)
+        if out_ptr[0] != runner.ffi.NULL:
+            lib.amp_free(out_ptr[0])
+    _ = keepalive
