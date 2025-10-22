@@ -572,6 +572,7 @@ static void (*_cffi_call_python_org)(struct _cffi_externpy_s *, char *);
 
 
 #include <ctype.h>
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -663,6 +664,20 @@ typedef struct {
     uint32_t node_count;
     EdgeRunnerCompiledNode *nodes;
 } EdgeRunnerCompiledPlan;
+
+typedef struct {
+    char *name;
+    uint32_t name_len;
+    double *values;
+    uint32_t value_count;
+    double timestamp;
+} EdgeRunnerControlCurve;
+
+typedef struct {
+    uint32_t frames_hint;
+    uint32_t curve_count;
+    EdgeRunnerControlCurve *curves;
+} EdgeRunnerControlHistory;
 
 static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     if (plan == NULL) {
@@ -851,6 +866,205 @@ EdgeRunnerCompiledPlan *amp_load_compiled_plan(
 
 void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     destroy_compiled_plan(plan);
+}
+
+static void destroy_control_history(EdgeRunnerControlHistory *history) {
+    if (history == NULL) {
+        return;
+    }
+    if (history->curves != NULL) {
+        for (uint32_t i = 0; i < history->curve_count; ++i) {
+            EdgeRunnerControlCurve *curve = &history->curves[i];
+            if (curve->name != NULL) {
+                free(curve->name);
+                curve->name = NULL;
+            }
+            if (curve->values != NULL) {
+                free(curve->values);
+                curve->values = NULL;
+            }
+            curve->value_count = 0;
+        }
+        free(history->curves);
+        history->curves = NULL;
+    }
+    free(history);
+}
+
+static const EdgeRunnerControlCurve *find_history_curve(
+    const EdgeRunnerControlHistory *history,
+    const char *name,
+    size_t name_len
+) {
+    if (history == NULL || name == NULL || name_len == 0) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < history->curve_count; ++i) {
+        const EdgeRunnerControlCurve *curve = &history->curves[i];
+        if (curve->name_len == name_len && curve->name != NULL && strncmp(curve->name, name, name_len) == 0) {
+            return curve;
+        }
+    }
+    return NULL;
+}
+
+static void apply_history_curve(
+    double *dest,
+    int batches,
+    int frames,
+    const EdgeRunnerControlCurve *curve
+) {
+    if (dest == NULL || curve == NULL || curve->values == NULL || curve->value_count == 0) {
+        return;
+    }
+    int count = (int)curve->value_count;
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    for (int b = 0; b < batches; ++b) {
+        for (int f = 0; f < frames; ++f) {
+            double value = 0.0;
+            if (count >= frames) {
+                if (f < count) {
+                    value = curve->values[f];
+                } else {
+                    value = curve->values[count - 1];
+                }
+            } else if (count == 1) {
+                value = curve->values[0];
+            } else {
+                if (f < count) {
+                    value = curve->values[f];
+                } else {
+                    value = curve->values[count - 1];
+                }
+            }
+            dest[((size_t)b * (size_t)frames) + (size_t)f] = value;
+        }
+    }
+}
+
+EdgeRunnerControlHistory *amp_load_control_history(
+    const uint8_t *blob,
+    size_t blob_len,
+    int frames_hint
+) {
+    if (blob == NULL || blob_len < 8) {
+        return NULL;
+    }
+    const uint8_t *cursor = blob;
+    size_t remaining = blob_len;
+    uint32_t event_count = 0;
+    uint32_t key_count = 0;
+    if (!read_u32_le(&cursor, &remaining, &event_count) || !read_u32_le(&cursor, &remaining, &key_count)) {
+        return NULL;
+    }
+    EdgeRunnerControlHistory *history = (EdgeRunnerControlHistory *)calloc(1, sizeof(EdgeRunnerControlHistory));
+    if (history == NULL) {
+        return NULL;
+    }
+    history->frames_hint = frames_hint > 0 ? (uint32_t)frames_hint : 0U;
+    history->curve_count = key_count;
+    if (key_count > 0) {
+        history->curves = (EdgeRunnerControlCurve *)calloc(key_count, sizeof(EdgeRunnerControlCurve));
+        if (history->curves == NULL) {
+            destroy_control_history(history);
+            return NULL;
+        }
+    }
+    if (key_count == 0) {
+        return history;
+    }
+    uint32_t *name_lengths = (uint32_t *)calloc(key_count, sizeof(uint32_t));
+    if (name_lengths == NULL) {
+        destroy_control_history(history);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < key_count; ++i) {
+        if (!read_u32_le(&cursor, &remaining, &name_lengths[i])) {
+            free(name_lengths);
+            destroy_control_history(history);
+            return NULL;
+        }
+    }
+    for (uint32_t i = 0; i < key_count; ++i) {
+        uint32_t name_len = name_lengths[i];
+        if (remaining < name_len) {
+            free(name_lengths);
+            destroy_control_history(history);
+            return NULL;
+        }
+        EdgeRunnerControlCurve *curve = &history->curves[i];
+        curve->name = (char *)malloc((size_t)name_len + 1);
+        if (curve->name == NULL) {
+            free(name_lengths);
+            destroy_control_history(history);
+            return NULL;
+        }
+        memcpy(curve->name, cursor, name_len);
+        curve->name[name_len] = '\0';
+        curve->name_len = name_len;
+        curve->value_count = 0;
+        curve->values = NULL;
+        curve->timestamp = -DBL_MAX;
+        cursor += name_len;
+        remaining -= name_len;
+    }
+    free(name_lengths);
+    for (uint32_t event_idx = 0; event_idx < event_count; ++event_idx) {
+        if (remaining < sizeof(double)) {
+            destroy_control_history(history);
+            return NULL;
+        }
+        double timestamp = 0.0;
+        memcpy(&timestamp, cursor, sizeof(double));
+        cursor += sizeof(double);
+        remaining -= sizeof(double);
+        for (uint32_t key_idx = 0; key_idx < key_count; ++key_idx) {
+            uint32_t value_count = 0;
+            if (!read_u32_le(&cursor, &remaining, &value_count)) {
+                destroy_control_history(history);
+                return NULL;
+            }
+            double *values_copy = NULL;
+            if (value_count > 0) {
+                size_t bytes = (size_t)value_count * sizeof(double);
+                if (remaining < bytes) {
+                    destroy_control_history(history);
+                    return NULL;
+                }
+                values_copy = (double *)malloc(bytes);
+                if (values_copy == NULL) {
+                    destroy_control_history(history);
+                    return NULL;
+                }
+                memcpy(values_copy, cursor, bytes);
+                cursor += bytes;
+                remaining -= bytes;
+            }
+            EdgeRunnerControlCurve *curve = &history->curves[key_idx];
+            if (value_count > 0 && (curve->values == NULL || timestamp >= curve->timestamp)) {
+                if (curve->values != NULL) {
+                    free(curve->values);
+                }
+                curve->values = values_copy;
+                curve->value_count = value_count;
+                curve->timestamp = timestamp;
+                values_copy = NULL;
+            }
+            if (values_copy != NULL) {
+                free(values_copy);
+            }
+        }
+    }
+    return history;
+}
+
+void amp_release_control_history(EdgeRunnerControlHistory *history) {
+    destroy_control_history(history);
 }
 
 static int envelope_reserve_scratch(int F) {
@@ -1825,6 +2039,12 @@ typedef enum {
     NODE_KIND_MIX,
     NODE_KIND_SAFETY,
     NODE_KIND_SINE_OSC,
+    NODE_KIND_CONTROLLER,
+    NODE_KIND_LFO,
+    NODE_KIND_ENVELOPE,
+    NODE_KIND_PITCH,
+    NODE_KIND_OSC,
+    NODE_KIND_SUBHARM,
 } node_kind_t;
 
 typedef struct {
@@ -1849,6 +2069,52 @@ typedef struct {
             int channels;
             double base_phase;
         } sine;
+        struct {
+            double *phase;
+            double *phase_buffer;
+            double *wave_buffer;
+            double *dphi_buffer;
+            double *tri_state;
+            int batches;
+            int channels;
+            double base_phase;
+            int stereo;
+        } osc;
+        struct {
+            double *slew_state;
+            int batches;
+            double phase;
+        } lfo;
+        struct {
+            int *stage;
+            double *value;
+            double *timer;
+            double *velocity;
+            int64_t *activations;
+            double *release_start;
+            int batches;
+        } envelope;
+        struct {
+            double *last_freq;
+            int batches;
+        } pitch;
+        struct {
+            double *hp_y;
+            double *lp_y;
+            double *prev;
+            int8_t *sign;
+            int8_t *ff2;
+            int8_t *ff4;
+            int32_t *ff4_count;
+            double *sub2_lp;
+            double *sub4_lp;
+            double *env;
+            double *hp_out_y;
+            double *hp_out_x;
+            int batches;
+            int channels;
+            int use_div4;
+        } subharm;
     } u;
 } node_state_t;
 
@@ -1869,6 +2135,76 @@ static void release_node_state(node_state_t *state) {
         state->u.sine.batches = 0;
         state->u.sine.channels = 0;
         state->u.sine.base_phase = 0.0;
+    }
+    if (state->kind == NODE_KIND_OSC) {
+        free(state->u.osc.phase);
+        free(state->u.osc.phase_buffer);
+        free(state->u.osc.wave_buffer);
+        free(state->u.osc.dphi_buffer);
+        free(state->u.osc.tri_state);
+        state->u.osc.phase = NULL;
+        state->u.osc.phase_buffer = NULL;
+        state->u.osc.wave_buffer = NULL;
+        state->u.osc.dphi_buffer = NULL;
+        state->u.osc.tri_state = NULL;
+        state->u.osc.batches = 0;
+        state->u.osc.channels = 0;
+        state->u.osc.stereo = 0;
+    }
+    if (state->kind == NODE_KIND_LFO) {
+        free(state->u.lfo.slew_state);
+        state->u.lfo.slew_state = NULL;
+        state->u.lfo.batches = 0;
+        state->u.lfo.phase = 0.0;
+    }
+    if (state->kind == NODE_KIND_ENVELOPE) {
+        free(state->u.envelope.stage);
+        free(state->u.envelope.value);
+        free(state->u.envelope.timer);
+        free(state->u.envelope.velocity);
+        free(state->u.envelope.activations);
+        free(state->u.envelope.release_start);
+        state->u.envelope.stage = NULL;
+        state->u.envelope.value = NULL;
+        state->u.envelope.timer = NULL;
+        state->u.envelope.velocity = NULL;
+        state->u.envelope.activations = NULL;
+        state->u.envelope.release_start = NULL;
+        state->u.envelope.batches = 0;
+    }
+    if (state->kind == NODE_KIND_PITCH) {
+        free(state->u.pitch.last_freq);
+        state->u.pitch.last_freq = NULL;
+        state->u.pitch.batches = 0;
+    }
+    if (state->kind == NODE_KIND_SUBHARM) {
+        free(state->u.subharm.hp_y);
+        free(state->u.subharm.lp_y);
+        free(state->u.subharm.prev);
+        free(state->u.subharm.sign);
+        free(state->u.subharm.ff2);
+        free(state->u.subharm.ff4);
+        free(state->u.subharm.ff4_count);
+        free(state->u.subharm.sub2_lp);
+        free(state->u.subharm.sub4_lp);
+        free(state->u.subharm.env);
+        free(state->u.subharm.hp_out_y);
+        free(state->u.subharm.hp_out_x);
+        state->u.subharm.hp_y = NULL;
+        state->u.subharm.lp_y = NULL;
+        state->u.subharm.prev = NULL;
+        state->u.subharm.sign = NULL;
+        state->u.subharm.ff2 = NULL;
+        state->u.subharm.ff4 = NULL;
+        state->u.subharm.ff4_count = NULL;
+        state->u.subharm.sub2_lp = NULL;
+        state->u.subharm.sub4_lp = NULL;
+        state->u.subharm.env = NULL;
+        state->u.subharm.hp_out_y = NULL;
+        state->u.subharm.hp_out_x = NULL;
+        state->u.subharm.batches = 0;
+        state->u.subharm.channels = 0;
+        state->u.subharm.use_div4 = 0;
     }
     free(state);
 }
@@ -1891,6 +2227,24 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "SineOscillatorNode") == 0) {
         return NODE_KIND_SINE_OSC;
+    }
+    if (strcmp(descriptor->type_name, "ControllerNode") == 0) {
+        return NODE_KIND_CONTROLLER;
+    }
+    if (strcmp(descriptor->type_name, "LFONode") == 0) {
+        return NODE_KIND_LFO;
+    }
+    if (strcmp(descriptor->type_name, "EnvelopeModulatorNode") == 0) {
+        return NODE_KIND_ENVELOPE;
+    }
+    if (strcmp(descriptor->type_name, "PitchQuantizerNode") == 0) {
+        return NODE_KIND_PITCH;
+    }
+    if (strcmp(descriptor->type_name, "OscNode") == 0) {
+        return NODE_KIND_OSC;
+    }
+    if (strcmp(descriptor->type_name, "SubharmonicLowLifterNode") == 0) {
+        return NODE_KIND_SUBHARM;
     }
     return NODE_KIND_UNKNOWN;
 }
@@ -1945,6 +2299,62 @@ static int json_get_int(const char *json, size_t json_len, const char *key, int 
     return (int)(value - 0.5);
 }
 
+static int json_get_bool(const char *json, size_t json_len, const char *key, int default_value) {
+    double value = json_get_double(json, json_len, key, default_value ? 1.0 : 0.0);
+    return value >= 0.5 ? 1 : 0;
+}
+
+static int json_copy_string(const char *json, size_t json_len, const char *key, char *out, size_t out_len) {
+    (void)json_len;
+    if (out == NULL || out_len == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (json == NULL || key == NULL) {
+        return 0;
+    }
+    size_t key_len = strlen(key);
+    if (key_len == 0) {
+        return 0;
+    }
+    char pattern[128];
+    if (key_len + 3 >= sizeof(pattern)) {
+        return 0;
+    }
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *cursor = json;
+    size_t pattern_len = strlen(pattern);
+    while ((cursor = strstr(cursor, pattern)) != NULL) {
+        cursor += pattern_len;
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
+            cursor++;
+        }
+        if (*cursor != ':') {
+            continue;
+        }
+        cursor++;
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
+            cursor++;
+        }
+        if (*cursor != '"') {
+            continue;
+        }
+        cursor++;
+        const char *start = cursor;
+        while (*cursor != '\0' && *cursor != '"') {
+            cursor++;
+        }
+        size_t length = (size_t)(cursor - start);
+        if (length >= out_len) {
+            length = out_len - 1;
+        }
+        memcpy(out, start, length);
+        out[length] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 static const EdgeRunnerParamView *find_param(const EdgeRunnerNodeInputs *inputs, const char *name) {
     if (inputs == NULL || name == NULL) {
         return NULL;
@@ -1958,6 +2368,258 @@ static const EdgeRunnerParamView *find_param(const EdgeRunnerNodeInputs *inputs,
         }
     }
     return NULL;
+}
+
+typedef struct {
+    char output[64];
+    char source[64];
+} controller_source_t;
+
+static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) {
+    if (csv == NULL || tokens == NULL || max_tokens <= 0) {
+        return 0;
+    }
+    int count = 0;
+    const char *cursor = csv;
+    while (*cursor != '\0' && count < max_tokens) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == ',') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        const char *start = cursor;
+        while (*cursor != '\0' && *cursor != ',') {
+            cursor++;
+        }
+        size_t len = (size_t)(cursor - start);
+        if (len >= 63) {
+            len = 63;
+        }
+        memcpy(tokens[count], start, len);
+        tokens[count][len] = '\0';
+        count++;
+    }
+    return count;
+}
+
+static int parse_controller_sources(const char *csv, controller_source_t *items, int max_items) {
+    if (csv == NULL || items == NULL || max_items <= 0) {
+        return 0;
+    }
+    int count = 0;
+    const char *cursor = csv;
+    while (*cursor != '\0' && count < max_items) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == ',') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        const char *eq = strchr(cursor, '=');
+        if (eq == NULL) {
+            break;
+        }
+        size_t key_len = (size_t)(eq - cursor);
+        if (key_len >= sizeof(items[count].output)) {
+            key_len = sizeof(items[count].output) - 1;
+        }
+        memcpy(items[count].output, cursor, key_len);
+        items[count].output[key_len] = '\0';
+        cursor = eq + 1;
+        const char *end = strchr(cursor, ',');
+        if (end == NULL) {
+            end = cursor + strlen(cursor);
+        }
+        size_t value_len = (size_t)(end - cursor);
+        if (value_len >= sizeof(items[count].source)) {
+            value_len = sizeof(items[count].source) - 1;
+        }
+        memcpy(items[count].source, cursor, value_len);
+        items[count].source[value_len] = '\0';
+        cursor = end;
+        count++;
+    }
+    return count;
+}
+
+static int parse_csv_doubles(const char *csv, double *values, int max_values) {
+    if (csv == NULL || values == NULL || max_values <= 0) {
+        return 0;
+    }
+    int count = 0;
+    const char *cursor = csv;
+    while (*cursor != '\0' && count < max_values) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == ',') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        char *endptr = NULL;
+        double value = strtod(cursor, &endptr);
+        if (endptr == cursor) {
+            break;
+        }
+        values[count++] = value;
+        cursor = endptr;
+    }
+    return count;
+}
+
+static const double *ensure_param_plane(
+    const EdgeRunnerParamView *view,
+    int batches,
+    int frames,
+    double default_value,
+    double **owned_out
+) {
+    if (owned_out != NULL) {
+        *owned_out = NULL;
+    }
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    size_t total = (size_t)batches * (size_t)frames;
+    if (view == NULL || view->data == NULL) {
+        if (owned_out == NULL) {
+            return NULL;
+        }
+        double *buf = (double *)malloc(total * sizeof(double));
+        if (buf == NULL) {
+            return NULL;
+        }
+        for (size_t i = 0; i < total; ++i) {
+            buf[i] = default_value;
+        }
+        *owned_out = buf;
+        return buf;
+    }
+    int vb = view->batches > 0 ? (int)view->batches : batches;
+    int vc = view->channels > 0 ? (int)view->channels : 1;
+    int vf = view->frames > 0 ? (int)view->frames : frames;
+    if (vb == batches && vc == 1 && vf == frames) {
+        return view->data;
+    }
+    if (owned_out == NULL) {
+        return NULL;
+    }
+    double *buf = (double *)malloc(total * sizeof(double));
+    if (buf == NULL) {
+        return NULL;
+    }
+    for (int b = 0; b < batches; ++b) {
+        for (int f = 0; f < frames; ++f) {
+            size_t idx = (size_t)b * (size_t)frames + (size_t)f;
+            double value = default_value;
+            if (b < vb && f < vf) {
+                size_t src_idx = ((size_t)b * (size_t)vc) * (size_t)vf + (size_t)f;
+                if (vc > 0) {
+                    src_idx = ((size_t)b * (size_t)vc + 0) * (size_t)vf + (size_t)f;
+                }
+                size_t span = (size_t)vb * (size_t)vc * (size_t)vf;
+                if (src_idx < span) {
+                    value = view->data[src_idx];
+                }
+            }
+            buf[idx] = value;
+        }
+    }
+    *owned_out = buf;
+    return buf;
+}
+
+static double read_scalar_param(const EdgeRunnerParamView *view, double default_value) {
+    if (view == NULL || view->data == NULL) {
+        return default_value;
+    }
+    size_t total = (size_t)(view->batches ? view->batches : 1)
+        * (size_t)(view->channels ? view->channels : 1)
+        * (size_t)(view->frames ? view->frames : 1);
+    if (total == 0) {
+        return default_value;
+    }
+    return view->data[total - 1];
+}
+
+static int compare_double(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    if (da < db) {
+        return -1;
+    }
+    if (da > db) {
+        return 1;
+    }
+    return 0;
+}
+
+static int build_sorted_grid(const double *values, int count, double *sorted, double *ext) {
+    if (values == NULL || sorted == NULL || ext == NULL || count <= 0) {
+        return 0;
+    }
+    int n = count;
+    if (n < 2) {
+        n = 12;
+        for (int i = 0; i < n; ++i) {
+            sorted[i] = (double)i * 100.0;
+        }
+    } else {
+        memcpy(sorted, values, (size_t)n * sizeof(double));
+        qsort(sorted, (size_t)n, sizeof(double), compare_double);
+    }
+    for (int i = 0; i < n; ++i) {
+        ext[i] = sorted[i];
+    }
+    ext[n] = sorted[0] + 1200.0;
+    return n;
+}
+
+static double grid_warp_forward_value(double cents, const double *grid, const double *grid_ext, int N) {
+    double octs = floor(cents / 1200.0);
+    double c_mod = fmod(cents, 1200.0);
+    if (c_mod < 0.0) {
+        c_mod += 1200.0;
+    }
+    int idx = 0;
+    for (int i = 0; i < N; ++i) {
+        if (c_mod >= grid_ext[i] && c_mod < grid_ext[i + 1]) {
+            idx = i;
+            break;
+        }
+        if (i == N - 1) {
+            idx = N - 1;
+        }
+    }
+    double lower = grid_ext[idx];
+    double upper = grid_ext[idx + 1];
+    double denom = upper - lower;
+    if (fabs(denom) < 1e-9) {
+        denom = 1e-9;
+    }
+    double t = (c_mod - lower) / denom;
+    double u_mod = (double)idx + t;
+    return octs * (double)N + u_mod;
+}
+
+static double grid_warp_inverse_value(double u, const double *grid, const double *grid_ext, int N) {
+    double octs = floor(u / (double)N);
+    double u_mod = u - octs * (double)N;
+    int idx = (int)floor(u_mod);
+    if (idx < 0) {
+        idx = 0;
+    }
+    if (idx >= N) {
+        idx = N - 1;
+    }
+    double frac = u_mod - (double)idx;
+    double lower = grid_ext[idx];
+    double upper = grid_ext[idx + 1];
+    double cents = lower + frac * (upper - lower);
+    return octs * 1200.0 + cents;
 }
 
 static int run_constant_node(
@@ -1993,6 +2655,777 @@ static int run_constant_node(
     }
     *out_buffer = buffer;
     *out_channels = channels;
+    return 0;
+}
+
+static double render_lfo_wave(const char *wave, double phase) {
+    if (wave != NULL) {
+        if (strcmp(wave, "square") == 0) {
+            return phase < 0.5 ? 1.0 : -1.0;
+        }
+        if (strcmp(wave, "saw") == 0) {
+            double t = phase - floor(phase);
+            return 2.0 * t - 1.0;
+        }
+        if (strcmp(wave, "triangle") == 0) {
+            double t = phase - floor(phase);
+            return 2.0 * fabs(2.0 * t - 1.0) - 1.0;
+        }
+    }
+    return sin(phase * 2.0 * M_PI);
+}
+
+static int run_controller_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double **out_buffer,
+    int *out_channels,
+    const EdgeRunnerControlHistory *history
+) {
+    if (out_buffer == NULL || out_channels == NULL) {
+        return -1;
+    }
+    char outputs_csv[256];
+    char sources_csv[512];
+    char output_names[32][64];
+    controller_source_t mappings[32];
+    int output_count = 0;
+    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_outputs__", outputs_csv, sizeof(outputs_csv))) {
+        output_count = parse_csv_tokens(outputs_csv, output_names, 32);
+    }
+    if (output_count <= 0 && inputs != NULL) {
+        uint32_t count = inputs->params.count;
+        EdgeRunnerParamView *items = inputs->params.items;
+        for (uint32_t i = 0; i < count && i < 32U; ++i) {
+            if (items[i].name != NULL) {
+                strncpy(output_names[output_count], items[i].name, sizeof(output_names[output_count]) - 1);
+                output_names[output_count][sizeof(output_names[output_count]) - 1] = '\0';
+                output_count++;
+            }
+        }
+    }
+    if (output_count <= 0) {
+        return -1;
+    }
+    int mapping_count = 0;
+    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_sources__", sources_csv, sizeof(sources_csv))) {
+        mapping_count = parse_controller_sources(sources_csv, mappings, 32);
+    }
+    int resolved_channels = output_count;
+    if (inputs != NULL && inputs->params.count > 0) {
+        const EdgeRunnerParamView *view = &inputs->params.items[0];
+        if (batches <= 0 && view->batches > 0) {
+            batches = (int)view->batches;
+        }
+        if (frames <= 0 && view->frames > 0) {
+            frames = (int)view->frames;
+        }
+    }
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    size_t total = (size_t)batches * (size_t)resolved_channels * (size_t)frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    for (int c = 0; c < resolved_channels; ++c) {
+        const char *source_name = output_names[c];
+        for (int m = 0; m < mapping_count; ++m) {
+            if (strcmp(mappings[m].output, output_names[c]) == 0) {
+                source_name = mappings[m].source;
+                break;
+            }
+        }
+        const EdgeRunnerParamView *view = find_param(inputs, source_name);
+        int view_missing = (view == NULL || view->data == NULL);
+        double *owned = NULL;
+        const double *data = ensure_param_plane(view, batches, frames, 0.0, &owned);
+        if (data == NULL) {
+            free(buffer);
+            return -1;
+        }
+        if (view_missing && owned != NULL && history != NULL) {
+            const EdgeRunnerControlCurve *curve = find_history_curve(history, source_name, strlen(source_name));
+            if (curve != NULL) {
+                apply_history_curve(owned, batches, frames, curve);
+            }
+            data = owned;
+        }
+        for (int b = 0; b < batches; ++b) {
+            for (int f = 0; f < frames; ++f) {
+                size_t src_idx = (size_t)b * (size_t)frames + (size_t)f;
+                size_t dst_idx = ((size_t)b * (size_t)resolved_channels + (size_t)c) * (size_t)frames + (size_t)f;
+                buffer[dst_idx] = data[src_idx];
+            }
+        }
+        if (owned != NULL) {
+            free(owned);
+        }
+    }
+    *out_buffer = buffer;
+    *out_channels = resolved_channels;
+    return 0;
+}
+
+static int run_lfo_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    if (out_buffer == NULL || out_channels == NULL) {
+        return -1;
+    }
+    char wave_buf[32];
+    if (!json_copy_string(descriptor->params_json, descriptor->params_len, "wave", wave_buf, sizeof(wave_buf))) {
+        strcpy(wave_buf, "sine");
+    }
+    double rate_hz = json_get_double(descriptor->params_json, descriptor->params_len, "rate_hz", 1.0);
+    double depth = json_get_double(descriptor->params_json, descriptor->params_len, "depth", 0.5);
+    double slew_ms = json_get_double(descriptor->params_json, descriptor->params_len, "slew_ms", 0.0);
+    int use_input = json_get_bool(descriptor->params_json, descriptor->params_len, "use_input", 0);
+    int B = batches > 0 ? batches : 1;
+    int F = frames > 0 ? frames : 1;
+    int audio_channels = 0;
+    const double *audio_data = NULL;
+    if (use_input && inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
+        B = inputs->audio.batches > 0 ? (int)inputs->audio.batches : B;
+        F = inputs->audio.frames > 0 ? (int)inputs->audio.frames : F;
+        audio_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 1;
+        audio_data = inputs->audio.data;
+    }
+    size_t total = (size_t)B * (size_t)F;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    if (use_input && audio_data != NULL) {
+        for (int b = 0; b < B; ++b) {
+            double max_abs = 0.0;
+            for (int c = 0; c < audio_channels; ++c) {
+                for (int f = 0; f < F; ++f) {
+                    size_t idx = ((size_t)b * (size_t)audio_channels + (size_t)c) * (size_t)F + (size_t)f;
+                    double val = fabs(audio_data[idx]);
+                    if (val > max_abs) {
+                        max_abs = val;
+                    }
+                }
+            }
+            if (max_abs < 1e-12) {
+                max_abs = 1.0;
+            }
+            for (int f = 0; f < F; ++f) {
+                size_t src_idx = ((size_t)b * (size_t)audio_channels) * (size_t)F + (size_t)f;
+                double sample = audio_data[src_idx];
+                buffer[(size_t)b * (size_t)F + (size_t)f] = (sample / max_abs) * depth;
+            }
+        }
+    } else {
+        if (sample_rate <= 0.0) {
+            sample_rate = 48000.0;
+        }
+        double step = rate_hz / sample_rate;
+        double phase = 0.0;
+        if (state != NULL) {
+            phase = state->u.lfo.phase;
+        }
+        for (int b = 0; b < B; ++b) {
+            double local_phase = phase;
+            for (int f = 0; f < F; ++f) {
+                double value = render_lfo_wave(wave_buf, local_phase) * depth;
+                buffer[(size_t)b * (size_t)F + (size_t)f] = value;
+                local_phase += step;
+                local_phase -= floor(local_phase);
+            }
+            if (state != NULL) {
+                phase = local_phase;
+            }
+        }
+        if (state != NULL) {
+            state->u.lfo.phase = phase;
+        }
+    }
+    if (slew_ms > 0.0 && state != NULL) {
+        if (sample_rate <= 0.0) {
+            sample_rate = 48000.0;
+        }
+        double alpha = 1.0 - exp(-1.0 / (sample_rate * (slew_ms / 1000.0)));
+        if (alpha < 1.0 - 1e-15) {
+            double r = 1.0 - alpha;
+            if (state->u.lfo.slew_state == NULL || state->u.lfo.batches != B) {
+                free(state->u.lfo.slew_state);
+                state->u.lfo.slew_state = (double *)calloc((size_t)B, sizeof(double));
+                state->u.lfo.batches = B;
+            }
+            if (state->u.lfo.slew_state != NULL) {
+                lfo_slew(buffer, buffer, B, F, r, alpha, state->u.lfo.slew_state);
+            }
+        }
+    }
+    *out_buffer = buffer;
+    *out_channels = 1;
+    return 0;
+}
+
+static int run_envelope_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    if (out_buffer == NULL || out_channels == NULL) {
+        return -1;
+    }
+    if (sample_rate <= 0.0) {
+        sample_rate = 48000.0;
+    }
+    int B = batches > 0 ? batches : 1;
+    int F = frames > 0 ? frames : 1;
+    const EdgeRunnerParamView *trigger_view = find_param(inputs, "trigger");
+    const EdgeRunnerParamView *gate_view = find_param(inputs, "gate");
+    const EdgeRunnerParamView *drone_view = find_param(inputs, "drone");
+    const EdgeRunnerParamView *velocity_view = find_param(inputs, "velocity");
+    const EdgeRunnerParamView *send_reset_view = find_param(inputs, "send_reset");
+    if (trigger_view != NULL && trigger_view->batches > 0) {
+        B = (int)trigger_view->batches;
+    }
+    if (trigger_view != NULL && trigger_view->frames > 0) {
+        F = (int)trigger_view->frames;
+    }
+    if (B <= 0) {
+        B = 1;
+    }
+    if (F <= 0) {
+        F = 1;
+    }
+    double attack_ms = json_get_double(descriptor->params_json, descriptor->params_len, "attack_ms", 12.0);
+    double hold_ms = json_get_double(descriptor->params_json, descriptor->params_len, "hold_ms", 8.0);
+    double decay_ms = json_get_double(descriptor->params_json, descriptor->params_len, "decay_ms", 90.0);
+    double sustain_level = json_get_double(descriptor->params_json, descriptor->params_len, "sustain_level", 0.7);
+    double sustain_ms = json_get_double(descriptor->params_json, descriptor->params_len, "sustain_ms", 0.0);
+    double release_ms = json_get_double(descriptor->params_json, descriptor->params_len, "release_ms", 220.0);
+    int send_resets_default = json_get_bool(descriptor->params_json, descriptor->params_len, "send_resets", 1);
+    int atk_frames = (int)lrint((attack_ms / 1000.0) * sample_rate);
+    int hold_frames = (int)lrint((hold_ms / 1000.0) * sample_rate);
+    int dec_frames = (int)lrint((decay_ms / 1000.0) * sample_rate);
+    int sus_frames = (int)lrint((sustain_ms / 1000.0) * sample_rate);
+    int rel_frames = (int)lrint((release_ms / 1000.0) * sample_rate);
+    if (atk_frames < 0) atk_frames = 0;
+    if (hold_frames < 0) hold_frames = 0;
+    if (dec_frames < 0) dec_frames = 0;
+    if (sus_frames < 0) sus_frames = 0;
+    if (rel_frames < 0) rel_frames = 0;
+    double *owned_trigger = NULL;
+    double *owned_gate = NULL;
+    double *owned_drone = NULL;
+    double *owned_velocity = NULL;
+    const double *trigger = ensure_param_plane(trigger_view, B, F, 0.0, &owned_trigger);
+    const double *gate = ensure_param_plane(gate_view, B, F, 0.0, &owned_gate);
+    const double *drone = ensure_param_plane(drone_view, B, F, 0.0, &owned_drone);
+    const double *velocity = ensure_param_plane(velocity_view, B, F, 1.0, &owned_velocity);
+    if (trigger == NULL || gate == NULL || drone == NULL || velocity == NULL) {
+        free(owned_trigger);
+        free(owned_gate);
+        free(owned_drone);
+        free(owned_velocity);
+        return -1;
+    }
+    double send_reset_value = read_scalar_param(send_reset_view, (double)send_resets_default);
+    int send_reset_flag = send_reset_value >= 0.5 ? 1 : 0;
+    size_t total = (size_t)B * (size_t)F * 2;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        free(owned_trigger);
+        free(owned_gate);
+        free(owned_drone);
+        free(owned_velocity);
+        return -1;
+    }
+    double *amp_plane = buffer;
+    double *reset_plane = buffer + (size_t)B * (size_t)F;
+    if (state == NULL) {
+        free(buffer);
+        free(owned_trigger);
+        free(owned_gate);
+        free(owned_drone);
+        free(owned_velocity);
+        return -1;
+    }
+    if (state->u.envelope.stage == NULL || state->u.envelope.batches != B) {
+        free(state->u.envelope.stage);
+        free(state->u.envelope.value);
+        free(state->u.envelope.timer);
+        free(state->u.envelope.velocity);
+        free(state->u.envelope.activations);
+        free(state->u.envelope.release_start);
+        state->u.envelope.stage = (int *)calloc((size_t)B, sizeof(int));
+        state->u.envelope.value = (double *)calloc((size_t)B, sizeof(double));
+        state->u.envelope.timer = (double *)calloc((size_t)B, sizeof(double));
+        state->u.envelope.velocity = (double *)calloc((size_t)B, sizeof(double));
+        state->u.envelope.activations = (int64_t *)calloc((size_t)B, sizeof(int64_t));
+        state->u.envelope.release_start = (double *)calloc((size_t)B, sizeof(double));
+        state->u.envelope.batches = B;
+    }
+    if (state->u.envelope.stage == NULL || state->u.envelope.value == NULL || state->u.envelope.timer == NULL) {
+        free(buffer);
+        free(owned_trigger);
+        free(owned_gate);
+        free(owned_drone);
+        free(owned_velocity);
+        return -1;
+    }
+    envelope_process(
+        trigger,
+        gate,
+        drone,
+        velocity,
+        B,
+        F,
+        atk_frames,
+        hold_frames,
+        dec_frames,
+        sus_frames,
+        rel_frames,
+        sustain_level,
+        send_reset_flag,
+        state->u.envelope.stage,
+        state->u.envelope.value,
+        state->u.envelope.timer,
+        state->u.envelope.velocity,
+        state->u.envelope.activations,
+        state->u.envelope.release_start,
+        amp_plane,
+        reset_plane
+    );
+    free(owned_trigger);
+    free(owned_gate);
+    free(owned_drone);
+    free(owned_velocity);
+    *out_buffer = buffer;
+    *out_channels = 2;
+    return 0;
+}
+
+static int run_pitch_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    (void)sample_rate;
+    if (out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    char grid_csv[1024];
+    double grid_values[256];
+    double grid_sorted_vals[256];
+    double grid_ext[257];
+    int grid_count = 0;
+    if (json_copy_string(descriptor->params_json, descriptor->params_len, "grid_cents", grid_csv, sizeof(grid_csv))) {
+        grid_count = parse_csv_doubles(grid_csv, grid_values, 256);
+    }
+    if (grid_count <= 0) {
+        for (int i = 0; i < 12; ++i) {
+            grid_values[i] = (double)i * 100.0;
+        }
+        grid_count = 12;
+    }
+    int grid_size = build_sorted_grid(grid_values, grid_count, grid_sorted_vals, grid_ext);
+    int is_free_mode = json_get_bool(descriptor->params_json, descriptor->params_len, "is_free_mode", 0);
+    char variant_buf[32];
+    if (!json_copy_string(descriptor->params_json, descriptor->params_len, "free_variant", variant_buf, sizeof(variant_buf))) {
+        strcpy(variant_buf, "continuous");
+    }
+    double span_default = json_get_double(descriptor->params_json, descriptor->params_len, "span_default", 2.0);
+    int slew_enabled = json_get_bool(descriptor->params_json, descriptor->params_len, "slew", 1);
+    const EdgeRunnerParamView *input_view = find_param(inputs, "input");
+    const EdgeRunnerParamView *root_view = find_param(inputs, "root_midi");
+    const EdgeRunnerParamView *span_view = find_param(inputs, "span_oct");
+    int B = batches > 0 ? batches : 1;
+    int F = frames > 0 ? frames : 1;
+    if (input_view != NULL && input_view->batches > 0) {
+        B = (int)input_view->batches;
+    }
+    if (input_view != NULL && input_view->frames > 0) {
+        F = (int)input_view->frames;
+    }
+    if (B <= 0) B = 1;
+    if (F <= 0) F = 1;
+    double *owned_input = NULL;
+    double *owned_root = NULL;
+    double *owned_span = NULL;
+    const double *ctrl = ensure_param_plane(input_view, B, F, 0.0, &owned_input);
+    const double *root = ensure_param_plane(root_view, B, F, 60.0, &owned_root);
+    const double *span = ensure_param_plane(span_view, B, F, span_default, &owned_span);
+    if (ctrl == NULL || root == NULL || span == NULL) {
+        free(owned_input);
+        free(owned_root);
+        free(owned_span);
+        return -1;
+    }
+    size_t total = (size_t)B * (size_t)F;
+    double *freq_target = (double *)malloc(total * sizeof(double));
+    if (freq_target == NULL) {
+        free(owned_input);
+        free(owned_root);
+        free(owned_span);
+        return -1;
+    }
+    for (int b = 0; b < B; ++b) {
+        for (int f = 0; f < F; ++f) {
+            size_t idx = (size_t)b * (size_t)F + (size_t)f;
+            double ctrl_scaled = ctrl[idx] * span[idx];
+            double root_midi = root[idx];
+            double root_freq = 440.0 * pow(2.0, (root_midi - 69.0) / 12.0);
+            double cents = 0.0;
+            if (is_free_mode) {
+                if (strcmp(variant_buf, "weighted") == 0) {
+                    double u = ctrl_scaled * (double)grid_size;
+                    cents = grid_warp_inverse_value(u, grid_sorted_vals, grid_ext, grid_size);
+                } else if (strcmp(variant_buf, "stepped") == 0) {
+                    double u = round(ctrl_scaled * (double)grid_size);
+                    cents = grid_warp_inverse_value(u, grid_sorted_vals, grid_ext, grid_size);
+                } else {
+                    cents = ctrl_scaled * 1200.0;
+                }
+            } else {
+                double cents_unq = ctrl_scaled * 1200.0;
+                double u = grid_warp_forward_value(cents_unq, grid_sorted_vals, grid_ext, grid_size);
+                double u_round = round(u);
+                cents = grid_warp_inverse_value(u_round, grid_sorted_vals, grid_ext, grid_size);
+            }
+            freq_target[idx] = root_freq * pow(2.0, cents / 1200.0);
+        }
+    }
+    free(owned_input);
+    free(owned_root);
+    free(owned_span);
+    double *output = (double *)malloc(total * sizeof(double));
+    if (output == NULL) {
+        free(freq_target);
+        return -1;
+    }
+    if (slew_enabled) {
+        if (state->u.pitch.last_freq == NULL || state->u.pitch.batches != B) {
+            free(state->u.pitch.last_freq);
+            state->u.pitch.last_freq = (double *)calloc((size_t)B, sizeof(double));
+            state->u.pitch.batches = B;
+        }
+        if (state->u.pitch.last_freq == NULL) {
+            free(freq_target);
+            free(output);
+            return -1;
+        }
+        for (int b = 0; b < B; ++b) {
+            double y0 = state->u.pitch.last_freq[b];
+            double y1 = freq_target[(size_t)b * (size_t)F + (size_t)(F - 1)];
+            for (int f = 0; f < F; ++f) {
+                double t = (double)f / (double)F;
+                double ramp = 3.0 * t * t - 2.0 * t * t * t;
+                output[(size_t)b * (size_t)F + (size_t)f] = y0 + (y1 - y0) * ramp;
+            }
+            state->u.pitch.last_freq[b] = y1;
+        }
+    } else {
+        memcpy(output, freq_target, total * sizeof(double));
+    }
+    free(freq_target);
+    *out_buffer = output;
+    *out_channels = 1;
+    return 0;
+}
+
+static double alpha_lp(double fc, double sr) {
+    if (fc < 1.0) {
+        fc = 1.0;
+    }
+    return 1.0 - exp(-2.0 * M_PI * fc / sr);
+}
+
+static double alpha_hp(double fc, double sr) {
+    if (fc < 1.0) {
+        fc = 1.0;
+    }
+    double rc = 1.0 / (2.0 * M_PI * fc);
+    return rc / (rc + 1.0 / sr);
+}
+
+static int run_subharm_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    if (out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    if (inputs == NULL || !inputs->audio.has_audio || inputs->audio.data == NULL) {
+        return -1;
+    }
+    int B = inputs->audio.batches > 0 ? (int)inputs->audio.batches : (batches > 0 ? batches : 1);
+    int C = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 1;
+    int F = inputs->audio.frames > 0 ? (int)inputs->audio.frames : (frames > 0 ? frames : 1);
+    if (sample_rate <= 0.0) {
+        sample_rate = 48000.0;
+    }
+    const double *audio = inputs->audio.data;
+    double band_lo = json_get_double(descriptor->params_json, descriptor->params_len, "band_lo", 70.0);
+    double band_hi = json_get_double(descriptor->params_json, descriptor->params_len, "band_hi", 160.0);
+    double mix = json_get_double(descriptor->params_json, descriptor->params_len, "mix", 0.5);
+    double drive = json_get_double(descriptor->params_json, descriptor->params_len, "drive", 1.0);
+    double out_hp = json_get_double(descriptor->params_json, descriptor->params_len, "out_hp", 25.0);
+    int use_div4 = json_get_bool(descriptor->params_json, descriptor->params_len, "use_div4", 0);
+    double a_hp_in = alpha_hp(band_lo, sample_rate);
+    double a_lp_in = alpha_lp(band_hi, sample_rate);
+    double a_sub2 = alpha_lp(fmax(band_hi / 3.0, 30.0), sample_rate);
+    double a_sub4 = use_div4 ? alpha_lp(fmax(band_hi / 5.0, 20.0), sample_rate) : 0.0;
+    double a_env_attack = alpha_lp(100.0, sample_rate);
+    double a_env_release = alpha_lp(5.0, sample_rate);
+    double a_hp_out = alpha_hp(out_hp, sample_rate);
+    size_t total = (size_t)B * (size_t)C * (size_t)F;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    int need_resize = state->u.subharm.batches != B || state->u.subharm.channels != C || state->u.subharm.use_div4 != use_div4;
+    if (need_resize) {
+        free(state->u.subharm.hp_y);
+        free(state->u.subharm.lp_y);
+        free(state->u.subharm.prev);
+        free(state->u.subharm.sign);
+        free(state->u.subharm.ff2);
+        free(state->u.subharm.ff4);
+        free(state->u.subharm.ff4_count);
+        free(state->u.subharm.sub2_lp);
+        free(state->u.subharm.sub4_lp);
+        free(state->u.subharm.env);
+        free(state->u.subharm.hp_out_y);
+        free(state->u.subharm.hp_out_x);
+        state->u.subharm.hp_y = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        state->u.subharm.lp_y = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        state->u.subharm.prev = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        state->u.subharm.sign = (int8_t *)calloc((size_t)B * (size_t)C, sizeof(int8_t));
+        state->u.subharm.ff2 = (int8_t *)calloc((size_t)B * (size_t)C, sizeof(int8_t));
+        state->u.subharm.sub2_lp = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        state->u.subharm.env = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        state->u.subharm.hp_out_y = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        state->u.subharm.hp_out_x = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        if (use_div4) {
+            state->u.subharm.ff4 = (int8_t *)calloc((size_t)B * (size_t)C, sizeof(int8_t));
+            state->u.subharm.ff4_count = (int32_t *)calloc((size_t)B * (size_t)C, sizeof(int32_t));
+            state->u.subharm.sub4_lp = (double *)calloc((size_t)B * (size_t)C, sizeof(double));
+        } else {
+            free(state->u.subharm.ff4);
+            free(state->u.subharm.ff4_count);
+            free(state->u.subharm.sub4_lp);
+            state->u.subharm.ff4 = NULL;
+            state->u.subharm.ff4_count = NULL;
+            state->u.subharm.sub4_lp = NULL;
+        }
+        state->u.subharm.batches = B;
+        state->u.subharm.channels = C;
+        state->u.subharm.use_div4 = use_div4;
+    }
+    if (state->u.subharm.hp_y == NULL || state->u.subharm.lp_y == NULL || state->u.subharm.prev == NULL || state->u.subharm.sign == NULL || state->u.subharm.ff2 == NULL || state->u.subharm.sub2_lp == NULL || state->u.subharm.env == NULL || state->u.subharm.hp_out_y == NULL || state->u.subharm.hp_out_x == NULL) {
+        free(buffer);
+        return -1;
+    }
+    subharmonic_process(
+        audio,
+        buffer,
+        B,
+        C,
+        F,
+        a_hp_in,
+        a_lp_in,
+        a_sub2,
+        use_div4,
+        a_sub4,
+        a_env_attack,
+        a_env_release,
+        a_hp_out,
+        drive,
+        mix,
+        state->u.subharm.hp_y,
+        state->u.subharm.lp_y,
+        state->u.subharm.prev,
+        state->u.subharm.sign,
+        state->u.subharm.ff2,
+        state->u.subharm.ff4,
+        state->u.subharm.ff4_count,
+        state->u.subharm.sub2_lp,
+        state->u.subharm.sub4_lp,
+        state->u.subharm.env,
+        state->u.subharm.hp_out_y,
+        state->u.subharm.hp_out_x
+    );
+    *out_buffer = buffer;
+    *out_channels = C;
+    return 0;
+}
+
+static int run_osc_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    if (out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    if (sample_rate <= 0.0) {
+        sample_rate = 48000.0;
+    }
+    char wave_buf[32];
+    if (!json_copy_string(descriptor->params_json, descriptor->params_len, "wave", wave_buf, sizeof(wave_buf))) {
+        strcpy(wave_buf, "sine");
+    }
+    int accept_reset = json_get_bool(descriptor->params_json, descriptor->params_len, "accept_reset", 1);
+    const EdgeRunnerParamView *freq_view = find_param(inputs, "freq");
+    const EdgeRunnerParamView *amp_view = find_param(inputs, "amp");
+    const EdgeRunnerParamView *pan_view = find_param(inputs, "pan");
+    const EdgeRunnerParamView *reset_view = accept_reset ? find_param(inputs, "reset") : NULL;
+    int B = batches > 0 ? batches : 1;
+    int F = frames > 0 ? frames : 1;
+    if (freq_view != NULL && freq_view->batches > 0) {
+        B = (int)freq_view->batches;
+    }
+    if (freq_view != NULL && freq_view->frames > 0) {
+        F = (int)freq_view->frames;
+    }
+    if (B <= 0) B = 1;
+    if (F <= 0) F = 1;
+    double *owned_freq = NULL;
+    double *owned_amp = NULL;
+    double *owned_pan = NULL;
+    double *owned_reset = NULL;
+    const double *freq = ensure_param_plane(freq_view, B, F, 0.0, &owned_freq);
+    const double *amp = ensure_param_plane(amp_view, B, F, 1.0, &owned_amp);
+    const double *pan = ensure_param_plane(pan_view, B, F, 0.0, &owned_pan);
+    const double *reset = ensure_param_plane(reset_view, B, F, 0.0, &owned_reset);
+    if (freq == NULL || amp == NULL) {
+        free(owned_freq);
+        free(owned_amp);
+        free(owned_pan);
+        free(owned_reset);
+        return -1;
+    }
+    size_t total = (size_t)B * (size_t)F;
+    if (state->u.osc.phase == NULL || state->u.osc.batches != B) {
+        free(state->u.osc.phase);
+        state->u.osc.phase = (double *)calloc((size_t)B, sizeof(double));
+        state->u.osc.batches = B;
+    }
+    if (state->u.osc.phase_buffer == NULL || state->u.osc.batches != B || state->u.osc.channels != 1) {
+        free(state->u.osc.phase_buffer);
+        state->u.osc.phase_buffer = (double *)malloc(total * sizeof(double));
+    }
+    if (state->u.osc.wave_buffer == NULL || state->u.osc.batches != B || state->u.osc.channels != 1) {
+        free(state->u.osc.wave_buffer);
+        state->u.osc.wave_buffer = (double *)malloc(total * sizeof(double));
+    }
+    if (state->u.osc.dphi_buffer == NULL || state->u.osc.batches != B || state->u.osc.channels != 1) {
+        free(state->u.osc.dphi_buffer);
+        state->u.osc.dphi_buffer = (double *)malloc(total * sizeof(double));
+    }
+    if (strcmp(wave_buf, "triangle") == 0) {
+        if (state->u.osc.tri_state == NULL || state->u.osc.batches != B) {
+            free(state->u.osc.tri_state);
+            state->u.osc.tri_state = (double *)calloc((size_t)B, sizeof(double));
+        }
+    }
+    if (state->u.osc.phase == NULL || state->u.osc.phase_buffer == NULL || state->u.osc.wave_buffer == NULL || state->u.osc.dphi_buffer == NULL) {
+        free(owned_freq);
+        free(owned_amp);
+        free(owned_pan);
+        free(owned_reset);
+        return -1;
+    }
+    for (int b = 0; b < B; ++b) {
+        for (int f = 0; f < F; ++f) {
+            size_t idx = (size_t)b * (size_t)F + (size_t)f;
+            state->u.osc.dphi_buffer[idx] = freq[idx] / sample_rate;
+        }
+    }
+    const double *reset_ptr = accept_reset ? reset : NULL;
+    phase_advance(state->u.osc.dphi_buffer, state->u.osc.phase_buffer, B, F, state->u.osc.phase, reset_ptr);
+    if (strcmp(wave_buf, "saw") == 0) {
+        osc_saw_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, state->u.osc.wave_buffer, B, F);
+    } else if (strcmp(wave_buf, "square") == 0) {
+        osc_square_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, 0.5, state->u.osc.wave_buffer, B, F);
+    } else if (strcmp(wave_buf, "triangle") == 0) {
+        osc_triangle_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, state->u.osc.wave_buffer, B, F, state->u.osc.tri_state);
+    } else {
+        for (int b = 0; b < B; ++b) {
+            for (int f = 0; f < F; ++f) {
+                size_t idx = (size_t)b * (size_t)F + (size_t)f;
+                state->u.osc.wave_buffer[idx] = sin(state->u.osc.phase_buffer[idx] * 2.0 * M_PI);
+            }
+        }
+    }
+    int stereo = (pan_view != NULL && pan_view->data != NULL) ? 1 : 0;
+    int channels = stereo ? 2 : 1;
+    size_t total_out = (size_t)B * (size_t)channels * (size_t)F;
+    double *buffer = (double *)malloc(total_out * sizeof(double));
+    if (buffer == NULL) {
+        free(owned_freq);
+        free(owned_amp);
+        free(owned_pan);
+        free(owned_reset);
+        return -1;
+    }
+    for (int b = 0; b < B; ++b) {
+        for (int f = 0; f < F; ++f) {
+            size_t idx = (size_t)b * (size_t)F + (size_t)f;
+            double sample = state->u.osc.wave_buffer[idx] * amp[idx];
+            if (stereo) {
+                double pan_val = pan[idx];
+                if (pan_val < -1.0) pan_val = -1.0;
+                if (pan_val > 1.0) pan_val = 1.0;
+                double angle = (pan_val + 1.0) * (M_PI / 4.0);
+                double left = sample * cos(angle);
+                double right = sample * sin(angle);
+                buffer[((size_t)b * 2) * (size_t)F + (size_t)f] = left;
+                buffer[((size_t)b * 2 + 1) * (size_t)F + (size_t)f] = right;
+            } else {
+                buffer[(size_t)b * (size_t)F + (size_t)f] = sample;
+            }
+        }
+    }
+    free(owned_freq);
+    free(owned_amp);
+    free(owned_pan);
+    free(owned_reset);
+    state->u.osc.channels = 1;
+    state->u.osc.stereo = stereo;
+    *out_buffer = buffer;
+    *out_channels = stereo ? 2 : 1;
     return 0;
 }
 
@@ -2262,7 +3695,8 @@ int amp_run_node(
     double sample_rate,
     double **out_buffer,
     int *out_channels,
-    void **state
+    void **state,
+    const EdgeRunnerControlHistory *history
 ) {
     (void)channels;
     if (out_buffer == NULL || out_channels == NULL) {
@@ -2311,6 +3745,24 @@ int amp_run_node(
         case NODE_KIND_SINE_OSC:
             rc = run_sine_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
             break;
+        case NODE_KIND_CONTROLLER:
+            rc = run_controller_node(descriptor, inputs, batches, frames, out_buffer, out_channels, history);
+            break;
+        case NODE_KIND_LFO:
+            rc = run_lfo_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            break;
+        case NODE_KIND_ENVELOPE:
+            rc = run_envelope_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            break;
+        case NODE_KIND_PITCH:
+            rc = run_pitch_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            break;
+        case NODE_KIND_OSC:
+            rc = run_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            break;
+        case NODE_KIND_SUBHARM:
+            rc = run_subharm_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            break;
         default:
             rc = -3;
             break;
@@ -2336,149 +3788,709 @@ void amp_release_state(void *state_ptr) {
 /************************************************************/
 
 static void *_cffi_types[] = {
-/*  0 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double *, int, int, double *, double const *)
-/*  1 */ _CFFI_OP(_CFFI_OP_POINTER, 13), // double const *
-/*  2 */ _CFFI_OP(_CFFI_OP_POINTER, 13), // double *
-/*  3 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7), // int
-/*  4 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/*  5 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/*  6 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/*  7 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/*  8 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double *, int, int, double, double, double *)
-/*  9 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 10 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 11 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 12 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 13 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14), // double
-/* 14 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 15 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 16 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 17 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double *, int, int, int, double, double *)
-/* 18 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 19 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 20 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 21 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 22 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 23 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 24 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
+/*  0 */ _CFFI_OP(_CFFI_OP_FUNCTION, 24), // EdgeRunnerCompiledPlan *()(unsigned char const *, size_t, unsigned char const *, size_t)
+/*  1 */ _CFFI_OP(_CFFI_OP_POINTER, 193), // unsigned char const *
+/*  2 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28), // size_t
+/*  3 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
+/*  4 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28),
+/*  5 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/*  6 */ _CFFI_OP(_CFFI_OP_FUNCTION, 27), // EdgeRunnerControlHistory *()(unsigned char const *, size_t, int)
+/*  7 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
+/*  8 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28),
+/*  9 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7), // int
+/* 10 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 11 */ _CFFI_OP(_CFFI_OP_FUNCTION, 9), // int()(EdgeRunnerNodeDescriptor const *, EdgeRunnerNodeInputs const *, int, int, int, double, double * *, int *, void * *, EdgeRunnerControlHistory const *)
+/* 12 */ _CFFI_OP(_CFFI_OP_POINTER, 182), // EdgeRunnerNodeDescriptor const *
+/* 13 */ _CFFI_OP(_CFFI_OP_POINTER, 183), // EdgeRunnerNodeInputs const *
+/* 14 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 15 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 16 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 17 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14), // double
+/* 18 */ _CFFI_OP(_CFFI_OP_POINTER, 30), // double * *
+/* 19 */ _CFFI_OP(_CFFI_OP_POINTER, 9), // int *
+/* 20 */ _CFFI_OP(_CFFI_OP_POINTER, 171), // void * *
+/* 21 */ _CFFI_OP(_CFFI_OP_POINTER, 181), // EdgeRunnerControlHistory const *
+/* 22 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 23 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(EdgeRunnerCompiledPlan *)
+/* 24 */ _CFFI_OP(_CFFI_OP_POINTER, 178), // EdgeRunnerCompiledPlan *
 /* 25 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 26 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double *, int, int, int, double, double *, double *)
-/* 27 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 28 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 29 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 30 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 31 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 32 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 33 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 34 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 35 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 36 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double *, int, int, int, double, double, double, int, double, double, double, double, double, double, double *, double *, double *, int8_t *, int8_t *, int8_t *, int32_t *, double *, double *, double *, double *, double *)
-/* 37 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 38 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 39 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 40 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 41 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 42 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 43 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 44 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 45 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 26 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(EdgeRunnerControlHistory *)
+/* 27 */ _CFFI_OP(_CFFI_OP_POINTER, 181), // EdgeRunnerControlHistory *
+/* 28 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 29 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double *)
+/* 30 */ _CFFI_OP(_CFFI_OP_POINTER, 17), // double *
+/* 31 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 32 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, double *, double const *)
+/* 33 */ _CFFI_OP(_CFFI_OP_POINTER, 17), // double const *
+/* 34 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 35 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 36 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 37 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 38 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 39 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 40 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, double, double, double *)
+/* 41 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 42 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 43 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 44 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 45 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
 /* 46 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 47 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 48 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 49 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 50 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 51 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 52 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 53 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 54 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 55 */ _CFFI_OP(_CFFI_OP_POINTER, 140), // int8_t *
-/* 56 */ _CFFI_OP(_CFFI_OP_NOOP, 55),
-/* 57 */ _CFFI_OP(_CFFI_OP_NOOP, 55),
-/* 58 */ _CFFI_OP(_CFFI_OP_POINTER, 138), // int32_t *
-/* 59 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 60 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 61 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 62 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 63 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 64 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 65 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double const *, double *, int)
-/* 66 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 67 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 68 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 69 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 70 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 71 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double const *, double *, int, int)
-/* 72 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 73 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 74 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 75 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 76 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 77 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 78 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double const *, double *, int, int, double *)
-/* 79 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 80 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 81 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 82 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 83 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 84 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 85 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 86 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double const *, double const *, double const *, int, int, int, double *, double *)
-/* 87 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 88 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 89 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 90 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 91 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 92 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 93 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 94 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 95 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
+/* 47 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 48 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 49 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, int, double, double *)
+/* 50 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 51 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 52 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 53 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 54 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 55 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 56 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 57 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 58 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, int, double, double *, double *)
+/* 59 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 60 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 61 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 62 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 63 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 64 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 65 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 66 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 67 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 68 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, int, double, double, double, int, double, double, double, double, double, double, double *, double *, double *, int8_t *, int8_t *, int8_t *, int32_t *, double *, double *, double *, double *, double *)
+/* 69 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 70 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 71 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 72 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 73 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 74 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 75 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 76 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 77 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 78 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 79 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 80 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 81 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 82 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 83 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 84 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 85 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 86 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 87 */ _CFFI_OP(_CFFI_OP_POINTER, 192), // int8_t *
+/* 88 */ _CFFI_OP(_CFFI_OP_NOOP, 87),
+/* 89 */ _CFFI_OP(_CFFI_OP_NOOP, 87),
+/* 90 */ _CFFI_OP(_CFFI_OP_POINTER, 190), // int32_t *
+/* 91 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 92 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 93 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 94 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 95 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
 /* 96 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 97 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double const *, double const *, double const *, int, int, int, int, int, int, int, double, int, int *, double *, double *, double *, int64_t *, double *, double *, double *)
-/* 98 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 99 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 100 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 101 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 102 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 103 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 104 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 105 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 106 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 97 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double *, int)
+/* 98 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 99 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 100 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 101 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 102 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 103 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double *, int, int)
+/* 104 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 105 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 106 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
 /* 107 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 108 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 109 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 110 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 111 */ _CFFI_OP(_CFFI_OP_POINTER, 3), // int *
-/* 112 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 113 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 114 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 115 */ _CFFI_OP(_CFFI_OP_POINTER, 139), // int64_t *
-/* 116 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 117 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 118 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 119 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 120 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, double const *, double, double *, int, int)
-/* 121 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 122 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 123 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 124 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
+/* 109 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 110 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double *, int, int, double *)
+/* 111 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 112 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 113 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 114 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 115 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 116 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 117 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 118 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double const *, double const *, int, int, int, double *, double *)
+/* 119 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 120 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 121 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 122 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 123 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 124 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 125 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 126 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 127 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 128 */ _CFFI_OP(_CFFI_OP_FUNCTION, 141), // void()(double const *, int, double *, int, int, int *, int *, int)
-/* 129 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
-/* 130 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 131 */ _CFFI_OP(_CFFI_OP_NOOP, 2),
-/* 132 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 133 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 134 */ _CFFI_OP(_CFFI_OP_NOOP, 111),
-/* 135 */ _CFFI_OP(_CFFI_OP_NOOP, 111),
+/* 126 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 127 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 128 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 129 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double const *, double const *, int, int, int, int, int, int, int, double, int, int *, double *, double *, double *, int64_t *, double *, double *, double *)
+/* 130 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 131 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 132 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 133 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 134 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 135 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 136 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 137 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 138 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 21), // int32_t
-/* 139 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 23), // int64_t
-/* 140 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 17), // int8_t
-/* 141 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 0), // void
+/* 137 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 138 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 139 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 140 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 141 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 142 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 143 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
+/* 144 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 145 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 146 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 147 */ _CFFI_OP(_CFFI_OP_POINTER, 191), // int64_t *
+/* 148 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 149 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 150 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 151 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 152 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double, double *, int, int)
+/* 153 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 154 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 155 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 156 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 157 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 158 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 159 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 160 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, int, double *, int, int, int *, int *, int)
+/* 161 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
+/* 162 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 163 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 164 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 165 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 166 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
+/* 167 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
+/* 168 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 169 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 170 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(void *)
+/* 171 */ _CFFI_OP(_CFFI_OP_POINTER, 195), // void *
+/* 172 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 173 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 0), // EdgeRunnerAudioView
+/* 174 */ _CFFI_OP(_CFFI_OP_POINTER, 175), // EdgeRunnerCompiledNode *
+/* 175 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 1), // EdgeRunnerCompiledNode
+/* 176 */ _CFFI_OP(_CFFI_OP_POINTER, 177), // EdgeRunnerCompiledParam *
+/* 177 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 2), // EdgeRunnerCompiledParam
+/* 178 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 3), // EdgeRunnerCompiledPlan
+/* 179 */ _CFFI_OP(_CFFI_OP_POINTER, 180), // EdgeRunnerControlCurve *
+/* 180 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 4), // EdgeRunnerControlCurve
+/* 181 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 5), // EdgeRunnerControlHistory
+/* 182 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 6), // EdgeRunnerNodeDescriptor
+/* 183 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 7), // EdgeRunnerNodeInputs
+/* 184 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 8), // EdgeRunnerParamSet
+/* 185 */ _CFFI_OP(_CFFI_OP_POINTER, 186), // EdgeRunnerParamView *
+/* 186 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 9), // EdgeRunnerParamView
+/* 187 */ _CFFI_OP(_CFFI_OP_POINTER, 189), // char *
+/* 188 */ _CFFI_OP(_CFFI_OP_POINTER, 189), // char const *
+/* 189 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 2), // char
+/* 190 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 21), // int32_t
+/* 191 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 23), // int64_t
+/* 192 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 17), // int8_t
+/* 193 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 4), // unsigned char
+/* 194 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8), // unsigned int
+/* 195 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 0), // void
 };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerAudioView(EdgeRunnerAudioView *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  (void)((p->has_audio) | 0);  /* check that 'EdgeRunnerAudioView.has_audio' is an integer */
+  (void)((p->batches) | 0);  /* check that 'EdgeRunnerAudioView.batches' is an integer */
+  (void)((p->channels) | 0);  /* check that 'EdgeRunnerAudioView.channels' is an integer */
+  (void)((p->frames) | 0);  /* check that 'EdgeRunnerAudioView.frames' is an integer */
+  { double const * *tmp = &p->data; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerAudioView { char x; EdgeRunnerAudioView y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerCompiledNode(EdgeRunnerCompiledNode *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  { char * *tmp = &p->name; (void)tmp; }
+  (void)((p->name_len) | 0);  /* check that 'EdgeRunnerCompiledNode.name_len' is an integer */
+  (void)((p->function_id) | 0);  /* check that 'EdgeRunnerCompiledNode.function_id' is an integer */
+  (void)((p->audio_offset) | 0);  /* check that 'EdgeRunnerCompiledNode.audio_offset' is an integer */
+  (void)((p->audio_span) | 0);  /* check that 'EdgeRunnerCompiledNode.audio_span' is an integer */
+  (void)((p->param_count) | 0);  /* check that 'EdgeRunnerCompiledNode.param_count' is an integer */
+  { EdgeRunnerCompiledParam * *tmp = &p->params; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerCompiledNode { char x; EdgeRunnerCompiledNode y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerCompiledParam(EdgeRunnerCompiledParam *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  { char * *tmp = &p->name; (void)tmp; }
+  (void)((p->name_len) | 0);  /* check that 'EdgeRunnerCompiledParam.name_len' is an integer */
+  (void)((p->offset) | 0);  /* check that 'EdgeRunnerCompiledParam.offset' is an integer */
+  (void)((p->span) | 0);  /* check that 'EdgeRunnerCompiledParam.span' is an integer */
+}
+struct _cffi_align_typedef_EdgeRunnerCompiledParam { char x; EdgeRunnerCompiledParam y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerCompiledPlan(EdgeRunnerCompiledPlan *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  (void)((p->version) | 0);  /* check that 'EdgeRunnerCompiledPlan.version' is an integer */
+  (void)((p->node_count) | 0);  /* check that 'EdgeRunnerCompiledPlan.node_count' is an integer */
+  { EdgeRunnerCompiledNode * *tmp = &p->nodes; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerCompiledPlan { char x; EdgeRunnerCompiledPlan y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerControlCurve(EdgeRunnerControlCurve *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  { char * *tmp = &p->name; (void)tmp; }
+  (void)((p->name_len) | 0);  /* check that 'EdgeRunnerControlCurve.name_len' is an integer */
+  { double * *tmp = &p->values; (void)tmp; }
+  (void)((p->value_count) | 0);  /* check that 'EdgeRunnerControlCurve.value_count' is an integer */
+  { double *tmp = &p->timestamp; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerControlCurve { char x; EdgeRunnerControlCurve y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerControlHistory(EdgeRunnerControlHistory *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  (void)((p->frames_hint) | 0);  /* check that 'EdgeRunnerControlHistory.frames_hint' is an integer */
+  (void)((p->curve_count) | 0);  /* check that 'EdgeRunnerControlHistory.curve_count' is an integer */
+  { EdgeRunnerControlCurve * *tmp = &p->curves; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerControlHistory { char x; EdgeRunnerControlHistory y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerNodeDescriptor(EdgeRunnerNodeDescriptor *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  { char const * *tmp = &p->name; (void)tmp; }
+  (void)((p->name_len) | 0);  /* check that 'EdgeRunnerNodeDescriptor.name_len' is an integer */
+  { char const * *tmp = &p->type_name; (void)tmp; }
+  (void)((p->type_len) | 0);  /* check that 'EdgeRunnerNodeDescriptor.type_len' is an integer */
+  { char const * *tmp = &p->params_json; (void)tmp; }
+  (void)((p->params_len) | 0);  /* check that 'EdgeRunnerNodeDescriptor.params_len' is an integer */
+}
+struct _cffi_align_typedef_EdgeRunnerNodeDescriptor { char x; EdgeRunnerNodeDescriptor y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerNodeInputs(EdgeRunnerNodeInputs *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  { EdgeRunnerAudioView *tmp = &p->audio; (void)tmp; }
+  { EdgeRunnerParamSet *tmp = &p->params; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerNodeInputs { char x; EdgeRunnerNodeInputs y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerParamSet(EdgeRunnerParamSet *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  (void)((p->count) | 0);  /* check that 'EdgeRunnerParamSet.count' is an integer */
+  { EdgeRunnerParamView * *tmp = &p->items; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerParamSet { char x; EdgeRunnerParamSet y; };
+
+_CFFI_UNUSED_FN
+static void _cffi_checkfld_typedef_EdgeRunnerParamView(EdgeRunnerParamView *p)
+{
+  /* only to generate compile-time warnings or errors */
+  (void)p;
+  { char const * *tmp = &p->name; (void)tmp; }
+  (void)((p->batches) | 0);  /* check that 'EdgeRunnerParamView.batches' is an integer */
+  (void)((p->channels) | 0);  /* check that 'EdgeRunnerParamView.channels' is an integer */
+  (void)((p->frames) | 0);  /* check that 'EdgeRunnerParamView.frames' is an integer */
+  { double const * *tmp = &p->data; (void)tmp; }
+}
+struct _cffi_align_typedef_EdgeRunnerParamView { char x; EdgeRunnerParamView y; };
+
+static void _cffi_d_amp_free(double * x0)
+{
+  amp_free(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_free(PyObject *self, PyObject *arg0)
+{
+  double * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(30), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(30), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_free(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_free _cffi_d_amp_free
+#endif
+
+static EdgeRunnerCompiledPlan * _cffi_d_amp_load_compiled_plan(unsigned char const * x0, size_t x1, unsigned char const * x2, size_t x3)
+{
+  return amp_load_compiled_plan(x0, x1, x2, x3);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_load_compiled_plan(PyObject *self, PyObject *args)
+{
+  unsigned char const * x0;
+  size_t x1;
+  unsigned char const * x2;
+  size_t x3;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  EdgeRunnerCompiledPlan * result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+  PyObject *arg3;
+
+  if (!PyArg_UnpackTuple(args, "amp_load_compiled_plan", 4, 4, &arg0, &arg1, &arg2, &arg3))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(1), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (unsigned char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x1 = _cffi_to_c_int(arg1, size_t);
+  if (x1 == (size_t)-1 && PyErr_Occurred())
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(1), arg2, (char **)&x2);
+  if (datasize != 0) {
+    x2 = ((size_t)datasize) <= 640 ? (unsigned char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(1), arg2, (char **)&x2,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x3 = _cffi_to_c_int(arg3, size_t);
+  if (x3 == (size_t)-1 && PyErr_Occurred())
+    return NULL;
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_load_compiled_plan(x0, x1, x2, x3); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(24));
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_load_compiled_plan _cffi_d_amp_load_compiled_plan
+#endif
+
+static EdgeRunnerControlHistory * _cffi_d_amp_load_control_history(unsigned char const * x0, size_t x1, int x2)
+{
+  return amp_load_control_history(x0, x1, x2);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_load_control_history(PyObject *self, PyObject *args)
+{
+  unsigned char const * x0;
+  size_t x1;
+  int x2;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  EdgeRunnerControlHistory * result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+
+  if (!PyArg_UnpackTuple(args, "amp_load_control_history", 3, 3, &arg0, &arg1, &arg2))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(1), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (unsigned char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x1 = _cffi_to_c_int(arg1, size_t);
+  if (x1 == (size_t)-1 && PyErr_Occurred())
+    return NULL;
+
+  x2 = _cffi_to_c_int(arg2, int);
+  if (x2 == (int)-1 && PyErr_Occurred())
+    return NULL;
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_load_control_history(x0, x1, x2); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(27));
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_load_control_history _cffi_d_amp_load_control_history
+#endif
+
+static void _cffi_d_amp_release_compiled_plan(EdgeRunnerCompiledPlan * x0)
+{
+  amp_release_compiled_plan(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_release_compiled_plan(PyObject *self, PyObject *arg0)
+{
+  EdgeRunnerCompiledPlan * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(24), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (EdgeRunnerCompiledPlan *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(24), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_release_compiled_plan(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_release_compiled_plan _cffi_d_amp_release_compiled_plan
+#endif
+
+static void _cffi_d_amp_release_control_history(EdgeRunnerControlHistory * x0)
+{
+  amp_release_control_history(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_release_control_history(PyObject *self, PyObject *arg0)
+{
+  EdgeRunnerControlHistory * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(27), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (EdgeRunnerControlHistory *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(27), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_release_control_history(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_release_control_history _cffi_d_amp_release_control_history
+#endif
+
+static void _cffi_d_amp_release_state(void * x0)
+{
+  amp_release_state(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_release_state(PyObject *self, PyObject *arg0)
+{
+  void * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(171), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (void *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(171), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_release_state(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_release_state _cffi_d_amp_release_state
+#endif
+
+static int _cffi_d_amp_run_node(EdgeRunnerNodeDescriptor const * x0, EdgeRunnerNodeInputs const * x1, int x2, int x3, int x4, double x5, double * * x6, int * x7, void * * x8, EdgeRunnerControlHistory const * x9)
+{
+  return amp_run_node(x0, x1, x2, x3, x4, x5, x6, x7, x8, x9);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_run_node(PyObject *self, PyObject *args)
+{
+  EdgeRunnerNodeDescriptor const * x0;
+  EdgeRunnerNodeInputs const * x1;
+  int x2;
+  int x3;
+  int x4;
+  double x5;
+  double * * x6;
+  int * x7;
+  void * * x8;
+  EdgeRunnerControlHistory const * x9;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  int result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+  PyObject *arg3;
+  PyObject *arg4;
+  PyObject *arg5;
+  PyObject *arg6;
+  PyObject *arg7;
+  PyObject *arg8;
+  PyObject *arg9;
+
+  if (!PyArg_UnpackTuple(args, "amp_run_node", 10, 10, &arg0, &arg1, &arg2, &arg3, &arg4, &arg5, &arg6, &arg7, &arg8, &arg9))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(12), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (EdgeRunnerNodeDescriptor const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(12), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(13), arg1, (char **)&x1);
+  if (datasize != 0) {
+    x1 = ((size_t)datasize) <= 640 ? (EdgeRunnerNodeInputs const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(13), arg1, (char **)&x1,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x2 = _cffi_to_c_int(arg2, int);
+  if (x2 == (int)-1 && PyErr_Occurred())
+    return NULL;
+
+  x3 = _cffi_to_c_int(arg3, int);
+  if (x3 == (int)-1 && PyErr_Occurred())
+    return NULL;
+
+  x4 = _cffi_to_c_int(arg4, int);
+  if (x4 == (int)-1 && PyErr_Occurred())
+    return NULL;
+
+  x5 = (double)_cffi_to_c_double(arg5);
+  if (x5 == (double)-1 && PyErr_Occurred())
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(18), arg6, (char **)&x6);
+  if (datasize != 0) {
+    x6 = ((size_t)datasize) <= 640 ? (double * *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(18), arg6, (char **)&x6,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(19), arg7, (char **)&x7);
+  if (datasize != 0) {
+    x7 = ((size_t)datasize) <= 640 ? (int *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(19), arg7, (char **)&x7,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(20), arg8, (char **)&x8);
+  if (datasize != 0) {
+    x8 = ((size_t)datasize) <= 640 ? (void * *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(20), arg8, (char **)&x8,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(21), arg9, (char **)&x9);
+  if (datasize != 0) {
+    x9 = ((size_t)datasize) <= 640 ? (EdgeRunnerControlHistory const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(21), arg9, (char **)&x9,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_run_node(x0, x1, x2, x3, x4, x5, x6, x7, x8, x9); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_int(result, int);
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_run_node _cffi_d_amp_run_node
+#endif
 
 static void _cffi_d_arp_advance(double const * x0, int x1, double * x2, int x3, int x4, int * x5, int * x6, int x7)
 {
@@ -2511,10 +4523,10 @@ _cffi_f_arp_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2524,10 +4536,10 @@ _cffi_f_arp_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg2, (char **)&x2);
+      _cffi_type(30), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2541,19 +4553,19 @@ _cffi_f_arp_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(111), arg5, (char **)&x5);
+      _cffi_type(19), arg5, (char **)&x5);
   if (datasize != 0) {
     x5 = ((size_t)datasize) <= 640 ? (int *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(111), arg5, (char **)&x5,
+    if (_cffi_convert_array_argument(_cffi_type(19), arg5, (char **)&x5,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(111), arg6, (char **)&x6);
+      _cffi_type(19), arg6, (char **)&x6);
   if (datasize != 0) {
     x6 = ((size_t)datasize) <= 640 ? (int *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(111), arg6, (char **)&x6,
+    if (_cffi_convert_array_argument(_cffi_type(19), arg6, (char **)&x6,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2606,19 +4618,19 @@ _cffi_f_dc_block(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg1, (char **)&x1);
+      _cffi_type(30), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2640,10 +4652,10 @@ _cffi_f_dc_block(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg6, (char **)&x6);
+      _cffi_type(30), arg6, (char **)&x6);
   if (datasize != 0) {
     x6 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg6, (char **)&x6,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg6, (char **)&x6,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2720,37 +4732,37 @@ _cffi_f_envelope_process(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg1, (char **)&x1);
+      _cffi_type(33), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg2, (char **)&x2);
+      _cffi_type(33), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg3, (char **)&x3);
+      _cffi_type(33), arg3, (char **)&x3);
   if (datasize != 0) {
     x3 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg3, (char **)&x3,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg3, (char **)&x3,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2792,73 +4804,73 @@ _cffi_f_envelope_process(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(111), arg13, (char **)&x13);
+      _cffi_type(19), arg13, (char **)&x13);
   if (datasize != 0) {
     x13 = ((size_t)datasize) <= 640 ? (int *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(111), arg13, (char **)&x13,
+    if (_cffi_convert_array_argument(_cffi_type(19), arg13, (char **)&x13,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg14, (char **)&x14);
+      _cffi_type(30), arg14, (char **)&x14);
   if (datasize != 0) {
     x14 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg14, (char **)&x14,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg14, (char **)&x14,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg15, (char **)&x15);
+      _cffi_type(30), arg15, (char **)&x15);
   if (datasize != 0) {
     x15 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg15, (char **)&x15,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg15, (char **)&x15,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg16, (char **)&x16);
+      _cffi_type(30), arg16, (char **)&x16);
   if (datasize != 0) {
     x16 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg16, (char **)&x16,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg16, (char **)&x16,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(115), arg17, (char **)&x17);
+      _cffi_type(147), arg17, (char **)&x17);
   if (datasize != 0) {
     x17 = ((size_t)datasize) <= 640 ? (int64_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(115), arg17, (char **)&x17,
+    if (_cffi_convert_array_argument(_cffi_type(147), arg17, (char **)&x17,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg18, (char **)&x18);
+      _cffi_type(30), arg18, (char **)&x18);
   if (datasize != 0) {
     x18 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg18, (char **)&x18,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg18, (char **)&x18,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg19, (char **)&x19);
+      _cffi_type(30), arg19, (char **)&x19);
   if (datasize != 0) {
     x19 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg19, (char **)&x19,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg19, (char **)&x19,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg20, (char **)&x20);
+      _cffi_type(30), arg20, (char **)&x20);
   if (datasize != 0) {
     x20 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg20, (char **)&x20,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg20, (char **)&x20,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2907,19 +4919,19 @@ _cffi_f_lfo_slew(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg1, (char **)&x1);
+      _cffi_type(30), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2941,10 +4953,10 @@ _cffi_f_lfo_slew(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg6, (char **)&x6);
+      _cffi_type(30), arg6, (char **)&x6);
   if (datasize != 0) {
     x6 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg6, (char **)&x6,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg6, (char **)&x6,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -2989,28 +5001,28 @@ _cffi_f_osc_saw_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg1, (char **)&x1);
+      _cffi_type(33), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg2, (char **)&x2);
+      _cffi_type(30), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3065,19 +5077,19 @@ _cffi_f_osc_square_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg1, (char **)&x1);
+      _cffi_type(33), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3087,10 +5099,10 @@ _cffi_f_osc_square_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg3, (char **)&x3);
+      _cffi_type(30), arg3, (char **)&x3);
   if (datasize != 0) {
     x3 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg3, (char **)&x3,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg3, (char **)&x3,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3145,28 +5157,28 @@ _cffi_f_osc_triangle_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg1, (char **)&x1);
+      _cffi_type(33), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg2, (char **)&x2);
+      _cffi_type(30), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3180,10 +5192,10 @@ _cffi_f_osc_triangle_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg5, (char **)&x5);
+      _cffi_type(30), arg5, (char **)&x5);
   if (datasize != 0) {
     x5 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg5, (char **)&x5,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg5, (char **)&x5,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3230,19 +5242,19 @@ _cffi_f_phase_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg1, (char **)&x1);
+      _cffi_type(30), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3256,19 +5268,19 @@ _cffi_f_phase_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg4, (char **)&x4);
+      _cffi_type(30), arg4, (char **)&x4);
   if (datasize != 0) {
     x4 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg4, (char **)&x4,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg4, (char **)&x4,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg5, (char **)&x5);
+      _cffi_type(33), arg5, (char **)&x5);
   if (datasize != 0) {
     x5 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg5, (char **)&x5,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg5, (char **)&x5,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3311,28 +5323,28 @@ _cffi_f_polyblep_arr(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg1, (char **)&x1);
+      _cffi_type(33), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg2, (char **)&x2);
+      _cffi_type(30), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3389,37 +5401,37 @@ _cffi_f_portamento_smooth(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg1, (char **)&x1);
+      _cffi_type(33), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg2, (char **)&x2);
+      _cffi_type(33), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg3, (char **)&x3);
+      _cffi_type(33), arg3, (char **)&x3);
   if (datasize != 0) {
     x3 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg3, (char **)&x3,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg3, (char **)&x3,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3437,19 +5449,19 @@ _cffi_f_portamento_smooth(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg7, (char **)&x7);
+      _cffi_type(30), arg7, (char **)&x7);
   if (datasize != 0) {
     x7 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg7, (char **)&x7,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg7, (char **)&x7,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg8, (char **)&x8);
+      _cffi_type(30), arg8, (char **)&x8);
   if (datasize != 0) {
     x8 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg8, (char **)&x8,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg8, (char **)&x8,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3500,19 +5512,19 @@ _cffi_f_safety_filter(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg1, (char **)&x1);
+      _cffi_type(30), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3534,19 +5546,19 @@ _cffi_f_safety_filter(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg6, (char **)&x6);
+      _cffi_type(30), arg6, (char **)&x6);
   if (datasize != 0) {
     x6 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg6, (char **)&x6,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg6, (char **)&x6,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg7, (char **)&x7);
+      _cffi_type(30), arg7, (char **)&x7);
   if (datasize != 0) {
     x7 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg7, (char **)&x7,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg7, (char **)&x7,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3635,19 +5647,19 @@ _cffi_f_subharmonic_process(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(1), arg0, (char **)&x0);
+      _cffi_type(33), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg1, (char **)&x1);
+      _cffi_type(30), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3705,109 +5717,109 @@ _cffi_f_subharmonic_process(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg15, (char **)&x15);
+      _cffi_type(30), arg15, (char **)&x15);
   if (datasize != 0) {
     x15 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg15, (char **)&x15,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg15, (char **)&x15,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg16, (char **)&x16);
+      _cffi_type(30), arg16, (char **)&x16);
   if (datasize != 0) {
     x16 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg16, (char **)&x16,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg16, (char **)&x16,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg17, (char **)&x17);
+      _cffi_type(30), arg17, (char **)&x17);
   if (datasize != 0) {
     x17 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg17, (char **)&x17,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg17, (char **)&x17,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(55), arg18, (char **)&x18);
+      _cffi_type(87), arg18, (char **)&x18);
   if (datasize != 0) {
     x18 = ((size_t)datasize) <= 640 ? (int8_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(55), arg18, (char **)&x18,
+    if (_cffi_convert_array_argument(_cffi_type(87), arg18, (char **)&x18,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(55), arg19, (char **)&x19);
+      _cffi_type(87), arg19, (char **)&x19);
   if (datasize != 0) {
     x19 = ((size_t)datasize) <= 640 ? (int8_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(55), arg19, (char **)&x19,
+    if (_cffi_convert_array_argument(_cffi_type(87), arg19, (char **)&x19,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(55), arg20, (char **)&x20);
+      _cffi_type(87), arg20, (char **)&x20);
   if (datasize != 0) {
     x20 = ((size_t)datasize) <= 640 ? (int8_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(55), arg20, (char **)&x20,
+    if (_cffi_convert_array_argument(_cffi_type(87), arg20, (char **)&x20,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(58), arg21, (char **)&x21);
+      _cffi_type(90), arg21, (char **)&x21);
   if (datasize != 0) {
     x21 = ((size_t)datasize) <= 640 ? (int32_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(58), arg21, (char **)&x21,
+    if (_cffi_convert_array_argument(_cffi_type(90), arg21, (char **)&x21,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg22, (char **)&x22);
+      _cffi_type(30), arg22, (char **)&x22);
   if (datasize != 0) {
     x22 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg22, (char **)&x22,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg22, (char **)&x22,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg23, (char **)&x23);
+      _cffi_type(30), arg23, (char **)&x23);
   if (datasize != 0) {
     x23 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg23, (char **)&x23,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg23, (char **)&x23,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg24, (char **)&x24);
+      _cffi_type(30), arg24, (char **)&x24);
   if (datasize != 0) {
     x24 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg24, (char **)&x24,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg24, (char **)&x24,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg25, (char **)&x25);
+      _cffi_type(30), arg25, (char **)&x25);
   if (datasize != 0) {
     x25 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg25, (char **)&x25,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg25, (char **)&x25,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(2), arg26, (char **)&x26);
+      _cffi_type(30), arg26, (char **)&x26);
   if (datasize != 0) {
     x26 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(2), arg26, (char **)&x26,
+    if (_cffi_convert_array_argument(_cffi_type(30), arg26, (char **)&x26,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -3828,33 +5840,207 @@ _cffi_f_subharmonic_process(PyObject *self, PyObject *args)
 #endif
 
 static const struct _cffi_global_s _cffi_globals[] = {
-  { "arp_advance", (void *)_cffi_f_arp_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 128), (void *)_cffi_d_arp_advance },
-  { "dc_block", (void *)_cffi_f_dc_block, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 17), (void *)_cffi_d_dc_block },
-  { "envelope_process", (void *)_cffi_f_envelope_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 97), (void *)_cffi_d_envelope_process },
-  { "lfo_slew", (void *)_cffi_f_lfo_slew, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 8), (void *)_cffi_d_lfo_slew },
-  { "osc_saw_blep_c", (void *)_cffi_f_osc_saw_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 71), (void *)_cffi_d_osc_saw_blep_c },
-  { "osc_square_blep_c", (void *)_cffi_f_osc_square_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 120), (void *)_cffi_d_osc_square_blep_c },
-  { "osc_triangle_blep_c", (void *)_cffi_f_osc_triangle_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 78), (void *)_cffi_d_osc_triangle_blep_c },
-  { "phase_advance", (void *)_cffi_f_phase_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 0), (void *)_cffi_d_phase_advance },
-  { "polyblep_arr", (void *)_cffi_f_polyblep_arr, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 65), (void *)_cffi_d_polyblep_arr },
-  { "portamento_smooth", (void *)_cffi_f_portamento_smooth, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 86), (void *)_cffi_d_portamento_smooth },
-  { "safety_filter", (void *)_cffi_f_safety_filter, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 26), (void *)_cffi_d_safety_filter },
-  { "subharmonic_process", (void *)_cffi_f_subharmonic_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 36), (void *)_cffi_d_subharmonic_process },
+  { "amp_free", (void *)_cffi_f_amp_free, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 29), (void *)_cffi_d_amp_free },
+  { "amp_load_compiled_plan", (void *)_cffi_f_amp_load_compiled_plan, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 0), (void *)_cffi_d_amp_load_compiled_plan },
+  { "amp_load_control_history", (void *)_cffi_f_amp_load_control_history, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 6), (void *)_cffi_d_amp_load_control_history },
+  { "amp_release_compiled_plan", (void *)_cffi_f_amp_release_compiled_plan, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 23), (void *)_cffi_d_amp_release_compiled_plan },
+  { "amp_release_control_history", (void *)_cffi_f_amp_release_control_history, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 26), (void *)_cffi_d_amp_release_control_history },
+  { "amp_release_state", (void *)_cffi_f_amp_release_state, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 170), (void *)_cffi_d_amp_release_state },
+  { "amp_run_node", (void *)_cffi_f_amp_run_node, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 11), (void *)_cffi_d_amp_run_node },
+  { "arp_advance", (void *)_cffi_f_arp_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 160), (void *)_cffi_d_arp_advance },
+  { "dc_block", (void *)_cffi_f_dc_block, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 49), (void *)_cffi_d_dc_block },
+  { "envelope_process", (void *)_cffi_f_envelope_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 129), (void *)_cffi_d_envelope_process },
+  { "lfo_slew", (void *)_cffi_f_lfo_slew, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 40), (void *)_cffi_d_lfo_slew },
+  { "osc_saw_blep_c", (void *)_cffi_f_osc_saw_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 103), (void *)_cffi_d_osc_saw_blep_c },
+  { "osc_square_blep_c", (void *)_cffi_f_osc_square_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 152), (void *)_cffi_d_osc_square_blep_c },
+  { "osc_triangle_blep_c", (void *)_cffi_f_osc_triangle_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 110), (void *)_cffi_d_osc_triangle_blep_c },
+  { "phase_advance", (void *)_cffi_f_phase_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 32), (void *)_cffi_d_phase_advance },
+  { "polyblep_arr", (void *)_cffi_f_polyblep_arr, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 97), (void *)_cffi_d_polyblep_arr },
+  { "portamento_smooth", (void *)_cffi_f_portamento_smooth, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 118), (void *)_cffi_d_portamento_smooth },
+  { "safety_filter", (void *)_cffi_f_safety_filter, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 58), (void *)_cffi_d_safety_filter },
+  { "subharmonic_process", (void *)_cffi_f_subharmonic_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 68), (void *)_cffi_d_subharmonic_process },
+};
+
+static const struct _cffi_field_s _cffi_fields[] = {
+  { "has_audio", offsetof(EdgeRunnerAudioView, has_audio),
+                 sizeof(((EdgeRunnerAudioView *)0)->has_audio),
+                 _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "batches", offsetof(EdgeRunnerAudioView, batches),
+               sizeof(((EdgeRunnerAudioView *)0)->batches),
+               _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "channels", offsetof(EdgeRunnerAudioView, channels),
+                sizeof(((EdgeRunnerAudioView *)0)->channels),
+                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "frames", offsetof(EdgeRunnerAudioView, frames),
+              sizeof(((EdgeRunnerAudioView *)0)->frames),
+              _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "data", offsetof(EdgeRunnerAudioView, data),
+            sizeof(((EdgeRunnerAudioView *)0)->data),
+            _CFFI_OP(_CFFI_OP_NOOP, 33) },
+  { "name", offsetof(EdgeRunnerCompiledNode, name),
+            sizeof(((EdgeRunnerCompiledNode *)0)->name),
+            _CFFI_OP(_CFFI_OP_NOOP, 187) },
+  { "name_len", offsetof(EdgeRunnerCompiledNode, name_len),
+                sizeof(((EdgeRunnerCompiledNode *)0)->name_len),
+                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "function_id", offsetof(EdgeRunnerCompiledNode, function_id),
+                   sizeof(((EdgeRunnerCompiledNode *)0)->function_id),
+                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "audio_offset", offsetof(EdgeRunnerCompiledNode, audio_offset),
+                    sizeof(((EdgeRunnerCompiledNode *)0)->audio_offset),
+                    _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "audio_span", offsetof(EdgeRunnerCompiledNode, audio_span),
+                  sizeof(((EdgeRunnerCompiledNode *)0)->audio_span),
+                  _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "param_count", offsetof(EdgeRunnerCompiledNode, param_count),
+                   sizeof(((EdgeRunnerCompiledNode *)0)->param_count),
+                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "params", offsetof(EdgeRunnerCompiledNode, params),
+              sizeof(((EdgeRunnerCompiledNode *)0)->params),
+              _CFFI_OP(_CFFI_OP_NOOP, 176) },
+  { "name", offsetof(EdgeRunnerCompiledParam, name),
+            sizeof(((EdgeRunnerCompiledParam *)0)->name),
+            _CFFI_OP(_CFFI_OP_NOOP, 187) },
+  { "name_len", offsetof(EdgeRunnerCompiledParam, name_len),
+                sizeof(((EdgeRunnerCompiledParam *)0)->name_len),
+                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "offset", offsetof(EdgeRunnerCompiledParam, offset),
+              sizeof(((EdgeRunnerCompiledParam *)0)->offset),
+              _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "span", offsetof(EdgeRunnerCompiledParam, span),
+            sizeof(((EdgeRunnerCompiledParam *)0)->span),
+            _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "version", offsetof(EdgeRunnerCompiledPlan, version),
+               sizeof(((EdgeRunnerCompiledPlan *)0)->version),
+               _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "node_count", offsetof(EdgeRunnerCompiledPlan, node_count),
+                  sizeof(((EdgeRunnerCompiledPlan *)0)->node_count),
+                  _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "nodes", offsetof(EdgeRunnerCompiledPlan, nodes),
+             sizeof(((EdgeRunnerCompiledPlan *)0)->nodes),
+             _CFFI_OP(_CFFI_OP_NOOP, 174) },
+  { "name", offsetof(EdgeRunnerControlCurve, name),
+            sizeof(((EdgeRunnerControlCurve *)0)->name),
+            _CFFI_OP(_CFFI_OP_NOOP, 187) },
+  { "name_len", offsetof(EdgeRunnerControlCurve, name_len),
+                sizeof(((EdgeRunnerControlCurve *)0)->name_len),
+                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "values", offsetof(EdgeRunnerControlCurve, values),
+              sizeof(((EdgeRunnerControlCurve *)0)->values),
+              _CFFI_OP(_CFFI_OP_NOOP, 30) },
+  { "value_count", offsetof(EdgeRunnerControlCurve, value_count),
+                   sizeof(((EdgeRunnerControlCurve *)0)->value_count),
+                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "timestamp", offsetof(EdgeRunnerControlCurve, timestamp),
+                 sizeof(((EdgeRunnerControlCurve *)0)->timestamp),
+                 _CFFI_OP(_CFFI_OP_NOOP, 17) },
+  { "frames_hint", offsetof(EdgeRunnerControlHistory, frames_hint),
+                   sizeof(((EdgeRunnerControlHistory *)0)->frames_hint),
+                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "curve_count", offsetof(EdgeRunnerControlHistory, curve_count),
+                   sizeof(((EdgeRunnerControlHistory *)0)->curve_count),
+                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "curves", offsetof(EdgeRunnerControlHistory, curves),
+              sizeof(((EdgeRunnerControlHistory *)0)->curves),
+              _CFFI_OP(_CFFI_OP_NOOP, 179) },
+  { "name", offsetof(EdgeRunnerNodeDescriptor, name),
+            sizeof(((EdgeRunnerNodeDescriptor *)0)->name),
+            _CFFI_OP(_CFFI_OP_NOOP, 188) },
+  { "name_len", offsetof(EdgeRunnerNodeDescriptor, name_len),
+                sizeof(((EdgeRunnerNodeDescriptor *)0)->name_len),
+                _CFFI_OP(_CFFI_OP_NOOP, 2) },
+  { "type_name", offsetof(EdgeRunnerNodeDescriptor, type_name),
+                 sizeof(((EdgeRunnerNodeDescriptor *)0)->type_name),
+                 _CFFI_OP(_CFFI_OP_NOOP, 188) },
+  { "type_len", offsetof(EdgeRunnerNodeDescriptor, type_len),
+                sizeof(((EdgeRunnerNodeDescriptor *)0)->type_len),
+                _CFFI_OP(_CFFI_OP_NOOP, 2) },
+  { "params_json", offsetof(EdgeRunnerNodeDescriptor, params_json),
+                   sizeof(((EdgeRunnerNodeDescriptor *)0)->params_json),
+                   _CFFI_OP(_CFFI_OP_NOOP, 188) },
+  { "params_len", offsetof(EdgeRunnerNodeDescriptor, params_len),
+                  sizeof(((EdgeRunnerNodeDescriptor *)0)->params_len),
+                  _CFFI_OP(_CFFI_OP_NOOP, 2) },
+  { "audio", offsetof(EdgeRunnerNodeInputs, audio),
+             sizeof(((EdgeRunnerNodeInputs *)0)->audio),
+             _CFFI_OP(_CFFI_OP_NOOP, 173) },
+  { "params", offsetof(EdgeRunnerNodeInputs, params),
+              sizeof(((EdgeRunnerNodeInputs *)0)->params),
+              _CFFI_OP(_CFFI_OP_NOOP, 184) },
+  { "count", offsetof(EdgeRunnerParamSet, count),
+             sizeof(((EdgeRunnerParamSet *)0)->count),
+             _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "items", offsetof(EdgeRunnerParamSet, items),
+             sizeof(((EdgeRunnerParamSet *)0)->items),
+             _CFFI_OP(_CFFI_OP_NOOP, 185) },
+  { "name", offsetof(EdgeRunnerParamView, name),
+            sizeof(((EdgeRunnerParamView *)0)->name),
+            _CFFI_OP(_CFFI_OP_NOOP, 188) },
+  { "batches", offsetof(EdgeRunnerParamView, batches),
+               sizeof(((EdgeRunnerParamView *)0)->batches),
+               _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "channels", offsetof(EdgeRunnerParamView, channels),
+                sizeof(((EdgeRunnerParamView *)0)->channels),
+                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "frames", offsetof(EdgeRunnerParamView, frames),
+              sizeof(((EdgeRunnerParamView *)0)->frames),
+              _CFFI_OP(_CFFI_OP_NOOP, 194) },
+  { "data", offsetof(EdgeRunnerParamView, data),
+            sizeof(((EdgeRunnerParamView *)0)->data),
+            _CFFI_OP(_CFFI_OP_NOOP, 33) },
+};
+
+static const struct _cffi_struct_union_s _cffi_struct_unions[] = {
+  { "$EdgeRunnerAudioView", 173, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerAudioView), offsetof(struct _cffi_align_typedef_EdgeRunnerAudioView, y), 0, 5 },
+  { "$EdgeRunnerCompiledNode", 175, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerCompiledNode), offsetof(struct _cffi_align_typedef_EdgeRunnerCompiledNode, y), 5, 7 },
+  { "$EdgeRunnerCompiledParam", 177, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerCompiledParam), offsetof(struct _cffi_align_typedef_EdgeRunnerCompiledParam, y), 12, 4 },
+  { "$EdgeRunnerCompiledPlan", 178, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerCompiledPlan), offsetof(struct _cffi_align_typedef_EdgeRunnerCompiledPlan, y), 16, 3 },
+  { "$EdgeRunnerControlCurve", 180, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerControlCurve), offsetof(struct _cffi_align_typedef_EdgeRunnerControlCurve, y), 19, 5 },
+  { "$EdgeRunnerControlHistory", 181, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerControlHistory), offsetof(struct _cffi_align_typedef_EdgeRunnerControlHistory, y), 24, 3 },
+  { "$EdgeRunnerNodeDescriptor", 182, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerNodeDescriptor), offsetof(struct _cffi_align_typedef_EdgeRunnerNodeDescriptor, y), 27, 6 },
+  { "$EdgeRunnerNodeInputs", 183, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerNodeInputs), offsetof(struct _cffi_align_typedef_EdgeRunnerNodeInputs, y), 33, 2 },
+  { "$EdgeRunnerParamSet", 184, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerParamSet), offsetof(struct _cffi_align_typedef_EdgeRunnerParamSet, y), 35, 2 },
+  { "$EdgeRunnerParamView", 186, _CFFI_F_CHECK_FIELDS,
+    sizeof(EdgeRunnerParamView), offsetof(struct _cffi_align_typedef_EdgeRunnerParamView, y), 37, 5 },
+};
+
+static const struct _cffi_typename_s _cffi_typenames[] = {
+  { "EdgeRunnerAudioView", 173 },
+  { "EdgeRunnerCompiledNode", 175 },
+  { "EdgeRunnerCompiledParam", 177 },
+  { "EdgeRunnerCompiledPlan", 178 },
+  { "EdgeRunnerControlCurve", 180 },
+  { "EdgeRunnerControlHistory", 181 },
+  { "EdgeRunnerNodeDescriptor", 182 },
+  { "EdgeRunnerNodeInputs", 183 },
+  { "EdgeRunnerParamSet", 184 },
+  { "EdgeRunnerParamView", 186 },
+  { "uint32_t", 194 },
+  { "uint8_t", 193 },
 };
 
 static const struct _cffi_type_context_s _cffi_type_context = {
   _cffi_types,
   _cffi_globals,
-  NULL,  /* no fields */
-  NULL,  /* no struct_unions */
+  _cffi_fields,
+  _cffi_struct_unions,
   NULL,  /* no enums */
-  NULL,  /* no typenames */
-  12,  /* num_globals */
-  0,  /* num_struct_unions */
+  _cffi_typenames,
+  19,  /* num_globals */
+  10,  /* num_struct_unions */
   0,  /* num_enums */
-  0,  /* num_typenames */
+  12,  /* num_typenames */
   NULL,  /* no includes */
-  142,  /* num_types */
+  196,  /* num_types */
   0,  /* flags */
 };
 
