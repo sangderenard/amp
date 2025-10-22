@@ -913,44 +913,13 @@ class CffiEdgeRunner:
 
                 if status == -3:
                     contract = self._node_contracts.get(name)
+                    message = (
+                        "C kernel declined node '{name}' (type {type_name}); "
+                        "runtime forbids Python fallbacks during graph execution"
+                    ).format(name=name, type_name=descriptor.type_name)
                     if contract is not None and not contract.allow_python_fallback:
-                        raise RuntimeError(
-                            (
-                                "C kernel declined node '{name}' (type {type_name}); "
-                                "contract forbids Python fallback"
-                            ).format(name=name, type_name=descriptor.type_name)
-                        )
-                    self._python_fallback_counts[name] = (
-                        self._python_fallback_counts.get(name, 0) + 1
-                    )
-                    node_obj = self._graph._nodes.get(name)
-                    if node_obj is None:
-                        raise RuntimeError(f"Unknown node '{name}' encountered during fallback execution")
-                    audio_in = handle.node_buffer
-                    params = handle.params
-                    try:
-                        output = node_obj.process(
-                            int(handle.frames),
-                            float(self._sample_rate),
-                            audio_in,
-                            {},
-                            params,
-                        )
-                    except Exception as exc:
-                        print(f"[CffiEdgeRunner] Python fallback for node '{name}' raised: {exc!r}", flush=True)
-                        print(f"  descriptor.type={descriptor.type_name} params={descriptor.params_json}", flush=True)
-                        raise
-                    if output is None:
-                        print(f"[CffiEdgeRunner] Python fallback for node '{name}' returned None", flush=True)
-                        print(f"  descriptor.type={descriptor.type_name} params={descriptor.params_json}", flush=True)
-                        raise RuntimeError(f"Fallback node '{name}' produced no output (None)")
-                    array = np.asarray(output, dtype=RAW_DTYPE)
-                    batches = array.shape[0]
-                    channels = array.shape[1]
-                    if array.shape[2] != handle.frames:
-                        raise RuntimeError(
-                            f"Fallback node '{name}' produced mismatched frame count"
-                        )
+                        message += "; contract already marked this node as C-only"
+                    raise RuntimeError(message)
                 elif status == 0:
                     self._node_states[name] = state_ptr[0]
                     batches = int(handle.batches)

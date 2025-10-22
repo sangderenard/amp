@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+import threading
+from pathlib import Path
+from queue import Queue
+from typing import Mapping
+
+import numpy as np
+
+AVAILABLE = False
+_IMPL = None
+UNAVAILABLE_REASON: str | None = None
+
+_CDEF = """
+typedef unsigned char uint8_t;
+typedef unsigned int uint32_t;
+typedef struct AmpGraphRuntime AmpGraphRuntime;
+typedef struct AmpGraphControlHistory AmpGraphControlHistory;
+AmpGraphRuntime *amp_graph_runtime_create(
+    const uint8_t *descriptor_blob,
+    size_t descriptor_len,
+    const uint8_t *plan_blob,
+    size_t plan_len
+);
+void amp_graph_runtime_destroy(AmpGraphRuntime *runtime);
+int amp_graph_runtime_configure(AmpGraphRuntime *runtime, uint32_t batches, uint32_t frames);
+void amp_graph_runtime_clear_params(AmpGraphRuntime *runtime);
+int amp_graph_runtime_set_param(
+    AmpGraphRuntime *runtime,
+    const char *node_name,
+    const char *param_name,
+    const double *data,
+    uint32_t batches,
+    uint32_t channels,
+    uint32_t frames
+);
+int amp_graph_runtime_execute(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    double **out_buffer,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+);
+void amp_graph_runtime_buffer_free(double *buffer);
+AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
+void amp_graph_history_destroy(AmpGraphControlHistory *history);
+"""
+
+
+def _build_impl() -> tuple["cffi.FFI", object]:
+    import cffi
+
+    from . import c_kernels
+
+    ffi = cffi.FFI()
+    ffi.cdef(_CDEF)
+    source_path = Path(__file__).resolve().parents[1] / "native" / "graph_runtime.c"
+    runtime_source = source_path.read_text(encoding="utf-8")
+    combined_source = f"{c_kernels.C_SRC}\n{runtime_source}"
+    ffi.set_source("_amp_graph_runtime", combined_source)
+    module_path = ffi.compile(verbose=False)
+    compiled_path = Path(module_path)
+    target_dir = Path(__file__).resolve().parent
+    target_path = target_dir / compiled_path.name
+    if compiled_path.exists() and compiled_path != target_path:
+        try:
+            target_path.write_bytes(compiled_path.read_bytes())
+        except Exception:
+            target_path = compiled_path
+    else:
+        target_path = compiled_path
+    spec = importlib.util.spec_from_file_location("_amp_graph_runtime", str(target_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load compiled runtime module from {target_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_amp_graph_runtime"] = module
+    spec.loader.exec_module(module)
+    return module.ffi, module.lib
+
+
+def _load_impl() -> tuple["cffi.FFI", object]:
+    global AVAILABLE, _IMPL, UNAVAILABLE_REASON
+    if _IMPL is not None:
+        AVAILABLE = True
+        UNAVAILABLE_REASON = None
+        return _IMPL
+    try:
+        from . import _amp_graph_runtime as module  # type: ignore
+
+        _IMPL = (module.ffi, module.lib)
+        AVAILABLE = True
+        UNAVAILABLE_REASON = None
+    except ImportError:
+        try:
+            _IMPL = _build_impl()
+            AVAILABLE = True
+            UNAVAILABLE_REASON = None
+        except Exception as exc:  # pragma: no cover - depends on build tooling
+            AVAILABLE = False
+            UNAVAILABLE_REASON = f"Failed to build native graph runtime: {exc}"
+            raise
+    return _IMPL
+
+
+def get_graph_runtime_impl() -> tuple["cffi.FFI", object]:
+    """Return the (ffi, lib) pair for the native graph runtime."""
+
+    return _load_impl()
+
+
+class NativeGraphExecutor:
+    """Small shim that evaluates an AudioGraph via the native runtime."""
+
+    def __init__(self, graph) -> None:
+        if graph is None:
+            raise ValueError("graph must be provided")
+        self._graph = graph
+        self.ffi, self.lib = get_graph_runtime_impl()
+        descriptor_blob = graph.serialize_node_descriptors()
+        runner = graph._ensure_edge_runner()
+        plan_blob = getattr(runner, "_compiled_plan", b"") or b""
+        desc_buf = self.ffi.new("uint8_t[]", descriptor_blob)
+        if plan_blob:
+            plan_buf = self.ffi.new("uint8_t[]", plan_blob)
+            plan_ptr = plan_buf
+            plan_len = len(plan_blob)
+        else:
+            plan_buf = None
+            plan_ptr = self.ffi.NULL
+            plan_len = 0
+        runtime = self.lib.amp_graph_runtime_create(
+            desc_buf,
+            len(descriptor_blob),
+            plan_ptr,
+            plan_len,
+        )
+        if runtime == self.ffi.NULL:
+            raise RuntimeError("native runtime rejected graph descriptors")
+        self._runtime = runtime
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> "NativeGraphExecutor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if getattr(self, "_runtime", self.ffi.NULL) not in (None, self.ffi.NULL):
+            self.lib.amp_graph_runtime_destroy(self._runtime)
+            self._runtime = self.ffi.NULL
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def run_block(
+        self,
+        frames: int,
+        sample_rate: float,
+        base_params: Mapping[str, Mapping[str, np.ndarray]] | None = None,
+        control_history_blob: bytes | None = None,
+        timeout: float | None = None,
+    ) -> np.ndarray:
+        if self._runtime == self.ffi.NULL:
+            raise RuntimeError("native runtime has been closed")
+        if frames <= 0:
+            raise ValueError("frames must be positive")
+        result_queue: "Queue[tuple[str, object]]" = Queue(maxsize=1)
+
+        def _worker() -> None:
+            try:
+                with self._lock:
+                    batches = 1
+                    if base_params and "_B" in base_params:
+                        batches = int(base_params["_B"])
+                    self.lib.amp_graph_runtime_clear_params(self._runtime)
+                    self.lib.amp_graph_runtime_configure(self._runtime, batches, frames)
+                    if base_params:
+                        for node_name, params in base_params.items():
+                            if node_name.startswith("_"):
+                                continue
+                            for param_name, array in params.items():
+                                arr = np.asarray(array, dtype=np.float64)
+                                if arr.ndim != 3:
+                                    raise ValueError(
+                                        f"param '{param_name}' for node '{node_name}' must be BxCxF"
+                                    )
+                                arr_c = np.require(arr, requirements=("C",))
+                                ptr = self.ffi.from_buffer("double[]", arr_c)
+                                status = self.lib.amp_graph_runtime_set_param(
+                                    self._runtime,
+                                    node_name.encode("utf-8"),
+                                    param_name.encode("utf-8"),
+                                    ptr,
+                                    arr_c.shape[0],
+                                    arr_c.shape[1],
+                                    arr_c.shape[2],
+                                )
+                                if int(status) != 0:
+                                    raise RuntimeError(
+                                        f"failed to bind param '{param_name}' for node '{node_name}'"
+                                    )
+                    ctrl_blob = control_history_blob or b""
+                    ctrl_buf = self.ffi.new("uint8_t[]", ctrl_blob) if ctrl_blob else self.ffi.NULL
+                    out_ptr = self.ffi.new("double **")
+                    out_batches = self.ffi.new("uint32_t *")
+                    out_channels = self.ffi.new("uint32_t *")
+                    out_frames = self.ffi.new("uint32_t *")
+                    status = self.lib.amp_graph_runtime_execute(
+                        self._runtime,
+                        ctrl_buf if ctrl_blob else self.ffi.NULL,
+                        len(ctrl_blob),
+                        frames,
+                        float(sample_rate),
+                        out_ptr,
+                        out_batches,
+                        out_channels,
+                        out_frames,
+                    )
+                    if int(status) != 0:
+                        raise RuntimeError(f"native runtime execution failed (status {int(status)})")
+                    total = int(out_batches[0]) * int(out_channels[0]) * int(out_frames[0])
+                    buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(np.float64).itemsize)
+                    array = np.frombuffer(buffer, dtype=np.float64).copy().reshape(
+                        int(out_batches[0]), int(out_channels[0]), int(out_frames[0])
+                    )
+                    self.lib.amp_graph_runtime_buffer_free(out_ptr[0])
+                result_queue.put(("ok", array))
+            except Exception as exc:  # pragma: no cover - background error propagation
+                result_queue.put(("err", exc))
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            raise TimeoutError("native runtime execution timed out")
+        status, payload = result_queue.get()
+        if status == "err":
+            raise payload
+        return payload  # type: ignore[return-value]
+
+
+__all__ = [
+    "AVAILABLE",
+    "UNAVAILABLE_REASON",
+    "get_graph_runtime_impl",
+    "NativeGraphExecutor",
+]
+
+try:  # Attempt eager load so AVAILABLE reflects the environment
+    _load_impl()
+except Exception:
+    # Leave AVAILABLE/UNAVAILABLE_REASON as set by _load_impl
+    pass
