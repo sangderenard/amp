@@ -154,6 +154,218 @@ typedef struct {
     size_t params_len;
 } EdgeRunnerNodeDescriptor;
 
+typedef struct {
+    char *name;
+    uint32_t name_len;
+    uint32_t offset;
+    uint32_t span;
+} EdgeRunnerCompiledParam;
+
+typedef struct {
+    char *name;
+    uint32_t name_len;
+    uint32_t function_id;
+    uint32_t audio_offset;
+    uint32_t audio_span;
+    uint32_t param_count;
+    EdgeRunnerCompiledParam *params;
+} EdgeRunnerCompiledNode;
+
+typedef struct {
+    uint32_t version;
+    uint32_t node_count;
+    EdgeRunnerCompiledNode *nodes;
+} EdgeRunnerCompiledPlan;
+
+static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+    if (plan == NULL) {
+        return;
+    }
+    if (plan->nodes != NULL) {
+        for (uint32_t i = 0; i < plan->node_count; ++i) {
+            EdgeRunnerCompiledNode *node = &plan->nodes[i];
+            if (node->params != NULL) {
+                for (uint32_t j = 0; j < node->param_count; ++j) {
+                    EdgeRunnerCompiledParam *param = &node->params[j];
+                    if (param->name != NULL) {
+                        free(param->name);
+                        param->name = NULL;
+                    }
+                }
+                free(node->params);
+                node->params = NULL;
+            }
+            if (node->name != NULL) {
+                free(node->name);
+                node->name = NULL;
+            }
+        }
+        free(plan->nodes);
+        plan->nodes = NULL;
+    }
+    free(plan);
+}
+
+static int read_u32_le(const uint8_t **cursor, size_t *remaining, uint32_t *out_value) {
+    if (cursor == NULL || remaining == NULL || out_value == NULL) {
+        return 0;
+    }
+    if (*remaining < 4) {
+        return 0;
+    }
+    const uint8_t *ptr = *cursor;
+    *out_value = (uint32_t)ptr[0]
+        | ((uint32_t)ptr[1] << 8)
+        | ((uint32_t)ptr[2] << 16)
+        | ((uint32_t)ptr[3] << 24);
+    *cursor += 4;
+    *remaining -= 4;
+    return 1;
+}
+
+EdgeRunnerCompiledPlan *amp_load_compiled_plan(
+    const uint8_t *descriptor_blob,
+    size_t descriptor_len,
+    const uint8_t *plan_blob,
+    size_t plan_len
+) {
+    if (descriptor_blob == NULL || plan_blob == NULL) {
+        return NULL;
+    }
+    if (descriptor_len < 4 || plan_len < 12) {
+        return NULL;
+    }
+
+    const uint8_t *descriptor_cursor = descriptor_blob;
+    size_t descriptor_remaining = descriptor_len;
+    uint32_t descriptor_count = 0;
+    if (!read_u32_le(&descriptor_cursor, &descriptor_remaining, &descriptor_count)) {
+        return NULL;
+    }
+
+    const uint8_t *cursor = plan_blob;
+    size_t remaining = plan_len;
+    if (remaining < 4) {
+        return NULL;
+    }
+    if (cursor[0] != 'A' || cursor[1] != 'M' || cursor[2] != 'P' || cursor[3] != 'L') {
+        return NULL;
+    }
+    cursor += 4;
+    remaining -= 4;
+
+    uint32_t version = 0;
+    uint32_t node_count = 0;
+    if (!read_u32_le(&cursor, &remaining, &version) || !read_u32_le(&cursor, &remaining, &node_count)) {
+        return NULL;
+    }
+    if (descriptor_count != node_count) {
+        return NULL;
+    }
+
+    EdgeRunnerCompiledPlan *plan = (EdgeRunnerCompiledPlan *)calloc(1, sizeof(EdgeRunnerCompiledPlan));
+    if (plan == NULL) {
+        return NULL;
+    }
+    plan->version = version;
+    plan->node_count = node_count;
+
+    if (node_count == 0) {
+        if (remaining != 0) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        return plan;
+    }
+
+    plan->nodes = (EdgeRunnerCompiledNode *)calloc(node_count, sizeof(EdgeRunnerCompiledNode));
+    if (plan->nodes == NULL) {
+        destroy_compiled_plan(plan);
+        return NULL;
+    }
+
+    for (uint32_t idx = 0; idx < node_count; ++idx) {
+        EdgeRunnerCompiledNode *node = &plan->nodes[idx];
+        uint32_t function_id = 0;
+        uint32_t name_len = 0;
+        uint32_t audio_offset = 0;
+        uint32_t audio_span = 0;
+        uint32_t param_count = 0;
+        if (!read_u32_le(&cursor, &remaining, &function_id)
+            || !read_u32_le(&cursor, &remaining, &name_len)
+            || !read_u32_le(&cursor, &remaining, &audio_offset)
+            || !read_u32_le(&cursor, &remaining, &audio_span)
+            || !read_u32_le(&cursor, &remaining, &param_count)) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        if (remaining < name_len) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        node->name = (char *)malloc((size_t)name_len + 1);
+        if (node->name == NULL) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        memcpy(node->name, cursor, name_len);
+        node->name[name_len] = '\0';
+        node->name_len = name_len;
+        cursor += name_len;
+        remaining -= name_len;
+        node->function_id = function_id;
+        node->audio_offset = audio_offset;
+        node->audio_span = audio_span;
+        node->param_count = param_count;
+        if (param_count > 0) {
+            node->params = (EdgeRunnerCompiledParam *)calloc(param_count, sizeof(EdgeRunnerCompiledParam));
+            if (node->params == NULL) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+        }
+        for (uint32_t param_idx = 0; param_idx < param_count; ++param_idx) {
+            EdgeRunnerCompiledParam *param = &node->params[param_idx];
+            uint32_t param_name_len = 0;
+            uint32_t param_offset = 0;
+            uint32_t param_span = 0;
+            if (!read_u32_le(&cursor, &remaining, &param_name_len)
+                || !read_u32_le(&cursor, &remaining, &param_offset)
+                || !read_u32_le(&cursor, &remaining, &param_span)) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+            if (remaining < param_name_len) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+            param->name = (char *)malloc((size_t)param_name_len + 1);
+            if (param->name == NULL) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+            memcpy(param->name, cursor, param_name_len);
+            param->name[param_name_len] = '\0';
+            param->name_len = param_name_len;
+            param->offset = param_offset;
+            param->span = param_span;
+            cursor += param_name_len;
+            remaining -= param_name_len;
+        }
+    }
+
+    if (remaining != 0) {
+        destroy_compiled_plan(plan);
+        return NULL;
+    }
+
+    return plan;
+}
+
+void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+    destroy_compiled_plan(plan);
+}
+
 static int envelope_reserve_scratch(int F) {
     size_t needed_boundaries = (size_t)(4 * F + 4);
     size_t needed_trig = (size_t)(F > 0 ? F : 1);

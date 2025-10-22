@@ -79,6 +79,8 @@ _EDGE_RUNNER_CDEF = """
      *  -1   -> allocation or contract violation (fatal)
      *  -3   -> node type not handled by the C backend (fallback to Python)
      */
+    typedef unsigned char uint8_t;
+
     typedef struct {
         uint32_t has_audio;
         uint32_t batches;
@@ -114,6 +116,29 @@ _EDGE_RUNNER_CDEF = """
         size_t params_len;
     } EdgeRunnerNodeDescriptor;
 
+    typedef struct {
+        const char *name;
+        uint32_t name_len;
+        uint32_t offset;
+        uint32_t span;
+    } EdgeRunnerCompiledParam;
+
+    typedef struct {
+        const char *name;
+        uint32_t name_len;
+        uint32_t function_id;
+        uint32_t audio_offset;
+        uint32_t audio_span;
+        uint32_t param_count;
+        EdgeRunnerCompiledParam *params;
+    } EdgeRunnerCompiledNode;
+
+    typedef struct {
+        uint32_t version;
+        uint32_t node_count;
+        EdgeRunnerCompiledNode *nodes;
+    } EdgeRunnerCompiledPlan;
+
     int amp_run_node(
         const EdgeRunnerNodeDescriptor *descriptor,
         const EdgeRunnerNodeInputs *inputs,
@@ -128,6 +153,15 @@ _EDGE_RUNNER_CDEF = """
 
     void amp_free(double *buffer);
     void amp_release_state(void *state);
+
+    EdgeRunnerCompiledPlan *amp_load_compiled_plan(
+        const uint8_t *descriptor_blob,
+        size_t descriptor_len,
+        const uint8_t *plan_blob,
+        size_t plan_len
+    );
+
+    void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan);
 """
 
 
@@ -151,6 +185,8 @@ class CffiEdgeRunner:
         self._gather_handles: Dict[str, NodeInputHandle] = {}
         self._compiled = False
         self._compiled_plan: bytes | None = None
+        self._plan_handle: Any = self.ffi.NULL
+        self._plan_names: tuple[str, ...] = ()
         self._c_kernel: Any | None = None
         self._node_states: Dict[str, Any] = {}
         self.compile()
@@ -194,6 +230,7 @@ class CffiEdgeRunner:
         """
         if self._node_states:
             self._release_states()
+        self._release_plan()
         self._load_descriptors()
         # Preallocate per-node cache placeholders (actual arrays will be allocated by C or reused)
         self._caches = {name: None for name in self._graph._nodes}
@@ -204,6 +241,7 @@ class CffiEdgeRunner:
             if recycle is not None:
                 recycle()
         self._compiled_plan = self._serialize_compiled_plan()
+        self._load_compiled_plan_handle()
         self._compiled = True
 
     def gather_to(self, node_name: str) -> NodeInputHandle:
@@ -262,6 +300,97 @@ class CffiEdgeRunner:
         self._node_descriptors = tuple(descriptors)
         self._descriptor_by_name = {desc.name: desc for desc in descriptors}
         self._ordered_names = tuple(desc.name for desc in descriptors)
+
+    def _release_plan(self) -> None:
+        if self._plan_handle not in (None, self.ffi.NULL):
+            lib = self._c_kernel
+            if lib is not None:
+                try:
+                    lib.amp_release_compiled_plan(self._plan_handle)
+                except Exception:  # pragma: no cover - defensive cleanup
+                    pass
+            self._plan_handle = self.ffi.NULL
+        self._plan_names = ()
+
+    def _load_compiled_plan_handle(self) -> None:
+        self._plan_names = self._ordered_names
+        if not self._descriptor_blob or not self._compiled_plan:
+            self._release_plan()
+            return
+        lib = self._ensure_c_kernel()
+        desc_buf = self.ffi.new("uint8_t[]", self._descriptor_blob)
+        plan_buf = self.ffi.new("uint8_t[]", self._compiled_plan)
+        handle = lib.amp_load_compiled_plan(
+            desc_buf,
+            len(self._descriptor_blob),
+            plan_buf,
+            len(self._compiled_plan),
+        )
+        if handle == self.ffi.NULL:
+            raise RuntimeError("C kernel rejected compiled plan blob")
+        plan_struct = handle[0]
+        names: list[str] = []
+        for idx in range(int(plan_struct.node_count)):
+            entry = plan_struct.nodes[idx]
+            if entry.name == self.ffi.NULL:
+                lib.amp_release_compiled_plan(handle)
+                raise RuntimeError("Compiled plan entry is missing a node name")
+            decoded = self.ffi.string(entry.name, entry.name_len).decode("utf-8")
+            names.append(decoded)
+        plan_names = tuple(names)
+        if plan_names != self._ordered_names:
+            lib.amp_release_compiled_plan(handle)
+            raise RuntimeError("C kernel returned plan with mismatched node ordering")
+        self._release_plan()
+        self._plan_handle = handle
+        self._plan_names = plan_names
+
+    def describe_compiled_plan(self) -> Dict[str, Any]:
+        if self._plan_handle in (None, self.ffi.NULL):
+            return {
+                "version": 0,
+                "node_count": len(self._ordered_names),
+                "nodes": tuple(
+                    {
+                        "name": name,
+                        "function_id": idx,
+                        "audio_offset": idx,
+                        "audio_span": 1,
+                        "params": tuple(),
+                    }
+                    for idx, name in enumerate(self._ordered_names)
+                ),
+            }
+        plan_struct = self._plan_handle[0]
+        nodes: list[Dict[str, Any]] = []
+        for idx in range(int(plan_struct.node_count)):
+            entry = plan_struct.nodes[idx]
+            name = self.ffi.string(entry.name, entry.name_len).decode("utf-8")
+            params: list[Dict[str, Any]] = []
+            for param_idx in range(int(entry.param_count)):
+                param_entry = entry.params[param_idx]
+                param_name = self.ffi.string(param_entry.name, param_entry.name_len).decode("utf-8")
+                params.append(
+                    {
+                        "name": param_name,
+                        "offset": int(param_entry.offset),
+                        "span": int(param_entry.span),
+                    }
+                )
+            nodes.append(
+                {
+                    "name": name,
+                    "function_id": int(entry.function_id),
+                    "audio_offset": int(entry.audio_offset),
+                    "audio_span": int(entry.audio_span),
+                    "params": tuple(params),
+                }
+            )
+        return {
+            "version": int(plan_struct.version),
+            "node_count": int(plan_struct.node_count),
+            "nodes": tuple(nodes),
+        }
 
     def _ensure_c_kernel(self) -> Any:
         if self._c_kernel is not None:
@@ -613,7 +742,8 @@ class CffiEdgeRunner:
 
         result: np.ndarray | None = None
         sink_name = getattr(self._graph, "sink", None)
-        for name in self._ordered_names:
+        execution_order = self._plan_names or self._ordered_names
+        for name in execution_order:
             descriptor = self._descriptor_by_name.get(name)
             if descriptor is None:
                 raise RuntimeError(f"Missing descriptor for node '{name}'")
