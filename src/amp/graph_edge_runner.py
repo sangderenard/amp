@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Sequence
+import json
 import struct
+import time
 
 import numpy as np
 
@@ -29,8 +31,12 @@ _MODE_NAMES = {code: name for name, code in _MODE_CODES.items()}
 @dataclass(slots=True)
 class _ParsedNodeDescriptor:
     name: str
+    type_name: str
+    params_json: str
     audio_inputs: tuple[str, ...]
     mod_groups: tuple[tuple[str, tuple[ModConnection, ...]], ...]
+    blob_offset: int
+    blob_size: int
 
 
 @dataclass(slots=True)
@@ -55,6 +61,24 @@ class NodeInputHandle:
 
 
 _EDGE_RUNNER_CDEF = """
+    /*
+     * C execution contract shared with the compiled `_amp_ckernels_cffi` module.
+     *
+     * The Python runner provides node descriptors (static metadata), node inputs
+     * (audio buffers + parameter views) and receives an owned output buffer.
+     *
+     * Ownership rules:
+     *   - `amp_run_node` allocates `out_buffer` when it returns 0 (success).
+     *   - Callers must release that buffer with `amp_free` after copying.
+     *   - `amp_run_node` stores per-node state via the opaque `state` pointer.
+     *     Python retains the pointer between invocations and eventually calls
+     *     `amp_release_state` to free any associated allocations.
+     *
+     * Return codes from `amp_run_node`:
+     *   0   -> success (buffer+channels populated)
+     *  -1   -> allocation or contract violation (fatal)
+     *  -3   -> node type not handled by the C backend (fallback to Python)
+     */
     typedef struct {
         uint32_t has_audio;
         uint32_t batches;
@@ -81,24 +105,29 @@ _EDGE_RUNNER_CDEF = """
         EdgeRunnerParamSet params;
     } EdgeRunnerNodeInputs;
 
-    int amp_test_run_graph(
-        const uint8_t *control_blob,
-        size_t control_size,
-        const uint8_t *node_blob,
-        size_t node_size,
-        const uint8_t *plan_blob,
-        size_t plan_size,
+    typedef struct {
+        const char *name;
+        size_t name_len;
+        const char *type_name;
+        size_t type_len;
+        const char *params_json;
+        size_t params_len;
+    } EdgeRunnerNodeDescriptor;
+
+    int amp_run_node(
+        const EdgeRunnerNodeDescriptor *descriptor,
+        const EdgeRunnerNodeInputs *inputs,
         int batches,
         int channels,
         int frames,
         double sample_rate,
         double **out_buffer,
-        int *out_batches,
         int *out_channels,
-        int *out_frames
+        void **state
     );
 
-    void amp_test_free(double *buffer);
+    void amp_free(double *buffer);
+    void amp_release_state(void *state);
 """
 
 
@@ -111,6 +140,7 @@ class CffiEdgeRunner:
         self._graph = graph
         self.ffi = cffi.FFI()
         self.ffi.cdef(_EDGE_RUNNER_CDEF)
+        self._descriptor_blob: bytes = b""
         self._node_descriptors: tuple[_ParsedNodeDescriptor, ...] = ()
         self._descriptor_by_name: dict[str, _ParsedNodeDescriptor] = {}
         self._ordered_names: tuple[str, ...] = ()
@@ -122,6 +152,7 @@ class CffiEdgeRunner:
         self._compiled = False
         self._compiled_plan: bytes | None = None
         self._c_kernel: Any | None = None
+        self._node_states: Dict[str, Any] = {}
         self.compile()
 
     @property
@@ -161,6 +192,8 @@ class CffiEdgeRunner:
 
         This should be run once when the graph changes (or when the runner is created).
         """
+        if self._node_states:
+            self._release_states()
         self._load_descriptors()
         # Preallocate per-node cache placeholders (actual arrays will be allocated by C or reused)
         self._caches = {name: None for name in self._graph._nodes}
@@ -225,6 +258,7 @@ class CffiEdgeRunner:
     def _load_descriptors(self) -> None:
         blob = self._graph.serialize_node_descriptors()
         descriptors = list(self._parse_descriptors(blob))
+        self._descriptor_blob = blob
         self._node_descriptors = tuple(descriptors)
         self._descriptor_by_name = {desc.name: desc for desc in descriptors}
         self._ordered_names = tuple(desc.name for desc in descriptors)
@@ -232,18 +266,30 @@ class CffiEdgeRunner:
     def _ensure_c_kernel(self) -> Any:
         if self._c_kernel is not None:
             return self._c_kernel
-        lib = None
         try:
             lib = self.ffi.dlopen("_amp_ckernels_cffi")
-        except OSError:
-            lib = None
-        if lib is not None and hasattr(lib, "amp_test_run_graph"):
-            self._c_kernel = lib
-            return lib
-        from . import _edge_runner_test_lib
+        except OSError as exc:  # pragma: no cover - depends on deployment environment
+            try:
+                from . import c_kernels  # noqa: WPS433 - runtime import to trigger build
 
-        self._c_kernel = _edge_runner_test_lib.load(self.ffi)
-        return self._c_kernel
+                if getattr(c_kernels, "AVAILABLE", False):
+                    module_path = getattr(getattr(c_kernels, "_impl", None), "__file__", None)
+                    if module_path:
+                        lib = self.ffi.dlopen(module_path)
+                    else:
+                        lib = self.ffi.dlopen("_amp_ckernels_cffi")
+                else:  # pragma: no cover - depends on optional dependency
+                    reason = getattr(c_kernels, "UNAVAILABLE_REASON", "unavailable")
+                    raise RuntimeError(
+                        "The compiled '_amp_ckernels_cffi' shared library is required for C graph execution"
+                        f" (unavailable: {reason})"
+                    ) from exc
+            except Exception as build_exc:  # pragma: no cover - defensive
+                raise RuntimeError(
+                    "The compiled '_amp_ckernels_cffi' shared library is required for C graph execution"
+                ) from build_exc
+        self._c_kernel = lib
+        return lib
 
     def _serialize_compiled_plan(self) -> bytes:
         if not self._ordered_names:
@@ -290,6 +336,7 @@ class CffiEdgeRunner:
         (count,) = struct.unpack_from("<I", blob, offset)
         offset += 4
         for _ in range(count):
+            start = offset
             header = _NODE_DESCRIPTOR_HEADER.unpack_from(blob, offset)
             offset += _NODE_DESCRIPTOR_HEADER.size
             name_len = header[1]
@@ -302,7 +349,8 @@ class CffiEdgeRunner:
 
             name = blob[offset : offset + name_len].decode("utf-8")
             offset += name_len
-            offset += type_len  # skip type name
+            type_name = blob[offset : offset + type_len].decode("utf-8")
+            offset += type_len
 
             audio_inputs = []
             for _ in range(audio_count):
@@ -349,11 +397,19 @@ class CffiEdgeRunner:
             offset += buffer_shape_count * 12
             offset += params_json_len
 
+            params_json = blob[offset - params_json_len : offset].decode("utf-8") if params_json_len else "{}"
+
+            size = offset - start
+
             mod_groups = tuple((param, tuple(grouped[param])) for param in order)
             yield _ParsedNodeDescriptor(
                 name=name,
+                type_name=type_name,
+                params_json=params_json,
                 audio_inputs=tuple(audio_inputs),
                 mod_groups=mod_groups,
+                blob_offset=start,
+                blob_size=size,
             )
 
     def _collect_audio_inputs(self, descriptor: _ParsedNodeDescriptor) -> list[np.ndarray]:
@@ -546,68 +602,150 @@ class CffiEdgeRunner:
         """
         if not self._compiled:
             raise RuntimeError("CffiEdgeRunner must be compiled before running the graph")
-        if self._compiled_plan is None:
-            raise RuntimeError("Compiled plan is not available for C execution")
-        node_descriptors = self._graph.serialize_node_descriptors()
-        plan_blob = self._compiled_plan
         lib = self._ensure_c_kernel()
 
-        if control_history_blob:
-            control_buf = self.ffi.new("uint8_t[]", control_history_blob)
-            control_size = len(control_history_blob)
-        else:
-            control_buf = self.ffi.NULL
-            control_size = 0
-        if node_descriptors:
-            descriptor_buf = self.ffi.new("uint8_t[]", node_descriptors)
-            descriptor_size = len(node_descriptors)
-        else:
-            descriptor_buf = self.ffi.NULL
-            descriptor_size = 0
-        if plan_blob:
-            plan_buf = self.ffi.new("uint8_t[]", plan_blob)
-            plan_size = len(plan_blob)
-        else:
-            plan_buf = self.ffi.NULL
-            plan_size = 0
+        if not self._descriptor_blob:
+            raise RuntimeError("Descriptor blob not initialised for C execution")
 
-        out_ptr = self.ffi.new("double **")
-        out_batches = self.ffi.new("int *")
-        out_channels = self.ffi.new("int *")
-        out_frames = self.ffi.new("int *")
+        timings: Dict[str, float] | None = getattr(self._graph, "_last_node_timings", None)
+        if timings is not None:
+            timings.clear()
 
-        batches = int(self._base_params.get("_B", 1))
-        channels = int(self._graph.output_channels or 1)
+        result: np.ndarray | None = None
+        sink_name = getattr(self._graph, "sink", None)
+        for name in self._ordered_names:
+            descriptor = self._descriptor_by_name.get(name)
+            if descriptor is None:
+                raise RuntimeError(f"Missing descriptor for node '{name}'")
+            handle = self.gather_to(name)
+            desc_struct, desc_keepalive = self._build_descriptor_struct(descriptor)
+            _keepalive = (handle, desc_keepalive)
+            out_ptr = self.ffi.new("double **")
+            out_channels = self.ffi.new("int *")
+            state_ptr = self.ffi.new(
+                "void **", self._node_states.get(name, self.ffi.NULL)
+            )
+            start_time = time.perf_counter()
+            status = lib.amp_run_node(
+                desc_struct,
+                handle.cdata,
+                int(handle.batches),
+                int(handle.channels),
+                int(handle.frames),
+                float(self._sample_rate),
+                out_ptr,
+                out_channels,
+                state_ptr,
+            )
+            if status == -3:
+                node_obj = self._graph._nodes.get(name)
+                if node_obj is None:
+                    raise RuntimeError(f"Unknown node '{name}' encountered during fallback execution")
+                audio_in = handle.node_buffer
+                params = handle.params
+                output = node_obj.process(
+                    int(handle.frames),
+                    float(self._sample_rate),
+                    audio_in,
+                    {},
+                    params,
+                )
+                array = np.asarray(output, dtype=RAW_DTYPE)
+                batches = array.shape[0]
+                channels = array.shape[1]
+                if array.shape[2] != handle.frames:
+                    raise RuntimeError(
+                        f"Fallback node '{name}' produced mismatched frame count"
+                    )
+            elif status == 0:
+                self._node_states[name] = state_ptr[0]
+                batches = int(handle.batches)
+                channels = int(out_channels[0])
+                frames = int(handle.frames)
+                total = batches * channels * frames
+                if total <= 0:
+                    raise RuntimeError(f"Node '{name}' produced an empty buffer")
+                buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(RAW_DTYPE).itemsize)
+                array = np.frombuffer(buffer, dtype=RAW_DTYPE).copy().reshape(
+                    batches, channels, frames
+                )
+                lib.amp_free(out_ptr[0])
+            else:
+                raise RuntimeError(
+                    f"C kernel failed while executing node '{name}' (status {status})"
+                )
+            end_time = time.perf_counter()
+            if timings is not None:
+                timings[name] = float(end_time - start_time)
+            self.set_node_output(name, array)
+            if sink_name == name:
+                result = array
+        if sink_name is None:
+            raise RuntimeError("Graph sink has not been configured")
+        if result is None:
+            sink_buffer = self.get_cached_output(sink_name)
+            if sink_buffer is None:
+                raise RuntimeError("Sink node did not produce output")
+            result = sink_buffer
+        return np.require(result, dtype=RAW_DTYPE, requirements=("C",)).copy()
 
-        status = lib.amp_test_run_graph(
-            control_buf,
-            control_size,
-            descriptor_buf,
-            descriptor_size,
-            plan_buf,
-            plan_size,
-            batches,
-            channels,
-            self._frames,
-            self._sample_rate,
-            out_ptr,
-            out_batches,
-            out_channels,
-            out_frames,
-        )
-        if status != 0:
-            raise RuntimeError(f"C kernel returned error status {status}")
-        total = int(out_batches[0]) * int(out_channels[0]) * int(out_frames[0])
-        if total <= 0:
-            raise RuntimeError("C kernel returned an empty buffer")
-        buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(RAW_DTYPE).itemsize)
-        array = np.frombuffer(buffer, dtype=RAW_DTYPE).copy().reshape(
-            int(out_batches[0]), int(out_channels[0]), int(out_frames[0])
-        )
-        lib.amp_test_free(out_ptr[0])
-        sink = getattr(self._graph, "sink", None)
-        if sink:
-            self._caches[sink] = array
-        return array
+    def _build_descriptor_struct(
+        self, descriptor: _ParsedNodeDescriptor
+    ) -> tuple[Any, tuple[Any, ...]]:
+        struct_obj = self.ffi.new("EdgeRunnerNodeDescriptor *")
+        name_bytes = descriptor.name.encode("utf-8")
+        type_bytes = descriptor.type_name.encode("utf-8")
+        params_json = descriptor.params_json
+        if not params_json or params_json == "{}":
+            node_obj = self._graph._nodes.get(descriptor.name)
+            extras: Dict[str, Any] = {}
+            if descriptor.type_name == "MixNode" and node_obj is not None:
+                channels = getattr(node_obj, "out_channels", None)
+                if channels:
+                    extras["channels"] = int(channels)
+            if descriptor.type_name == "SafetyNode" and node_obj is not None:
+                channels = getattr(node_obj, "channels", None)
+                if channels:
+                    extras.setdefault("channels", int(channels))
+                alpha = getattr(node_obj, "dc_alpha", None)
+                if alpha is not None:
+                    extras.setdefault("dc_alpha", float(alpha))
+            if descriptor.type_name == "SineOscillatorNode" and node_obj is not None:
+                channels = getattr(node_obj, "channels", None)
+                if channels:
+                    extras.setdefault("channels", int(channels))
+                phase_state = getattr(node_obj, "_phase", None)
+                try:
+                    initial_phase = float(phase_state[0, 0]) if phase_state is not None else None
+                except Exception:  # pragma: no cover - defensive indexing
+                    initial_phase = None
+                if initial_phase is not None:
+                    extras.setdefault("phase", float(initial_phase))
+            if extras:
+                params_json = json.dumps(extras)
+        params_bytes = params_json.encode("utf-8")
+        name_buf = self.ffi.new("char[]", name_bytes)
+        type_buf = self.ffi.new("char[]", type_bytes)
+        params_buf = self.ffi.new("char[]", params_bytes)
+        struct_obj.name = name_buf
+        struct_obj.name_len = len(name_bytes)
+        struct_obj.type_name = type_buf
+        struct_obj.type_len = len(type_bytes)
+        struct_obj.params_json = params_buf
+        struct_obj.params_len = len(params_bytes)
+        keepers: tuple[Any, ...] = (struct_obj, name_buf, type_buf, params_buf)
+        return struct_obj, keepers
+
+    def _release_states(self) -> None:
+        if not self._node_states:
+            return
+        lib = self._c_kernel
+        if lib is None:
+            self._node_states.clear()
+            return
+        for state in self._node_states.values():
+            if state:
+                lib.amp_release_state(state)
+        self._node_states.clear()
 
 __all__ = ["CffiEdgeRunner", "NodeInputHandle"]
