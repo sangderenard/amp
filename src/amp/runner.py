@@ -155,6 +155,18 @@ def render_audio_block(
         start_time=start_time,
     )
     output_node_buffer = graph.render_block(frames, sample_rate, base_params)
+    runner = getattr(graph, "_edge_runner", None)
+    if runner is not None:
+        fallback_summary = getattr(runner, "python_fallback_summary", lambda: {})()
+        if fallback_summary:
+            details = ", ".join(
+                f"{name}={count}" for name, count in sorted(fallback_summary.items()) if count
+            )
+            raise RuntimeError(
+                "Graph execution invoked Python fallbacks; "
+                "runtime requires the C backend for all nodes"
+                + (f" (fallbacks: {details})" if details else "")
+            )
     meta = {
         "render_duration": None,  # caller can fill timing
         "produced_frames": frames,
