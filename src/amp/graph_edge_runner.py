@@ -18,6 +18,7 @@ from .graph import (
     _PARAM_DESCRIPTOR_HEADER,
     _assert_bcf,
 )
+from . import quantizer
 
 try:  # pragma: no cover - optional dependency
     import cffi
@@ -26,6 +27,21 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 _MODE_NAMES = {code: name for name, code in _MODE_CODES.items()}
+
+
+def _extract_controller_signal(expression: str) -> str | None:
+    """Return the referenced signal name when expression is a simple lookup."""
+
+    expr = expression.strip()
+    for prefix in ("signals[", "raw_signals["):
+        if not expr.startswith(prefix):
+            continue
+        if not expr.endswith("]"):
+            continue
+        inner = expr[len(prefix) : -1].strip()
+        if len(inner) >= 2 and inner[0] in {'"', "'"} and inner[-1] == inner[0]:
+            return inner[1:-1]
+    return None
 
 
 @dataclass(slots=True)
@@ -139,6 +155,20 @@ _EDGE_RUNNER_CDEF = """
         EdgeRunnerCompiledNode *nodes;
     } EdgeRunnerCompiledPlan;
 
+    typedef struct {
+        char *name;
+        uint32_t name_len;
+        double *values;
+        uint32_t value_count;
+        double timestamp;
+    } EdgeRunnerControlCurve;
+
+    typedef struct {
+        uint32_t frames_hint;
+        uint32_t curve_count;
+        EdgeRunnerControlCurve *curves;
+    } EdgeRunnerControlHistory;
+
     int amp_run_node(
         const EdgeRunnerNodeDescriptor *descriptor,
         const EdgeRunnerNodeInputs *inputs,
@@ -148,7 +178,8 @@ _EDGE_RUNNER_CDEF = """
         double sample_rate,
         double **out_buffer,
         int *out_channels,
-        void **state
+        void **state,
+        const EdgeRunnerControlHistory *history
     );
 
     void amp_free(double *buffer);
@@ -162,6 +193,14 @@ _EDGE_RUNNER_CDEF = """
     );
 
     void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan);
+
+    EdgeRunnerControlHistory *amp_load_control_history(
+        const uint8_t *blob,
+        size_t blob_len,
+        int frames_hint
+    );
+
+    void amp_release_control_history(EdgeRunnerControlHistory *history);
 """
 
 
@@ -743,73 +782,91 @@ class CffiEdgeRunner:
         result: np.ndarray | None = None
         sink_name = getattr(self._graph, "sink", None)
         execution_order = self._plan_names or self._ordered_names
-        for name in execution_order:
-            descriptor = self._descriptor_by_name.get(name)
-            if descriptor is None:
-                raise RuntimeError(f"Missing descriptor for node '{name}'")
-            handle = self.gather_to(name)
-            desc_struct, desc_keepalive = self._build_descriptor_struct(descriptor)
-            _keepalive = (handle, desc_keepalive)
-            out_ptr = self.ffi.new("double **")
-            out_channels = self.ffi.new("int *")
-            state_ptr = self.ffi.new(
-                "void **", self._node_states.get(name, self.ffi.NULL)
-            )
-            start_time = time.perf_counter()
-            status = lib.amp_run_node(
-                desc_struct,
-                handle.cdata,
-                int(handle.batches),
-                int(handle.channels),
-                int(handle.frames),
-                float(self._sample_rate),
-                out_ptr,
-                out_channels,
-                state_ptr,
-            )
-            if status == -3:
-                node_obj = self._graph._nodes.get(name)
-                if node_obj is None:
-                    raise RuntimeError(f"Unknown node '{name}' encountered during fallback execution")
-                audio_in = handle.node_buffer
-                params = handle.params
-                output = node_obj.process(
+        history_handle = self.ffi.NULL
+        history_keepalive: tuple[Any, ...] = ()
+        if control_history_blob:
+            history_buf = self.ffi.new("uint8_t[]", control_history_blob)
+            handle = lib.amp_load_control_history(history_buf, len(control_history_blob), int(self._frames))
+            if handle == self.ffi.NULL:
+                raise RuntimeError("C kernel rejected control history blob")
+            history_handle = handle
+            history_keepalive = (history_buf,)
+        try:
+            for name in execution_order:
+                descriptor = self._descriptor_by_name.get(name)
+                if descriptor is None:
+                    raise RuntimeError(f"Missing descriptor for node '{name}'")
+                handle = self.gather_to(name)
+                desc_struct, desc_keepalive = self._build_descriptor_struct(descriptor)
+                _keepalive = (handle, desc_keepalive)
+                out_ptr = self.ffi.new("double **")
+                out_channels = self.ffi.new("int *")
+                state_ptr = self.ffi.new(
+                    "void **", self._node_states.get(name, self.ffi.NULL)
+                )
+                start_time = time.perf_counter()
+                status = lib.amp_run_node(
+                    desc_struct,
+                    handle.cdata,
+                    int(handle.batches),
+                    int(handle.channels),
                     int(handle.frames),
                     float(self._sample_rate),
-                    audio_in,
-                    {},
-                    params,
+                    out_ptr,
+                    out_channels,
+                    state_ptr,
+                    history_handle,
                 )
-                array = np.asarray(output, dtype=RAW_DTYPE)
-                batches = array.shape[0]
-                channels = array.shape[1]
-                if array.shape[2] != handle.frames:
-                    raise RuntimeError(
-                        f"Fallback node '{name}' produced mismatched frame count"
+                if status == -3:
+                    node_obj = self._graph._nodes.get(name)
+                    if node_obj is None:
+                        raise RuntimeError(f"Unknown node '{name}' encountered during fallback execution")
+                    audio_in = handle.node_buffer
+                    params = handle.params
+                    output = node_obj.process(
+                        int(handle.frames),
+                        float(self._sample_rate),
+                        audio_in,
+                        {},
+                        params,
                     )
-            elif status == 0:
-                self._node_states[name] = state_ptr[0]
-                batches = int(handle.batches)
-                channels = int(out_channels[0])
-                frames = int(handle.frames)
-                total = batches * channels * frames
-                if total <= 0:
-                    raise RuntimeError(f"Node '{name}' produced an empty buffer")
-                buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(RAW_DTYPE).itemsize)
-                array = np.frombuffer(buffer, dtype=RAW_DTYPE).copy().reshape(
-                    batches, channels, frames
-                )
-                lib.amp_free(out_ptr[0])
-            else:
-                raise RuntimeError(
-                    f"C kernel failed while executing node '{name}' (status {status})"
-                )
-            end_time = time.perf_counter()
-            if timings is not None:
-                timings[name] = float(end_time - start_time)
-            self.set_node_output(name, array)
-            if sink_name == name:
-                result = array
+                    array = np.asarray(output, dtype=RAW_DTYPE)
+                    batches = array.shape[0]
+                    channels = array.shape[1]
+                    if array.shape[2] != handle.frames:
+                        raise RuntimeError(
+                            f"Fallback node '{name}' produced mismatched frame count"
+                        )
+                elif status == 0:
+                    self._node_states[name] = state_ptr[0]
+                    batches = int(handle.batches)
+                    channels = int(out_channels[0])
+                    frames = int(handle.frames)
+                    total = batches * channels * frames
+                    if total <= 0:
+                        raise RuntimeError(f"Node '{name}' produced an empty buffer")
+                    buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(RAW_DTYPE).itemsize)
+                    array = np.frombuffer(buffer, dtype=RAW_DTYPE).copy().reshape(
+                        batches, channels, frames
+                    )
+                    lib.amp_free(out_ptr[0])
+                else:
+                    raise RuntimeError(
+                        f"C kernel failed while executing node '{name}' (status {status})"
+                    )
+                end_time = time.perf_counter()
+                if timings is not None:
+                    timings[name] = float(end_time - start_time)
+                self.set_node_output(name, array)
+                if sink_name == name:
+                    result = array
+        finally:
+            if history_handle not in (None, self.ffi.NULL):
+                try:
+                    lib.amp_release_control_history(history_handle)
+                except Exception:  # pragma: no cover - defensive cleanup
+                    pass
+        _ = history_keepalive
         if sink_name is None:
             raise RuntimeError("Graph sink has not been configured")
         if result is None:
@@ -825,34 +882,105 @@ class CffiEdgeRunner:
         struct_obj = self.ffi.new("EdgeRunnerNodeDescriptor *")
         name_bytes = descriptor.name.encode("utf-8")
         type_bytes = descriptor.type_name.encode("utf-8")
-        params_json = descriptor.params_json
-        if not params_json or params_json == "{}":
-            node_obj = self._graph._nodes.get(descriptor.name)
-            extras: Dict[str, Any] = {}
-            if descriptor.type_name == "MixNode" and node_obj is not None:
-                channels = getattr(node_obj, "out_channels", None)
-                if channels:
-                    extras["channels"] = int(channels)
-            if descriptor.type_name == "SafetyNode" and node_obj is not None:
-                channels = getattr(node_obj, "channels", None)
-                if channels:
-                    extras.setdefault("channels", int(channels))
-                alpha = getattr(node_obj, "dc_alpha", None)
-                if alpha is not None:
-                    extras.setdefault("dc_alpha", float(alpha))
-            if descriptor.type_name == "SineOscillatorNode" and node_obj is not None:
-                channels = getattr(node_obj, "channels", None)
-                if channels:
-                    extras.setdefault("channels", int(channels))
-                phase_state = getattr(node_obj, "_phase", None)
-                try:
-                    initial_phase = float(phase_state[0, 0]) if phase_state is not None else None
-                except Exception:  # pragma: no cover - defensive indexing
-                    initial_phase = None
-                if initial_phase is not None:
-                    extras.setdefault("phase", float(initial_phase))
-            if extras:
-                params_json = json.dumps(extras)
+        node_obj = self._graph._nodes.get(descriptor.name)
+        try:
+            params_dict: Dict[str, Any] = json.loads(descriptor.params_json) if descriptor.params_json else {}
+        except Exception:
+            params_dict = {}
+        extras: Dict[str, Any] = {}
+        if descriptor.type_name == "MixNode" and node_obj is not None:
+            channels = getattr(node_obj, "out_channels", None)
+            if channels:
+                extras.setdefault("channels", int(channels))
+        if descriptor.type_name == "SafetyNode" and node_obj is not None:
+            channels = getattr(node_obj, "channels", None)
+            if channels:
+                extras.setdefault("channels", int(channels))
+            alpha = getattr(node_obj, "dc_alpha", None)
+            if alpha is not None:
+                extras.setdefault("dc_alpha", float(alpha))
+        if descriptor.type_name == "SineOscillatorNode" and node_obj is not None:
+            channels = getattr(node_obj, "channels", None)
+            if channels:
+                extras.setdefault("channels", int(channels))
+            phase_state = getattr(node_obj, "_phase", None)
+            try:
+                initial_phase = float(phase_state[0, 0]) if phase_state is not None else None
+            except Exception:  # pragma: no cover - defensive indexing
+                initial_phase = None
+            if initial_phase is not None:
+                extras.setdefault("phase", float(initial_phase))
+            freq = getattr(node_obj, "frequency", None)
+            amp = getattr(node_obj, "amplitude", None)
+            if freq is not None:
+                extras.setdefault("frequency", float(freq))
+            if amp is not None:
+                extras.setdefault("amplitude", float(amp))
+        if descriptor.type_name == "ControllerNode" and node_obj is not None:
+            outputs = tuple(getattr(node_obj, "_output_order", ()))
+            if outputs:
+                extras.setdefault("__controller_outputs__", ",".join(outputs))
+                mapping: Dict[str, Any] = {}
+                params_cfg = getattr(node_obj, "params", {})
+                outputs_cfg = params_cfg.get("outputs", {}) if isinstance(params_cfg, dict) else {}
+                for out_name in outputs:
+                    spec = outputs_cfg.get(out_name)
+                    signal = None
+                    if isinstance(spec, str):
+                        signal = _extract_controller_signal(spec)
+                    elif isinstance(spec, dict):
+                        expr_val = spec.get("equation") or spec.get("expr") or spec.get("expression")
+                        if isinstance(expr_val, str):
+                            signal = _extract_controller_signal(expr_val)
+                    if signal:
+                        mapping[out_name] = signal
+                if mapping:
+                    extras.setdefault(
+                        "__controller_sources__",
+                        ",".join(f"{key}={value}" for key, value in mapping.items()),
+                    )
+        if descriptor.type_name == "LFONode" and node_obj is not None:
+            extras.setdefault("wave", getattr(node_obj, "wave", "sine"))
+            extras.setdefault("rate_hz", float(getattr(node_obj, "rate", 1.0)))
+            extras.setdefault("depth", float(getattr(node_obj, "depth", 0.5)))
+            extras.setdefault("use_input", 1 if getattr(node_obj, "use_input", False) else 0)
+            extras.setdefault("slew_ms", float(getattr(node_obj, "slew_ms", 0.0)))
+        if descriptor.type_name == "EnvelopeModulatorNode" and node_obj is not None:
+            extras.setdefault("attack_ms", float(getattr(node_obj, "attack_ms", 0.0)))
+            extras.setdefault("hold_ms", float(getattr(node_obj, "hold_ms", 0.0)))
+            extras.setdefault("decay_ms", float(getattr(node_obj, "decay_ms", 0.0)))
+            extras.setdefault("sustain_level", float(getattr(node_obj, "sustain_level", 0.0)))
+            extras.setdefault("sustain_ms", float(getattr(node_obj, "sustain_ms", 0.0)))
+            extras.setdefault("release_ms", float(getattr(node_obj, "release_ms", 0.0)))
+            extras.setdefault("send_resets", 1 if getattr(node_obj, "send_resets", True) else 0)
+        if descriptor.type_name == "PitchQuantizerNode" and node_obj is not None:
+            token = getattr(node_obj, "effective_token", "12tet/full")
+            extras.setdefault("effective_token", token)
+            extras.setdefault("free_variant", getattr(node_obj, "free_variant", "continuous"))
+            extras.setdefault("span_default", float(getattr(node_obj, "span_oct", 2.0)))
+            extras.setdefault("slew", 1 if getattr(node_obj, "slew", True) else 0)
+            try:
+                grid = quantizer.get_reference_grid_cents(getattr(node_obj, "state", {}), token)
+            except Exception:
+                grid = [i * 100.0 for i in range(12)]
+            extras.setdefault("grid_cents", ",".join(f"{float(val):.12g}" for val in grid))
+            extras.setdefault("is_free_mode", 1 if quantizer.is_free_mode_token(token) else 0)
+        if descriptor.type_name == "OscNode" and node_obj is not None:
+            extras.setdefault("wave", getattr(node_obj, "wave", "sine"))
+            extras.setdefault("accept_reset", 1 if getattr(node_obj, "accept_reset", True) else 0)
+        if descriptor.type_name == "SubharmonicLowLifterNode" and node_obj is not None:
+            extras.setdefault("band_lo", float(getattr(node_obj, "band_lo", 70.0)))
+            extras.setdefault("band_hi", float(getattr(node_obj, "band_hi", 160.0)))
+            extras.setdefault("mix", float(getattr(node_obj, "mix", 0.5)))
+            extras.setdefault("drive", float(getattr(node_obj, "drive", 1.0)))
+            extras.setdefault("out_hp", float(getattr(node_obj, "out_hp", 25.0)))
+            extras.setdefault("use_div4", 1 if getattr(node_obj, "use_div4", False) else 0)
+        if extras:
+            merged = dict(params_dict)
+            merged.update(extras)
+        else:
+            merged = params_dict
+        params_json = json.dumps(merged, sort_keys=True) if merged else descriptor.params_json
         params_bytes = params_json.encode("utf-8")
         name_buf = self.ffi.new("char[]", name_bytes)
         type_buf = self.ffi.new("char[]", type_bytes)
