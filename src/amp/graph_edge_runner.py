@@ -80,6 +80,25 @@ _EDGE_RUNNER_CDEF = """
         EdgeRunnerAudioView audio;
         EdgeRunnerParamSet params;
     } EdgeRunnerNodeInputs;
+
+    int amp_test_run_graph(
+        const uint8_t *control_blob,
+        size_t control_size,
+        const uint8_t *node_blob,
+        size_t node_size,
+        const uint8_t *plan_blob,
+        size_t plan_size,
+        int batches,
+        int channels,
+        int frames,
+        double sample_rate,
+        double **out_buffer,
+        int *out_batches,
+        int *out_channels,
+        int *out_frames
+    );
+
+    void amp_test_free(double *buffer);
 """
 
 
@@ -101,6 +120,9 @@ class CffiEdgeRunner:
         self._caches: Dict[str, np.ndarray | None] = {}
         self._gather_handles: Dict[str, NodeInputHandle] = {}
         self._compiled = False
+        self._compiled_plan: bytes | None = None
+        self._c_kernel: Any | None = None
+        self.compile()
 
     @property
     def ordered_nodes(self) -> tuple[str, ...]:
@@ -148,6 +170,7 @@ class CffiEdgeRunner:
             recycle = getattr(node, "recycle_blocks", None)
             if recycle is not None:
                 recycle()
+        self._compiled_plan = self._serialize_compiled_plan()
         self._compiled = True
 
     def gather_to(self, node_name: str) -> NodeInputHandle:
@@ -205,6 +228,62 @@ class CffiEdgeRunner:
         self._node_descriptors = tuple(descriptors)
         self._descriptor_by_name = {desc.name: desc for desc in descriptors}
         self._ordered_names = tuple(desc.name for desc in descriptors)
+
+    def _ensure_c_kernel(self) -> Any:
+        if self._c_kernel is not None:
+            return self._c_kernel
+        lib = None
+        try:
+            lib = self.ffi.dlopen("_amp_ckernels_cffi")
+        except OSError:
+            lib = None
+        if lib is not None and hasattr(lib, "amp_test_run_graph"):
+            self._c_kernel = lib
+            return lib
+        from . import _edge_runner_test_lib
+
+        self._c_kernel = _edge_runner_test_lib.load(self.ffi)
+        return self._c_kernel
+
+    def _serialize_compiled_plan(self) -> bytes:
+        if not self._ordered_names:
+            return b""
+        payload = bytearray()
+        payload.extend(b"AMPL")
+        payload.extend(struct.pack("<II", 1, len(self._ordered_names)))
+        audio_cursor = 0
+        for function_id, name in enumerate(self._ordered_names):
+            descriptor = self._descriptor_by_name[name]
+            name_bytes = name.encode("utf-8")
+            audio_offset = audio_cursor
+            audio_span = 1
+            audio_cursor += 1
+            param_count = len(descriptor.mod_groups)
+            payload.extend(
+                struct.pack(
+                    "<IIIII",
+                    int(function_id),
+                    len(name_bytes),
+                    int(audio_offset),
+                    int(audio_span),
+                    int(param_count),
+                )
+            )
+            payload.extend(name_bytes)
+            param_cursor = 0
+            for param_name, _ in descriptor.mod_groups:
+                param_bytes = param_name.encode("utf-8")
+                payload.extend(
+                    struct.pack(
+                        "<III",
+                        len(param_bytes),
+                        int(param_cursor),
+                        0,
+                    )
+                )
+                payload.extend(param_bytes)
+                param_cursor += 1
+        return bytes(payload)
 
     def _parse_descriptors(self, blob: bytes) -> Iterable[_ParsedNodeDescriptor]:
         offset = 0
@@ -465,19 +544,70 @@ class CffiEdgeRunner:
         Invoke the C kernel for the entire graph using the serialized control history blob.
         Returns the output buffer as a C-ready numpy array.
         """
-        # For now, also pass the node descriptors so C can know the graph structure
+        if not self._compiled:
+            raise RuntimeError("CffiEdgeRunner must be compiled before running the graph")
+        if self._compiled_plan is None:
+            raise RuntimeError("Compiled plan is not available for C execution")
         node_descriptors = self._graph.serialize_node_descriptors()
-        print("[CffiEdgeRunner] Passing control history blob of size:", len(control_history_blob))
-        print("[CffiEdgeRunner] Passing node descriptors of size:", len(node_descriptors))
-        print("[CffiEdgeRunner] Graph traversal order:", self.ordered_nodes)
-        # CFFI call stub: replace with actual C call
-        # Example: c_output = self.ffi.dlopen("_amp_ckernels_cffi").amp_cffi_run_graph(control_history_blob, node_descriptors, ...)
-        # For now, just return a dummy output buffer
-        batches = 1
-        channels = self._graph.output_channels if hasattr(self._graph, 'output_channels') else 2
-        frames = self._frames
-        dummy = np.zeros((batches, channels, frames), dtype=RAW_DTYPE)
-        print("[CffiEdgeRunner] (Stub) Returning dummy output buffer:", dummy.shape)
-        return dummy
+        plan_blob = self._compiled_plan
+        lib = self._ensure_c_kernel()
+
+        if control_history_blob:
+            control_buf = self.ffi.new("uint8_t[]", control_history_blob)
+            control_size = len(control_history_blob)
+        else:
+            control_buf = self.ffi.NULL
+            control_size = 0
+        if node_descriptors:
+            descriptor_buf = self.ffi.new("uint8_t[]", node_descriptors)
+            descriptor_size = len(node_descriptors)
+        else:
+            descriptor_buf = self.ffi.NULL
+            descriptor_size = 0
+        if plan_blob:
+            plan_buf = self.ffi.new("uint8_t[]", plan_blob)
+            plan_size = len(plan_blob)
+        else:
+            plan_buf = self.ffi.NULL
+            plan_size = 0
+
+        out_ptr = self.ffi.new("double **")
+        out_batches = self.ffi.new("int *")
+        out_channels = self.ffi.new("int *")
+        out_frames = self.ffi.new("int *")
+
+        batches = int(self._base_params.get("_B", 1))
+        channels = int(self._graph.output_channels or 1)
+
+        status = lib.amp_test_run_graph(
+            control_buf,
+            control_size,
+            descriptor_buf,
+            descriptor_size,
+            plan_buf,
+            plan_size,
+            batches,
+            channels,
+            self._frames,
+            self._sample_rate,
+            out_ptr,
+            out_batches,
+            out_channels,
+            out_frames,
+        )
+        if status != 0:
+            raise RuntimeError(f"C kernel returned error status {status}")
+        total = int(out_batches[0]) * int(out_channels[0]) * int(out_frames[0])
+        if total <= 0:
+            raise RuntimeError("C kernel returned an empty buffer")
+        buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(RAW_DTYPE).itemsize)
+        array = np.frombuffer(buffer, dtype=RAW_DTYPE).copy().reshape(
+            int(out_batches[0]), int(out_channels[0]), int(out_frames[0])
+        )
+        lib.amp_test_free(out_ptr[0])
+        sink = getattr(self._graph, "sink", None)
+        if sink:
+            self._caches[sink] = array
+        return array
 
 __all__ = ["CffiEdgeRunner", "NodeInputHandle"]
