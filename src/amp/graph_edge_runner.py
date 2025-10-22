@@ -20,6 +20,7 @@ from .graph import (
     _assert_bcf,
 )
 from . import quantizer
+from .node_contracts import NodeContract, get_node_contract
 
 try:  # pragma: no cover - optional dependency
     import cffi
@@ -221,14 +222,17 @@ class CffiEdgeRunner:
         self._frames: int = 0
         self._sample_rate: float = float(graph.sample_rate)
         self._base_params: Dict[str, Dict[str, np.ndarray]] = {}
+        self._descriptor_params_cache: Dict[str, Dict[str, Any]] = {}
         self._caches: Dict[str, np.ndarray | None] = {}
         self._gather_handles: Dict[str, NodeInputHandle] = {}
+        self._node_contracts: Dict[str, NodeContract | None] = {}
         self._compiled = False
         self._compiled_plan: bytes | None = None
         self._plan_handle: Any = self.ffi.NULL
         self._plan_names: tuple[str, ...] = ()
         self._c_kernel: Any | None = None
         self._node_states: Dict[str, Any] = {}
+        self._python_fallback_counts: Dict[str, int] = {}
         self.compile()
 
     @property
@@ -275,6 +279,7 @@ class CffiEdgeRunner:
         # Preallocate per-node cache placeholders (actual arrays will be allocated by C or reused)
         self._caches = {name: None for name in self._graph._nodes}
         self._gather_handles.clear()
+        self._python_fallback_counts.clear()
         # Allow nodes to recycle or preallocate any node-local buffers
         for node in self._graph._nodes.values():
             recycle = getattr(node, "recycle_blocks", None)
@@ -300,7 +305,7 @@ class CffiEdgeRunner:
         else:
             node_buffer = None
             batches = int(self._base_params.get("_B", 1))
-            channels = int(self._base_params.get("_C", 1))
+            channels = self._predict_output_channels(node_name, descriptor, batches)
             frame_count = self._frames
         param_buffers = self._prepare_base_params(node_name, batches, channels, frame_count)
         merged_param_buffers = self._apply_modulations(
@@ -340,6 +345,8 @@ class CffiEdgeRunner:
         self._node_descriptors = tuple(descriptors)
         self._descriptor_by_name = {desc.name: desc for desc in descriptors}
         self._ordered_names = tuple(desc.name for desc in descriptors)
+        self._descriptor_params_cache.clear()
+        self._node_contracts = {desc.name: get_node_contract(desc.type_name) for desc in descriptors}
 
     def _release_plan(self) -> None:
         if self._plan_handle not in (None, self.ffi.NULL):
@@ -438,6 +445,11 @@ class CffiEdgeRunner:
             "node_count": int(plan_struct.node_count),
             "nodes": tuple(nodes),
         }
+
+    def python_fallback_summary(self) -> Dict[str, int]:
+        """Return a copy of the per-node Python fallback invocation counts."""
+
+        return dict(self._python_fallback_counts)
 
     def _ensure_c_kernel(self) -> Any:
         if self._c_kernel is not None:
@@ -900,6 +912,17 @@ class CffiEdgeRunner:
                     )
 
                 if status == -3:
+                    contract = self._node_contracts.get(name)
+                    if contract is not None and not contract.allow_python_fallback:
+                        raise RuntimeError(
+                            (
+                                "C kernel declined node '{name}' (type {type_name}); "
+                                "contract forbids Python fallback"
+                            ).format(name=name, type_name=descriptor.type_name)
+                        )
+                    self._python_fallback_counts[name] = (
+                        self._python_fallback_counts.get(name, 0) + 1
+                    )
                     node_obj = self._graph._nodes.get(name)
                     if node_obj is None:
                         raise RuntimeError(f"Unknown node '{name}' encountered during fallback execution")
@@ -982,6 +1005,99 @@ class CffiEdgeRunner:
                 raise RuntimeError("Sink node did not produce output")
             result = sink_buffer
         return np.require(result, dtype=RAW_DTYPE, requirements=("C",)).copy()
+
+    def _predict_output_channels(
+        self, node_name: str, descriptor: _ParsedNodeDescriptor, batches: int
+    ) -> int:
+        """Determine the expected output channel count for nodes without audio inputs."""
+
+        def _coerce_positive_int(value: Any) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, (int, np.integer)):
+                return int(value) if int(value) > 0 else None
+            if isinstance(value, (float, np.floating)) and not np.isnan(value):
+                coerced = int(value)
+                return coerced if coerced > 0 else None
+            try:
+                coerced = int(value)
+            except Exception:
+                return None
+            return coerced if coerced > 0 else None
+
+        contract = self._node_contracts.get(node_name)
+        attr_keys: Sequence[str]
+        param_keys: Sequence[str]
+        stereo_params: Sequence[str]
+
+        if contract is not None and contract.default_channels is not None:
+            default_channels = int(contract.default_channels)
+        else:
+            default_channels = int(self._base_params.get("_C", 1))
+
+        if contract is not None:
+            attr_keys = contract.channel_attributes or ("channels", "out_channels")
+            param_keys = contract.channel_params or ("channels", "out_channels")
+            stereo_params = contract.stereo_params or ()
+        else:
+            attr_keys = ("channels", "out_channels")
+            param_keys = ("channels", "out_channels")
+            stereo_params = ()
+
+        node_obj = self._graph._nodes.get(node_name)
+        for attr_name in attr_keys:
+            candidate = (
+                _coerce_positive_int(getattr(node_obj, attr_name, None)) if node_obj else None
+            )
+            if candidate is not None:
+                default_channels = candidate
+                break
+
+        params = self._descriptor_params_cache.get(node_name)
+        if params is None:
+            try:
+                params = json.loads(descriptor.params_json) if descriptor.params_json else {}
+                if not isinstance(params, dict):
+                    params = {}
+            except Exception:
+                params = {}
+            self._descriptor_params_cache[node_name] = params
+        for key in param_keys:
+            candidate = _coerce_positive_int(params.get(key))
+            if candidate is not None:
+                default_channels = candidate
+                break
+
+        if stereo_params and self._stereo_request(node_name, descriptor, stereo_params, batches):
+            default_channels = max(default_channels, 2)
+
+        if default_channels <= 0:
+            return 1
+        return int(default_channels)
+
+    def _stereo_request(
+        self,
+        node_name: str,
+        descriptor: _ParsedNodeDescriptor,
+        stereo_params: Sequence[str],
+        batches: int,
+    ) -> bool:
+        """Return True when the node contract requests promotion to stereo output."""
+
+        if not stereo_params:
+            return False
+        node_params = self._base_params.get(node_name) or {}
+        for param in stereo_params:
+            if param in node_params:
+                return True
+        for param_name, connections in descriptor.mod_groups:
+            if param_name not in stereo_params:
+                continue
+            for connection in connections:
+                source_buffer = self._caches.get(connection.source)
+                if source_buffer is not None and source_buffer.shape[0] == batches:
+                    return True
+        return False
 
     def _build_descriptor_struct(
         self, descriptor: _ParsedNodeDescriptor

@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 import numpy as np
 from amp.graph_edge_runner import CffiEdgeRunner
+from amp.node_contracts import get_node_contract
 from amp.graph import AudioGraph
 from amp.app import build_runtime_graph
 from amp.state import build_default_state
@@ -52,6 +53,14 @@ def main():
         try:
             handle = runner.gather_to(name)
             desc_struct, desc_keep = runner._build_descriptor_struct(runner._descriptor_by_name[name])
+            contract = get_node_contract(runner._descriptor_by_name[name].type_name)
+            if contract is not None:
+                print(
+                    "  contract: allow_python_fallback=%s stereo_params=%s" % (
+                        contract.allow_python_fallback,
+                        ",".join(contract.stereo_params) if contract.stereo_params else "(none)",
+                    )
+                )
             out_ptr = runner.ffi.new("double **")
             out_channels = runner.ffi.new("int *")
             state_ptr = runner.ffi.new("void **", runner._node_states.get(name, runner.ffi.NULL))
@@ -92,6 +101,10 @@ def main():
                         f = int(handle.frames)
                         py_ch = int(out_channels[0])
                         print(f"  python: batches={b}, out_channels={py_ch}, frames={f}, expected={total}")
+                        if handle.node_buffer is None and py_ch != handle.channels:
+                            raise RuntimeError(
+                                f"gather_to() predicted {handle.channels} channel(s) but the C kernel reported {py_ch}"
+                            )
                         print(f"  C reported alloc elements={c_alloc}")
                         try:
                             # infer how many channels C allocated (integer division)
@@ -103,9 +116,11 @@ def main():
                         print("  amp_last_alloc_count_get not available on C lib")
                 except Exception as e:
                     print(f"  calling amp_last_alloc_count_get() raised: {e!r}")
+                array = None
                 if total > 0:
                     buf = runner.ffi.buffer(out_ptr[0], total * np.dtype(np.float64).itemsize)
-                    arr = np.frombuffer(buf, dtype=np.float64).copy().reshape((int(handle.batches), int(out_channels[0]), int(handle.frames)))
+                    array = np.frombuffer(buf, dtype=np.float64).copy().reshape((int(handle.batches), int(out_channels[0]), int(handle.frames)))
+                runner.set_node_output(name, array)
                 lib.amp_free(out_ptr[0])
             # run a large numpy op to try to trigger heap-corruption detection quickly
             try:
@@ -119,6 +134,11 @@ def main():
             print(f"  Exception while testing node {name}: {exc!r}")
             raise
     print("All nodes tested without triggering immediate numpy failure")
+    fallback_summary = runner.python_fallback_summary()
+    if fallback_summary:
+        print("Python fallbacks detected:")
+        for node, count in fallback_summary.items():
+            print(f"  {node}: {count}")
     return 0
 
 
