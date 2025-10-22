@@ -171,7 +171,7 @@ def _match_channels(data: np.ndarray, channels: int) -> np.ndarray:
 # Filters consume audio streams (`audio_in`) and transform them.
 # Modulators emit control-rate signals that downstream nodes treat as parameters.
 class Node:
-    """Base class providing pooled CFFI-backed buffers for graph nodes."""
+    """Base class providing pooled CFFI-backed node buffers for graph nodes (C-ready)."""
 
     __slots__ = ("name", "_block_pool", "_leases")
 
@@ -180,7 +180,7 @@ class Node:
         self._block_pool = block_pool or BlockPool()
         self._leases: list[BlockLease] = []
 
-    def allocate_block(
+    def allocate_node_buffer(
         self,
         batches: int,
         channels: int,
@@ -189,23 +189,23 @@ class Node:
         tag: str = "out",
         zero: bool = False,
     ) -> np.ndarray:
-        """Return a reusable buffer shaped ``(B, C, F)`` for writing output."""
+        """Return a reusable C-ready node buffer shaped ``(B, C, F)`` for writing output."""
 
         lease = self._block_pool.acquire((int(batches), int(channels), int(frames)), tag=tag)
         self._leases.append(lease)
-        buffer = lease.view
+        node_buffer = lease.view
         if zero:
-            buffer.fill(0.0)
-        return buffer
+            node_buffer.fill(0.0)
+        return node_buffer
 
-    def recycle_blocks(self) -> None:
-        """Return any leased blocks to the pool for reuse."""
+    def recycle_node_buffers(self) -> None:
+        """Return any leased node buffers to the pool for reuse."""
 
         for lease in self._leases:
             lease.release()
         self._leases.clear()
 
-    def process(self, frames, sr, audio_in, mods, params):
+    def process(self, frames, sr, input_buffer, mods, params):
         raise NotImplementedError
 
 
@@ -442,9 +442,9 @@ class SilenceNode(ConfigNode):
         super().__init__(name, params)
         self.channels = int(self.params.get("channels", 1))
 
-    def process(self, frames, sr, audio_in, mods, params):
-        _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
-        return self.allocate_block(batches, self.channels, frames, zero=True)
+    def process(self, frames, sr, input_buffer, mods, params):
+        _, batches = _ensure_bcf(input_buffer, frames, name=f"{self.name}.in")
+        return self.allocate_node_buffer(batches, self.channels, frames, zero=True)
 
 
 class ConstantNode(ConfigNode):
@@ -453,11 +453,11 @@ class ConstantNode(ConfigNode):
         self.channels = int(self.params.get("channels", 1))
         self.value = float(self.params.get("value", 0.0))
 
-    def process(self, frames, sr, audio_in, mods, params):
-        _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
-        buffer = self.allocate_block(batches, self.channels, frames, zero=False)
-        buffer.fill(self.value)
-        return buffer
+    def process(self, frames, sr, input_buffer, mods, params):
+        _, batches = _ensure_bcf(input_buffer, frames, name=f"{self.name}.in")
+        node_buffer = self.allocate_node_buffer(batches, self.channels, frames, zero=False)
+        node_buffer.fill(self.value)
+        return node_buffer
 
 
 class SineOscillatorNode(ConfigNode):
@@ -469,8 +469,8 @@ class SineOscillatorNode(ConfigNode):
         phase = float(self.params.get("phase", 0.0)) % 1.0
         self._phase = np.array([[phase]], dtype=RAW_DTYPE)
 
-    def process(self, frames, sr, audio_in, mods, params):
-        _, batches = _ensure_bcf(audio_in, frames, name=f"{self.name}.in")
+    def process(self, frames, sr, input_buffer, mods, params):
+        _, batches = _ensure_bcf(input_buffer, frames, name=f"{self.name}.in")
         channels = self.channels
         freq = as_BCF(
             params.get("frequency", self.frequency),
@@ -491,10 +491,10 @@ class SineOscillatorNode(ConfigNode):
         dphi = freq / float(sr)
         phase = (self._phase[..., None] + np.cumsum(dphi, axis=2)) % 1.0
         self._phase = phase[..., -1]
-        wave = self.allocate_block(batches, channels, frames, tag="sine")
-        np.sin(2.0 * np.pi * phase, out=wave)
-        np.multiply(wave, amp, out=wave)
-        return wave
+        node_buffer = self.allocate_node_buffer(batches, channels, frames, tag="sine")
+        np.sin(2.0 * np.pi * phase, out=node_buffer)
+        np.multiply(node_buffer, amp, out=node_buffer)
+        return node_buffer
 
 
 class SafetyNode(ConfigNode):

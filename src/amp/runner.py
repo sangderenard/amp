@@ -20,8 +20,9 @@ def run_producer_thread(
 ):
     """
     Shared producer thread for both interactive and headless runs.
-    Renders audio blocks in batches, enqueues PCM, and records timing.
+    Renders C-ready output node buffers in batches, enqueues PCM, and records timing.
     joystick_curves_fn(frames) -> dict for each block.
+    All per-node data and audio blocks are C-ready buffers.
     """
     # Use ControllerMonitor for synthetic input, writing to control history
     from .controller_monitor import ControllerMonitor
@@ -40,7 +41,7 @@ def run_producer_thread(
             # ControllerMonitor writes synthetic input to history; sample history for params
             # joystick_curves is now always sourced from history
             joystick_curves = {}  # Not used directly; build_base_params will sample from history
-            audio_block, meta = render_audio_block(
+            output_node_buffer, meta = render_audio_block(
                 graph,
                 start_time,
                 total_frames,
@@ -58,10 +59,10 @@ def run_producer_thread(
             meta["batch_blocks"] = batch_blocks
             meta["block_frames"] = block_frames
             timing_samples.append(meta)
-            # Split into blocks and enqueue
+            # Split into output node buffers and enqueue
             for idx in range(batch_blocks):
-                block = audio_block[:, :, idx * block_frames : (idx + 1) * block_frames]
-                pcm_queue.put((block, meta))
+                node_buffer = output_node_buffer[:, :, idx * block_frames : (idx + 1) * block_frames]
+                pcm_queue.put((node_buffer, meta))
     finally:
         controller_monitor.stop()
 
@@ -80,6 +81,7 @@ def run_benchmark(
     """
     Shared headless benchmark runner.
     Runs render_audio_block in a loop, collects timing/efficiency stats.
+    All audio blocks are C-ready output node buffers.
     Returns a pandas DataFrame of results.
     """
     timing_samples = []
@@ -96,7 +98,7 @@ def run_benchmark(
         for i in range(iterations):
             start_time = time.perf_counter()
             joystick_curves = {}  # Not used directly; build_base_params will sample from history
-            audio_block, meta = render_audio_block(
+            output_node_buffer, meta = render_audio_block(
                 graph,
                 start_time,
                 block_frames,
@@ -137,8 +139,8 @@ def render_audio_block(
     Shared block renderer for both interactive and benchmark runs.
     - Records control events (if needed) before rendering.
     - Samples history and builds params.
-    - Calls graph.render_block and returns audio + timing metadata.
-    - All inputs/outputs are simple types or numpy arrays.
+    - Calls graph.render_block and returns a C-ready output node buffer + timing metadata.
+    - All inputs/outputs are simple types or C-ready numpy arrays.
     """
     # Build base params using shared builder
     from .app import build_base_params
@@ -152,11 +154,11 @@ def render_audio_block(
         joystick_curves,
         start_time=start_time,
     )
-    audio_block = graph.render_block(frames, sample_rate, base_params)
+    output_node_buffer = graph.render_block(frames, sample_rate, base_params)
     meta = {
         "render_duration": None,  # caller can fill timing
         "produced_frames": frames,
         "sample_rate": sample_rate,
         "node_timings": getattr(graph, "last_node_timings", {}),
     }
-    return audio_block, meta
+    return output_node_buffer, meta

@@ -35,22 +35,23 @@ class _ParsedNodeDescriptor:
 
 @dataclass(slots=True)
 class NodeInputHandle:
-    """Holds the CFFI view for a node's prepared inputs."""
+    """Holds the CFFI view for a node's C-ready input buffers."""
 
     node: str
     ffi: Any
     cdata: Any
-    audio: np.ndarray | None
+    node_buffer: np.ndarray | None  # C-ready node buffer for audio inputs
     batches: int
     channels: int
     frames: int
     param_names: tuple[str, ...]
-    param_arrays: tuple[np.ndarray, ...]
+    param_buffers: tuple[np.ndarray, ...]  # C-ready parameter buffers
     keepers: tuple[Any, ...]
 
     @property
     def params(self) -> Dict[str, np.ndarray]:
-        return {name: array for name, array in zip(self.param_names, self.param_arrays)}
+        """Return a mapping of parameter names to their C-ready buffers."""
+        return {name: buf for name, buf in zip(self.param_names, self.param_buffers)}
 
 
 _EDGE_RUNNER_CDEF = """
@@ -83,7 +84,7 @@ _EDGE_RUNNER_CDEF = """
 
 
 class CffiEdgeRunner:
-    """Prepares node inputs using the C-formatted graph descriptors."""
+    """Prepares C-ready node input buffers using the C-formatted graph descriptors."""
 
     def __init__(self, graph: AudioGraph) -> None:
         if cffi is None:  # pragma: no cover - depends on optional dependency
@@ -99,6 +100,7 @@ class CffiEdgeRunner:
         self._base_params: Dict[str, Dict[str, np.ndarray]] = {}
         self._caches: Dict[str, np.ndarray | None] = {}
         self._gather_handles: Dict[str, NodeInputHandle] = {}
+        self._compiled = False
 
     @property
     def ordered_nodes(self) -> tuple[str, ...]:
@@ -110,56 +112,91 @@ class CffiEdgeRunner:
         sample_rate: float | None = None,
         base_params: Dict[str, Dict[str, np.ndarray]] | None = None,
     ) -> None:
+        """
+        Prepare for a new processing block (frame window), initializing all C-ready node buffers and caches.
+        """
         if frames <= 0:
             raise ValueError("frames must be positive")
         self._frames = int(frames)
         self._sample_rate = float(sample_rate or self._graph.sample_rate)
         self._base_params = dict(base_params or {})
-        self._load_descriptors()
-        self._caches = {name: None for name in self._graph._nodes}
+        # Descriptor parsing and cache allocation are performed in compile();
+        # begin_block should be lightweight and only reset per-block state.
+        if not self._compiled:
+            raise RuntimeError("CffiEdgeRunner must be compiled before beginning a block")
+        # Reset per-block caches (keep allocations) and gather handles map
+        for name in tuple(self._caches.keys()):
+            # preserve existing arrays; setting to None marks as not yet produced this block
+            self._caches[name] = None
         self._gather_handles.clear()
         for node in self._graph._nodes.values():
             recycle = getattr(node, "recycle_blocks", None)
             if recycle is not None:
                 recycle()
 
+    def compile(self) -> None:
+        """Compile the graph descriptors and preallocate reusable caches.
+
+        This should be run once when the graph changes (or when the runner is created).
+        """
+        self._load_descriptors()
+        # Preallocate per-node cache placeholders (actual arrays will be allocated by C or reused)
+        self._caches = {name: None for name in self._graph._nodes}
+        self._gather_handles.clear()
+        # Allow nodes to recycle or preallocate any node-local buffers
+        for node in self._graph._nodes.values():
+            recycle = getattr(node, "recycle_blocks", None)
+            if recycle is not None:
+                recycle()
+        self._compiled = True
+
     def gather_to(self, node_name: str) -> NodeInputHandle:
+        """
+        Gather all C-ready input buffers for the given node, including audio and parameter buffers.
+        Returns a NodeInputHandle with CFFI pointers to C-ready buffers.
+        """
         descriptor = self._descriptor_by_name.get(node_name)
         if descriptor is None:
             raise KeyError(f"Unknown node '{node_name}' in edge runner")
-        audio_arrays = self._collect_audio_inputs(descriptor)
-        if audio_arrays:
-            batches = audio_arrays[0].shape[0]
-            frame_count = audio_arrays[0].shape[2]
-            audio_view, channels = self._merge_audio(audio_arrays, batches, frame_count)
+        audio_node_buffers = self._collect_audio_inputs(descriptor)
+        if audio_node_buffers:
+            batches = audio_node_buffers[0].shape[0]
+            frame_count = audio_node_buffers[0].shape[2]
+            node_buffer, channels = self._merge_audio(audio_node_buffers, batches, frame_count)
         else:
-            audio_view = None
+            node_buffer = None
             batches = int(self._base_params.get("_B", 1))
             channels = int(self._base_params.get("_C", 1))
             frame_count = self._frames
-        node_params = self._prepare_base_params(node_name, batches, channels, frame_count)
-        merged_params = self._apply_modulations(
-            node_name, descriptor.mod_groups, node_params, batches, channels, frame_count
+        param_buffers = self._prepare_base_params(node_name, batches, channels, frame_count)
+        merged_param_buffers = self._apply_modulations(
+            node_name, descriptor.mod_groups, param_buffers, batches, channels, frame_count
         )
         handle = self._build_handle(
-            node_name, audio_view, batches, channels, frame_count, merged_params
+            node_name, node_buffer, batches, channels, frame_count, merged_param_buffers
         )
         self._gather_handles[node_name] = handle
         return handle
 
-    def set_node_output(self, node_name: str, output: np.ndarray | None) -> None:
+    def set_node_output(self, node_name: str, output_buffer: np.ndarray | None) -> None:
+        """
+        Set the C-ready output buffer for a node after C evaluation.
+        """
         if node_name not in self._caches:
             raise KeyError(f"Unknown node '{node_name}' in edge runner caches")
-        if output is None:
+        if output_buffer is None:
             self._caches[node_name] = None
             return
-        array = np.asarray(output, dtype=RAW_DTYPE)
-        array = _assert_bcf(array, name=f"{node_name}.out")
-        if not array.flags["C_CONTIGUOUS"]:
-            array = np.ascontiguousarray(array, dtype=RAW_DTYPE)
-        self._caches[node_name] = array
+        c_ready_buffer = np.asarray(output_buffer, dtype=RAW_DTYPE)
+        c_ready_buffer = _assert_bcf(c_ready_buffer, name=f"{node_name}.out")
+        if not c_ready_buffer.flags["C_CONTIGUOUS"]:
+            c_ready_buffer = np.ascontiguousarray(c_ready_buffer, dtype=RAW_DTYPE)
+        self._caches[node_name] = c_ready_buffer
 
     def get_cached_output(self, node_name: str) -> np.ndarray | None:
+        """
+        Get the C-ready output buffer for a node.
+        """
         return self._caches.get(node_name)
 
     def _load_descriptors(self) -> None:
@@ -241,32 +278,38 @@ class CffiEdgeRunner:
             )
 
     def _collect_audio_inputs(self, descriptor: _ParsedNodeDescriptor) -> list[np.ndarray]:
-        arrays: list[np.ndarray] = []
+        """
+        Collect C-ready output buffers from upstream nodes for use as input node buffers.
+        """
+        node_buffers: list[np.ndarray] = []
         for source in descriptor.audio_inputs:
-            buffer = self._caches.get(source)
-            if buffer is None:
+            output_buffer = self._caches.get(source)
+            if output_buffer is None:
                 continue
-            arrays.append(_assert_bcf(buffer, name=f"{source}.out"))
-        return arrays
+            node_buffers.append(_assert_bcf(output_buffer, name=f"{source}.out"))
+        return node_buffers
 
     def _merge_audio(
         self,
-        audio_inputs: Sequence[np.ndarray],
+        node_buffers: Sequence[np.ndarray],
         batches: int,
         frames: int,
     ) -> tuple[np.ndarray, int]:
-        if len(audio_inputs) == 1:
-            audio = audio_inputs[0]
-            channels = audio.shape[1]
-            return audio, channels
-        total_channels = audio_inputs[0].shape[1]
-        for buf in audio_inputs[1:]:
+        """
+        Merge multiple C-ready node buffers into a single C-ready input buffer for the node.
+        """
+        if len(node_buffers) == 1:
+            node_buffer = node_buffers[0]
+            channels = node_buffer.shape[1]
+            return node_buffer, channels
+        total_channels = node_buffers[0].shape[1]
+        for buf in node_buffers[1:]:
             if buf.shape[0] != batches or buf.shape[2] != frames:
-                raise ValueError("Shape mismatch in audio inputs during gather")
+                raise ValueError("Shape mismatch in node buffers during gather")
             total_channels += buf.shape[1]
         workspace = self._graph._acquire_audio_workspace((batches, total_channels, frames))
         offset = 0
-        for buf in audio_inputs:
+        for buf in node_buffers:
             channels = buf.shape[1]
             target = workspace[:, offset : offset + channels, :]
             np.copyto(target, buf)
@@ -280,26 +323,32 @@ class CffiEdgeRunner:
         channels: int,
         frames: int,
     ) -> Dict[str, np.ndarray]:
-        params: Dict[str, np.ndarray] = {}
+        """
+        Prepare C-ready parameter buffers for the node.
+        """
+        param_buffers: Dict[str, np.ndarray] = {}
         node_params = self._base_params.get(node_name)
         if not node_params:
-            return params
+            return param_buffers
         for key, value in node_params.items():
-            params[key] = self._graph._prepare_param_buffer(
+            param_buffers[key] = self._graph._prepare_param_buffer(
                 node_name, key, value, batches, channels, frames
             )
-        return params
+        return param_buffers
 
     def _apply_modulations(
         self,
         node_name: str,
         mod_groups: Sequence[tuple[str, Sequence[ModConnection]]],
-        node_params: Dict[str, np.ndarray],
+        param_buffers: Dict[str, np.ndarray],
         batches: int,
         channels: int,
         frames: int,
     ) -> Dict[str, np.ndarray]:
-        merged = dict(node_params)
+        """
+        Apply modulations to C-ready parameter buffers for the node.
+        """
+        merged = dict(param_buffers)
         if not mod_groups:
             return merged
         shape = (batches, channels, frames)
@@ -307,10 +356,10 @@ class CffiEdgeRunner:
         for param_name, connections in mod_groups:
             signals: list[tuple[np.ndarray, float, str]] = []
             for connection in connections:
-                buffer = self._caches.get(connection.source)
-                if buffer is None:
+                output_buffer = self._caches.get(connection.source)
+                if output_buffer is None:
                     continue
-                source_buf = _assert_bcf(buffer, name=f"{connection.source}.out")
+                source_buf = _assert_bcf(output_buffer, name=f"{connection.source}.out")
                 mod_signal = self._graph._prepare_mod_buffer(
                     node_name,
                     param_name,
@@ -350,43 +399,46 @@ class CffiEdgeRunner:
     def _build_handle(
         self,
         node_name: str,
-        audio: np.ndarray | None,
+        node_buffer: np.ndarray | None,
         batches: int,
         channels: int,
         frames: int,
-        params: Dict[str, np.ndarray],
+        param_buffers: Dict[str, np.ndarray],
     ) -> NodeInputHandle:
+        """
+        Build a NodeInputHandle with CFFI pointers to all C-ready node and parameter buffers.
+        """
         struct_obj = self.ffi.new("EdgeRunnerNodeInputs *")
         keepers: list[Any] = [struct_obj]
-        audio_array = None
-        audio_ptr = self.ffi.NULL
-        if audio is not None:
-            audio_array = np.require(audio, dtype=RAW_DTYPE, requirements=("C",))
-            audio_ptr = self.ffi.from_buffer("double[]", audio_array)
-            keepers.append(audio_ptr)
-        struct_obj.audio.has_audio = 1 if audio_array is not None else 0
+        c_node_buffer = None
+        node_ptr = self.ffi.NULL
+        if node_buffer is not None:
+            c_node_buffer = np.require(node_buffer, dtype=RAW_DTYPE, requirements=("C",))
+            node_ptr = self.ffi.from_buffer("double[]", c_node_buffer)
+            keepers.append(node_ptr)
+        struct_obj.audio.has_audio = 1 if c_node_buffer is not None else 0
         struct_obj.audio.batches = int(batches)
         struct_obj.audio.channels = int(channels)
         struct_obj.audio.frames = int(frames)
-        struct_obj.audio.data = audio_ptr
+        struct_obj.audio.data = node_ptr
 
-        param_names = tuple(params.keys())
-        param_arrays: list[np.ndarray] = []
+        param_names = tuple(param_buffers.keys())
+        param_bufs: list[np.ndarray] = []
         if param_names:
             items = self.ffi.new("EdgeRunnerParamView[]", len(param_names))
             keepers.append(items)
             name_buffers: list[Any] = []
             for idx, name in enumerate(param_names):
-                array = np.require(params[name], dtype=RAW_DTYPE, requirements=("C",))
-                param_arrays.append(array)
+                buf = np.require(param_buffers[name], dtype=RAW_DTYPE, requirements=("C",))
+                param_bufs.append(buf)
                 name_buf = self.ffi.new("char[]", name.encode("utf-8"))
                 name_buffers.append(name_buf)
-                data_ptr = self.ffi.from_buffer("double[]", array)
+                data_ptr = self.ffi.from_buffer("double[]", buf)
                 keepers.append(data_ptr)
                 items[idx].name = name_buf
-                items[idx].batches = int(array.shape[0])
-                items[idx].channels = int(array.shape[1])
-                items[idx].frames = int(array.shape[2])
+                items[idx].batches = int(buf.shape[0])
+                items[idx].channels = int(buf.shape[1])
+                items[idx].frames = int(buf.shape[2])
                 items[idx].data = data_ptr
             keepers.extend(name_buffers)
             struct_obj.params.count = len(param_names)
@@ -399,14 +451,33 @@ class CffiEdgeRunner:
             node=node_name,
             ffi=self.ffi,
             cdata=struct_obj,
-            audio=audio_array,
+            node_buffer=c_node_buffer,
             batches=int(batches),
             channels=int(channels),
             frames=int(frames),
             param_names=param_names,
-            param_arrays=tuple(param_arrays),
+            param_buffers=tuple(param_bufs),
             keepers=tuple(keepers),
         )
 
+    def run_c_graph(self, control_history_blob: bytes) -> np.ndarray:
+        """
+        Invoke the C kernel for the entire graph using the serialized control history blob.
+        Returns the output buffer as a C-ready numpy array.
+        """
+        # For now, also pass the node descriptors so C can know the graph structure
+        node_descriptors = self._graph.serialize_node_descriptors()
+        print("[CffiEdgeRunner] Passing control history blob of size:", len(control_history_blob))
+        print("[CffiEdgeRunner] Passing node descriptors of size:", len(node_descriptors))
+        print("[CffiEdgeRunner] Graph traversal order:", self.ordered_nodes)
+        # CFFI call stub: replace with actual C call
+        # Example: c_output = self.ffi.dlopen("_amp_ckernels_cffi").amp_cffi_run_graph(control_history_blob, node_descriptors, ...)
+        # For now, just return a dummy output buffer
+        batches = 1
+        channels = self._graph.output_channels if hasattr(self._graph, 'output_channels') else 2
+        frames = self._frames
+        dummy = np.zeros((batches, channels, frames), dtype=RAW_DTYPE)
+        print("[CffiEdgeRunner] (Stub) Returning dummy output buffer:", dummy.shape)
+        return dummy
 
 __all__ = ["CffiEdgeRunner", "NodeInputHandle"]

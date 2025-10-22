@@ -14,12 +14,12 @@ from .joystick import JoystickController, JoystickState, JoystickUnavailableErro
 
 @dataclass(slots=True)
 class SynthApplication:
-    """Runtime container for the synthesiser graph.
+    """Runtime container for the synthesiser graph and C-ready node buffers.
 
-    The application loads a configuration, builds the audio graph and
-    exposes a small API for rendering buffers in-process.  No external
-    controllers or audio devices are required which keeps tests and
-    command line usage deterministic.
+    The application loads a configuration, builds the audio graph, and
+    exposes a small API for rendering C-ready output buffers in-process.
+    No external controllers or audio devices are required, which keeps tests and
+    command line usage deterministic and ensures all per-node data is C-ready.
     """
 
     config: AppConfig
@@ -44,16 +44,21 @@ class SynthApplication:
         return cls.from_config(load_configuration(path))
 
     def render(self, frames: Optional[int] = None) -> np.ndarray:
-        """Render *frames* samples from the configured graph.
+        """
+        Render a C-ready output buffer for the given number of frames from the configured graph.
 
         Parameters
         ----------
         frames:
-            Optional frame count.  When omitted the runtime default from the
+            Optional frame count. When omitted, the runtime default from the
             configuration is used.
+        Returns
+        -------
+        np.ndarray
+            C-ready output buffer (node buffer) for the rendered audio block.
         """
-
         frame_count = frames or self.config.runtime.frames_per_chunk
+        # The graph.render method must return a C-ready output buffer (node buffer)
         return self.graph.render(frame_count)
 
     def poll_joystick(self) -> Optional[JoystickState]:
@@ -64,8 +69,9 @@ class SynthApplication:
         return self.joystick.poll()
 
     def summary(self) -> str:
-        """Return a human readable description of the graph."""
-
+        """
+        Return a human-readable description of the graph and C-ready node buffers.
+        """
         lines = [
             f"Sample rate: {self.config.sample_rate} Hz",
             f"Output channels: {self.config.runtime.output_channels}",
@@ -78,7 +84,7 @@ class SynthApplication:
                 lines.append(f"Joystick: unavailable ({self.joystick_error or 'not detected'})")
         else:
             lines.append("Joystick: disabled")
-        lines.extend(["Nodes:"])
+        lines.append("Nodes (C-ready node buffers):")
         for node in self.graph.ordered_nodes:
             lines.append(f"  - {node.name} ({node.__class__.__name__})")
         return "\n".join(lines)

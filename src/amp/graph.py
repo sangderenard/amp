@@ -109,29 +109,29 @@ class ControlEvent:
 
 @dataclass(slots=True)
 class PcmChunk:
-    """Block of PCM samples aligned to an absolute timeline."""
+    """Block of PCM frames aligned to an absolute timeline (C-ready output buffer)."""
 
     timestamp: float
-    data: np.ndarray
+    output_buffer: np.ndarray
     sample_rate: float
 
     def __post_init__(self) -> None:
         self.timestamp = float(self.timestamp)
         self.sample_rate = float(self.sample_rate)
-        array = np.asarray(self.data, dtype=RAW_DTYPE)
+        array = np.asarray(self.output_buffer, dtype=RAW_DTYPE)
         if array.ndim == 1:
             array = array[None, :]
         if array.ndim != 2:
-            raise ValueError("pcm data must be shaped (C, F)")
-        self.data = array
+            raise ValueError("PCM output buffer must be shaped (C, F)")
+        self.output_buffer = array
 
     @property
     def frames(self) -> int:
-        return int(self.data.shape[1])
+        return int(self.output_buffer.shape[1])
 
     @property
     def channels(self) -> int:
-        return int(self.data.shape[0])
+        return int(self.output_buffer.shape[0])
 
     @property
     def end_time(self) -> float:
@@ -139,6 +139,40 @@ class PcmChunk:
 
 
 class ControlDelay:
+
+    def export_control_history_blob(self, start_time: float, end_time: float) -> bytes:
+        """
+        Serialize all control events (timestamps, axes/buttons, etc.) in [start_time, end_time) into a C-compatible binary blob.
+        Each event includes timestamp and all extras (axes/buttons as curves). No upsampling or derived signals.
+        """
+        # Gather relevant events
+        events = [e for e in self._events if start_time <= e.timestamp < end_time]
+        # Determine all axes/buttons present in any event
+        all_keys = set()
+        for e in events:
+            if e.extras:
+                all_keys.update(e.extras.keys())
+        all_keys = sorted(all_keys)
+        # Prepare binary layout: [event_count][key_count][key_lens][keys][events...]
+        import struct
+        payload = bytearray()
+        payload.extend(struct.pack('<II', len(events), len(all_keys)))
+        for key in all_keys:
+            payload.extend(struct.pack('<I', len(key)))
+        for key in all_keys:
+            payload.extend(key.encode('utf-8'))
+        for e in events:
+            payload.extend(struct.pack('<d', e.timestamp))
+            for key in all_keys:
+                arr = None
+                if e.extras and key in e.extras:
+                    arr = np.asarray(e.extras[key], dtype=RAW_DTYPE)
+                if arr is None:
+                    payload.extend(struct.pack('<I', 0))
+                else:
+                    payload.extend(struct.pack('<I', arr.size))
+                    payload.extend(arr.tobytes(order='C'))
+        return bytes(payload)
     """Retains controller history for pre-buffered read-ahead rendering."""
 
     def __init__(
@@ -192,11 +226,11 @@ class ControlDelay:
     def add_pcm(
         self,
         timestamp: float,
-        data: np.ndarray,
+        output_buffer: np.ndarray,
         *,
         sample_rate: float | None = None,
     ) -> PcmChunk:
-        chunk = PcmChunk(timestamp, data, sample_rate or self.sample_rate)
+        chunk = PcmChunk(timestamp, output_buffer, sample_rate or self.sample_rate)
         if not np.isclose(chunk.sample_rate, self.sample_rate):
             raise ValueError("PCM chunk sample rate must match the graph sample rate")
         self._insert_pcm(chunk)
@@ -403,7 +437,7 @@ class ControlDelay:
         if not self._pcm:
             return np.zeros((1, frames), dtype=RAW_DTYPE)
         out_channels = self._pcm[-1].channels
-        output = np.zeros((out_channels, frames), dtype=RAW_DTYPE)
+        output_buffer = np.zeros((out_channels, frames), dtype=RAW_DTYPE)
         frame_step = 1.0 / self.sample_rate
         end_time = start_time + frames * frame_step
         for chunk in self._pcm:
@@ -419,8 +453,8 @@ class ControlDelay:
             out_end = out_start + (local_end - local_start)
             if chunk.channels != out_channels:
                 raise ValueError("PCM chunk channel count mismatch in history")
-            output[:, out_start:out_end] = chunk.data[:, local_start:local_end]
-        return output
+            output_buffer[:, out_start:out_end] = chunk.output_buffer[:, local_start:local_end]
+        return output_buffer
 
 
 @dataclass(slots=True)
@@ -736,6 +770,13 @@ class AudioGraph:
             except Exception as exc:  # pragma: no cover - defensive import guard
                 raise RuntimeError("cffi edge runner is required for graph rendering") from exc
             self._edge_runner = CffiEdgeRunner(self)
+            # Compile the edge runner once when it's created (i.e., when the plan changes)
+            try:
+                self._edge_runner.compile()
+            except Exception:
+                # If compilation fails, ensure runner isn't left in a partial state
+                self._edge_runner = None
+                raise
         return self._edge_runner
 
     def render_block(
@@ -744,39 +785,22 @@ class AudioGraph:
         sample_rate: int | None = None,
         base_params: Mapping[str, Mapping[str, np.ndarray]] | None = None,
     ) -> np.ndarray:
+        """
+        Render a block using the CFFI edge runner only. All node and edge processing is performed in C.
+        Controller history for the block is serialized (raw, not upsampled) and delivered to the C kernel; output is returned from C.
+        """
         if not self.sink:
             raise RuntimeError("Sink node has not been configured")
         sr = int(sample_rate or self.sample_rate)
-        plan = self._ensure_execution_plan()
-        payload = dict(base_params) if base_params is not None else {}
         runner = self._ensure_edge_runner()
-        runner.begin_block(frames, sample_rate=sr, base_params=payload)
-        node_timings: Dict[str, float] = {}
-        for node in self._nodes.values():
-            recycle = getattr(node, "recycle_blocks", None)
-            if recycle is not None:
-                recycle()
-        for entry in plan:
-            node = self._nodes[entry.name]
-            handle = runner.gather_to(entry.name)
-            params = handle.params
-            audio_in = handle.audio
-            start = time.perf_counter()
-            output = node.process(handle.frames, sr, audio_in, {}, params)
-            node_timings[entry.name] = time.perf_counter() - start
-            runner.set_node_output(entry.name, output)
-        caches = {name: runner.get_cached_output(name) for name in runner.ordered_nodes}
-        sink_output = caches.get(self.sink)
-        if sink_output is None:
-            raise RuntimeError(f"Sink node '{self.sink}' produced no data")
-        with self._levels_lock:
-            self._last_node_levels = {
-                name: np.max(np.abs(buf), axis=2)
-                for name, buf in caches.items()
-                if buf is not None
-            }
-            self._last_node_timings = dict(node_timings)
-        return sink_output
+        # Serialize raw control history for the relevant window
+        start_time = getattr(self, "_last_block_time", 0.0)
+        end_time = start_time + (frames / sr)
+        control_history_blob = self.control_delay.export_control_history_blob(start_time, end_time)
+        runner.begin_block(frames, sample_rate=sr, base_params=base_params or {})
+        output = runner.run_c_graph(control_history_blob)
+        self._last_block_time = end_time
+        return output
 
     def render(
         self,
@@ -914,13 +938,13 @@ class AudioGraph:
     def add_pcm_history(
         self,
         timestamp: float,
-        data: np.ndarray,
+        output_buffer: np.ndarray,
         *,
         sample_rate: float | None = None,
     ) -> PcmChunk:
-        """Append PCM history aligned to the graph timeline."""
+        """Append PCM history aligned to the graph timeline (C-ready output buffer)."""
 
-        return self.control_delay.add_pcm(timestamp, data, sample_rate=sample_rate)
+        return self.control_delay.add_pcm(timestamp, output_buffer, sample_rate=sample_rate)
 
     def sample_control_tensor(
         self,

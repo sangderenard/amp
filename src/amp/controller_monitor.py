@@ -231,45 +231,25 @@ class ControllerMonitor:
             except Exception:
                 print("ControllerMonitor poll_fn raised an exception", file=sys.stderr)
                 import traceback
-
                 traceback.print_exc()
                 time.sleep(self.poll_interval)
                 continue
 
-            if isinstance(payload, Mapping) and "extras" in payload:
-                extras = payload.get("extras", {})
-                pitch = np.asarray(payload.get("pitch", np.zeros(1)), dtype=np.float64)
-                envelope = np.asarray(payload.get("envelope", np.zeros(1)), dtype=np.float64)
-                if pitch.ndim == 0:
-                    pitch = np.asarray([float(pitch)], dtype=np.float64)
-                if envelope.ndim == 0:
-                    envelope = np.asarray([float(envelope)], dtype=np.float64)
-                try:
-                    self.control_history.record_control_event(
-                        float(payload.get("timestamp", timestamp)),
-                        pitch=pitch,
-                        envelope=envelope,
-                        extras=extras,
-                    )
-                except Exception:
-                    print("ControllerMonitor failed to record synthetic control event", file=sys.stderr)
-                    import traceback
-
-                    traceback.print_exc()
-                else:
-                    with self._lock:
-                        self._latest_snapshot = None
-                time.sleep(self.poll_interval)
-                continue
-
             axes, buttons = self._coerce_axes_buttons(payload)
-            snapshot = self._derive_snapshot(axes, buttons)
+            # Store raw axes/buttons as arrays in 'extras' for the control event
+            extras = {
+                "axes": np.asarray(axes, dtype=np.float64),
+                "buttons": np.asarray(buttons, dtype=np.float64),
+            }
+            pitch = np.zeros(1, dtype=np.float64)
+            envelope = np.zeros(1, dtype=np.float64)
             try:
-                self._record_snapshot(timestamp, snapshot)
+                self.control_history.record_control_event(
+                    float(timestamp), pitch=pitch, envelope=envelope, extras=extras
+                )
             except Exception:
-                print("ControllerMonitor failed to record controller snapshot", file=sys.stderr)
+                print("ControllerMonitor failed to record raw controller state", file=sys.stderr)
                 import traceback
-
                 traceback.print_exc()
             time.sleep(self.poll_interval)
 
