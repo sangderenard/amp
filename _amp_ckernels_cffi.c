@@ -571,10 +571,16 @@ static void (*_cffi_call_python_org)(struct _cffi_externpy_s *, char *);
 /************************************************************/
 
 
+#include <ctype.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 typedef struct {
     int *boundaries;
@@ -587,6 +593,265 @@ typedef struct {
 } envelope_scratch_t;
 
 static envelope_scratch_t envelope_scratch = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+
+/*
+ * Edge runner contract (mirrors `_EDGE_RUNNER_CDEF` in Python).
+ *
+ * The runtime passes node descriptors/inputs to `amp_run_node`, which may
+ * allocate per-node state (returned via `state`) and a heap-owned audio buffer
+ * (`out_buffer`).
+ *
+ * Return codes:
+ *   0   -> success
+ *  -1   -> allocation failure / invalid contract usage
+ *  -3   -> unsupported node kind (caller should fall back to Python)
+ */
+typedef struct {
+    uint32_t has_audio;
+    uint32_t batches;
+    uint32_t channels;
+    uint32_t frames;
+    const double *data;
+} EdgeRunnerAudioView;
+
+typedef struct {
+    const char *name;
+    uint32_t batches;
+    uint32_t channels;
+    uint32_t frames;
+    const double *data;
+} EdgeRunnerParamView;
+
+typedef struct {
+    uint32_t count;
+    EdgeRunnerParamView *items;
+} EdgeRunnerParamSet;
+
+typedef struct {
+    EdgeRunnerAudioView audio;
+    EdgeRunnerParamSet params;
+} EdgeRunnerNodeInputs;
+
+typedef struct {
+    const char *name;
+    size_t name_len;
+    const char *type_name;
+    size_t type_len;
+    const char *params_json;
+    size_t params_len;
+} EdgeRunnerNodeDescriptor;
+
+typedef struct {
+    char *name;
+    uint32_t name_len;
+    uint32_t offset;
+    uint32_t span;
+} EdgeRunnerCompiledParam;
+
+typedef struct {
+    char *name;
+    uint32_t name_len;
+    uint32_t function_id;
+    uint32_t audio_offset;
+    uint32_t audio_span;
+    uint32_t param_count;
+    EdgeRunnerCompiledParam *params;
+} EdgeRunnerCompiledNode;
+
+typedef struct {
+    uint32_t version;
+    uint32_t node_count;
+    EdgeRunnerCompiledNode *nodes;
+} EdgeRunnerCompiledPlan;
+
+static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+    if (plan == NULL) {
+        return;
+    }
+    if (plan->nodes != NULL) {
+        for (uint32_t i = 0; i < plan->node_count; ++i) {
+            EdgeRunnerCompiledNode *node = &plan->nodes[i];
+            if (node->params != NULL) {
+                for (uint32_t j = 0; j < node->param_count; ++j) {
+                    EdgeRunnerCompiledParam *param = &node->params[j];
+                    if (param->name != NULL) {
+                        free(param->name);
+                        param->name = NULL;
+                    }
+                }
+                free(node->params);
+                node->params = NULL;
+            }
+            if (node->name != NULL) {
+                free(node->name);
+                node->name = NULL;
+            }
+        }
+        free(plan->nodes);
+        plan->nodes = NULL;
+    }
+    free(plan);
+}
+
+static int read_u32_le(const uint8_t **cursor, size_t *remaining, uint32_t *out_value) {
+    if (cursor == NULL || remaining == NULL || out_value == NULL) {
+        return 0;
+    }
+    if (*remaining < 4) {
+        return 0;
+    }
+    const uint8_t *ptr = *cursor;
+    *out_value = (uint32_t)ptr[0]
+        | ((uint32_t)ptr[1] << 8)
+        | ((uint32_t)ptr[2] << 16)
+        | ((uint32_t)ptr[3] << 24);
+    *cursor += 4;
+    *remaining -= 4;
+    return 1;
+}
+
+EdgeRunnerCompiledPlan *amp_load_compiled_plan(
+    const uint8_t *descriptor_blob,
+    size_t descriptor_len,
+    const uint8_t *plan_blob,
+    size_t plan_len
+) {
+    if (descriptor_blob == NULL || plan_blob == NULL) {
+        return NULL;
+    }
+    if (descriptor_len < 4 || plan_len < 12) {
+        return NULL;
+    }
+
+    const uint8_t *descriptor_cursor = descriptor_blob;
+    size_t descriptor_remaining = descriptor_len;
+    uint32_t descriptor_count = 0;
+    if (!read_u32_le(&descriptor_cursor, &descriptor_remaining, &descriptor_count)) {
+        return NULL;
+    }
+
+    const uint8_t *cursor = plan_blob;
+    size_t remaining = plan_len;
+    if (remaining < 4) {
+        return NULL;
+    }
+    if (cursor[0] != 'A' || cursor[1] != 'M' || cursor[2] != 'P' || cursor[3] != 'L') {
+        return NULL;
+    }
+    cursor += 4;
+    remaining -= 4;
+
+    uint32_t version = 0;
+    uint32_t node_count = 0;
+    if (!read_u32_le(&cursor, &remaining, &version) || !read_u32_le(&cursor, &remaining, &node_count)) {
+        return NULL;
+    }
+    if (descriptor_count != node_count) {
+        return NULL;
+    }
+
+    EdgeRunnerCompiledPlan *plan = (EdgeRunnerCompiledPlan *)calloc(1, sizeof(EdgeRunnerCompiledPlan));
+    if (plan == NULL) {
+        return NULL;
+    }
+    plan->version = version;
+    plan->node_count = node_count;
+
+    if (node_count == 0) {
+        if (remaining != 0) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        return plan;
+    }
+
+    plan->nodes = (EdgeRunnerCompiledNode *)calloc(node_count, sizeof(EdgeRunnerCompiledNode));
+    if (plan->nodes == NULL) {
+        destroy_compiled_plan(plan);
+        return NULL;
+    }
+
+    for (uint32_t idx = 0; idx < node_count; ++idx) {
+        EdgeRunnerCompiledNode *node = &plan->nodes[idx];
+        uint32_t function_id = 0;
+        uint32_t name_len = 0;
+        uint32_t audio_offset = 0;
+        uint32_t audio_span = 0;
+        uint32_t param_count = 0;
+        if (!read_u32_le(&cursor, &remaining, &function_id)
+            || !read_u32_le(&cursor, &remaining, &name_len)
+            || !read_u32_le(&cursor, &remaining, &audio_offset)
+            || !read_u32_le(&cursor, &remaining, &audio_span)
+            || !read_u32_le(&cursor, &remaining, &param_count)) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        if (remaining < name_len) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        node->name = (char *)malloc((size_t)name_len + 1);
+        if (node->name == NULL) {
+            destroy_compiled_plan(plan);
+            return NULL;
+        }
+        memcpy(node->name, cursor, name_len);
+        node->name[name_len] = '\0';
+        node->name_len = name_len;
+        cursor += name_len;
+        remaining -= name_len;
+        node->function_id = function_id;
+        node->audio_offset = audio_offset;
+        node->audio_span = audio_span;
+        node->param_count = param_count;
+        if (param_count > 0) {
+            node->params = (EdgeRunnerCompiledParam *)calloc(param_count, sizeof(EdgeRunnerCompiledParam));
+            if (node->params == NULL) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+        }
+        for (uint32_t param_idx = 0; param_idx < param_count; ++param_idx) {
+            EdgeRunnerCompiledParam *param = &node->params[param_idx];
+            uint32_t param_name_len = 0;
+            uint32_t param_offset = 0;
+            uint32_t param_span = 0;
+            if (!read_u32_le(&cursor, &remaining, &param_name_len)
+                || !read_u32_le(&cursor, &remaining, &param_offset)
+                || !read_u32_le(&cursor, &remaining, &param_span)) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+            if (remaining < param_name_len) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+            param->name = (char *)malloc((size_t)param_name_len + 1);
+            if (param->name == NULL) {
+                destroy_compiled_plan(plan);
+                return NULL;
+            }
+            memcpy(param->name, cursor, param_name_len);
+            param->name[param_name_len] = '\0';
+            param->name_len = param_name_len;
+            param->offset = param_offset;
+            param->span = param_span;
+            cursor += param_name_len;
+            remaining -= param_name_len;
+        }
+    }
+
+    if (remaining != 0) {
+        destroy_compiled_plan(plan);
+        return NULL;
+    }
+
+    return plan;
+}
+
+void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+    destroy_compiled_plan(plan);
+}
 
 static int envelope_reserve_scratch(int F) {
     size_t needed_boundaries = (size_t)(4 * F + 4);
@@ -1551,6 +1816,520 @@ void osc_triangle_blep_c(const double* ph, const double* dphi, double* out, int 
         }
         if (tri_state != NULL) tri_state[b] = s;
     }
+}
+
+typedef enum {
+    NODE_KIND_UNKNOWN = 0,
+    NODE_KIND_CONSTANT,
+    NODE_KIND_GAIN,
+    NODE_KIND_MIX,
+    NODE_KIND_SAFETY,
+    NODE_KIND_SINE_OSC,
+} node_kind_t;
+
+typedef struct {
+    node_kind_t kind;
+    union {
+        struct {
+            double value;
+            int channels;
+        } constant;
+        struct {
+            int out_channels;
+        } mix;
+        struct {
+            double *state;
+            int batches;
+            int channels;
+            double alpha;
+        } safety;
+        struct {
+            double *phase;
+            int batches;
+            int channels;
+            double base_phase;
+        } sine;
+    } u;
+} node_state_t;
+
+static void release_node_state(node_state_t *state) {
+    if (state == NULL) {
+        return;
+    }
+    if (state->kind == NODE_KIND_SAFETY && state->u.safety.state != NULL) {
+        free(state->u.safety.state);
+        state->u.safety.state = NULL;
+        state->u.safety.batches = 0;
+        state->u.safety.channels = 0;
+        state->u.safety.alpha = 0.0;
+    }
+    if (state->kind == NODE_KIND_SINE_OSC && state->u.sine.phase != NULL) {
+        free(state->u.sine.phase);
+        state->u.sine.phase = NULL;
+        state->u.sine.batches = 0;
+        state->u.sine.channels = 0;
+        state->u.sine.base_phase = 0.0;
+    }
+    free(state);
+}
+
+static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descriptor) {
+    if (descriptor == NULL || descriptor->type_name == NULL) {
+        return NODE_KIND_UNKNOWN;
+    }
+    if (strcmp(descriptor->type_name, "ConstantNode") == 0) {
+        return NODE_KIND_CONSTANT;
+    }
+    if (strcmp(descriptor->type_name, "GainNode") == 0) {
+        return NODE_KIND_GAIN;
+    }
+    if (strcmp(descriptor->type_name, "MixNode") == 0) {
+        return NODE_KIND_MIX;
+    }
+    if (strcmp(descriptor->type_name, "SafetyNode") == 0) {
+        return NODE_KIND_SAFETY;
+    }
+    if (strcmp(descriptor->type_name, "SineOscillatorNode") == 0) {
+        return NODE_KIND_SINE_OSC;
+    }
+    return NODE_KIND_UNKNOWN;
+}
+
+static double json_get_double(const char *json, size_t json_len, const char *key, double default_value) {
+    (void)json_len;
+    if (json == NULL || key == NULL) {
+        return default_value;
+    }
+    size_t key_len = strlen(key);
+    if (key_len == 0) {
+        return default_value;
+    }
+    char pattern[128];
+    if (key_len + 3 >= sizeof(pattern)) {
+        return default_value;
+    }
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *cursor = json;
+    size_t pattern_len = strlen(pattern);
+    while ((cursor = strstr(cursor, pattern)) != NULL) {
+        cursor += pattern_len;
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
+            cursor++;
+        }
+        if (*cursor != ':') {
+            continue;
+        }
+        cursor++;
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        char *endptr = NULL;
+        double value = strtod(cursor, &endptr);
+        if (endptr == cursor) {
+            cursor = endptr;
+            continue;
+        }
+        return value;
+    }
+    return default_value;
+}
+
+static int json_get_int(const char *json, size_t json_len, const char *key, int default_value) {
+    double value = json_get_double(json, json_len, key, (double)default_value);
+    if (value >= 0.0) {
+        return (int)(value + 0.5);
+    }
+    return (int)(value - 0.5);
+}
+
+static const EdgeRunnerParamView *find_param(const EdgeRunnerNodeInputs *inputs, const char *name) {
+    if (inputs == NULL || name == NULL) {
+        return NULL;
+    }
+    uint32_t count = inputs->params.count;
+    EdgeRunnerParamView *items = inputs->params.items;
+    for (uint32_t i = 0; i < count; ++i) {
+        const EdgeRunnerParamView *view = &items[i];
+        if (view->name != NULL && strcmp(view->name, name) == 0) {
+            return view;
+        }
+    }
+    return NULL;
+}
+
+static int run_constant_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    int batches,
+    int frames,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    int channels = json_get_int(descriptor->params_json, descriptor->params_len, "channels", 1);
+    if (channels <= 0) {
+        channels = 1;
+    }
+    double value = json_get_double(descriptor->params_json, descriptor->params_len, "value", 0.0);
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < total; ++i) {
+        buffer[i] = value;
+    }
+    if (state != NULL) {
+        state->u.constant.value = value;
+        state->u.constant.channels = channels;
+    }
+    *out_buffer = buffer;
+    *out_channels = channels;
+    return 0;
+}
+
+static int run_gain_node(
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double **out_buffer,
+    int *out_channels
+) {
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    int channels = (int)inputs->audio.channels;
+    if (!inputs->audio.has_audio || inputs->audio.data == NULL || channels <= 0) {
+        channels = channels > 0 ? channels : 1;
+        size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+        double *buffer = (double *)calloc(total, sizeof(double));
+        if (buffer == NULL) {
+            return -1;
+        }
+        *out_buffer = buffer;
+        *out_channels = channels;
+        return 0;
+    }
+    if (channels <= 0) {
+        channels = 1;
+    }
+    size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    const double *audio = inputs->audio.data;
+    const EdgeRunnerParamView *gain_view = find_param(inputs, "gain");
+    const double *gain = (gain_view != NULL) ? gain_view->data : NULL;
+    for (int b = 0; b < batches; ++b) {
+        for (int c = 0; c < channels; ++c) {
+            size_t base = ((size_t)b * (size_t)channels + (size_t)c) * (size_t)frames;
+            for (int f = 0; f < frames; ++f) {
+                double sample = audio[base + (size_t)f];
+                double g = gain != NULL ? gain[base + (size_t)f] : 1.0;
+                buffer[base + (size_t)f] = sample * g;
+            }
+        }
+    }
+    *out_buffer = buffer;
+    *out_channels = channels;
+    return 0;
+}
+
+static int run_mix_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double **out_buffer,
+    int *out_channels
+) {
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    int target_channels = json_get_int(descriptor->params_json, descriptor->params_len, "channels", 1);
+    if (target_channels <= 0) {
+        target_channels = 1;
+    }
+    size_t total = (size_t)batches * (size_t)target_channels * (size_t)frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    if (!inputs->audio.has_audio || inputs->audio.data == NULL || inputs->audio.channels == 0) {
+        memset(buffer, 0, total * sizeof(double));
+        *out_buffer = buffer;
+        *out_channels = target_channels;
+        return 0;
+    }
+    int in_channels = (int)inputs->audio.channels;
+    const double *audio = inputs->audio.data;
+    for (int b = 0; b < batches; ++b) {
+        for (int f = 0; f < frames; ++f) {
+            double sum = 0.0;
+            for (int c = 0; c < in_channels; ++c) {
+                size_t idx = ((size_t)b * (size_t)in_channels + (size_t)c) * (size_t)frames + (size_t)f;
+                sum += audio[idx];
+            }
+            for (int oc = 0; oc < target_channels; ++oc) {
+                size_t out_idx = ((size_t)b * (size_t)target_channels + (size_t)oc) * (size_t)frames + (size_t)f;
+                buffer[out_idx] = sum;
+            }
+        }
+    }
+    *out_buffer = buffer;
+    *out_channels = target_channels;
+    return 0;
+}
+
+static int run_sine_osc_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    if (sample_rate <= 0.0) {
+        sample_rate = 48000.0;
+    }
+    int channels = json_get_int(descriptor->params_json, descriptor->params_len, "channels", 1);
+    if (channels <= 0) {
+        channels = 1;
+    }
+    size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    double initial_phase = json_get_double(descriptor->params_json, descriptor->params_len, "phase", 0.0);
+    double normalized_phase = initial_phase - floor(initial_phase);
+    if (state != NULL) {
+        if (state->u.sine.phase == NULL || state->u.sine.batches != batches || state->u.sine.channels != channels) {
+            free(state->u.sine.phase);
+            state->u.sine.phase = (double *)calloc((size_t)batches * (size_t)channels, sizeof(double));
+            if (state->u.sine.phase == NULL) {
+                free(buffer);
+                state->u.sine.batches = 0;
+                state->u.sine.channels = 0;
+                return -1;
+            }
+            state->u.sine.batches = batches;
+            state->u.sine.channels = channels;
+            state->u.sine.base_phase = normalized_phase;
+            for (size_t idx = 0; idx < (size_t)batches * (size_t)channels; ++idx) {
+                state->u.sine.phase[idx] = normalized_phase;
+            }
+        }
+    }
+    double *phase = state != NULL ? state->u.sine.phase : NULL;
+    double base_freq = json_get_double(descriptor->params_json, descriptor->params_len, "frequency", 440.0);
+    double base_amp = json_get_double(descriptor->params_json, descriptor->params_len, "amplitude", 0.5);
+    const EdgeRunnerParamView *freq_view = find_param(inputs, "frequency");
+    const EdgeRunnerParamView *amp_view = find_param(inputs, "amplitude");
+    const double *freq_data = freq_view != NULL ? freq_view->data : NULL;
+    const double *amp_data = amp_view != NULL ? amp_view->data : NULL;
+    for (int b = 0; b < batches; ++b) {
+        for (int c = 0; c < channels; ++c) {
+            size_t bc = (size_t)b * (size_t)channels + (size_t)c;
+            double phase_acc = phase != NULL ? phase[bc] : normalized_phase;
+            for (int f = 0; f < frames; ++f) {
+                size_t idx = bc * (size_t)frames + (size_t)f;
+                double freq = freq_data != NULL ? freq_data[idx] : base_freq;
+                double amp = amp_data != NULL ? amp_data[idx] : base_amp;
+                double step = freq / sample_rate;
+                phase_acc += step;
+                phase_acc -= floor(phase_acc);
+                buffer[idx] = sin(phase_acc * 2.0 * M_PI) * amp;
+            }
+            if (phase != NULL) {
+                phase[bc] = phase_acc;
+            }
+        }
+    }
+    *out_buffer = buffer;
+    *out_channels = channels;
+    return 0;
+}
+
+static int run_safety_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    (void)sample_rate;
+    if (batches <= 0) {
+        batches = 1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    int channels = json_get_int(descriptor->params_json, descriptor->params_len, "channels", (int)inputs->audio.channels);
+    if (channels <= 0) {
+        channels = (int)inputs->audio.channels;
+    }
+    if (channels <= 0) {
+        channels = 1;
+    }
+    double alpha = json_get_double(descriptor->params_json, descriptor->params_len, "dc_alpha", 0.995);
+    size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+    if (state != NULL) {
+        if (state->u.safety.state == NULL || state->u.safety.batches != batches || state->u.safety.channels != channels) {
+            free(state->u.safety.state);
+            state->u.safety.state = (double *)calloc((size_t)batches * (size_t)channels, sizeof(double));
+            if (state->u.safety.state == NULL) {
+                free(buffer);
+                state->u.safety.batches = 0;
+                state->u.safety.channels = 0;
+                return -1;
+            }
+            state->u.safety.batches = batches;
+            state->u.safety.channels = channels;
+        }
+        state->u.safety.alpha = alpha;
+    }
+    if (!inputs->audio.has_audio || inputs->audio.data == NULL) {
+        memset(buffer, 0, total * sizeof(double));
+    } else {
+        double *dc_state = NULL;
+        if (state != NULL) {
+            dc_state = state->u.safety.state;
+        }
+        if (dc_state == NULL) {
+            dc_state = (double *)calloc((size_t)batches * (size_t)channels, sizeof(double));
+            if (dc_state == NULL) {
+                free(buffer);
+                return -1;
+            }
+            if (state != NULL) {
+                state->u.safety.state = dc_state;
+                state->u.safety.batches = batches;
+                state->u.safety.channels = channels;
+            }
+        }
+        dc_block(inputs->audio.data, buffer, batches, channels, frames, alpha, dc_state);
+        for (size_t i = 0; i < total; ++i) {
+            double v = buffer[i];
+            if (v > 1.0) {
+                buffer[i] = 1.0;
+            } else if (v < -1.0) {
+                buffer[i] = -1.0;
+            }
+        }
+    }
+    *out_buffer = buffer;
+    *out_channels = channels;
+    return 0;
+}
+
+int amp_run_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    void **state
+) {
+    (void)channels;
+    if (out_buffer == NULL || out_channels == NULL) {
+        return -1;
+    }
+    node_kind_t kind = determine_node_kind(descriptor);
+    if (kind == NODE_KIND_UNKNOWN) {
+        return -3;
+    }
+    node_state_t *node_state = NULL;
+    if (state != NULL && *state != NULL) {
+        node_state = (node_state_t *)(*state);
+    }
+    if (node_state != NULL && node_state->kind != kind) {
+        release_node_state(node_state);
+        node_state = NULL;
+        if (state != NULL) {
+            *state = NULL;
+        }
+    }
+    if (node_state == NULL) {
+        node_state = (node_state_t *)calloc(1, sizeof(node_state_t));
+        if (node_state == NULL) {
+            return -1;
+        }
+        node_state->kind = kind;
+        if (state != NULL) {
+            *state = node_state;
+        }
+    }
+
+    int rc = 0;
+    switch (kind) {
+        case NODE_KIND_CONSTANT:
+            rc = run_constant_node(descriptor, batches, frames, out_buffer, out_channels, node_state);
+            break;
+        case NODE_KIND_GAIN:
+            rc = run_gain_node(inputs, batches, frames, out_buffer, out_channels);
+            break;
+        case NODE_KIND_MIX:
+            rc = run_mix_node(descriptor, inputs, batches, frames, out_buffer, out_channels);
+            break;
+        case NODE_KIND_SAFETY:
+            rc = run_safety_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            break;
+        case NODE_KIND_SINE_OSC:
+            rc = run_sine_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            break;
+        default:
+            rc = -3;
+            break;
+    }
+    return rc;
+}
+
+void amp_free(double *buffer) {
+    if (buffer != NULL) {
+        free(buffer);
+    }
+}
+
+void amp_release_state(void *state_ptr) {
+    if (state_ptr == NULL) {
+        return;
+    }
+    node_state_t *node_state = (node_state_t *)state_ptr;
+    release_node_state(node_state);
 }
 
 

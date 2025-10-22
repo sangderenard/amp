@@ -95,3 +95,14 @@ def test_audio_graph_render_block_uses_edge_runner(simple_graph):
     assert simple_graph._edge_runner is not None
     assert output.shape == (1, 1, frames)
     assert np.allclose(output, 0.5)
+
+
+def test_edge_runner_compiled_plan_metadata(simple_graph):
+    runner = CffiEdgeRunner(simple_graph)
+    plan = runner.describe_compiled_plan()
+
+    assert plan["version"] == 1
+    assert plan["node_count"] == len(simple_graph._nodes)
+    ordered = runner.ordered_nodes
+    assert tuple(node["name"] for node in plan["nodes"]) == ordered
+    assert all("params" in node for node in plan["nodes"])
