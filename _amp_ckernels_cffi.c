@@ -579,6 +579,12 @@ static void (*_cffi_call_python_org)(struct _cffi_externpy_s *, char *);
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32) || defined(_WIN64)
+#define AMP_CAPI __declspec(dllexport)
+#else
+#define AMP_CAPI
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -725,7 +731,7 @@ static int read_u32_le(const uint8_t **cursor, size_t *remaining, uint32_t *out_
     return 1;
 }
 
-EdgeRunnerCompiledPlan *amp_load_compiled_plan(
+AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
     const uint8_t *descriptor_blob,
     size_t descriptor_len,
     const uint8_t *plan_blob,
@@ -864,7 +870,7 @@ EdgeRunnerCompiledPlan *amp_load_compiled_plan(
     return plan;
 }
 
-void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+AMP_CAPI void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     destroy_compiled_plan(plan);
 }
 
@@ -947,7 +953,7 @@ static void apply_history_curve(
     }
 }
 
-EdgeRunnerControlHistory *amp_load_control_history(
+AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
     const uint8_t *blob,
     size_t blob_len,
     int frames_hint
@@ -1063,7 +1069,7 @@ EdgeRunnerControlHistory *amp_load_control_history(
     return history;
 }
 
-void amp_release_control_history(EdgeRunnerControlHistory *history) {
+AMP_CAPI void amp_release_control_history(EdgeRunnerControlHistory *history) {
     destroy_control_history(history);
 }
 
@@ -3686,7 +3692,7 @@ static int run_safety_node(
     return 0;
 }
 
-int amp_run_node(
+AMP_CAPI int amp_run_node(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
     int batches,
@@ -3770,13 +3776,13 @@ int amp_run_node(
     return rc;
 }
 
-void amp_free(double *buffer) {
+AMP_CAPI void amp_free(double *buffer) {
     if (buffer != NULL) {
         free(buffer);
     }
 }
 
-void amp_release_state(void *state_ptr) {
+AMP_CAPI void amp_release_state(void *state_ptr) {
     if (state_ptr == NULL) {
         return;
     }
