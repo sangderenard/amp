@@ -538,6 +538,8 @@ def run(
     try:
         import pygame
     except ImportError as exc:  # pragma: no cover - exercised only when pygame missing
+        STATUS_PRINTER.emit(f"pygame unavailable, running summary instead: {exc}", force=True)
+        STATUS_PRINTER.flush()
         return render_summary(f"pygame unavailable, running summary instead: {exc}")
 
     if no_audio:
@@ -546,6 +548,8 @@ def run(
         try:
             import sounddevice as sd
         except ImportError as exc:  # pragma: no cover - exercised only when sounddevice missing
+            STATUS_PRINTER.emit(f"sounddevice unavailable, running summary instead: {exc}", force=True)
+            STATUS_PRINTER.flush()
             return render_summary(f"sounddevice unavailable, running summary instead: {exc}")
 
     pygame.init()
@@ -575,6 +579,8 @@ def run(
     if pygame.joystick.get_count() == 0:
         if not allow_no_joystick:
             STATUS_PRINTER.emit("No joystick. Connect controller and restart.", force=True)
+            # Ensure the background printer flushes queued messages before exiting
+            STATUS_PRINTER.flush()
             return 1
         joy = _NullJoystick()
         STATUS_PRINTER.emit(
@@ -1047,6 +1053,61 @@ def run(
 
     running = True
     audio_failures: list[Exception] = []
+
+    # Install global handlers to capture uncaught exceptions in threads
+    # and at process exit for diagnostic purposes. These helpers use the
+    # STATUS_PRINTER so messages appear in the same rate-limited output
+    # channel as the rest of the application.
+    try:
+        import atexit
+
+        def _thread_excepthook(args):
+            try:
+                tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+                STATUS_PRINTER.emit(f"[ThreadException] {tb}", force=True)
+            except Exception:
+                try:
+                    STATUS_PRINTER.emit(f"[ThreadException] {args.exc_value!r}", force=True)
+                except Exception:
+                    pass
+
+        # Python 3.8+ threading.excepthook
+        try:
+            threading.excepthook = _thread_excepthook
+        except Exception:
+            # Older Python versions may not have threading.excepthook
+            pass
+
+        def _sys_excepthook(exc_type, exc_value, exc_tb):
+            try:
+                tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+                STATUS_PRINTER.emit(f"[Uncaught] {tb}", force=True)
+            except Exception:
+                pass
+
+        sys.excepthook = _sys_excepthook
+
+        def _exit_dump():
+            try:
+                names = [t.name for t in threading.enumerate()]
+                STATUS_PRINTER.emit(f"[ExitDump] threads={names} audio_failures_count={len(audio_failures)}", force=True)
+                # Attempt to print stack for each thread
+                try:
+                    import faulthandler
+
+                    for t in threading.enumerate():
+                        try:
+                            STATUS_PRINTER.emit(f"[ExitDump] thread: {t.name} id={getattr(t, 'ident', None)}", force=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        atexit.register(_exit_dump)
+    except Exception:
+        pass
 
     if sd is None:
         STATUS_PRINTER.emit("[Audio] Skipping output initialisation (no-audio mode).", force=True)
@@ -1851,6 +1912,31 @@ def run(
     try:
         while True:
             if audio_failures:
+                # Emit diagnostic information so early exits due to audio
+                # thread/producer/consumer failures are visible to the user
+                try:
+                    # Direct print so it appears even if STATUS_PRINTER queue is delayed
+                    try:
+                        print(f"[Exit-PRINT] audio_failures (count={len(audio_failures)}): {audio_failures!r}")
+                    except Exception:
+                        pass
+                    STATUS_PRINTER.emit(
+                        f"[Exit] audio_failures (count={len(audio_failures)}): {audio_failures[0]!r}",
+                        force=True,
+                    )
+                    # Emit full tracebacks for better diagnostics
+                    for idx, exc in enumerate(list(audio_failures)):
+                        try:
+                            tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+                            STATUS_PRINTER.emit(f"[Exit] failure #{idx}: {''.join(tb)}", force=True)
+                        except Exception:
+                            STATUS_PRINTER.emit(f"[Exit] failure #{idx}: {exc!r}", force=True)
+                except Exception:
+                    # If diagnostics fail, fall back to a simple print
+                    try:
+                        STATUS_PRINTER.emit(f"[Exit] audio_failures: {audio_failures!r}", force=True)
+                    except Exception:
+                        pass
                 pygame.quit()
                 return render_summary(
                     f"Audio initialisation failed, running summary instead: {audio_failures[0]}",

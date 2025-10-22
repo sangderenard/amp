@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import AppConfig, load_configuration
 from .graph import AudioGraph
+from .app import build_runtime_graph
 from .joystick import JoystickController, JoystickState, JoystickUnavailableError
 
 
@@ -29,7 +30,47 @@ class SynthApplication:
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "SynthApplication":
-        graph = AudioGraph.from_config(config.graph, config.sample_rate, config.runtime.output_channels)
+        # Prefer the interactive/default graph construction when possible.
+        # Many configs (including the default distributed config) are a
+        # lightweight headless graph; the interactive graph is the canonical
+        # runtime layout. If the config provides a custom graph explicitly
+        # we will still respect it, otherwise construct the interactive
+        # runtime graph using `build_runtime_graph` so headless outputs
+        # match interactive behaviour.
+        graph: AudioGraph
+        try:
+            # Detect if the config graph contains non-default nodes: if it
+            # contains more than a couple nodes we assume it's intentional
+            # and use it directly. Otherwise, construct the interactive
+            # graph which is the canonical runtime graph.
+            cfg_nodes = getattr(config.graph, "nodes", None) or []
+            if len(cfg_nodes) > 6:
+                graph = AudioGraph.from_config(config.graph, config.sample_rate, config.runtime.output_channels)
+            else:
+                # Build an interactive runtime state compatible with the
+                # build_runtime_graph helper. We do not have pygame here so
+                # pass `joy=None` and rely on defaults.
+                runtime_state = {
+                    # minimal set of runtime keys used by build_runtime_graph
+                    "root_midi": 60,
+                    "free_variant": "continuous",
+                    "base_token": "12tet/full",
+                    "waves": ["sine", "square", "saw"],
+                    "wave_idx": 0,
+                    "filter_type": "lowpass",
+                    "mod_wave_types": ["sine", "square", "saw"],
+                    "mod_wave_idx": 0,
+                    "mod_rate_hz": 4.0,
+                    "mod_depth": 0.5,
+                    "mod_use_input": False,
+                    "polyphony_mode": "strings",
+                    "polyphony_voices": 3,
+                    # envelope defaults are read by build_runtime_graph
+                }
+                graph, _, _ = build_runtime_graph(config.sample_rate, runtime_state)
+        except Exception:
+            # Fallback to config-driven construction on any error
+            graph = AudioGraph.from_config(config.graph, config.sample_rate, config.runtime.output_channels)
         joystick: Optional[JoystickController] = None
         joystick_error: Optional[str] = None
         if config.runtime.joystick.enabled:

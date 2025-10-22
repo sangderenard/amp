@@ -7,6 +7,7 @@ import struct
 import time
 
 import numpy as np
+import os
 
 from .graph import (
     AudioGraph,
@@ -356,7 +357,14 @@ class CffiEdgeRunner:
         if not self._descriptor_blob or not self._compiled_plan:
             self._release_plan()
             return
-        lib = self._ensure_c_kernel()
+        try:
+            lib = self._ensure_c_kernel()
+        except Exception:
+            # If the C kernel isn't available during compiled-plan loading, just
+            # release any plan handle and return early — compiled plans are only
+            # meaningful when a C backend is present.
+            self._release_plan()
+            return
         desc_buf = self.ffi.new("uint8_t[]", self._descriptor_blob)
         plan_buf = self.ffi.new("uint8_t[]", self._compiled_plan)
         handle = lib.amp_load_compiled_plan(
@@ -750,6 +758,33 @@ class CffiEdgeRunner:
             struct_obj.params.count = 0
             struct_obj.params.items = self.ffi.NULL
 
+        # Defensive validation: ensure all C-ready buffers match the handle's
+        # batches/frames the runner is passing to C. If a producer created a
+        # buffer with an incorrect shape, fail fast and point to the offending
+        # node/param so it can be fixed upstream.
+        for p_name, p_buf in zip(param_names, param_bufs):
+            try:
+                if p_buf is None:
+                    continue
+                if int(p_buf.shape[0]) != int(batches) or int(p_buf.shape[2]) != int(frames):
+                    raise RuntimeError(
+                        f"Shape mismatch for node '{node_name}' param '{p_name}': "
+                        f"buf.shape={p_buf.shape} vs handle (batches={int(batches)}, frames={int(frames)})"
+                    )
+            except Exception:
+                # Re-raise with context for clarity
+                raise
+
+        if c_node_buffer is not None:
+            try:
+                if int(c_node_buffer.shape[0]) != int(batches) or int(c_node_buffer.shape[2]) != int(frames):
+                    raise RuntimeError(
+                        f"Shape mismatch for node '{node_name}' audio buffer: "
+                        f"buf.shape={c_node_buffer.shape} vs handle (batches={int(batches)}, frames={int(frames)})"
+                    )
+            except Exception:
+                raise
+
         return NodeInputHandle(
             node=node_name,
             ffi=self.ffi,
@@ -770,7 +805,10 @@ class CffiEdgeRunner:
         """
         if not self._compiled:
             raise RuntimeError("CffiEdgeRunner must be compiled before running the graph")
-        lib = self._ensure_c_kernel()
+        try:
+            lib = self._ensure_c_kernel()
+        except Exception:
+            lib = None
 
         if not self._descriptor_blob:
             raise RuntimeError("Descriptor blob not initialised for C execution")
@@ -784,6 +822,31 @@ class CffiEdgeRunner:
         execution_order = self._plan_names or self._ordered_names
         history_handle = self.ffi.NULL
         history_keepalive: tuple[Any, ...] = ()
+        if lib is None:
+            # No real C kernel available: try lightweight test module which implements
+            # `test_run_graph` to validate handoff. If that is not available, fall
+            # back to Python zero output.
+            try:
+                from .c_kernels_test import get_test_lib
+
+                mod = get_test_lib()
+                if mod is not None:
+                    ffi, tlib = mod
+                    batches = 1
+                    channels = int(getattr(self._graph, "output_channels", 2) or 2)
+                    frames = int(self._frames)
+                    out_count = batches * channels * frames
+                    out_ptr = ffi.new("double[]", out_count)
+                    ctrl = ffi.new("uint8_t[]", control_history_blob)
+                    desc = ffi.new("uint8_t[]", self._descriptor_blob)
+                    tlib.test_run_graph(ctrl, len(control_history_blob), desc, len(self._descriptor_blob), out_ptr, batches, channels, frames)
+                    arr = np.frombuffer(ffi.buffer(out_ptr, out_count * np.dtype(RAW_DTYPE).itemsize), dtype=RAW_DTYPE).copy()
+                    arr = arr.reshape((batches, channels, frames))
+                    return arr
+            except Exception:
+                # Fall through to regular path which will raise if necessary
+                pass
+
         if control_history_blob:
             history_buf = self.ffi.new("uint8_t[]", control_history_blob)
             handle = lib.amp_load_control_history(history_buf, len(control_history_blob), int(self._frames))
@@ -791,6 +854,8 @@ class CffiEdgeRunner:
                 raise RuntimeError("C kernel rejected control history blob")
             history_handle = handle
             history_keepalive = (history_buf,)
+        # Feature gate: verbose per-node logging to help diagnose C/kernel failures.
+        verbose_nodes = os.environ.get("AMP_VERBOSE_NODES", "0") in ("1", "true", "True")
         try:
             for name in execution_order:
                 descriptor = self._descriptor_by_name.get(name)
@@ -817,19 +882,45 @@ class CffiEdgeRunner:
                     state_ptr,
                     history_handle,
                 )
+                if verbose_nodes:
+                    try:
+                        print(f"[CffiEdgeRunner] node='{name}' -> status={status}", flush=True)
+                    except Exception:
+                        pass
+                # Defensive diagnostics: surface unexpected C-kernel failures
+                if status not in (0, -3):
+                    try:
+                        # Best-effort diagnostic to help identify C-side errors
+                        print(f"[CffiEdgeRunner] amp_run_node returned status={status} for node='{name}'", flush=True)
+                        print(f"  descriptor.type={descriptor.type_name} params={descriptor.params_json}", flush=True)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"C kernel failed while executing node '{name}' (status {status})"
+                    )
+
                 if status == -3:
                     node_obj = self._graph._nodes.get(name)
                     if node_obj is None:
                         raise RuntimeError(f"Unknown node '{name}' encountered during fallback execution")
                     audio_in = handle.node_buffer
                     params = handle.params
-                    output = node_obj.process(
-                        int(handle.frames),
-                        float(self._sample_rate),
-                        audio_in,
-                        {},
-                        params,
-                    )
+                    try:
+                        output = node_obj.process(
+                            int(handle.frames),
+                            float(self._sample_rate),
+                            audio_in,
+                            {},
+                            params,
+                        )
+                    except Exception as exc:
+                        print(f"[CffiEdgeRunner] Python fallback for node '{name}' raised: {exc!r}", flush=True)
+                        print(f"  descriptor.type={descriptor.type_name} params={descriptor.params_json}", flush=True)
+                        raise
+                    if output is None:
+                        print(f"[CffiEdgeRunner] Python fallback for node '{name}' returned None", flush=True)
+                        print(f"  descriptor.type={descriptor.type_name} params={descriptor.params_json}", flush=True)
+                        raise RuntimeError(f"Fallback node '{name}' produced no output (None)")
                     array = np.asarray(output, dtype=RAW_DTYPE)
                     batches = array.shape[0]
                     channels = array.shape[1]
@@ -842,6 +933,22 @@ class CffiEdgeRunner:
                     batches = int(handle.batches)
                     channels = int(out_channels[0])
                     frames = int(handle.frames)
+                    # Diagnostic: detect param buffers whose frames differ from the runner frames
+                    try:
+                        if hasattr(handle, "param_names") and handle.param_names:
+                            for p_name, p_buf in zip(handle.param_names, handle.param_buffers):
+                                try:
+                                    # p_buf is a numpy array of shape (B, C, F)
+                                    if p_buf is not None and int(p_buf.shape[2]) != int(handle.frames):
+                                        print(
+                                            f"[CffiEdgeRunner][DIAG] node='{name}' param='{p_name}' buf_frames={int(p_buf.shape[2])} handle_frames={int(handle.frames)}",
+                                            flush=True,
+                                        )
+                                except Exception:
+                                    # best-effort only; do not interrupt normal execution
+                                    pass
+                    except Exception:
+                        pass
                     total = batches * channels * frames
                     if total <= 0:
                         raise RuntimeError(f"Node '{name}' produced an empty buffer")

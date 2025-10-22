@@ -600,6 +600,12 @@ typedef struct {
 } envelope_scratch_t;
 
 static envelope_scratch_t envelope_scratch = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+/* Debug: track last allocation element count for diagnostics. */
+static size_t amp_last_alloc_count = 0;
+
+AMP_CAPI size_t amp_last_alloc_count_get(void) {
+    return amp_last_alloc_count;
+}
 
 /*
  * Edge runner contract (mirrors `_EDGE_RUNNER_CDEF` in Python).
@@ -2514,6 +2520,8 @@ static const double *ensure_param_plane(
         return NULL;
     }
     double *buf = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
+    amp_last_alloc_count = total;
     if (buf == NULL) {
         return NULL;
     }
@@ -2649,6 +2657,7 @@ static int run_constant_node(
     }
     size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -2737,6 +2746,7 @@ static int run_controller_node(
     }
     size_t total = (size_t)batches * (size_t)resolved_channels * (size_t)frames;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -2812,6 +2822,7 @@ static int run_lfo_node(
     }
     size_t total = (size_t)B * (size_t)F;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -2954,6 +2965,7 @@ static int run_envelope_node(
     int send_reset_flag = send_reset_value >= 0.5 ? 1 : 0;
     size_t total = (size_t)B * (size_t)F * 2;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         free(owned_trigger);
         free(owned_gate);
@@ -3089,6 +3101,7 @@ static int run_pitch_node(
     }
     size_t total = (size_t)B * (size_t)F;
     double *freq_target = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (freq_target == NULL) {
         free(owned_input);
         free(owned_root);
@@ -3125,6 +3138,7 @@ static int run_pitch_node(
     free(owned_root);
     free(owned_span);
     double *output = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (output == NULL) {
         free(freq_target);
         return -1;
@@ -3212,6 +3226,7 @@ static int run_subharm_node(
     double a_hp_out = alpha_hp(out_hp, sample_rate);
     size_t total = (size_t)B * (size_t)C * (size_t)F;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -3465,6 +3480,7 @@ static int run_gain_node(
     }
     size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -3794,202 +3810,204 @@ AMP_CAPI void amp_release_state(void *state_ptr) {
 /************************************************************/
 
 static void *_cffi_types[] = {
-/*  0 */ _CFFI_OP(_CFFI_OP_FUNCTION, 24), // EdgeRunnerCompiledPlan *()(unsigned char const *, size_t, unsigned char const *, size_t)
-/*  1 */ _CFFI_OP(_CFFI_OP_POINTER, 193), // unsigned char const *
+/*  0 */ _CFFI_OP(_CFFI_OP_FUNCTION, 26), // EdgeRunnerCompiledPlan *()(unsigned char const *, size_t, unsigned char const *, size_t)
+/*  1 */ _CFFI_OP(_CFFI_OP_POINTER, 195), // unsigned char const *
 /*  2 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28), // size_t
 /*  3 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
 /*  4 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28),
 /*  5 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/*  6 */ _CFFI_OP(_CFFI_OP_FUNCTION, 27), // EdgeRunnerControlHistory *()(unsigned char const *, size_t, int)
+/*  6 */ _CFFI_OP(_CFFI_OP_FUNCTION, 29), // EdgeRunnerControlHistory *()(unsigned char const *, size_t, int)
 /*  7 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
 /*  8 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28),
 /*  9 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7), // int
 /* 10 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
 /* 11 */ _CFFI_OP(_CFFI_OP_FUNCTION, 9), // int()(EdgeRunnerNodeDescriptor const *, EdgeRunnerNodeInputs const *, int, int, int, double, double * *, int *, void * *, EdgeRunnerControlHistory const *)
-/* 12 */ _CFFI_OP(_CFFI_OP_POINTER, 182), // EdgeRunnerNodeDescriptor const *
-/* 13 */ _CFFI_OP(_CFFI_OP_POINTER, 183), // EdgeRunnerNodeInputs const *
+/* 12 */ _CFFI_OP(_CFFI_OP_POINTER, 184), // EdgeRunnerNodeDescriptor const *
+/* 13 */ _CFFI_OP(_CFFI_OP_POINTER, 185), // EdgeRunnerNodeInputs const *
 /* 14 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 15 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 16 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 17 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14), // double
-/* 18 */ _CFFI_OP(_CFFI_OP_POINTER, 30), // double * *
+/* 18 */ _CFFI_OP(_CFFI_OP_POINTER, 32), // double * *
 /* 19 */ _CFFI_OP(_CFFI_OP_POINTER, 9), // int *
-/* 20 */ _CFFI_OP(_CFFI_OP_POINTER, 171), // void * *
-/* 21 */ _CFFI_OP(_CFFI_OP_POINTER, 181), // EdgeRunnerControlHistory const *
+/* 20 */ _CFFI_OP(_CFFI_OP_POINTER, 173), // void * *
+/* 21 */ _CFFI_OP(_CFFI_OP_POINTER, 183), // EdgeRunnerControlHistory const *
 /* 22 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 23 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(EdgeRunnerCompiledPlan *)
-/* 24 */ _CFFI_OP(_CFFI_OP_POINTER, 178), // EdgeRunnerCompiledPlan *
-/* 25 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 26 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(EdgeRunnerControlHistory *)
-/* 27 */ _CFFI_OP(_CFFI_OP_POINTER, 181), // EdgeRunnerControlHistory *
-/* 28 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 29 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double *)
-/* 30 */ _CFFI_OP(_CFFI_OP_POINTER, 17), // double *
-/* 31 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 32 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, double *, double const *)
-/* 33 */ _CFFI_OP(_CFFI_OP_POINTER, 17), // double const *
-/* 34 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 35 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 36 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 37 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 38 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 39 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 40 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, double, double, double *)
-/* 41 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 42 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 43 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 44 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 45 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 46 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 47 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 48 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 49 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, int, double, double *)
-/* 50 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 51 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 52 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 53 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 23 */ _CFFI_OP(_CFFI_OP_FUNCTION, 2), // size_t()(void)
+/* 24 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 25 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(EdgeRunnerCompiledPlan *)
+/* 26 */ _CFFI_OP(_CFFI_OP_POINTER, 180), // EdgeRunnerCompiledPlan *
+/* 27 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 28 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(EdgeRunnerControlHistory *)
+/* 29 */ _CFFI_OP(_CFFI_OP_POINTER, 183), // EdgeRunnerControlHistory *
+/* 30 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 31 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double *)
+/* 32 */ _CFFI_OP(_CFFI_OP_POINTER, 17), // double *
+/* 33 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 34 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double *, int, int, double *, double const *)
+/* 35 */ _CFFI_OP(_CFFI_OP_POINTER, 17), // double const *
+/* 36 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 37 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 38 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 39 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 40 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 41 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 42 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double *, int, int, double, double, double *)
+/* 43 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 44 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 45 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 46 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 47 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 48 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 49 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 50 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 51 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double *, int, int, int, double, double *)
+/* 52 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 53 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
 /* 54 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 55 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 56 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 57 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 58 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, int, double, double *, double *)
-/* 59 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 60 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 61 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 62 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 55 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 56 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 57 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 58 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 59 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 60 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double *, int, int, int, double, double *, double *)
+/* 61 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 62 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
 /* 63 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 64 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 65 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 66 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 67 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 68 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double *, int, int, int, double, double, double, int, double, double, double, double, double, double, double *, double *, double *, int8_t *, int8_t *, int8_t *, int32_t *, double *, double *, double *, double *, double *)
-/* 69 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 70 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 71 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 72 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 64 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 65 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 66 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 67 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 68 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 69 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 70 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double *, int, int, int, double, double, double, int, double, double, double, double, double, double, double *, double *, double *, int8_t *, int8_t *, int8_t *, int32_t *, double *, double *, double *, double *, double *)
+/* 71 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 72 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
 /* 73 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 74 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 75 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 74 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 75 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 76 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 77 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 77 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
 /* 78 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 79 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 79 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 80 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
 /* 81 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
 /* 82 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
 /* 83 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 84 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 85 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 86 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 87 */ _CFFI_OP(_CFFI_OP_POINTER, 192), // int8_t *
-/* 88 */ _CFFI_OP(_CFFI_OP_NOOP, 87),
-/* 89 */ _CFFI_OP(_CFFI_OP_NOOP, 87),
-/* 90 */ _CFFI_OP(_CFFI_OP_POINTER, 190), // int32_t *
-/* 91 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 92 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 93 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 94 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 95 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 96 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 97 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double *, int)
-/* 98 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 99 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 100 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 101 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 102 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 103 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double *, int, int)
-/* 104 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 105 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 106 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 107 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 108 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 109 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 110 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double *, int, int, double *)
-/* 111 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 112 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 113 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 114 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 115 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 116 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 117 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 118 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double const *, double const *, int, int, int, double *, double *)
-/* 119 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 120 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 121 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 122 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 123 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 124 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 84 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 85 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 86 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 87 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 88 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 89 */ _CFFI_OP(_CFFI_OP_POINTER, 194), // int8_t *
+/* 90 */ _CFFI_OP(_CFFI_OP_NOOP, 89),
+/* 91 */ _CFFI_OP(_CFFI_OP_NOOP, 89),
+/* 92 */ _CFFI_OP(_CFFI_OP_POINTER, 192), // int32_t *
+/* 93 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 94 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 95 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 96 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 97 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 98 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 99 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double const *, double *, int)
+/* 100 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 101 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 102 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 103 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 104 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 105 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double const *, double *, int, int)
+/* 106 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 107 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 108 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 109 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 110 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 111 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 112 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double const *, double *, int, int, double *)
+/* 113 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 114 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 115 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 116 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 117 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 118 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 119 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 120 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double const *, double const *, double const *, int, int, int, double *, double *)
+/* 121 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 122 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 123 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 124 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
 /* 125 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 126 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 127 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 128 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 129 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double const *, double const *, int, int, int, int, int, int, int, double, int, int *, double *, double *, double *, int64_t *, double *, double *, double *)
-/* 130 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 131 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 132 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 133 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 134 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 135 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 126 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 127 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 128 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 129 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 130 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 131 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double const *, double const *, double const *, int, int, int, int, int, int, int, double, int, int *, double *, double *, double *, int64_t *, double *, double *, double *)
+/* 132 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 133 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 134 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 135 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
 /* 136 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 137 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 138 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 139 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 140 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 141 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 141 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
 /* 142 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 143 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
-/* 144 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 145 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 146 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 147 */ _CFFI_OP(_CFFI_OP_POINTER, 191), // int64_t *
-/* 148 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 149 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 150 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 151 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 152 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, double const *, double, double *, int, int)
-/* 153 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 154 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 155 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
-/* 156 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
-/* 157 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 158 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 159 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 160 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(double const *, int, double *, int, int, int *, int *, int)
-/* 161 */ _CFFI_OP(_CFFI_OP_NOOP, 33),
-/* 162 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 163 */ _CFFI_OP(_CFFI_OP_NOOP, 30),
+/* 143 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 144 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 145 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
+/* 146 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 147 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 148 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 149 */ _CFFI_OP(_CFFI_OP_POINTER, 193), // int64_t *
+/* 150 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 151 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 152 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 153 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 154 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, double const *, double, double *, int, int)
+/* 155 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 156 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
+/* 157 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14),
+/* 158 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 159 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 160 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 161 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 162 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(double const *, int, double *, int, int, int *, int *, int)
+/* 163 */ _CFFI_OP(_CFFI_OP_NOOP, 35),
 /* 164 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 165 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 166 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
-/* 167 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
-/* 168 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
-/* 169 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 170 */ _CFFI_OP(_CFFI_OP_FUNCTION, 195), // void()(void *)
-/* 171 */ _CFFI_OP(_CFFI_OP_POINTER, 195), // void *
-/* 172 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
-/* 173 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 0), // EdgeRunnerAudioView
-/* 174 */ _CFFI_OP(_CFFI_OP_POINTER, 175), // EdgeRunnerCompiledNode *
-/* 175 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 1), // EdgeRunnerCompiledNode
-/* 176 */ _CFFI_OP(_CFFI_OP_POINTER, 177), // EdgeRunnerCompiledParam *
-/* 177 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 2), // EdgeRunnerCompiledParam
-/* 178 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 3), // EdgeRunnerCompiledPlan
-/* 179 */ _CFFI_OP(_CFFI_OP_POINTER, 180), // EdgeRunnerControlCurve *
-/* 180 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 4), // EdgeRunnerControlCurve
-/* 181 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 5), // EdgeRunnerControlHistory
-/* 182 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 6), // EdgeRunnerNodeDescriptor
-/* 183 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 7), // EdgeRunnerNodeInputs
-/* 184 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 8), // EdgeRunnerParamSet
-/* 185 */ _CFFI_OP(_CFFI_OP_POINTER, 186), // EdgeRunnerParamView *
-/* 186 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 9), // EdgeRunnerParamView
-/* 187 */ _CFFI_OP(_CFFI_OP_POINTER, 189), // char *
-/* 188 */ _CFFI_OP(_CFFI_OP_POINTER, 189), // char const *
-/* 189 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 2), // char
-/* 190 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 21), // int32_t
-/* 191 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 23), // int64_t
-/* 192 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 17), // int8_t
-/* 193 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 4), // unsigned char
-/* 194 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8), // unsigned int
-/* 195 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 0), // void
+/* 165 */ _CFFI_OP(_CFFI_OP_NOOP, 32),
+/* 166 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 167 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 168 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
+/* 169 */ _CFFI_OP(_CFFI_OP_NOOP, 19),
+/* 170 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 171 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 172 */ _CFFI_OP(_CFFI_OP_FUNCTION, 197), // void()(void *)
+/* 173 */ _CFFI_OP(_CFFI_OP_POINTER, 197), // void *
+/* 174 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 175 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 0), // EdgeRunnerAudioView
+/* 176 */ _CFFI_OP(_CFFI_OP_POINTER, 177), // EdgeRunnerCompiledNode *
+/* 177 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 1), // EdgeRunnerCompiledNode
+/* 178 */ _CFFI_OP(_CFFI_OP_POINTER, 179), // EdgeRunnerCompiledParam *
+/* 179 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 2), // EdgeRunnerCompiledParam
+/* 180 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 3), // EdgeRunnerCompiledPlan
+/* 181 */ _CFFI_OP(_CFFI_OP_POINTER, 182), // EdgeRunnerControlCurve *
+/* 182 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 4), // EdgeRunnerControlCurve
+/* 183 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 5), // EdgeRunnerControlHistory
+/* 184 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 6), // EdgeRunnerNodeDescriptor
+/* 185 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 7), // EdgeRunnerNodeInputs
+/* 186 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 8), // EdgeRunnerParamSet
+/* 187 */ _CFFI_OP(_CFFI_OP_POINTER, 188), // EdgeRunnerParamView *
+/* 188 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 9), // EdgeRunnerParamView
+/* 189 */ _CFFI_OP(_CFFI_OP_POINTER, 191), // char *
+/* 190 */ _CFFI_OP(_CFFI_OP_POINTER, 191), // char const *
+/* 191 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 2), // char
+/* 192 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 21), // int32_t
+/* 193 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 23), // int64_t
+/* 194 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 17), // int8_t
+/* 195 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 4), // unsigned char
+/* 196 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8), // unsigned int
+/* 197 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 0), // void
 };
 
 _CFFI_UNUSED_FN
@@ -4127,10 +4145,10 @@ _cffi_f_amp_free(PyObject *self, PyObject *arg0)
   struct _cffi_freeme_s *large_args_free = NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg0, (char **)&x0);
+      _cffi_type(32), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4148,6 +4166,32 @@ _cffi_f_amp_free(PyObject *self, PyObject *arg0)
 }
 #else
 #  define _cffi_f_amp_free _cffi_d_amp_free
+#endif
+
+static size_t _cffi_d_amp_last_alloc_count_get(void)
+{
+  return amp_last_alloc_count_get();
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_last_alloc_count_get(PyObject *self, PyObject *noarg)
+{
+  size_t result;
+  PyObject *pyresult;
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_last_alloc_count_get(); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  (void)noarg; /* unused */
+  pyresult = _cffi_from_c_int(result, size_t);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_last_alloc_count_get _cffi_d_amp_last_alloc_count_get
 #endif
 
 static EdgeRunnerCompiledPlan * _cffi_d_amp_load_compiled_plan(unsigned char const * x0, size_t x1, unsigned char const * x2, size_t x3)
@@ -4207,7 +4251,7 @@ _cffi_f_amp_load_compiled_plan(PyObject *self, PyObject *args)
   Py_END_ALLOW_THREADS
 
   (void)self; /* unused */
-  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(24));
+  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(26));
   if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
   return pyresult;
 }
@@ -4261,7 +4305,7 @@ _cffi_f_amp_load_control_history(PyObject *self, PyObject *args)
   Py_END_ALLOW_THREADS
 
   (void)self; /* unused */
-  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(27));
+  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(29));
   if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
   return pyresult;
 }
@@ -4282,10 +4326,10 @@ _cffi_f_amp_release_compiled_plan(PyObject *self, PyObject *arg0)
   struct _cffi_freeme_s *large_args_free = NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(24), arg0, (char **)&x0);
+      _cffi_type(26), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (EdgeRunnerCompiledPlan *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(24), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(26), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4318,10 +4362,10 @@ _cffi_f_amp_release_control_history(PyObject *self, PyObject *arg0)
   struct _cffi_freeme_s *large_args_free = NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(27), arg0, (char **)&x0);
+      _cffi_type(29), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (EdgeRunnerControlHistory *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(27), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(29), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4354,10 +4398,10 @@ _cffi_f_amp_release_state(PyObject *self, PyObject *arg0)
   struct _cffi_freeme_s *large_args_free = NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(171), arg0, (char **)&x0);
+      _cffi_type(173), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (void *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(171), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(173), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4529,10 +4573,10 @@ _cffi_f_arp_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4542,10 +4586,10 @@ _cffi_f_arp_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg2, (char **)&x2);
+      _cffi_type(32), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4624,19 +4668,19 @@ _cffi_f_dc_block(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg1, (char **)&x1);
+      _cffi_type(32), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4658,10 +4702,10 @@ _cffi_f_dc_block(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg6, (char **)&x6);
+      _cffi_type(32), arg6, (char **)&x6);
   if (datasize != 0) {
     x6 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg6, (char **)&x6,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg6, (char **)&x6,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4738,37 +4782,37 @@ _cffi_f_envelope_process(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg1, (char **)&x1);
+      _cffi_type(35), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg2, (char **)&x2);
+      _cffi_type(35), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg3, (char **)&x3);
+      _cffi_type(35), arg3, (char **)&x3);
   if (datasize != 0) {
     x3 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg3, (char **)&x3,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg3, (char **)&x3,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4819,64 +4863,64 @@ _cffi_f_envelope_process(PyObject *self, PyObject *args)
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg14, (char **)&x14);
+      _cffi_type(32), arg14, (char **)&x14);
   if (datasize != 0) {
     x14 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg14, (char **)&x14,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg14, (char **)&x14,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg15, (char **)&x15);
+      _cffi_type(32), arg15, (char **)&x15);
   if (datasize != 0) {
     x15 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg15, (char **)&x15,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg15, (char **)&x15,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg16, (char **)&x16);
+      _cffi_type(32), arg16, (char **)&x16);
   if (datasize != 0) {
     x16 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg16, (char **)&x16,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg16, (char **)&x16,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(147), arg17, (char **)&x17);
+      _cffi_type(149), arg17, (char **)&x17);
   if (datasize != 0) {
     x17 = ((size_t)datasize) <= 640 ? (int64_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(147), arg17, (char **)&x17,
+    if (_cffi_convert_array_argument(_cffi_type(149), arg17, (char **)&x17,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg18, (char **)&x18);
+      _cffi_type(32), arg18, (char **)&x18);
   if (datasize != 0) {
     x18 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg18, (char **)&x18,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg18, (char **)&x18,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg19, (char **)&x19);
+      _cffi_type(32), arg19, (char **)&x19);
   if (datasize != 0) {
     x19 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg19, (char **)&x19,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg19, (char **)&x19,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg20, (char **)&x20);
+      _cffi_type(32), arg20, (char **)&x20);
   if (datasize != 0) {
     x20 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg20, (char **)&x20,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg20, (char **)&x20,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4925,19 +4969,19 @@ _cffi_f_lfo_slew(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg1, (char **)&x1);
+      _cffi_type(32), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -4959,10 +5003,10 @@ _cffi_f_lfo_slew(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg6, (char **)&x6);
+      _cffi_type(32), arg6, (char **)&x6);
   if (datasize != 0) {
     x6 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg6, (char **)&x6,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg6, (char **)&x6,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5007,28 +5051,28 @@ _cffi_f_osc_saw_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg1, (char **)&x1);
+      _cffi_type(35), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg2, (char **)&x2);
+      _cffi_type(32), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5083,19 +5127,19 @@ _cffi_f_osc_square_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg1, (char **)&x1);
+      _cffi_type(35), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5105,10 +5149,10 @@ _cffi_f_osc_square_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg3, (char **)&x3);
+      _cffi_type(32), arg3, (char **)&x3);
   if (datasize != 0) {
     x3 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg3, (char **)&x3,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg3, (char **)&x3,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5163,28 +5207,28 @@ _cffi_f_osc_triangle_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg1, (char **)&x1);
+      _cffi_type(35), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg2, (char **)&x2);
+      _cffi_type(32), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5198,10 +5242,10 @@ _cffi_f_osc_triangle_blep_c(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg5, (char **)&x5);
+      _cffi_type(32), arg5, (char **)&x5);
   if (datasize != 0) {
     x5 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg5, (char **)&x5,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg5, (char **)&x5,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5248,19 +5292,19 @@ _cffi_f_phase_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg1, (char **)&x1);
+      _cffi_type(32), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5274,19 +5318,19 @@ _cffi_f_phase_advance(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg4, (char **)&x4);
+      _cffi_type(32), arg4, (char **)&x4);
   if (datasize != 0) {
     x4 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg4, (char **)&x4,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg4, (char **)&x4,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg5, (char **)&x5);
+      _cffi_type(35), arg5, (char **)&x5);
   if (datasize != 0) {
     x5 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg5, (char **)&x5,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg5, (char **)&x5,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5329,28 +5373,28 @@ _cffi_f_polyblep_arr(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg1, (char **)&x1);
+      _cffi_type(35), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg2, (char **)&x2);
+      _cffi_type(32), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5407,37 +5451,37 @@ _cffi_f_portamento_smooth(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg1, (char **)&x1);
+      _cffi_type(35), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg2, (char **)&x2);
+      _cffi_type(35), arg2, (char **)&x2);
   if (datasize != 0) {
     x2 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg2, (char **)&x2,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg2, (char **)&x2,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg3, (char **)&x3);
+      _cffi_type(35), arg3, (char **)&x3);
   if (datasize != 0) {
     x3 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg3, (char **)&x3,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg3, (char **)&x3,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5455,19 +5499,19 @@ _cffi_f_portamento_smooth(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg7, (char **)&x7);
+      _cffi_type(32), arg7, (char **)&x7);
   if (datasize != 0) {
     x7 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg7, (char **)&x7,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg7, (char **)&x7,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg8, (char **)&x8);
+      _cffi_type(32), arg8, (char **)&x8);
   if (datasize != 0) {
     x8 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg8, (char **)&x8,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg8, (char **)&x8,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5518,19 +5562,19 @@ _cffi_f_safety_filter(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg1, (char **)&x1);
+      _cffi_type(32), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5552,19 +5596,19 @@ _cffi_f_safety_filter(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg6, (char **)&x6);
+      _cffi_type(32), arg6, (char **)&x6);
   if (datasize != 0) {
     x6 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg6, (char **)&x6,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg6, (char **)&x6,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg7, (char **)&x7);
+      _cffi_type(32), arg7, (char **)&x7);
   if (datasize != 0) {
     x7 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg7, (char **)&x7,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg7, (char **)&x7,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5653,19 +5697,19 @@ _cffi_f_subharmonic_process(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(33), arg0, (char **)&x0);
+      _cffi_type(35), arg0, (char **)&x0);
   if (datasize != 0) {
     x0 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(33), arg0, (char **)&x0,
+    if (_cffi_convert_array_argument(_cffi_type(35), arg0, (char **)&x0,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg1, (char **)&x1);
+      _cffi_type(32), arg1, (char **)&x1);
   if (datasize != 0) {
     x1 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg1, (char **)&x1,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg1, (char **)&x1,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5723,109 +5767,109 @@ _cffi_f_subharmonic_process(PyObject *self, PyObject *args)
     return NULL;
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg15, (char **)&x15);
+      _cffi_type(32), arg15, (char **)&x15);
   if (datasize != 0) {
     x15 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg15, (char **)&x15,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg15, (char **)&x15,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg16, (char **)&x16);
+      _cffi_type(32), arg16, (char **)&x16);
   if (datasize != 0) {
     x16 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg16, (char **)&x16,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg16, (char **)&x16,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg17, (char **)&x17);
+      _cffi_type(32), arg17, (char **)&x17);
   if (datasize != 0) {
     x17 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg17, (char **)&x17,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg17, (char **)&x17,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(87), arg18, (char **)&x18);
+      _cffi_type(89), arg18, (char **)&x18);
   if (datasize != 0) {
     x18 = ((size_t)datasize) <= 640 ? (int8_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(87), arg18, (char **)&x18,
+    if (_cffi_convert_array_argument(_cffi_type(89), arg18, (char **)&x18,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(87), arg19, (char **)&x19);
+      _cffi_type(89), arg19, (char **)&x19);
   if (datasize != 0) {
     x19 = ((size_t)datasize) <= 640 ? (int8_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(87), arg19, (char **)&x19,
+    if (_cffi_convert_array_argument(_cffi_type(89), arg19, (char **)&x19,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(87), arg20, (char **)&x20);
+      _cffi_type(89), arg20, (char **)&x20);
   if (datasize != 0) {
     x20 = ((size_t)datasize) <= 640 ? (int8_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(87), arg20, (char **)&x20,
+    if (_cffi_convert_array_argument(_cffi_type(89), arg20, (char **)&x20,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(90), arg21, (char **)&x21);
+      _cffi_type(92), arg21, (char **)&x21);
   if (datasize != 0) {
     x21 = ((size_t)datasize) <= 640 ? (int32_t *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(90), arg21, (char **)&x21,
+    if (_cffi_convert_array_argument(_cffi_type(92), arg21, (char **)&x21,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg22, (char **)&x22);
+      _cffi_type(32), arg22, (char **)&x22);
   if (datasize != 0) {
     x22 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg22, (char **)&x22,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg22, (char **)&x22,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg23, (char **)&x23);
+      _cffi_type(32), arg23, (char **)&x23);
   if (datasize != 0) {
     x23 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg23, (char **)&x23,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg23, (char **)&x23,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg24, (char **)&x24);
+      _cffi_type(32), arg24, (char **)&x24);
   if (datasize != 0) {
     x24 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg24, (char **)&x24,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg24, (char **)&x24,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg25, (char **)&x25);
+      _cffi_type(32), arg25, (char **)&x25);
   if (datasize != 0) {
     x25 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg25, (char **)&x25,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg25, (char **)&x25,
             datasize, &large_args_free) < 0)
       return NULL;
   }
 
   datasize = _cffi_prepare_pointer_call_argument(
-      _cffi_type(30), arg26, (char **)&x26);
+      _cffi_type(32), arg26, (char **)&x26);
   if (datasize != 0) {
     x26 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
-    if (_cffi_convert_array_argument(_cffi_type(30), arg26, (char **)&x26,
+    if (_cffi_convert_array_argument(_cffi_type(32), arg26, (char **)&x26,
             datasize, &large_args_free) < 0)
       return NULL;
   }
@@ -5846,192 +5890,193 @@ _cffi_f_subharmonic_process(PyObject *self, PyObject *args)
 #endif
 
 static const struct _cffi_global_s _cffi_globals[] = {
-  { "amp_free", (void *)_cffi_f_amp_free, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 29), (void *)_cffi_d_amp_free },
+  { "amp_free", (void *)_cffi_f_amp_free, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 31), (void *)_cffi_d_amp_free },
+  { "amp_last_alloc_count_get", (void *)_cffi_f_amp_last_alloc_count_get, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_N, 23), (void *)_cffi_d_amp_last_alloc_count_get },
   { "amp_load_compiled_plan", (void *)_cffi_f_amp_load_compiled_plan, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 0), (void *)_cffi_d_amp_load_compiled_plan },
   { "amp_load_control_history", (void *)_cffi_f_amp_load_control_history, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 6), (void *)_cffi_d_amp_load_control_history },
-  { "amp_release_compiled_plan", (void *)_cffi_f_amp_release_compiled_plan, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 23), (void *)_cffi_d_amp_release_compiled_plan },
-  { "amp_release_control_history", (void *)_cffi_f_amp_release_control_history, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 26), (void *)_cffi_d_amp_release_control_history },
-  { "amp_release_state", (void *)_cffi_f_amp_release_state, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 170), (void *)_cffi_d_amp_release_state },
+  { "amp_release_compiled_plan", (void *)_cffi_f_amp_release_compiled_plan, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 25), (void *)_cffi_d_amp_release_compiled_plan },
+  { "amp_release_control_history", (void *)_cffi_f_amp_release_control_history, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 28), (void *)_cffi_d_amp_release_control_history },
+  { "amp_release_state", (void *)_cffi_f_amp_release_state, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 172), (void *)_cffi_d_amp_release_state },
   { "amp_run_node", (void *)_cffi_f_amp_run_node, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 11), (void *)_cffi_d_amp_run_node },
-  { "arp_advance", (void *)_cffi_f_arp_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 160), (void *)_cffi_d_arp_advance },
-  { "dc_block", (void *)_cffi_f_dc_block, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 49), (void *)_cffi_d_dc_block },
-  { "envelope_process", (void *)_cffi_f_envelope_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 129), (void *)_cffi_d_envelope_process },
-  { "lfo_slew", (void *)_cffi_f_lfo_slew, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 40), (void *)_cffi_d_lfo_slew },
-  { "osc_saw_blep_c", (void *)_cffi_f_osc_saw_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 103), (void *)_cffi_d_osc_saw_blep_c },
-  { "osc_square_blep_c", (void *)_cffi_f_osc_square_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 152), (void *)_cffi_d_osc_square_blep_c },
-  { "osc_triangle_blep_c", (void *)_cffi_f_osc_triangle_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 110), (void *)_cffi_d_osc_triangle_blep_c },
-  { "phase_advance", (void *)_cffi_f_phase_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 32), (void *)_cffi_d_phase_advance },
-  { "polyblep_arr", (void *)_cffi_f_polyblep_arr, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 97), (void *)_cffi_d_polyblep_arr },
-  { "portamento_smooth", (void *)_cffi_f_portamento_smooth, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 118), (void *)_cffi_d_portamento_smooth },
-  { "safety_filter", (void *)_cffi_f_safety_filter, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 58), (void *)_cffi_d_safety_filter },
-  { "subharmonic_process", (void *)_cffi_f_subharmonic_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 68), (void *)_cffi_d_subharmonic_process },
+  { "arp_advance", (void *)_cffi_f_arp_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 162), (void *)_cffi_d_arp_advance },
+  { "dc_block", (void *)_cffi_f_dc_block, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 51), (void *)_cffi_d_dc_block },
+  { "envelope_process", (void *)_cffi_f_envelope_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 131), (void *)_cffi_d_envelope_process },
+  { "lfo_slew", (void *)_cffi_f_lfo_slew, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 42), (void *)_cffi_d_lfo_slew },
+  { "osc_saw_blep_c", (void *)_cffi_f_osc_saw_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 105), (void *)_cffi_d_osc_saw_blep_c },
+  { "osc_square_blep_c", (void *)_cffi_f_osc_square_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 154), (void *)_cffi_d_osc_square_blep_c },
+  { "osc_triangle_blep_c", (void *)_cffi_f_osc_triangle_blep_c, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 112), (void *)_cffi_d_osc_triangle_blep_c },
+  { "phase_advance", (void *)_cffi_f_phase_advance, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 34), (void *)_cffi_d_phase_advance },
+  { "polyblep_arr", (void *)_cffi_f_polyblep_arr, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 99), (void *)_cffi_d_polyblep_arr },
+  { "portamento_smooth", (void *)_cffi_f_portamento_smooth, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 120), (void *)_cffi_d_portamento_smooth },
+  { "safety_filter", (void *)_cffi_f_safety_filter, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 60), (void *)_cffi_d_safety_filter },
+  { "subharmonic_process", (void *)_cffi_f_subharmonic_process, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 70), (void *)_cffi_d_subharmonic_process },
 };
 
 static const struct _cffi_field_s _cffi_fields[] = {
   { "has_audio", offsetof(EdgeRunnerAudioView, has_audio),
                  sizeof(((EdgeRunnerAudioView *)0)->has_audio),
-                 _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                 _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "batches", offsetof(EdgeRunnerAudioView, batches),
                sizeof(((EdgeRunnerAudioView *)0)->batches),
-               _CFFI_OP(_CFFI_OP_NOOP, 194) },
+               _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "channels", offsetof(EdgeRunnerAudioView, channels),
                 sizeof(((EdgeRunnerAudioView *)0)->channels),
-                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "frames", offsetof(EdgeRunnerAudioView, frames),
               sizeof(((EdgeRunnerAudioView *)0)->frames),
-              _CFFI_OP(_CFFI_OP_NOOP, 194) },
+              _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "data", offsetof(EdgeRunnerAudioView, data),
             sizeof(((EdgeRunnerAudioView *)0)->data),
-            _CFFI_OP(_CFFI_OP_NOOP, 33) },
+            _CFFI_OP(_CFFI_OP_NOOP, 35) },
   { "name", offsetof(EdgeRunnerCompiledNode, name),
             sizeof(((EdgeRunnerCompiledNode *)0)->name),
-            _CFFI_OP(_CFFI_OP_NOOP, 187) },
+            _CFFI_OP(_CFFI_OP_NOOP, 189) },
   { "name_len", offsetof(EdgeRunnerCompiledNode, name_len),
                 sizeof(((EdgeRunnerCompiledNode *)0)->name_len),
-                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "function_id", offsetof(EdgeRunnerCompiledNode, function_id),
                    sizeof(((EdgeRunnerCompiledNode *)0)->function_id),
-                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                   _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "audio_offset", offsetof(EdgeRunnerCompiledNode, audio_offset),
                     sizeof(((EdgeRunnerCompiledNode *)0)->audio_offset),
-                    _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                    _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "audio_span", offsetof(EdgeRunnerCompiledNode, audio_span),
                   sizeof(((EdgeRunnerCompiledNode *)0)->audio_span),
-                  _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                  _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "param_count", offsetof(EdgeRunnerCompiledNode, param_count),
                    sizeof(((EdgeRunnerCompiledNode *)0)->param_count),
-                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                   _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "params", offsetof(EdgeRunnerCompiledNode, params),
               sizeof(((EdgeRunnerCompiledNode *)0)->params),
-              _CFFI_OP(_CFFI_OP_NOOP, 176) },
+              _CFFI_OP(_CFFI_OP_NOOP, 178) },
   { "name", offsetof(EdgeRunnerCompiledParam, name),
             sizeof(((EdgeRunnerCompiledParam *)0)->name),
-            _CFFI_OP(_CFFI_OP_NOOP, 187) },
+            _CFFI_OP(_CFFI_OP_NOOP, 189) },
   { "name_len", offsetof(EdgeRunnerCompiledParam, name_len),
                 sizeof(((EdgeRunnerCompiledParam *)0)->name_len),
-                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "offset", offsetof(EdgeRunnerCompiledParam, offset),
               sizeof(((EdgeRunnerCompiledParam *)0)->offset),
-              _CFFI_OP(_CFFI_OP_NOOP, 194) },
+              _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "span", offsetof(EdgeRunnerCompiledParam, span),
             sizeof(((EdgeRunnerCompiledParam *)0)->span),
-            _CFFI_OP(_CFFI_OP_NOOP, 194) },
+            _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "version", offsetof(EdgeRunnerCompiledPlan, version),
                sizeof(((EdgeRunnerCompiledPlan *)0)->version),
-               _CFFI_OP(_CFFI_OP_NOOP, 194) },
+               _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "node_count", offsetof(EdgeRunnerCompiledPlan, node_count),
                   sizeof(((EdgeRunnerCompiledPlan *)0)->node_count),
-                  _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                  _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "nodes", offsetof(EdgeRunnerCompiledPlan, nodes),
              sizeof(((EdgeRunnerCompiledPlan *)0)->nodes),
-             _CFFI_OP(_CFFI_OP_NOOP, 174) },
+             _CFFI_OP(_CFFI_OP_NOOP, 176) },
   { "name", offsetof(EdgeRunnerControlCurve, name),
             sizeof(((EdgeRunnerControlCurve *)0)->name),
-            _CFFI_OP(_CFFI_OP_NOOP, 187) },
+            _CFFI_OP(_CFFI_OP_NOOP, 189) },
   { "name_len", offsetof(EdgeRunnerControlCurve, name_len),
                 sizeof(((EdgeRunnerControlCurve *)0)->name_len),
-                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "values", offsetof(EdgeRunnerControlCurve, values),
               sizeof(((EdgeRunnerControlCurve *)0)->values),
-              _CFFI_OP(_CFFI_OP_NOOP, 30) },
+              _CFFI_OP(_CFFI_OP_NOOP, 32) },
   { "value_count", offsetof(EdgeRunnerControlCurve, value_count),
                    sizeof(((EdgeRunnerControlCurve *)0)->value_count),
-                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                   _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "timestamp", offsetof(EdgeRunnerControlCurve, timestamp),
                  sizeof(((EdgeRunnerControlCurve *)0)->timestamp),
                  _CFFI_OP(_CFFI_OP_NOOP, 17) },
   { "frames_hint", offsetof(EdgeRunnerControlHistory, frames_hint),
                    sizeof(((EdgeRunnerControlHistory *)0)->frames_hint),
-                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                   _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "curve_count", offsetof(EdgeRunnerControlHistory, curve_count),
                    sizeof(((EdgeRunnerControlHistory *)0)->curve_count),
-                   _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                   _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "curves", offsetof(EdgeRunnerControlHistory, curves),
               sizeof(((EdgeRunnerControlHistory *)0)->curves),
-              _CFFI_OP(_CFFI_OP_NOOP, 179) },
+              _CFFI_OP(_CFFI_OP_NOOP, 181) },
   { "name", offsetof(EdgeRunnerNodeDescriptor, name),
             sizeof(((EdgeRunnerNodeDescriptor *)0)->name),
-            _CFFI_OP(_CFFI_OP_NOOP, 188) },
+            _CFFI_OP(_CFFI_OP_NOOP, 190) },
   { "name_len", offsetof(EdgeRunnerNodeDescriptor, name_len),
                 sizeof(((EdgeRunnerNodeDescriptor *)0)->name_len),
                 _CFFI_OP(_CFFI_OP_NOOP, 2) },
   { "type_name", offsetof(EdgeRunnerNodeDescriptor, type_name),
                  sizeof(((EdgeRunnerNodeDescriptor *)0)->type_name),
-                 _CFFI_OP(_CFFI_OP_NOOP, 188) },
+                 _CFFI_OP(_CFFI_OP_NOOP, 190) },
   { "type_len", offsetof(EdgeRunnerNodeDescriptor, type_len),
                 sizeof(((EdgeRunnerNodeDescriptor *)0)->type_len),
                 _CFFI_OP(_CFFI_OP_NOOP, 2) },
   { "params_json", offsetof(EdgeRunnerNodeDescriptor, params_json),
                    sizeof(((EdgeRunnerNodeDescriptor *)0)->params_json),
-                   _CFFI_OP(_CFFI_OP_NOOP, 188) },
+                   _CFFI_OP(_CFFI_OP_NOOP, 190) },
   { "params_len", offsetof(EdgeRunnerNodeDescriptor, params_len),
                   sizeof(((EdgeRunnerNodeDescriptor *)0)->params_len),
                   _CFFI_OP(_CFFI_OP_NOOP, 2) },
   { "audio", offsetof(EdgeRunnerNodeInputs, audio),
              sizeof(((EdgeRunnerNodeInputs *)0)->audio),
-             _CFFI_OP(_CFFI_OP_NOOP, 173) },
+             _CFFI_OP(_CFFI_OP_NOOP, 175) },
   { "params", offsetof(EdgeRunnerNodeInputs, params),
               sizeof(((EdgeRunnerNodeInputs *)0)->params),
-              _CFFI_OP(_CFFI_OP_NOOP, 184) },
+              _CFFI_OP(_CFFI_OP_NOOP, 186) },
   { "count", offsetof(EdgeRunnerParamSet, count),
              sizeof(((EdgeRunnerParamSet *)0)->count),
-             _CFFI_OP(_CFFI_OP_NOOP, 194) },
+             _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "items", offsetof(EdgeRunnerParamSet, items),
              sizeof(((EdgeRunnerParamSet *)0)->items),
-             _CFFI_OP(_CFFI_OP_NOOP, 185) },
+             _CFFI_OP(_CFFI_OP_NOOP, 187) },
   { "name", offsetof(EdgeRunnerParamView, name),
             sizeof(((EdgeRunnerParamView *)0)->name),
-            _CFFI_OP(_CFFI_OP_NOOP, 188) },
+            _CFFI_OP(_CFFI_OP_NOOP, 190) },
   { "batches", offsetof(EdgeRunnerParamView, batches),
                sizeof(((EdgeRunnerParamView *)0)->batches),
-               _CFFI_OP(_CFFI_OP_NOOP, 194) },
+               _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "channels", offsetof(EdgeRunnerParamView, channels),
                 sizeof(((EdgeRunnerParamView *)0)->channels),
-                _CFFI_OP(_CFFI_OP_NOOP, 194) },
+                _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "frames", offsetof(EdgeRunnerParamView, frames),
               sizeof(((EdgeRunnerParamView *)0)->frames),
-              _CFFI_OP(_CFFI_OP_NOOP, 194) },
+              _CFFI_OP(_CFFI_OP_NOOP, 196) },
   { "data", offsetof(EdgeRunnerParamView, data),
             sizeof(((EdgeRunnerParamView *)0)->data),
-            _CFFI_OP(_CFFI_OP_NOOP, 33) },
+            _CFFI_OP(_CFFI_OP_NOOP, 35) },
 };
 
 static const struct _cffi_struct_union_s _cffi_struct_unions[] = {
-  { "$EdgeRunnerAudioView", 173, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerAudioView", 175, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerAudioView), offsetof(struct _cffi_align_typedef_EdgeRunnerAudioView, y), 0, 5 },
-  { "$EdgeRunnerCompiledNode", 175, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerCompiledNode", 177, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerCompiledNode), offsetof(struct _cffi_align_typedef_EdgeRunnerCompiledNode, y), 5, 7 },
-  { "$EdgeRunnerCompiledParam", 177, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerCompiledParam", 179, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerCompiledParam), offsetof(struct _cffi_align_typedef_EdgeRunnerCompiledParam, y), 12, 4 },
-  { "$EdgeRunnerCompiledPlan", 178, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerCompiledPlan", 180, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerCompiledPlan), offsetof(struct _cffi_align_typedef_EdgeRunnerCompiledPlan, y), 16, 3 },
-  { "$EdgeRunnerControlCurve", 180, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerControlCurve", 182, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerControlCurve), offsetof(struct _cffi_align_typedef_EdgeRunnerControlCurve, y), 19, 5 },
-  { "$EdgeRunnerControlHistory", 181, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerControlHistory", 183, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerControlHistory), offsetof(struct _cffi_align_typedef_EdgeRunnerControlHistory, y), 24, 3 },
-  { "$EdgeRunnerNodeDescriptor", 182, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerNodeDescriptor", 184, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerNodeDescriptor), offsetof(struct _cffi_align_typedef_EdgeRunnerNodeDescriptor, y), 27, 6 },
-  { "$EdgeRunnerNodeInputs", 183, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerNodeInputs", 185, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerNodeInputs), offsetof(struct _cffi_align_typedef_EdgeRunnerNodeInputs, y), 33, 2 },
-  { "$EdgeRunnerParamSet", 184, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerParamSet", 186, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerParamSet), offsetof(struct _cffi_align_typedef_EdgeRunnerParamSet, y), 35, 2 },
-  { "$EdgeRunnerParamView", 186, _CFFI_F_CHECK_FIELDS,
+  { "$EdgeRunnerParamView", 188, _CFFI_F_CHECK_FIELDS,
     sizeof(EdgeRunnerParamView), offsetof(struct _cffi_align_typedef_EdgeRunnerParamView, y), 37, 5 },
 };
 
 static const struct _cffi_typename_s _cffi_typenames[] = {
-  { "EdgeRunnerAudioView", 173 },
-  { "EdgeRunnerCompiledNode", 175 },
-  { "EdgeRunnerCompiledParam", 177 },
-  { "EdgeRunnerCompiledPlan", 178 },
-  { "EdgeRunnerControlCurve", 180 },
-  { "EdgeRunnerControlHistory", 181 },
-  { "EdgeRunnerNodeDescriptor", 182 },
-  { "EdgeRunnerNodeInputs", 183 },
-  { "EdgeRunnerParamSet", 184 },
-  { "EdgeRunnerParamView", 186 },
-  { "uint32_t", 194 },
-  { "uint8_t", 193 },
+  { "EdgeRunnerAudioView", 175 },
+  { "EdgeRunnerCompiledNode", 177 },
+  { "EdgeRunnerCompiledParam", 179 },
+  { "EdgeRunnerCompiledPlan", 180 },
+  { "EdgeRunnerControlCurve", 182 },
+  { "EdgeRunnerControlHistory", 183 },
+  { "EdgeRunnerNodeDescriptor", 184 },
+  { "EdgeRunnerNodeInputs", 185 },
+  { "EdgeRunnerParamSet", 186 },
+  { "EdgeRunnerParamView", 188 },
+  { "uint32_t", 196 },
+  { "uint8_t", 195 },
 };
 
 static const struct _cffi_type_context_s _cffi_type_context = {
@@ -6041,12 +6086,12 @@ static const struct _cffi_type_context_s _cffi_type_context = {
   _cffi_struct_unions,
   NULL,  /* no enums */
   _cffi_typenames,
-  19,  /* num_globals */
+  20,  /* num_globals */
   10,  /* num_struct_unions */
   0,  /* num_enums */
   12,  /* num_typenames */
   NULL,  /* no includes */
-  196,  /* num_types */
+  198,  /* num_types */
   0,  /* flags */
 };
 

@@ -1,0 +1,156 @@
+Windows fatal exception: code 0xc0000374
+
+Thread 0x0000df88 (most recent call first):
+  <no Python frame>
+
+Thread 0x0000da74 (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 1544 in audio_thread
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000c90c (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 1500 in _requeue_daemon
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Current thread 0x0000e690 (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\site-packages\numpy\core\function_base.py", line 140 in linspace
+  File "C:\dev\Powershell\amp\src\amp\utils.py", line 153 in cubic_ramp
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 783 in _render_audio_frames
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 1306 in producer_thread
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000dba0 (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000daa0 (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x00007c98 (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\controller_monitor.py", line 254 in _run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000cef4 (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000a0d4 (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000d890 (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 48 in _run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000ba54 (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 2354 in run
+  File "C:\dev\Powershell\amp\src\amp\cli.py", line 39 in main
+  File "C:\dev\Powershell\amp\src\amp\__main__.py", line 26 in <module>
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86 in _run_code
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196 in _run_module_as_main
+Windows fatal exception: code 0xc0000374
+
+Thread 0x0000da34 (most recent call first):
+  <no Python frame>
+
+Thread 0x0000b8c0 (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 1544 in audio_thread
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x00009bc8 (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 1500 in _requeue_daemon
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Current thread 0x0000df6c (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\utils.py", line 154 in cubic_ramp
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 783 in _render_audio_frames
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 1306 in producer_thread
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000bc7c (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000cf40 (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000e2c4 (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\controller_monitor.py", line 254 in _run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000e29c (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000be7c (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\nodes.py", line 399 in _worker_loop
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000e16c (most recent call first):
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320 in wait
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171 in get
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 48 in _run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 953 in run
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 1016 in _bootstrap_inner
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\threading.py", line 973 in _bootstrap
+
+Thread 0x0000e6b0 (most recent call first):
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 1998 in draw_visualisation
+  File "C:\dev\Powershell\amp\src\amp\app.py", line 2338 in run
+  File "C:\dev\Powershell\amp\src\amp\cli.py", line 39 in main
+  File "C:\dev\Powershell\amp\src\amp\__main__.py", line 26 in <module>
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86 in _run_code
+  File "C:\Users\alber\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196 in _run_module_as_main

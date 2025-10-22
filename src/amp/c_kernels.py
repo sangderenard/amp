@@ -175,6 +175,7 @@ try:
     );
     void amp_free(double *buffer);
     void amp_release_state(void *state);
+    size_t amp_last_alloc_count_get(void);
     """)
     C_SRC = r"""
 #include <ctype.h>
@@ -206,6 +207,12 @@ typedef struct {
 } envelope_scratch_t;
 
 static envelope_scratch_t envelope_scratch = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+/* Debug: track last allocation element count for diagnostics. */
+static size_t amp_last_alloc_count = 0;
+
+AMP_CAPI size_t amp_last_alloc_count_get(void) {
+    return amp_last_alloc_count;
+}
 
 /*
  * Edge runner contract (mirrors `_EDGE_RUNNER_CDEF` in Python).
@@ -2120,6 +2127,8 @@ static const double *ensure_param_plane(
         return NULL;
     }
     double *buf = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
+    amp_last_alloc_count = total;
     if (buf == NULL) {
         return NULL;
     }
@@ -2255,6 +2264,7 @@ static int run_constant_node(
     }
     size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -2343,6 +2353,7 @@ static int run_controller_node(
     }
     size_t total = (size_t)batches * (size_t)resolved_channels * (size_t)frames;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -2418,6 +2429,7 @@ static int run_lfo_node(
     }
     size_t total = (size_t)B * (size_t)F;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -2560,6 +2572,7 @@ static int run_envelope_node(
     int send_reset_flag = send_reset_value >= 0.5 ? 1 : 0;
     size_t total = (size_t)B * (size_t)F * 2;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         free(owned_trigger);
         free(owned_gate);
@@ -2695,6 +2708,7 @@ static int run_pitch_node(
     }
     size_t total = (size_t)B * (size_t)F;
     double *freq_target = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (freq_target == NULL) {
         free(owned_input);
         free(owned_root);
@@ -2731,6 +2745,7 @@ static int run_pitch_node(
     free(owned_root);
     free(owned_span);
     double *output = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (output == NULL) {
         free(freq_target);
         return -1;
@@ -2818,6 +2833,7 @@ static int run_subharm_node(
     double a_hp_out = alpha_hp(out_hp, sample_rate);
     size_t total = (size_t)B * (size_t)C * (size_t)F;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -3071,6 +3087,7 @@ static int run_gain_node(
     }
     size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
     double *buffer = (double *)malloc(total * sizeof(double));
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
