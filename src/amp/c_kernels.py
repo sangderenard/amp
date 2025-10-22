@@ -83,6 +83,99 @@ try:
     void osc_square_blep_c(const double* ph, const double* dphi, double pw, double* out, int B, int F);
     void osc_triangle_blep_c(const double* ph, const double* dphi, double* out, int B, int F, double* tri_state);
     """)
+    ffi.cdef("""
+    typedef unsigned char uint8_t;
+    typedef unsigned int uint32_t;
+    typedef struct {
+        uint32_t has_audio;
+        uint32_t batches;
+        uint32_t channels;
+        uint32_t frames;
+        const double *data;
+    } EdgeRunnerAudioView;
+    typedef struct {
+        const char *name;
+        uint32_t batches;
+        uint32_t channels;
+        uint32_t frames;
+        const double *data;
+    } EdgeRunnerParamView;
+    typedef struct {
+        uint32_t count;
+        EdgeRunnerParamView *items;
+    } EdgeRunnerParamSet;
+    typedef struct {
+        EdgeRunnerAudioView audio;
+        EdgeRunnerParamSet params;
+    } EdgeRunnerNodeInputs;
+    typedef struct {
+        const char *name;
+        size_t name_len;
+        const char *type_name;
+        size_t type_len;
+        const char *params_json;
+        size_t params_len;
+    } EdgeRunnerNodeDescriptor;
+    typedef struct {
+        char *name;
+        uint32_t name_len;
+        uint32_t offset;
+        uint32_t span;
+    } EdgeRunnerCompiledParam;
+    typedef struct {
+        char *name;
+        uint32_t name_len;
+        uint32_t function_id;
+        uint32_t audio_offset;
+        uint32_t audio_span;
+        uint32_t param_count;
+        EdgeRunnerCompiledParam *params;
+    } EdgeRunnerCompiledNode;
+    typedef struct {
+        uint32_t version;
+        uint32_t node_count;
+        EdgeRunnerCompiledNode *nodes;
+    } EdgeRunnerCompiledPlan;
+    typedef struct {
+        char *name;
+        uint32_t name_len;
+        double *values;
+        uint32_t value_count;
+        double timestamp;
+    } EdgeRunnerControlCurve;
+    typedef struct {
+        uint32_t frames_hint;
+        uint32_t curve_count;
+        EdgeRunnerControlCurve *curves;
+    } EdgeRunnerControlHistory;
+    EdgeRunnerCompiledPlan *amp_load_compiled_plan(
+        const uint8_t *descriptor_blob,
+        size_t descriptor_len,
+        const uint8_t *plan_blob,
+        size_t plan_len
+    );
+    void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan);
+    EdgeRunnerControlHistory *amp_load_control_history(
+        const uint8_t *blob,
+        size_t blob_len,
+        int frames_hint
+    );
+    void amp_release_control_history(EdgeRunnerControlHistory *history);
+    int amp_run_node(
+        const EdgeRunnerNodeDescriptor *descriptor,
+        const EdgeRunnerNodeInputs *inputs,
+        int batches,
+        int channels,
+        int frames,
+        double sample_rate,
+        double **out_buffer,
+        int *out_channels,
+        void **state,
+        const EdgeRunnerControlHistory *history
+    );
+    void amp_free(double *buffer);
+    void amp_release_state(void *state);
+    """)
     C_SRC = r"""
 #include <ctype.h>
 #include <float.h>
