@@ -99,27 +99,75 @@ def benchmark_default_graph(
 
     for iteration in range(iterations + warmup):
         joystick_curves = virtual_joystick.generate(frames)
-        # Record a control event into the graph so ControlDelay history is
-        # populated the same way the interactive app does. The virtual
-        # joystick provides per-frame arrays for many controls; record
-        # these arrays into the event.extras so the graph history can be
-        # sampled by the canonical history-only path used by the app.
         timestamp = time.perf_counter()
+
+        def _control_array(value: Any) -> np.ndarray:
+            array = np.asarray(value, dtype=np.float64)
+            if array.ndim == 0:
+                return np.full(frames, float(array), dtype=np.float64)
+            if array.shape[0] != frames:
+                raise ValueError(
+                    f"Control array expected {frames} samples, received {array.shape[0]}"
+                )
+            return array
+
+        extras: Dict[str, Any] | None
         try:
-            extras = {}
-            for key, val in joystick_curves.items():
-                # Only store arrays or scalars we care about; convert to
-                # numpy arrays for consistent deserialisation by sample().
-                if isinstance(val, np.ndarray):
-                    extras[key] = np.asarray(val)
-                else:
-                    extras[key] = np.asarray([float(val)])
+            control_arrays: Dict[str, np.ndarray] = {
+                key: _control_array(val)
+                for key, val in joystick_curves.items()
+            }
+
+            # Derive synthetic raw axes/buttons mirroring ControllerMonitor's sampling.
+            def _frame_or_default(key: str, default: float = 0.0) -> np.ndarray:
+                array = control_arrays.get(key)
+                if array is None:
+                    return np.full(frames, default, dtype=np.float64)
+                return array
+
+            pitch_input_curve = np.clip(_frame_or_default("pitch_input"), -1.0, 1.0)
+            velocity_curve = np.clip(_frame_or_default("velocity"), 0.0, 1.0)
+            momentary_axis_curve = np.clip(_frame_or_default("momentary_axis", 0.0), 0.0, 1.0)
+            drone_axis_curve = np.clip(
+                _frame_or_default("drone_axis", 0.0),
+                0.0,
+                1.0,
+            )
+            cutoff_curve = _frame_or_default("cutoff", 1500.0)
+            q_curve = _frame_or_default("q", 0.9)
+
+            axes = np.zeros(6, dtype=np.float64)
+            buttons = np.zeros(2, dtype=np.float64)
+
+            if frames:
+                axes[0] = float(pitch_input_curve[-1])
+                axes[2] = float(momentary_axis_curve[-1] * 2.0 - 1.0)
+                axes[3] = float(np.clip((cutoff_curve[-1] - 1500.0) / 1000.0, -1.0, 1.0))
+                axes[4] = float(np.clip((q_curve[-1] - 0.9) / 0.3, -1.0, 1.0))
+                axes[5] = float(np.clip(drone_axis_curve[-1] * 2.0 - 1.0, -1.0, 1.0))
+                buttons[0] = float((_frame_or_default("trigger")[-1]) >= 0.5)
+                buttons[1] = float((_frame_or_default("drone")[-1]) >= 0.5)
+
+            def _snapshot(value: np.ndarray) -> np.ndarray:
+                arr = np.asarray(value, dtype=np.float64)
+                if arr.size == 0:
+                    return np.asarray([0.0], dtype=np.float64)
+                return np.asarray([float(arr.reshape(-1)[-1])], dtype=np.float64)
+
+            extras = {"axes": axes, "buttons": buttons}
+            for key, array in control_arrays.items():
+                extras[key] = _snapshot(array)
         except Exception:
             extras = None
 
-        # Use placeholders for pitch/envelope as their true per-frame
-        # values are derived from the control history via sampling.
-        graph.record_control_event(timestamp, pitch=np.zeros(1), envelope=np.zeros(1), extras=extras)
+        pitch_stub = np.zeros(1, dtype=np.float64)
+        envelope_stub = np.zeros(1, dtype=np.float64)
+        graph.record_control_event(
+            timestamp,
+            pitch=pitch_stub,
+            envelope=envelope_stub,
+            extras=extras,
+        )
 
         # Sample from the graph's retained history to obtain per-frame
         # pitch/envelope and any extras. This enforces the invariant that
@@ -146,24 +194,36 @@ def benchmark_default_graph(
             "pitch_span",
             "pitch_root",
         )
+        def _coerce_history_value(value: Any) -> Any:
+            if isinstance(value, np.ndarray):
+                array = np.asarray(value)
+                if array.ndim == 0:
+                    return float(array)
+                if array.ndim == 1:
+                    return array
+                # Flatten extra dimensions by taking the leading frame axis.
+                return array.reshape(array.shape[0], -1)[:, 0]
+            return value
+
         for key in expected_keys:
             if key in sampled_extras:
-                joystick_curves_from_history[key] = sampled_extras[key]
+                joystick_curves_from_history[key] = _coerce_history_value(sampled_extras[key])
             else:
-                # Fall back to sampled pitch/span/root where appropriate
                 if key == "pitch_input":
-                    # If pitch is multi-dim, use first column
-                    arr = sampled_pitch
-                    if arr is None:
-                        joystick_curves_from_history[key] = 0.0
+                    if sampled_pitch is None:
+                        joystick_curves_from_history[key] = np.zeros(frames, dtype=float)
                     else:
-                        joystick_curves_from_history[key] = arr[:, 0] if arr.ndim > 1 else arr[:, 0] if arr.ndim == 2 else arr[:, 0]
+                        pitch_array = np.asarray(sampled_pitch, dtype=float)
+                        if pitch_array.ndim == 1:
+                            joystick_curves_from_history[key] = pitch_array
+                        else:
+                            pitch_array = pitch_array.reshape(pitch_array.shape[0], -1)
+                            joystick_curves_from_history[key] = pitch_array[:, 0]
                 elif key == "pitch_span":
                     joystick_curves_from_history[key] = float(state.get("free_span_oct", 2.0))
                 elif key == "pitch_root":
                     joystick_curves_from_history[key] = float(state.get("root_midi", 60))
                 else:
-                    # Default to zeros for gates/triggers/mods
                     joystick_curves_from_history[key] = np.zeros(frames, dtype=float)
 
         from .runner import render_audio_block

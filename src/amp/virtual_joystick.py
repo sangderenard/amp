@@ -207,7 +207,14 @@ class VirtualJoystickPerformer:
             self._axis_remaining[name] = max(0.0, self._axis_remaining[name] - duration)
         return curves
 
-    def _render_axis_curves(self, *, frames: int, momentary_curve: np.ndarray, drone_curve: np.ndarray, prev_momentary: float) -> Dict[str, np.ndarray]:
+    def _render_axis_curves(
+        self,
+        *,
+        frames: int,
+        momentary_curve: np.ndarray,
+        drone_curve: np.ndarray,
+        prev_momentary: float,
+    ) -> Dict[str, np.ndarray]:
         if momentary_curve.shape[0] != frames or drone_curve.shape[0] != frames:
             raise ValueError("Axis curves must match the requested frame count")
 
@@ -251,6 +258,8 @@ class VirtualJoystickPerformer:
             "gate": gate_mask.astype(utils.RAW_DTYPE, copy=False),
             "drone": drone_mask.astype(utils.RAW_DTYPE, copy=False),
             "velocity": velocity_curve,
+            "momentary_axis": momentary_curve.astype(utils.RAW_DTYPE, copy=False),
+            "drone_axis": drone_curve.astype(utils.RAW_DTYPE, copy=False),
         }
 
     def _advance_switch_controls(self, frames: int) -> Dict[str, np.ndarray | float]:
@@ -299,6 +308,8 @@ class VirtualJoystickPerformer:
             "pitch_input": axis_curves["pitch_input"],
             "pitch_span": float(self._pitch_span),
             "pitch_root": float(self._pitch_root),
+            "momentary_axis": gate.astype(utils.RAW_DTYPE, copy=False),
+            "drone_axis": drone.astype(utils.RAW_DTYPE, copy=False),
         }
 
     def _advance_axis_controls(self, frames: int) -> Dict[str, np.ndarray | float]:
@@ -331,7 +342,12 @@ class VirtualJoystickPerformer:
         self._momentary_axis_remaining = max(0.0, self._momentary_axis_remaining - duration)
         self._drone_axis_remaining = max(0.0, self._drone_axis_remaining - duration)
 
-        axis_output = self._render_axis_curves(frames=frames, momentary_curve=momentary_curve, drone_curve=drone_curve, prev_momentary=prev_momentary)
+        axis_output = self._render_axis_curves(
+            frames=frames,
+            momentary_curve=momentary_curve,
+            drone_curve=drone_curve,
+            prev_momentary=prev_momentary,
+        )
         axis_curves = self._advance_axes(frames)
         axis_output.update({
             "cutoff": axis_curves["cutoff"],
@@ -361,7 +377,12 @@ class VirtualJoystickPerformer:
             if frames:
                 self._momentary_axis = float(momentary_curve[-1])
                 self._drone_axis = float(drone_curve[-1])
-            axis_output = self._render_axis_curves(frames=frames, momentary_curve=momentary_curve, drone_curve=drone_curve, prev_momentary=prev_momentary)
+            axis_output = self._render_axis_curves(
+                frames=frames,
+                momentary_curve=momentary_curve,
+                drone_curve=drone_curve,
+                prev_momentary=prev_momentary,
+            )
 
         def _control_array(name: str, source: Any) -> np.ndarray:
             array = np.asarray(source, dtype=utils.RAW_DTYPE)
@@ -396,6 +417,12 @@ class VirtualJoystickPerformer:
 
         result["pitch_span"] = float(block.get("pitch_span", self._pitch_span))
         result["pitch_root"] = float(block.get("pitch_root", self._pitch_root))
+        if axis_output is not None:
+            result.setdefault("momentary_axis", axis_output["momentary_axis"])
+            result.setdefault("drone_axis", axis_output["drone_axis"])
+        else:
+            result.setdefault("momentary_axis", np.full(frames, float(self._momentary_axis), dtype=utils.RAW_DTYPE))
+            result.setdefault("drone_axis", np.full(frames, float(self._drone_axis), dtype=utils.RAW_DTYPE))
         return result
 
     def generate(self, frames: int) -> Dict[str, np.ndarray | float]:

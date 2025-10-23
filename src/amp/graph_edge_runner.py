@@ -266,7 +266,6 @@ class CffiEdgeRunner:
         self._plan_names: tuple[str, ...] = ()
         self._c_kernel: Any | None = None
         self._node_states: Dict[str, Any] = {}
-        self._python_fallback_counts: Dict[str, int] = {}
         self.compile()
 
     @property
@@ -313,7 +312,6 @@ class CffiEdgeRunner:
         # Preallocate per-node cache placeholders (actual arrays will be allocated by C or reused)
         self._caches = {name: None for name in self._graph._nodes}
         self._gather_handles.clear()
-        self._python_fallback_counts.clear()
         # Allow nodes to recycle or preallocate any node-local buffers
         for node in self._graph._nodes.values():
             recycle = getattr(node, "recycle_blocks", None)
@@ -505,9 +503,9 @@ class CffiEdgeRunner:
         }
 
     def python_fallback_summary(self) -> Dict[str, int]:
-        """Return a copy of the per-node Python fallback invocation counts."""
+        """Return an empty summary; Python fallbacks are not supported."""
 
-        return dict(self._python_fallback_counts)
+        return {}
 
     def _ensure_c_kernel(self) -> Any:
         # Enforce single-threaded access policy for C kernel loading/usage
@@ -990,27 +988,22 @@ class CffiEdgeRunner:
                     except Exception:
                         pass
                 # Defensive diagnostics: surface unexpected C-kernel failures
-                if status not in (0, -3):
+                if status != 0:
                     try:
                         # Best-effort diagnostic to help identify C-side errors
                         print(f"[CffiEdgeRunner] amp_run_node returned status={status} for node='{name}'", flush=True)
                         print(f"  descriptor.type={descriptor.type_name} params={descriptor.params_json}", flush=True)
                     except Exception:
                         pass
+                    if int(status) == -3:
+                        raise RuntimeError(
+                            f"C kernel lacks an implementation for node '{name}'"
+                        )
                     raise RuntimeError(
                         f"C kernel failed while executing node '{name}' (status {status})"
                     )
 
-                if status == -3:
-                    contract = self._node_contracts.get(name)
-                    message = (
-                        "C kernel declined node '{name}' (type {type_name}); "
-                        "runtime forbids Python fallbacks during graph execution"
-                    ).format(name=name, type_name=descriptor.type_name)
-                    if contract is not None and not contract.allow_python_fallback:
-                        message += "; contract already marked this node as C-only"
-                    raise RuntimeError(message)
-                elif status == 0:
+                if status == 0:
                     self._node_states[name] = state_ptr[0]
                     batches = int(handle.batches)
                     channels = int(out_channels[0])
@@ -1053,10 +1046,6 @@ class CffiEdgeRunner:
                     except Exception:
                         # best-effort: do not block correct exception propagation
                         raise
-                else:
-                    raise RuntimeError(
-                        f"C kernel failed while executing node '{name}' (status {status})"
-                    )
                 end_time = time.perf_counter()
                 if timings is not None:
                     timings[name] = float(end_time - start_time)
