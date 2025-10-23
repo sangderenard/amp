@@ -67,6 +67,7 @@ class GraphConfig:
     nodes: List[NodeConfig]
     connections: List[ConnectionConfig]
     sink: str
+    use_runtime_graph: bool = False
 
 
 @dataclass(slots=True)
@@ -92,7 +93,11 @@ def _normalise_runtime(data: MutableMapping[str, Any]) -> RuntimeConfig:
 
 
 def _normalise_graph(data: Mapping[str, Any]) -> GraphConfig:
+    use_runtime_graph = bool(data.get("use_runtime_graph", False))
     node_items = data.get("nodes", [])
+    if use_runtime_graph:
+        sink = str(data.get("sink", "")) or "mixer"
+        return GraphConfig(nodes=[], connections=[], sink=sink, use_runtime_graph=True)
     if not node_items:
         raise ValueError("graph.nodes must contain at least one node definition")
     nodes = [

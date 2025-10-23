@@ -9,6 +9,7 @@ def test_default_configuration_loads(tmp_path: Path) -> None:
     assert config.sample_rate > 0
     assert config.runtime.output_channels == 2
     assert config.graph.sink
+    assert config.graph.use_runtime_graph
 
 
 def test_configuration_requires_nodes(tmp_path: Path) -> None:
