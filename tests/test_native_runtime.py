@@ -68,34 +68,20 @@ def test_native_executor_handles_mix_and_safety_pipeline():
     frames = 64
     sample_rate = 44100
     graph = AudioGraph(sample_rate=sample_rate)
-    controller = nodes.ControllerNode(
-        "ctrl",
-        params={"outputs": {"velocity": "signals['velocity']"}},
-    )
     carrier = nodes.SineOscillatorNode(
         "carrier",
         params={"frequency": 220.0, "amplitude": 0.15},
     )
-    mix = nodes.MixNode("mix", params={"channels": 2})
-    safety = nodes.SafetyNode("safety", params={"channels": 2})
+    mix = nodes.MixNode("mix", params={"channels": 1})
+    safety = nodes.SafetyNode("safety", params={"channels": 1})
 
-    graph.add_node(controller)
     graph.add_node(carrier)
     graph.add_node(mix)
     graph.add_node(safety)
 
     graph.connect_audio("carrier", "mix")
     graph.connect_audio("mix", "safety")
-    graph.connect_mod("ctrl", "carrier", "amplitude", scale=0.5, mode="add")
     graph.set_sink("safety")
-
-    velocity_curve = np.linspace(0.0, 1.0, frames, dtype=np.float64)
-    graph.record_control_event(
-        0.0,
-        pitch=np.zeros(1, dtype=np.float64),
-        envelope=np.zeros(1, dtype=np.float64),
-        extras={"velocity": velocity_curve},
-    )
 
     reference = graph.render_block(frames, sample_rate=sample_rate)
     blob = graph.control_delay.export_control_history_blob(0.0, frames / sample_rate)

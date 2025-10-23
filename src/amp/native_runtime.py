@@ -125,8 +125,10 @@ class NativeGraphExecutor:
             raise ValueError("graph must be provided")
         self._graph = graph
         self.ffi, self.lib = get_graph_runtime_impl()
-        descriptor_blob = graph.serialize_node_descriptors()
         runner = graph._ensure_edge_runner()
+        descriptor_blob = getattr(runner, "_descriptor_blob", None)
+        if not descriptor_blob:
+            descriptor_blob = graph.serialize_node_descriptors()
         plan_blob = getattr(runner, "_compiled_plan", b"") or b""
         desc_buf = self.ffi.new("uint8_t[]", descriptor_blob)
         if plan_blob:
