@@ -189,6 +189,9 @@ try:
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #endif
+#if defined(__GNUC__) && !defined(_WIN32) && !defined(_WIN64)
+#include <execinfo.h>
+#endif
 /* POSIX mkdir() */
 #include <sys/stat.h>
 #include <sys/types.h>
