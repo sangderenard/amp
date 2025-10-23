@@ -10,11 +10,12 @@ treated as hard failures rather than silently falling back to Python.
 
 ## Runtime build pipeline
 
-1. **Kernel scaffolding** – `src/amp/c_kernels.py` owns the monolithic
-   `C_SRC` string containing all DSP kernels and runtime glue.  The module builds
-   an `_amp_ckernels_cffi` extension on import via `ffi.set_source(...)` and
-   `ffi.compile(...)`, then copies the generated `.c` file and shared library
-   back into the repository so they can be inspected when compilation succeeds.
+1. **Kernel scaffolding** – `src/native/amp_kernels.c` and
+   `src/native/graph_runtime.c` hold the DSP kernels and runtime glue.  The
+   Python module `src/amp/c_kernels.py` builds an `_amp_ckernels_cffi` extension
+   on import via `ffi.set_source(...)` with those sources and `ffi.compile(...)`,
+   then copies the generated `.c` file and shared library back into the
+   repository so they can be inspected when compilation succeeds.
 2. **Graph specialisation** – `AudioGraph.render_block` asks
    `graph_edge_runner.CffiEdgeRunner` to serialise the Python graph into static
    descriptors (`serialize_node_descriptors`) and a compiled plan.  The runner
