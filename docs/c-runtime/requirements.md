@@ -1,5 +1,8 @@
 # C runtime requirements for `amp.nodes`
 
+> See also: [Native graph runtime policy](policy.md) for the overarching rule
+> that all graph execution flows must remain in C.
+
 This note captures the runtime-facing expectations for every class defined in
 `src/amp/nodes.py`. It focuses on the data arity each node handles, any
 persistent state carried across processing blocks, the NumPy primitives the
