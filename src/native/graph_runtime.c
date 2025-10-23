@@ -11,6 +11,8 @@
 #  include <pthread.h>
 #endif
 
+#include "amp_native.h"
+
 #if defined(_WIN32) || defined(_WIN64)
 #define AMP_API __declspec(dllexport)
 #else
@@ -21,11 +23,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-typedef struct EdgeRunnerControlHistory EdgeRunnerControlHistory;
 typedef EdgeRunnerControlHistory AmpGraphControlHistory;
-typedef struct EdgeRunnerParamView EdgeRunnerParamView;
-typedef struct EdgeRunnerNodeInputs EdgeRunnerNodeInputs;
-typedef struct EdgeRunnerNodeDescriptor EdgeRunnerNodeDescriptor;
 
 extern EdgeRunnerControlHistory *amp_load_control_history(const uint8_t *blob, size_t blob_len, int frames_hint);
 extern void amp_release_control_history(EdgeRunnerControlHistory *history);

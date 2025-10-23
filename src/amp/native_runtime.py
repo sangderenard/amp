@@ -56,14 +56,18 @@ void amp_graph_history_destroy(AmpGraphControlHistory *history);
 def _build_impl() -> tuple["cffi.FFI", object]:
     import cffi
 
-    from . import c_kernels
-
     ffi = cffi.FFI()
     ffi.cdef(_CDEF)
-    source_path = Path(__file__).resolve().parents[1] / "native" / "graph_runtime.c"
-    runtime_source = source_path.read_text(encoding="utf-8")
-    combined_source = f"{c_kernels.C_SRC}\n{runtime_source}"
-    ffi.set_source("_amp_graph_runtime", combined_source)
+    native_dir = Path(__file__).resolve().parents[1] / "native"
+    include_dir = native_dir / "include"
+    runtime_source = native_dir / "graph_runtime.c"
+    kernels_source = native_dir / "amp_kernels.c"
+    ffi.set_source(
+        "_amp_graph_runtime",
+        '#include "amp_native.h"\n',
+        sources=[str(kernels_source), str(runtime_source)],
+        include_dirs=[str(include_dir)],
+    )
     module_path = ffi.compile(verbose=False)
     compiled_path = Path(module_path)
     target_dir = Path(__file__).resolve().parent
