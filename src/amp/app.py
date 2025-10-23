@@ -849,7 +849,7 @@ def run(
         # All controller state is now handled by ControllerMonitor and control history.
 
         sr = sample_rate
-        start_time = time.perf_counter()
+        block_start_time = time.perf_counter()
         utils._scratch.ensure(frames)
 
         v = utils.cubic_ramp(velocity_current, velocity_target, frames, utils._scratch.a[:frames])
@@ -870,8 +870,7 @@ def run(
         # renderer consumes inputs derived from the ControlDelay. This keeps
         # the interactive and headless paths identical with respect to
         # interpolation and read-ahead semantics.
-        start_time = time.perf_counter()
-        sampled = graph.sample_control_tensor(start_time, frames)
+        sampled = graph.sample_control_tensor(block_start_time, frames)
         sampled_extras = sampled.get("extras", {})
 
         joystick_curves = {
@@ -909,7 +908,7 @@ def run(
         from .runner import render_audio_block
         audio_block, meta = render_audio_block(
             graph,
-            start_time,
+            block_start_time,
             frames,
             sr,
             joystick_curves,
@@ -918,12 +917,18 @@ def run(
             amp_mod_names,
             control_tensors,
         )
+        try:
+            pcm_block = np.asarray(audio_block, dtype=np.float64)
+            if pcm_block.ndim == 3 and pcm_block.shape[0] == 1:
+                graph.add_pcm_history(block_start_time, pcm_block[0], sample_rate=sr)
+        except Exception:
+            pass
         y = utils.assert_BCF(audio_block, name="sink")
         if y.shape[0] != 1:
             raise RuntimeError(f"Device expects single batch output, got {y.shape}")
         buffer = np.swapaxes(y[0], 0, 1).astype(np.float64, copy=False)
         # ...existing code for updating freq_current, velocity_current, etc.
-        render_duration = time.perf_counter() - start_time
+        render_duration = time.perf_counter() - block_start_time
         meta["render_duration"] = render_duration
         meta["allotted_time"] = (frames / sr) if sr else 0.0
         meta["produced_time"] = meta["allotted_time"]
