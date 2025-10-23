@@ -122,7 +122,13 @@ static char *dup_string(const char *src, size_t length) {
 /* Minimal native-entry logger that records wall-clock time and OS thread id.
    Writes one-line records to logs/native_c_calls.log: <timestamp> <os_tid> <fn> <a> <b>\n
    Best-effort only; failures are ignored to avoid impacting runtime behaviour. */
+extern void amp_log_native_call_external(const char *fn, size_t a, size_t b);
 static void _log_native_call(const char *fn, size_t a, size_t b) {
+    /* Prefer the external cached logger (if linked), otherwise fall back. */
+    if (&amp_log_native_call_external) {
+        amp_log_native_call_external(fn, a, b);
+        return;
+    }
     FILE *f = fopen("logs/native_c_calls.log", "a");
     if (f == NULL) {
         return;

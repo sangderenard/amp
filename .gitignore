@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 _amp_ckernels_cffi.*
+logs/
+Release/

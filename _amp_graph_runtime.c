@@ -1,183 +1,576 @@
-"""Optional C-backed kernels for tight loops.
+#define _CFFI_
 
-This module attempts to build a small C kernel using cffi. If compilation
-is not available in the environment (no compiler or cffi not installed),
-the module exposes python fallbacks so callers can transparently fall back
-to pure-Python/numpy implementations.
-"""
-from __future__ import annotations
+/* We try to define Py_LIMITED_API before including Python.h.
 
-import traceback
-from typing import Optional
+   Mess: we can only define it if Py_DEBUG, Py_TRACE_REFS and
+   Py_REF_DEBUG are not defined.  This is a best-effort approximation:
+   we can learn about Py_DEBUG from pyconfig.h, but it is unclear if
+   the same works for the other two macros.  Py_DEBUG implies them,
+   but not the other way around.
 
-import numpy as np
+   The implementation is messy (issue #350): on Windows, with _MSC_VER,
+   we have to define Py_LIMITED_API even before including pyconfig.h.
+   In that case, we guess what pyconfig.h will do to the macros above,
+   and check our guess after the #include.
 
-AVAILABLE = False
-_impl = None
-UNAVAILABLE_REASON: str | None = None
+   Note that on Windows, with CPython 3.x, you need >= 3.5 and virtualenv
+   version >= 16.0.0.  With older versions of either, you don't get a
+   copy of PYTHON3.DLL in the virtualenv.  We can't check the version of
+   CPython *before* we even include pyconfig.h.  ffi.set_source() puts
+   a ``#define _CFFI_NO_LIMITED_API'' at the start of this file if it is
+   running on Windows < 3.5, as an attempt at fixing it, but that's
+   arguably wrong because it may not be the target version of Python.
+   Still better than nothing I guess.  As another workaround, you can
+   remove the definition of Py_LIMITED_API here.
 
-try:
-    import cffi
-    ffi = cffi.FFI()
-    ffi.cdef("""
-    void lfo_slew(const double* x, double* out, int B, int F, double r, double alpha, double* z0);
-    void safety_filter(const double* x, double* y, int B, int C, int F, double a, double* prev_in, double* prev_dc);
-    void dc_block(const double* x, double* out, int B, int C, int F, double a, double* state);
-    void subharmonic_process(
-        const double* x,
-        double* y,
-        int B,
-        int C,
-        int F,
-        double a_hp_in,
-        double a_lp_in,
-        double a_sub2,
-        int use_div4,
-        double a_sub4,
-        double a_env_attack,
-        double a_env_release,
-        double a_hp_out,
-        double drive,
-        double mix,
-        double* hp_y,
-        double* lp_y,
-        double* prev,
-        int8_t* sign,
-        int8_t* ff2,
-        int8_t* ff4,
-        int32_t* ff4_count,
-        double* sub2_lp,
-        double* sub4_lp,
-        double* env,
-        double* hp_out_y,
-        double* hp_out_x
-    );
-    void envelope_process(
-        const double* trigger,
-        const double* gate,
-        const double* drone,
-        const double* velocity,
-        int B,
-        int F,
-        int atk_frames,
-        int hold_frames,
-        int dec_frames,
-        int sus_frames,
-        int rel_frames,
-        double sustain_level,
-        int send_resets,
-        int* stage,
-        double* value,
-        double* timer,
-        double* vel_state,
-        int64_t* activations,
-        double* release_start,
-        double* amp_out,
-        double* reset_out
-    );
-    void phase_advance(const double* dphi, double* phase_out, int B, int F, double* phase_state, const double* reset);
-    void portamento_smooth(const double* freq_target, const double* port_mask, const double* slide_time, const double* slide_damp, int B, int F, int sr, double* freq_state, double* out);
-    void arp_advance(const double* seq, int seq_len, double* offsets_out, int B, int F, int* step_state, int* timer_state, int fps);
-    void polyblep_arr(const double* t, const double* dt, double* out, int N);
-    void osc_saw_blep_c(const double* ph, const double* dphi, double* out, int B, int F);
-    void osc_square_blep_c(const double* ph, const double* dphi, double pw, double* out, int B, int F);
-    void osc_triangle_blep_c(const double* ph, const double* dphi, double* out, int B, int F, double* tri_state);
-    """)
-    ffi.cdef("""
-    typedef unsigned char uint8_t;
-    typedef unsigned int uint32_t;
-    typedef struct {
-        uint32_t has_audio;
-        uint32_t batches;
-        uint32_t channels;
-        uint32_t frames;
-        const double *data;
-    } EdgeRunnerAudioView;
-    typedef struct {
-        const char *name;
-        uint32_t batches;
-        uint32_t channels;
-        uint32_t frames;
-        const double *data;
-    } EdgeRunnerParamView;
-    typedef struct {
-        uint32_t count;
-        EdgeRunnerParamView *items;
-    } EdgeRunnerParamSet;
-    typedef struct {
-        EdgeRunnerAudioView audio;
-        EdgeRunnerParamSet params;
-    } EdgeRunnerNodeInputs;
-    typedef struct {
-        const char *name;
-        size_t name_len;
-        const char *type_name;
-        size_t type_len;
-        const char *params_json;
-        size_t params_len;
-    } EdgeRunnerNodeDescriptor;
-    typedef struct {
-        char *name;
-        uint32_t name_len;
-        uint32_t offset;
-        uint32_t span;
-    } EdgeRunnerCompiledParam;
-    typedef struct {
-        char *name;
-        uint32_t name_len;
-        uint32_t function_id;
-        uint32_t audio_offset;
-        uint32_t audio_span;
-        uint32_t param_count;
-        EdgeRunnerCompiledParam *params;
-    } EdgeRunnerCompiledNode;
-    typedef struct {
-        uint32_t version;
-        uint32_t node_count;
-        EdgeRunnerCompiledNode *nodes;
-    } EdgeRunnerCompiledPlan;
-    typedef struct {
-        char *name;
-        uint32_t name_len;
-        double *values;
-        uint32_t value_count;
-        double timestamp;
-    } EdgeRunnerControlCurve;
-    typedef struct {
-        uint32_t frames_hint;
-        uint32_t curve_count;
-        EdgeRunnerControlCurve *curves;
-    } EdgeRunnerControlHistory;
-    EdgeRunnerCompiledPlan *amp_load_compiled_plan(
-        const uint8_t *descriptor_blob,
-        size_t descriptor_len,
-        const uint8_t *plan_blob,
-        size_t plan_len
-    );
-    void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan);
-    EdgeRunnerControlHistory *amp_load_control_history(
-        const uint8_t *blob,
-        size_t blob_len,
-        int frames_hint
-    );
-    void amp_release_control_history(EdgeRunnerControlHistory *history);
-    int amp_run_node(
-        const EdgeRunnerNodeDescriptor *descriptor,
-        const EdgeRunnerNodeInputs *inputs,
-        int batches,
-        int channels,
-        int frames,
-        double sample_rate,
-        double **out_buffer,
-        int *out_channels,
-        void **state,
-        const EdgeRunnerControlHistory *history
-    );
-    void amp_free(double *buffer);
-    void amp_release_state(void *state);
-    size_t amp_last_alloc_count_get(void);
-    """)
-    C_SRC = r"""
+   See also 'py_limited_api' in cffi/setuptools_ext.py.
+*/
+#if !defined(_CFFI_USE_EMBEDDING) && !defined(Py_LIMITED_API)
+#  ifdef _MSC_VER
+#    if !defined(_DEBUG) && !defined(Py_DEBUG) && !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG) && !defined(_CFFI_NO_LIMITED_API)
+#      define Py_LIMITED_API
+#    endif
+#    include <pyconfig.h>
+     /* sanity-check: Py_LIMITED_API will cause crashes if any of these
+        are also defined.  Normally, the Python file PC/pyconfig.h does not
+        cause any of these to be defined, with the exception that _DEBUG
+        causes Py_DEBUG.  Double-check that. */
+#    ifdef Py_LIMITED_API
+#      if defined(Py_DEBUG)
+#        error "pyconfig.h unexpectedly defines Py_DEBUG, but Py_LIMITED_API is set"
+#      endif
+#      if defined(Py_TRACE_REFS)
+#        error "pyconfig.h unexpectedly defines Py_TRACE_REFS, but Py_LIMITED_API is set"
+#      endif
+#      if defined(Py_REF_DEBUG)
+#        error "pyconfig.h unexpectedly defines Py_REF_DEBUG, but Py_LIMITED_API is set"
+#      endif
+#    endif
+#  else
+#    include <pyconfig.h>
+#    if !defined(Py_DEBUG) && !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG) && !defined(_CFFI_NO_LIMITED_API)
+#      define Py_LIMITED_API
+#    endif
+#  endif
+#endif
+
+#include <Python.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <stddef.h>
+
+/* This part is from file 'cffi/parse_c_type.h'.  It is copied at the
+   beginning of C sources generated by CFFI's ffi.set_source(). */
+
+typedef void *_cffi_opcode_t;
+
+#define _CFFI_OP(opcode, arg)   (_cffi_opcode_t)(opcode | (((uintptr_t)(arg)) << 8))
+#define _CFFI_GETOP(cffi_opcode)    ((unsigned char)(uintptr_t)cffi_opcode)
+#define _CFFI_GETARG(cffi_opcode)   (((intptr_t)cffi_opcode) >> 8)
+
+#define _CFFI_OP_PRIMITIVE       1
+#define _CFFI_OP_POINTER         3
+#define _CFFI_OP_ARRAY           5
+#define _CFFI_OP_OPEN_ARRAY      7
+#define _CFFI_OP_STRUCT_UNION    9
+#define _CFFI_OP_ENUM           11
+#define _CFFI_OP_FUNCTION       13
+#define _CFFI_OP_FUNCTION_END   15
+#define _CFFI_OP_NOOP           17
+#define _CFFI_OP_BITFIELD       19
+#define _CFFI_OP_TYPENAME       21
+#define _CFFI_OP_CPYTHON_BLTN_V 23   // varargs
+#define _CFFI_OP_CPYTHON_BLTN_N 25   // noargs
+#define _CFFI_OP_CPYTHON_BLTN_O 27   // O  (i.e. a single arg)
+#define _CFFI_OP_CONSTANT       29
+#define _CFFI_OP_CONSTANT_INT   31
+#define _CFFI_OP_GLOBAL_VAR     33
+#define _CFFI_OP_DLOPEN_FUNC    35
+#define _CFFI_OP_DLOPEN_CONST   37
+#define _CFFI_OP_GLOBAL_VAR_F   39
+#define _CFFI_OP_EXTERN_PYTHON  41
+
+#define _CFFI_PRIM_VOID          0
+#define _CFFI_PRIM_BOOL          1
+#define _CFFI_PRIM_CHAR          2
+#define _CFFI_PRIM_SCHAR         3
+#define _CFFI_PRIM_UCHAR         4
+#define _CFFI_PRIM_SHORT         5
+#define _CFFI_PRIM_USHORT        6
+#define _CFFI_PRIM_INT           7
+#define _CFFI_PRIM_UINT          8
+#define _CFFI_PRIM_LONG          9
+#define _CFFI_PRIM_ULONG        10
+#define _CFFI_PRIM_LONGLONG     11
+#define _CFFI_PRIM_ULONGLONG    12
+#define _CFFI_PRIM_FLOAT        13
+#define _CFFI_PRIM_DOUBLE       14
+#define _CFFI_PRIM_LONGDOUBLE   15
+
+#define _CFFI_PRIM_WCHAR        16
+#define _CFFI_PRIM_INT8         17
+#define _CFFI_PRIM_UINT8        18
+#define _CFFI_PRIM_INT16        19
+#define _CFFI_PRIM_UINT16       20
+#define _CFFI_PRIM_INT32        21
+#define _CFFI_PRIM_UINT32       22
+#define _CFFI_PRIM_INT64        23
+#define _CFFI_PRIM_UINT64       24
+#define _CFFI_PRIM_INTPTR       25
+#define _CFFI_PRIM_UINTPTR      26
+#define _CFFI_PRIM_PTRDIFF      27
+#define _CFFI_PRIM_SIZE         28
+#define _CFFI_PRIM_SSIZE        29
+#define _CFFI_PRIM_INT_LEAST8   30
+#define _CFFI_PRIM_UINT_LEAST8  31
+#define _CFFI_PRIM_INT_LEAST16  32
+#define _CFFI_PRIM_UINT_LEAST16 33
+#define _CFFI_PRIM_INT_LEAST32  34
+#define _CFFI_PRIM_UINT_LEAST32 35
+#define _CFFI_PRIM_INT_LEAST64  36
+#define _CFFI_PRIM_UINT_LEAST64 37
+#define _CFFI_PRIM_INT_FAST8    38
+#define _CFFI_PRIM_UINT_FAST8   39
+#define _CFFI_PRIM_INT_FAST16   40
+#define _CFFI_PRIM_UINT_FAST16  41
+#define _CFFI_PRIM_INT_FAST32   42
+#define _CFFI_PRIM_UINT_FAST32  43
+#define _CFFI_PRIM_INT_FAST64   44
+#define _CFFI_PRIM_UINT_FAST64  45
+#define _CFFI_PRIM_INTMAX       46
+#define _CFFI_PRIM_UINTMAX      47
+#define _CFFI_PRIM_FLOATCOMPLEX 48
+#define _CFFI_PRIM_DOUBLECOMPLEX 49
+#define _CFFI_PRIM_CHAR16       50
+#define _CFFI_PRIM_CHAR32       51
+
+#define _CFFI__NUM_PRIM         52
+#define _CFFI__UNKNOWN_PRIM           (-1)
+#define _CFFI__UNKNOWN_FLOAT_PRIM     (-2)
+#define _CFFI__UNKNOWN_LONG_DOUBLE    (-3)
+
+#define _CFFI__IO_FILE_STRUCT         (-1)
+
+
+struct _cffi_global_s {
+    const char *name;
+    void *address;
+    _cffi_opcode_t type_op;
+    void *size_or_direct_fn;  // OP_GLOBAL_VAR: size, or 0 if unknown
+                              // OP_CPYTHON_BLTN_*: addr of direct function
+};
+
+struct _cffi_getconst_s {
+    unsigned long long value;
+    const struct _cffi_type_context_s *ctx;
+    int gindex;
+};
+
+struct _cffi_struct_union_s {
+    const char *name;
+    int type_index;          // -> _cffi_types, on a OP_STRUCT_UNION
+    int flags;               // _CFFI_F_* flags below
+    size_t size;
+    int alignment;
+    int first_field_index;   // -> _cffi_fields array
+    int num_fields;
+};
+#define _CFFI_F_UNION         0x01   // is a union, not a struct
+#define _CFFI_F_CHECK_FIELDS  0x02   // complain if fields are not in the
+                                     // "standard layout" or if some are missing
+#define _CFFI_F_PACKED        0x04   // for CHECK_FIELDS, assume a packed struct
+#define _CFFI_F_EXTERNAL      0x08   // in some other ffi.include()
+#define _CFFI_F_OPAQUE        0x10   // opaque
+
+struct _cffi_field_s {
+    const char *name;
+    size_t field_offset;
+    size_t field_size;
+    _cffi_opcode_t field_type_op;
+};
+
+struct _cffi_enum_s {
+    const char *name;
+    int type_index;          // -> _cffi_types, on a OP_ENUM
+    int type_prim;           // _CFFI_PRIM_xxx
+    const char *enumerators; // comma-delimited string
+};
+
+struct _cffi_typename_s {
+    const char *name;
+    int type_index;   /* if opaque, points to a possibly artificial
+                         OP_STRUCT which is itself opaque */
+};
+
+struct _cffi_type_context_s {
+    _cffi_opcode_t *types;
+    const struct _cffi_global_s *globals;
+    const struct _cffi_field_s *fields;
+    const struct _cffi_struct_union_s *struct_unions;
+    const struct _cffi_enum_s *enums;
+    const struct _cffi_typename_s *typenames;
+    int num_globals;
+    int num_struct_unions;
+    int num_enums;
+    int num_typenames;
+    const char *const *includes;
+    int num_types;
+    int flags;      /* future extension */
+};
+
+struct _cffi_parse_info_s {
+    const struct _cffi_type_context_s *ctx;
+    _cffi_opcode_t *output;
+    unsigned int output_size;
+    size_t error_location;
+    const char *error_message;
+};
+
+struct _cffi_externpy_s {
+    const char *name;
+    size_t size_of_result;
+    void *reserved1, *reserved2;
+};
+
+#ifdef _CFFI_INTERNAL
+static int parse_c_type(struct _cffi_parse_info_s *info, const char *input);
+static int search_in_globals(const struct _cffi_type_context_s *ctx,
+                             const char *search, size_t search_len);
+static int search_in_struct_unions(const struct _cffi_type_context_s *ctx,
+                                   const char *search, size_t search_len);
+#endif
+
+/* this block of #ifs should be kept exactly identical between
+   c/_cffi_backend.c, cffi/vengine_cpy.py, cffi/vengine_gen.py
+   and cffi/_cffi_include.h */
+#if defined(_MSC_VER)
+# include <malloc.h>   /* for alloca() */
+# if _MSC_VER < 1600   /* MSVC < 2010 */
+   typedef __int8 int8_t;
+   typedef __int16 int16_t;
+   typedef __int32 int32_t;
+   typedef __int64 int64_t;
+   typedef unsigned __int8 uint8_t;
+   typedef unsigned __int16 uint16_t;
+   typedef unsigned __int32 uint32_t;
+   typedef unsigned __int64 uint64_t;
+   typedef __int8 int_least8_t;
+   typedef __int16 int_least16_t;
+   typedef __int32 int_least32_t;
+   typedef __int64 int_least64_t;
+   typedef unsigned __int8 uint_least8_t;
+   typedef unsigned __int16 uint_least16_t;
+   typedef unsigned __int32 uint_least32_t;
+   typedef unsigned __int64 uint_least64_t;
+   typedef __int8 int_fast8_t;
+   typedef __int16 int_fast16_t;
+   typedef __int32 int_fast32_t;
+   typedef __int64 int_fast64_t;
+   typedef unsigned __int8 uint_fast8_t;
+   typedef unsigned __int16 uint_fast16_t;
+   typedef unsigned __int32 uint_fast32_t;
+   typedef unsigned __int64 uint_fast64_t;
+   typedef __int64 intmax_t;
+   typedef unsigned __int64 uintmax_t;
+# else
+#  include <stdint.h>
+# endif
+# if _MSC_VER < 1800   /* MSVC < 2013 */
+#  ifndef __cplusplus
+    typedef unsigned char _Bool;
+#  endif
+# endif
+# define _cffi_float_complex_t   _Fcomplex    /* include <complex.h> for it */
+# define _cffi_double_complex_t  _Dcomplex    /* include <complex.h> for it */
+#else
+# include <stdint.h>
+# if (defined (__SVR4) && defined (__sun)) || defined(_AIX) || defined(__hpux)
+#  include <alloca.h>
+# endif
+# define _cffi_float_complex_t   float _Complex
+# define _cffi_double_complex_t  double _Complex
+#endif
+
+#ifdef __GNUC__
+# define _CFFI_UNUSED_FN  __attribute__((unused))
+#else
+# define _CFFI_UNUSED_FN  /* nothing */
+#endif
+
+#ifdef __cplusplus
+# ifndef _Bool
+   typedef bool _Bool;   /* semi-hackish: C++ has no _Bool; bool is builtin */
+# endif
+#endif
+
+/**********  CPython-specific section  **********/
+#ifndef PYPY_VERSION
+
+
+#if PY_MAJOR_VERSION >= 3
+# define PyInt_FromLong PyLong_FromLong
+#endif
+
+#define _cffi_from_c_double PyFloat_FromDouble
+#define _cffi_from_c_float PyFloat_FromDouble
+#define _cffi_from_c_long PyInt_FromLong
+#define _cffi_from_c_ulong PyLong_FromUnsignedLong
+#define _cffi_from_c_longlong PyLong_FromLongLong
+#define _cffi_from_c_ulonglong PyLong_FromUnsignedLongLong
+#define _cffi_from_c__Bool PyBool_FromLong
+
+#define _cffi_to_c_double PyFloat_AsDouble
+#define _cffi_to_c_float PyFloat_AsDouble
+
+#define _cffi_from_c_int(x, type)                                        \
+    (((type)-1) > 0 ? /* unsigned */                                     \
+        (sizeof(type) < sizeof(long) ?                                   \
+            PyInt_FromLong((long)x) :                                    \
+         sizeof(type) == sizeof(long) ?                                  \
+            PyLong_FromUnsignedLong((unsigned long)x) :                  \
+            PyLong_FromUnsignedLongLong((unsigned long long)x)) :        \
+        (sizeof(type) <= sizeof(long) ?                                  \
+            PyInt_FromLong((long)x) :                                    \
+            PyLong_FromLongLong((long long)x)))
+
+#define _cffi_to_c_int(o, type)                                          \
+    ((type)(                                                             \
+     sizeof(type) == 1 ? (((type)-1) > 0 ? (type)_cffi_to_c_u8(o)        \
+                                         : (type)_cffi_to_c_i8(o)) :     \
+     sizeof(type) == 2 ? (((type)-1) > 0 ? (type)_cffi_to_c_u16(o)       \
+                                         : (type)_cffi_to_c_i16(o)) :    \
+     sizeof(type) == 4 ? (((type)-1) > 0 ? (type)_cffi_to_c_u32(o)       \
+                                         : (type)_cffi_to_c_i32(o)) :    \
+     sizeof(type) == 8 ? (((type)-1) > 0 ? (type)_cffi_to_c_u64(o)       \
+                                         : (type)_cffi_to_c_i64(o)) :    \
+     (Py_FatalError("unsupported size for type " #type), (type)0)))
+
+#define _cffi_to_c_i8                                                    \
+                 ((int(*)(PyObject *))_cffi_exports[1])
+#define _cffi_to_c_u8                                                    \
+                 ((int(*)(PyObject *))_cffi_exports[2])
+#define _cffi_to_c_i16                                                   \
+                 ((int(*)(PyObject *))_cffi_exports[3])
+#define _cffi_to_c_u16                                                   \
+                 ((int(*)(PyObject *))_cffi_exports[4])
+#define _cffi_to_c_i32                                                   \
+                 ((int(*)(PyObject *))_cffi_exports[5])
+#define _cffi_to_c_u32                                                   \
+                 ((unsigned int(*)(PyObject *))_cffi_exports[6])
+#define _cffi_to_c_i64                                                   \
+                 ((long long(*)(PyObject *))_cffi_exports[7])
+#define _cffi_to_c_u64                                                   \
+                 ((unsigned long long(*)(PyObject *))_cffi_exports[8])
+#define _cffi_to_c_char                                                  \
+                 ((int(*)(PyObject *))_cffi_exports[9])
+#define _cffi_from_c_pointer                                             \
+    ((PyObject *(*)(char *, struct _cffi_ctypedescr *))_cffi_exports[10])
+#define _cffi_to_c_pointer                                               \
+    ((char *(*)(PyObject *, struct _cffi_ctypedescr *))_cffi_exports[11])
+#define _cffi_get_struct_layout                                          \
+    not used any more
+#define _cffi_restore_errno                                              \
+    ((void(*)(void))_cffi_exports[13])
+#define _cffi_save_errno                                                 \
+    ((void(*)(void))_cffi_exports[14])
+#define _cffi_from_c_char                                                \
+    ((PyObject *(*)(char))_cffi_exports[15])
+#define _cffi_from_c_deref                                               \
+    ((PyObject *(*)(char *, struct _cffi_ctypedescr *))_cffi_exports[16])
+#define _cffi_to_c                                                       \
+    ((int(*)(char *, struct _cffi_ctypedescr *, PyObject *))_cffi_exports[17])
+#define _cffi_from_c_struct                                              \
+    ((PyObject *(*)(char *, struct _cffi_ctypedescr *))_cffi_exports[18])
+#define _cffi_to_c_wchar_t                                               \
+    ((_cffi_wchar_t(*)(PyObject *))_cffi_exports[19])
+#define _cffi_from_c_wchar_t                                             \
+    ((PyObject *(*)(_cffi_wchar_t))_cffi_exports[20])
+#define _cffi_to_c_long_double                                           \
+    ((long double(*)(PyObject *))_cffi_exports[21])
+#define _cffi_to_c__Bool                                                 \
+    ((_Bool(*)(PyObject *))_cffi_exports[22])
+#define _cffi_prepare_pointer_call_argument                              \
+    ((Py_ssize_t(*)(struct _cffi_ctypedescr *,                           \
+                    PyObject *, char **))_cffi_exports[23])
+#define _cffi_convert_array_from_object                                  \
+    ((int(*)(char *, struct _cffi_ctypedescr *, PyObject *))_cffi_exports[24])
+#define _CFFI_CPIDX  25
+#define _cffi_call_python                                                \
+    ((void(*)(struct _cffi_externpy_s *, char *))_cffi_exports[_CFFI_CPIDX])
+#define _cffi_to_c_wchar3216_t                                           \
+    ((int(*)(PyObject *))_cffi_exports[26])
+#define _cffi_from_c_wchar3216_t                                         \
+    ((PyObject *(*)(int))_cffi_exports[27])
+#define _CFFI_NUM_EXPORTS 28
+
+struct _cffi_ctypedescr;
+
+static void *_cffi_exports[_CFFI_NUM_EXPORTS];
+
+#define _cffi_type(index)   (                           \
+    assert((((uintptr_t)_cffi_types[index]) & 1) == 0), \
+    (struct _cffi_ctypedescr *)_cffi_types[index])
+
+static PyObject *_cffi_init(const char *module_name, Py_ssize_t version,
+                            const struct _cffi_type_context_s *ctx)
+{
+    PyObject *module, *o_arg, *new_module;
+    void *raw[] = {
+        (void *)module_name,
+        (void *)version,
+        (void *)_cffi_exports,
+        (void *)ctx,
+    };
+
+    module = PyImport_ImportModule("_cffi_backend");
+    if (module == NULL)
+        goto failure;
+
+    o_arg = PyLong_FromVoidPtr((void *)raw);
+    if (o_arg == NULL)
+        goto failure;
+
+    new_module = PyObject_CallMethod(
+        module, (char *)"_init_cffi_1_0_external_module", (char *)"O", o_arg);
+
+    Py_DECREF(o_arg);
+    Py_DECREF(module);
+    return new_module;
+
+  failure:
+    Py_XDECREF(module);
+    return NULL;
+}
+
+
+#ifdef HAVE_WCHAR_H
+typedef wchar_t _cffi_wchar_t;
+#else
+typedef uint16_t _cffi_wchar_t;   /* same random pick as _cffi_backend.c */
+#endif
+
+_CFFI_UNUSED_FN static uint16_t _cffi_to_c_char16_t(PyObject *o)
+{
+    if (sizeof(_cffi_wchar_t) == 2)
+        return (uint16_t)_cffi_to_c_wchar_t(o);
+    else
+        return (uint16_t)_cffi_to_c_wchar3216_t(o);
+}
+
+_CFFI_UNUSED_FN static PyObject *_cffi_from_c_char16_t(uint16_t x)
+{
+    if (sizeof(_cffi_wchar_t) == 2)
+        return _cffi_from_c_wchar_t((_cffi_wchar_t)x);
+    else
+        return _cffi_from_c_wchar3216_t((int)x);
+}
+
+_CFFI_UNUSED_FN static int _cffi_to_c_char32_t(PyObject *o)
+{
+    if (sizeof(_cffi_wchar_t) == 4)
+        return (int)_cffi_to_c_wchar_t(o);
+    else
+        return (int)_cffi_to_c_wchar3216_t(o);
+}
+
+_CFFI_UNUSED_FN static PyObject *_cffi_from_c_char32_t(unsigned int x)
+{
+    if (sizeof(_cffi_wchar_t) == 4)
+        return _cffi_from_c_wchar_t((_cffi_wchar_t)x);
+    else
+        return _cffi_from_c_wchar3216_t((int)x);
+}
+
+union _cffi_union_alignment_u {
+    unsigned char m_char;
+    unsigned short m_short;
+    unsigned int m_int;
+    unsigned long m_long;
+    unsigned long long m_longlong;
+    float m_float;
+    double m_double;
+    long double m_longdouble;
+};
+
+struct _cffi_freeme_s {
+    struct _cffi_freeme_s *next;
+    union _cffi_union_alignment_u alignment;
+};
+
+_CFFI_UNUSED_FN static int
+_cffi_convert_array_argument(struct _cffi_ctypedescr *ctptr, PyObject *arg,
+                             char **output_data, Py_ssize_t datasize,
+                             struct _cffi_freeme_s **freeme)
+{
+    char *p;
+    if (datasize < 0)
+        return -1;
+
+    p = *output_data;
+    if (p == NULL) {
+        struct _cffi_freeme_s *fp = (struct _cffi_freeme_s *)PyObject_Malloc(
+            offsetof(struct _cffi_freeme_s, alignment) + (size_t)datasize);
+        if (fp == NULL)
+            return -1;
+        fp->next = *freeme;
+        *freeme = fp;
+        p = *output_data = (char *)&fp->alignment;
+    }
+    memset((void *)p, 0, (size_t)datasize);
+    return _cffi_convert_array_from_object(p, ctptr, arg);
+}
+
+_CFFI_UNUSED_FN static void
+_cffi_free_array_arguments(struct _cffi_freeme_s *freeme)
+{
+    do {
+        void *p = (void *)freeme;
+        freeme = freeme->next;
+        PyObject_Free(p);
+    } while (freeme != NULL);
+}
+
+/**********  end CPython-specific section  **********/
+#else
+_CFFI_UNUSED_FN
+static void (*_cffi_call_python_org)(struct _cffi_externpy_s *, char *);
+# define _cffi_call_python  _cffi_call_python_org
+#endif
+
+
+#define _cffi_array_len(array)   (sizeof(array) / sizeof((array)[0]))
+
+#define _cffi_prim_int(size, sign)                                      \
+    ((size) == 1 ? ((sign) ? _CFFI_PRIM_INT8  : _CFFI_PRIM_UINT8)  :    \
+     (size) == 2 ? ((sign) ? _CFFI_PRIM_INT16 : _CFFI_PRIM_UINT16) :    \
+     (size) == 4 ? ((sign) ? _CFFI_PRIM_INT32 : _CFFI_PRIM_UINT32) :    \
+     (size) == 8 ? ((sign) ? _CFFI_PRIM_INT64 : _CFFI_PRIM_UINT64) :    \
+     _CFFI__UNKNOWN_PRIM)
+
+#define _cffi_prim_float(size)                                          \
+    ((size) == sizeof(float) ? _CFFI_PRIM_FLOAT :                       \
+     (size) == sizeof(double) ? _CFFI_PRIM_DOUBLE :                     \
+     (size) == sizeof(long double) ? _CFFI__UNKNOWN_LONG_DOUBLE :       \
+     _CFFI__UNKNOWN_FLOAT_PRIM)
+
+#define _cffi_check_int(got, got_nonpos, expected)      \
+    ((got_nonpos) == (expected <= 0) &&                 \
+     (got) == (unsigned long long)expected)
+
+#ifdef MS_WIN32
+# define _cffi_stdcall  __stdcall
+#else
+# define _cffi_stdcall  /* nothing */
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+/************************************************************/
+
+
 #include <ctype.h>
 #include <float.h>
 #include <math.h>
@@ -185,12 +578,6 @@ try:
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(_WIN32) || defined(_WIN64)
-#include <windows.h>
-#endif
-/* POSIX mkdir() */
-#include <sys/stat.h>
-#include <sys/types.h>
 
 #if defined(_WIN32) || defined(_WIN64)
 #define AMP_CAPI __declspec(dllexport)
@@ -304,483 +691,6 @@ typedef struct {
     EdgeRunnerControlCurve *curves;
 } EdgeRunnerControlHistory;
 
-/* Lightweight native-entry logger. Appends one-line records to logs/native_c_calls.log
-   Format: <timestamp> <py_thread_state_ptr_or_tid> <function> <arg1> <arg2>\n
-   Keep this function minimal and tolerant of failures (best-effort logging only).
-*/
-static void _log_native_call(const char *fn, size_t a, size_t b) {
-    ensure_log_files_open();
-    if (!log_f_ccalls) return;
-    double t = (double)time(NULL);
-#ifdef PyThreadState_Get
-    void *py_ts = (void *)PyThreadState_Get();
-    fprintf(log_f_ccalls, "%.3f %p %s %zu %zu\n", t, py_ts, fn, a, b);
-#else
-#if defined(_WIN32) || defined(_WIN64)
-    unsigned long tid = (unsigned long) GetCurrentThreadId();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#else
-    unsigned long tid = (unsigned long) pthread_self();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#endif
-#endif
-    /* best-effort; no fflush here to avoid heavy I/O on hot paths */
-}
-
-/* Generated-wrapper logger: record wrapper entry and a couple numeric args. */
-static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
-    ensure_log_files_open();
-    if (!log_f_cgenerated) return;
-#ifdef PyThreadState_Get
-    void *py_ts = (void *)PyThreadState_Get();
-    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, py_ts, a, b);
-#else
-    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, (void*)0, a, b);
-#endif
-    /* no fflush here to avoid extra I/O on hot wrapper paths */
-}
-
-/*
- * Debug allocation wrappers that capture caller file/line/function.
- * To ensure the wrappers call the real libc allocation functions we
- * temporarily undef the common allocation macros, declare wrappers that
- * accept caller metadata, then re-map the allocation names to pass
- * __FILE__/__LINE__/__func__ automatically.
- */
-#undef malloc
-#undef calloc
-#undef realloc
-#undef free
-
-#undef memcpy
-#undef memset
-
-/* Simple in-memory allocation registry to detect writes into freed or
-   undersized buffers. This is intentionally lightweight and only used
-   in debug runs. We maintain a singly-linked list of allocation records
-   updated by the allocation wrappers and consulted by the mem-op wrappers. */
-typedef struct alloc_rec {
-    void *ptr;
-    size_t size;
-    struct alloc_rec *next;
-    /* recorded backtrace captured at registration time */
-    void *bt[32];
-    unsigned short bt_count;
-} alloc_rec;
-
-static alloc_rec *alloc_list = NULL;
-
-/* forward declaration for backtrace dumper (defined below) */
-static void dump_backtrace(FILE *g);
-/* forward declarations for allocation backtrace helpers */
-static void capture_stack_frames(void **out_frames, unsigned short *out_count);
-static void dump_alloc_backtrace(FILE *g, struct alloc_rec *r);
-
-/* Cached FILE* handles for high-frequency logs to avoid open/close overhead.
- * We open these lazily and close them at process exit. For safety we still
- * fflush() on high-importance events (UNREGISTER_NOTFOUND, BAD_*) so the
- * data is durable even if the process crashes shortly thereafter.
- */
-static FILE *log_f_alloc = NULL;
-static FILE *log_f_memops = NULL;
-static FILE *log_f_ccalls = NULL;
-static FILE *log_f_cgenerated = NULL;
-
-#if defined(_WIN32) || defined(_WIN64)
-static CRITICAL_SECTION log_lock;
-static int log_lock_initialized = 0;
-#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { InitializeCriticalSection(&log_lock); log_lock_initialized = 1; } } while(0)
-#define LOG_LOCK() EnterCriticalSection(&log_lock)
-#define LOG_UNLOCK() LeaveCriticalSection(&log_lock)
-#else
-#include <pthread.h>
-static pthread_mutex_t log_lock;
-static int log_lock_initialized = 0;
-#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { pthread_mutex_init(&log_lock, NULL); log_lock_initialized = 1; } } while(0)
-#define LOG_LOCK() pthread_mutex_lock(&log_lock)
-#define LOG_UNLOCK() pthread_mutex_unlock(&log_lock)
-#endif
-
-static void close_all_logs(void);
-
-static void ensure_log_files_open(void) {
-    if (!log_lock_initialized) LOG_LOCK_INIT();
-    LOG_LOCK();
-    /* Create logs directory if it doesn't exist. On Windows CreateDirectoryA
-       is a no-op if the directory already exists; on POSIX use mkdir(). */
-#if defined(_WIN32) || defined(_WIN64)
-    CreateDirectoryA("logs", NULL);
-#else
-    /* ignore errors: directory may already exist */
-    mkdir("logs", 0775);
-#endif
-
-    if (log_f_alloc == NULL) log_f_alloc = fopen("logs/native_alloc_trace.log", "a");
-    if (log_f_memops == NULL) log_f_memops = fopen("logs/native_mem_ops.log", "a");
-    if (log_f_ccalls == NULL) log_f_ccalls = fopen("logs/native_c_calls.log", "a");
-    if (log_f_cgenerated == NULL) log_f_cgenerated = fopen("logs/native_c_generated.log", "a");
-    LOG_UNLOCK();
-
-    /* Register close handler once (safe to call repeatedly). We do this
-       outside the lock to avoid re-entrancy issues on some platforms. */
-    static int atexit_registered = 0;
-    if (!atexit_registered) {
-        atexit(close_all_logs);
-        atexit_registered = 1;
-    }
-}
-
-static void close_all_logs(void) {
-    if (!log_lock_initialized) LOG_LOCK_INIT();
-    LOG_LOCK();
-    if (log_f_alloc) { fflush(log_f_alloc); fclose(log_f_alloc); log_f_alloc = NULL; }
-    if (log_f_memops) { fflush(log_f_memops); fclose(log_f_memops); log_f_memops = NULL; }
-    if (log_f_ccalls) { fflush(log_f_ccalls); fclose(log_f_ccalls); log_f_ccalls = NULL; }
-    if (log_f_cgenerated) { fflush(log_f_cgenerated); fclose(log_f_cgenerated); log_f_cgenerated = NULL; }
-    LOG_UNLOCK();
-}
-
-/* Exported helper for other compilation units to emit generated-wrapper logs
-   using the same cached-file backing store. This avoids repeated fopen()/fclose()
-   in additional C files. */
-AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b) {
-    ensure_log_files_open();
-    if (!log_f_cgenerated) return;
-    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, py_ts, a, b);
-    fflush(log_f_cgenerated);
-}
-
-/* Exported helper for other C files to log native-entry calls into the
-   cached native_c_calls log. Mirrors the previous one-line format. */
-AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
-    ensure_log_files_open();
-    if (!log_f_ccalls) return;
-    double t = (double)time(NULL);
-#if defined(_WIN32) || defined(_WIN64)
-    unsigned long tid = (unsigned long) GetCurrentThreadId();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#else
-    unsigned long tid = (unsigned long) pthread_self();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#endif
-    fflush(log_f_ccalls);
-}
-
-/* Dump a compact snapshot of the live allocation registry to the given file.
- * This is intended to be called when we observe unexpected unregisters so
- * the offline correlator can inspect the live registry at the moment of the
- * event. Keep the output compact but include pointer, size and (if present)
- * the recorded registration backtrace id.
- */
-static void dump_alloc_snapshot(FILE *g) {
-    alloc_rec *it = alloc_list;
-    fprintf(g, "ALLOC_SNAPSHOT_BEGIN\n");
-    while (it) {
-        fprintf(g, "ALLOC_ENTRY ptr=%p size=%zu bt_count=%u\n", it->ptr, it->size, (unsigned)it->bt_count);
-        /* print the recorded registration backtrace (if available) inline */
-        for (unsigned i = 0; i < it->bt_count; ++i) {
-            fprintf(g, "RBT %p\n", it->bt[i]);
-        }
-        it = it->next;
-    }
-    fprintf(g, "ALLOC_SNAPSHOT_END\n");
-}
-
-static void register_alloc(void *ptr, size_t size) {
-    if (ptr == NULL) return;
-    /* If already registered, update size and record an update log instead
-       of creating duplicate entries. This avoids confusing duplicate
-       REGISTER lines and makes unregistering deterministic. */
-    alloc_rec *it = alloc_list;
-    while (it) {
-        if (it->ptr == ptr) {
-            /* update size if changed */
-            if (it->size != size) {
-                ensure_log_files_open();
-                if (log_f_alloc) {
-                    fprintf(log_f_alloc, "REGISTER_UPDATE %p old=%zu new=%zu\n", ptr, it->size, size);
-                    dump_alloc_snapshot(log_f_alloc);
-                    dump_backtrace(log_f_alloc);
-                    fflush(log_f_alloc);
-                }
-                it->size = size;
-            }
-            return;
-        }
-        it = it->next;
-    }
-    alloc_rec *r = (alloc_rec *)malloc(sizeof(alloc_rec));
-    if (r == NULL) return;
-    r->ptr = ptr;
-    r->size = size;
-    r->next = alloc_list;
-    /* record allocation backtrace for correlation */
-    r->bt_count = 0;
-    capture_stack_frames(r->bt, &r->bt_count);
-    alloc_list = r;
-    /* Durable log so post-processing can see registrations that
-       originate from stack-local buffers or manual calls to register_alloc. */
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "REGISTER %p size=%zu\n", ptr, size);
-        /* print recorded registration backtrace for easier offline mapping */
-        dump_alloc_backtrace(log_f_alloc, r);
-        fflush(log_f_alloc);
-    }
-}
-
-static void unregister_alloc(void *ptr) {
-    if (ptr == NULL) return;
-    /* Remove all matching entries for ptr (shouldn't be duplicates if
-       register_alloc prevents them, but be robust). Record if no entry
-       was found to help detect double-free or mismatched lifetime. */
-    alloc_rec **pp = &alloc_list;
-    int removed = 0;
-    while (*pp) {
-        if ((*pp)->ptr == ptr) {
-            alloc_rec *remove = *pp;
-            *pp = remove->next;
-            ensure_log_files_open();
-            if (log_f_alloc) {
-                fprintf(log_f_alloc, "UNREGISTER %p\n", ptr);
-                /* dump the registry and the recorded registration backtrace */
-                dump_alloc_snapshot(log_f_alloc);
-                dump_alloc_backtrace(log_f_alloc, remove);
-                dump_backtrace(log_f_alloc);
-                fflush(log_f_alloc);
-            }
-            free(remove);
-            removed = 1;
-            /* continue scanning to remove duplicates */
-            continue;
-        }
-        pp = &(*pp)->next;
-    }
-    if (!removed) {
-        ensure_log_files_open();
-        if (log_f_alloc) {
-            fprintf(log_f_alloc, "UNREGISTER_NOTFOUND %p\n", ptr);
-            dump_alloc_snapshot(log_f_alloc);
-            dump_backtrace(log_f_alloc);
-            fflush(log_f_alloc);
-        }
-    }
-}
-
-/* Check whether [addr, addr+len) is fully contained inside a known
-   allocated record. Returns 1 if contained, 0 otherwise. */
-static int range_within_alloc(void *addr, size_t len) {
-    if (addr == NULL) return 0;
-    unsigned char *a = (unsigned char *)addr;
-    alloc_rec *r = alloc_list;
-    while (r) {
-        unsigned char *base = (unsigned char *)r->ptr;
-        if (a >= base && (a + len) <= (base + r->size)) return 1;
-        r = r->next;
-    }
-    return 0;
-}
-
-/* Portable backtrace dumper: prints a compact list of return addresses or
-   symbolified strings (where available) to the provided file stream. This
-   is intentionally small and best-effort: the presence of addresses in the
-   BAD_* logs will significantly speed offline correlation even without
-   symbol resolution. */
-static void dump_backtrace(FILE *g) {
-    if (g == NULL) return;
-#if defined(_WIN32) || defined(_WIN64)
-    /* Use CaptureStackBackTrace which is available on Windows. We print
-       raw return addresses; symbol resolution can be done offline if
-       required. */
-    void *frames[64];
-    USHORT count = CaptureStackBackTrace(0, (ULONG) (sizeof(frames)/sizeof(frames[0])), frames, NULL);
-    fprintf(g, "BACKTRACE_FRAMES %u\n", (unsigned)count);
-    for (USHORT i = 0; i < count; ++i) {
-        fprintf(g, "BT %p\n", frames[i]);
-    }
-#else
-    /* POSIX: use backtrace/backtrace_symbols where available. */
-#ifdef __GNUC__
-    void *frames[64];
-    int count = backtrace(frames, (int)(sizeof(frames)/sizeof(frames[0])));
-    char **symbols = backtrace_symbols(frames, count);
-    if (symbols != NULL) {
-        fprintf(g, "BACKTRACE_FRAMES %d\n", count);
-        for (int i = 0; i < count; ++i) {
-            fprintf(g, "BT %s\n", symbols[i]);
-        }
-        free(symbols);
-    } else {
-        fprintf(g, "BACKTRACE_FRAMES %d\n", count);
-        for (int i = 0; i < count; ++i) fprintf(g, "BT %p\n", frames[i]);
-    }
-#else
-    (void)g; /* no-op if backtrace APIs unavailable */
-#endif
-#endif
-}
-
-/* Capture stack frames into the provided buffer and set count. This is
-   used to record a backtrace at allocation time for later correlation. */
-static void capture_stack_frames(void **out_frames, unsigned short *out_count) {
-    if (out_frames == NULL || out_count == NULL) return;
-#if defined(_WIN32) || defined(_WIN64)
-    void *frames[64];
-    USHORT count = CaptureStackBackTrace(0, (ULONG)(sizeof(frames)/sizeof(frames[0])), frames, NULL);
-    unsigned short copy_count = (unsigned short)((count > 32) ? 32 : count);
-    for (unsigned short i = 0; i < copy_count; ++i) out_frames[i] = frames[i];
-    *out_count = copy_count;
-#else
-#ifdef __GNUC__
-    void *frames[64];
-    int count = backtrace(frames, (int)(sizeof(frames)/sizeof(frames[0])));
-    int copy_count = (count > 32) ? 32 : count;
-    for (int i = 0; i < copy_count; ++i) out_frames[i] = frames[i];
-    *out_count = (unsigned short)copy_count;
-#else
-    *out_count = 0;
-#endif
-#endif
-}
-
-/* Print the recorded allocation backtrace stored in alloc_rec (if any). */
-static void dump_alloc_backtrace(FILE *g, alloc_rec *r) {
-    if (g == NULL || r == NULL) return;
-    fprintf(g, "REGISTER_BACKTRACE %u\n", (unsigned)r->bt_count);
-    for (unsigned i = 0; i < r->bt_count; ++i) {
-        fprintf(g, "RBT %p\n", r->bt[i]);
-    }
-}
-
-static void *_dbg_malloc(size_t s, const char *file, int line, const char *func) {
-    void *p = malloc(s); /* calls real malloc because we undef'd macro above */
-    /* log: op=malloc, size, ptr, caller */
-    _log_native_call("malloc", (size_t)s, (size_t)(uintptr_t)p);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "MALLOC %s:%d %s size=%zu ptr=%p\n", file, line, func, s, p);
-        fflush(log_f_alloc);
-    }
-    if (p != NULL) register_alloc(p, s);
-    return p;
-}
-
-static void *_dbg_calloc(size_t n, size_t size, const char *file, int line, const char *func) {
-    void *p = calloc(n, size);
-    _log_native_call("calloc", (size_t)(n * size), (size_t)(uintptr_t)p);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "CALLOC %s:%d %s nmemb=%zu size=%zu ptr=%p\n", file, line, func, n, size, p);
-        fflush(log_f_alloc);
-    }
-    if (p != NULL) register_alloc(p, n * size);
-    return p;
-}
-
-static void *_dbg_realloc(void *ptr, size_t s, const char *file, int line, const char *func) {
-    void *p = realloc(ptr, s);
-    _log_native_call("realloc_old", (size_t)(uintptr_t)ptr, (size_t)(uintptr_t)p);
-    _log_native_call("realloc_new", (size_t)s, (size_t)(uintptr_t)p);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "REALLOC %s:%d %s old=%p new=%p size=%zu\n", file, line, func, ptr, p, s);
-        dump_backtrace(log_f_alloc);
-        fflush(log_f_alloc);
-    }
-    /* update registry: remove old entry and register new pointer */
-    if (ptr != NULL) unregister_alloc(ptr);
-    if (p != NULL) register_alloc(p, s);
-    return p;
-}
-
-static void _dbg_free(void *ptr, const char *file, int line, const char *func) {
-    _log_native_call("free", (size_t)(uintptr_t)ptr, 0);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "FREE %s:%d %s ptr=%p\n", file, line, func, ptr);
-        dump_backtrace(log_f_alloc);
-        fflush(log_f_alloc);
-    }
-    if (ptr != NULL) {
-        unregister_alloc(ptr);
-        free(ptr);
-    }
-}
-
-/* Debug wrappers for memcpy/memset to log memory writes/copies. These use
-   simple byte loops to avoid calling the (possibly macro-redirected)
-   libc functions and to keep the logging minimal and self-contained. */
-static void *_dbg_memcpy(void *dest, const void *src, size_t n, const char *file, int line, const char *func) {
-    ensure_log_files_open();
-    if (log_f_memops) fprintf(log_f_memops, "MEMCPY %s:%d %s dest=%p src=%p n=%zu\n", file, line, func, dest, src, n);
-    if (dest == NULL || src == NULL || n == 0) {
-        return dest;
-    }
-    /* Check destination range against known allocations. If not found,
-       allow destinations that are likely on the current stack to avoid
-       false positives for local buffers. We use a heuristic window around
-       the current stack pointer. */
-        if (!range_within_alloc(dest, n)) {
-        uintptr_t stack_probe = (uintptr_t)&stack_probe;
-        uintptr_t d = (uintptr_t)dest;
-        const uintptr_t STACK_WINDOW = 0x100000; /* 1MB */
-        if (!(d >= stack_probe - STACK_WINDOW && d <= stack_probe + STACK_WINDOW)) {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "BAD_MEMCPY %s:%d %s dest=%p n=%zu stack_probe=%p (no matching alloc or too small)\n", file, line, func, dest, n, (void*)stack_probe);
-                /* dump live allocation registry snapshot for post-mortem correlation */
-                alloc_rec *it = alloc_list;
-                while (it) {
-                    fprintf(log_f_memops, "ALLOC_SNAPSHOT ptr=%p size=%zu\n", it->ptr, it->size);
-                    it = it->next;
-                }
-                /* Append a backtrace; best-effort and compact. */
-                dump_backtrace(log_f_memops);
-                fflush(log_f_memops);
-            }
-        }
-    }
-    unsigned char *d = (unsigned char *)dest;
-    const unsigned char *s = (const unsigned char *)src;
-    for (size_t i = 0; i < n; ++i) {
-        d[i] = s[i];
-    }
-    return dest;
-}
-
-static void *_dbg_memset(void *s_ptr, int c, size_t n, const char *file, int line, const char *func) {
-    ensure_log_files_open();
-    if (log_f_memops) fprintf(log_f_memops, "MEMSET %s:%d %s ptr=%p val=%d n=%zu\n", file, line, func, s_ptr, c, n);
-    if (s_ptr == NULL || n == 0) return s_ptr;
-    if (!range_within_alloc(s_ptr, n)) {
-        uintptr_t stack_probe = (uintptr_t)&stack_probe;
-        uintptr_t d = (uintptr_t)s_ptr;
-        const uintptr_t STACK_WINDOW = 0x100000; /* 1MB */
-        if (!(d >= stack_probe - STACK_WINDOW && d <= stack_probe + STACK_WINDOW)) {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "BAD_MEMSET %s:%d %s ptr=%p n=%zu stack_probe=%p (no matching alloc or too small)\n", file, line, func, s_ptr, n, (void*)stack_probe);
-                dump_backtrace(log_f_memops);
-                fflush(log_f_memops);
-            }
-        }
-    }
-    unsigned char *p = (unsigned char *)s_ptr;
-    unsigned char v = (unsigned char)c;
-    for (size_t i = 0; i < n; ++i) p[i] = v;
-    return s_ptr;
-}
-
-/* Re-map the allocation names so callers automatically pass caller metadata. */
-#define malloc(s) _dbg_malloc((s), __FILE__, __LINE__, __func__)
-#define calloc(n,s) _dbg_calloc((n),(s), __FILE__, __LINE__, __func__)
-#define realloc(p,s) _dbg_realloc((p),(s), __FILE__, __LINE__, __func__)
-#define free(p) _dbg_free((p), __FILE__, __LINE__, __func__)
-
-/* Redirect memcpy/memset to debug wrappers so we capture large buffer writes */
-#define memcpy(d,s,n) _dbg_memcpy((d),(s),(n), __FILE__, __LINE__, __func__)
-#define memset(p,c,n) _dbg_memset((p),(c),(n), __FILE__, __LINE__, __func__)
-
 static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     if (plan == NULL) {
         return;
@@ -834,7 +744,6 @@ AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
     size_t plan_len
 ) {
     _log_native_call("amp_load_compiled_plan", descriptor_len, plan_len);
-    _gen_wrapper_log("amp_load_compiled_plan", (size_t)descriptor_blob, (size_t)plan_blob);
     if (descriptor_blob == NULL || plan_blob == NULL) {
         return NULL;
     }
@@ -970,7 +879,6 @@ AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
 
 AMP_CAPI void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     _log_native_call("amp_release_compiled_plan", (size_t)(plan != NULL), 0);
-    _gen_wrapper_log("amp_release_compiled_plan", (size_t)plan, 0);
     destroy_compiled_plan(plan);
 }
 
@@ -1059,7 +967,6 @@ AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
     int frames_hint
 ) {
     _log_native_call("amp_load_control_history", blob_len, (size_t)frames_hint);
-    _gen_wrapper_log("amp_load_control_history", (size_t)blob, (size_t)frames_hint);
     if (blob == NULL || blob_len < 8) {
         return NULL;
     }
@@ -1172,8 +1079,6 @@ AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
 }
 
 AMP_CAPI void amp_release_control_history(EdgeRunnerControlHistory *history) {
-    _log_native_call("amp_release_control_history", (size_t)(history != NULL), 0);
-    _gen_wrapper_log("amp_release_control_history", (size_t)history, 0);
     destroy_control_history(history);
 }
 
@@ -2419,8 +2324,6 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
     if (out == NULL || out_len == 0) {
         return 0;
     }
-    /* Register destination buffer so mem-op logging can correlate writes. */
-    register_alloc(out, out_len);
     out[0] = '\0';
     if (json == NULL || key == NULL) {
         return 0;
@@ -2457,36 +2360,13 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
             cursor++;
         }
         size_t length = (size_t)(cursor - start);
-            if (length >= out_len) {
-                /* log attempted oversize copy */
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    void *stack_probe = (void*)&pattern;
-                    /* log the destination and a stack probe so we can detect stack-derived buffers */
-                    fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
-                }
-                length = out_len > 0 ? out_len - 1 : 0;
-            } else {
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    void *stack_probe = (void*)&pattern;
-                    fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
-                }
-            }
-            /* use safe copy that respects the provided destination capacity */
-            if (out_len > 0 && length > 0) {
-                memcpy(out, start, length);
-                /* POSTCOPY: record that we actually wrote to 'out' */
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    fprintf(log_f_memops, "POSTCOPY json_copy_string dest=%p wrote=%zu\n", out, length);
-                }
-            }
-            out[length] = '\0';
-            unregister_alloc(out);
-            return 1;
+        if (length >= out_len) {
+            length = out_len - 1;
+        }
+        memcpy(out, start, length);
+        out[length] = '\0';
+        return 1;
     }
-    unregister_alloc(out);
     return 0;
 }
 
@@ -2514,8 +2394,6 @@ static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) 
     if (csv == NULL || tokens == NULL || max_tokens <= 0) {
         return 0;
     }
-    /* Register tokens buffer for correlation of PRECOPY/MEMCPY events */
-    register_alloc(tokens, (size_t)max_tokens * 64);
     int count = 0;
     const char *cursor = csv;
     while (*cursor != '\0' && count < max_tokens) {
@@ -2531,32 +2409,12 @@ static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) 
         }
         size_t len = (size_t)(cursor - start);
         if (len >= 63) {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void*)tokens;
-                /* log both the tokens base and per-token dest so we can map to allocations */
-                fprintf(log_f_memops, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
-            }
             len = 63;
-        } else {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void*)tokens;
-                fprintf(log_f_memops, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
-            }
         }
-        if (len > 0) {
-            /* write with postcopy logging and bounds assertion */
-            memcpy(tokens[count], start, len);
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "POSTCOPY parse_csv_tokens dest=%p wrote=%zu token_idx=%d\n", tokens[count], len, count);
-            }
-        }
+        memcpy(tokens[count], start, len);
         tokens[count][len] = '\0';
         count++;
     }
-    unregister_alloc(tokens);
     return count;
 }
 
@@ -2564,8 +2422,6 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
     if (csv == NULL || items == NULL || max_items <= 0) {
         return 0;
     }
-    /* Register items buffer so writes to items->output/source are tracked */
-    register_alloc(items, (size_t)max_items * sizeof(controller_source_t));
     int count = 0;
     const char *cursor = csv;
     while (*cursor != '\0' && count < max_items) {
@@ -2581,26 +2437,9 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
         }
         size_t key_len = (size_t)(eq - cursor);
         if (key_len >= sizeof(items[count].output)) {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void*)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
-            }
             key_len = sizeof(items[count].output) - 1;
-        } else {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void*)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
-            }
         }
-        if (key_len > 0) {
-            memcpy(items[count].output, cursor, key_len);
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "POSTCOPY parse_controller_sources.output dest=%p wrote=%zu idx=%d\n", items[count].output, key_len, count);
-            }
-        }
+        memcpy(items[count].output, cursor, key_len);
         items[count].output[key_len] = '\0';
         cursor = eq + 1;
         const char *end = strchr(cursor, ',');
@@ -2609,31 +2448,13 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
         }
         size_t value_len = (size_t)(end - cursor);
         if (value_len >= sizeof(items[count].source)) {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void*)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
-            }
             value_len = sizeof(items[count].source) - 1;
-        } else {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void*)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
-            }
         }
-        if (value_len > 0) {
-            memcpy(items[count].source, cursor, value_len);
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "POSTCOPY parse_controller_sources.source dest=%p wrote=%zu idx=%d\n", items[count].source, value_len, count);
-            }
-        }
+        memcpy(items[count].source, cursor, value_len);
         items[count].source[value_len] = '\0';
         cursor = end;
         count++;
     }
-    unregister_alloc(items);
     return count;
 }
 
@@ -2884,53 +2705,12 @@ static int run_controller_node(
     if (out_buffer == NULL || out_channels == NULL) {
         return -1;
     }
-    /* allocate parsing buffers on the heap so they can be registered
-       and reliably observed by the debug registry (avoids untracked
-       stack writes and lifetime confusion). Sizes are chosen from the
-       descriptor length with safe defaults and caps. */
-    char *outputs_csv = NULL;
-    char *sources_csv = NULL;
-    char (*output_names)[64] = NULL;
-    controller_source_t *mappings = NULL;
+    char outputs_csv[256];
+    char sources_csv[512];
+    char output_names[32][64];
+    controller_source_t mappings[32];
     int output_count = 0;
-    int _rc = -1;
-    size_t outputs_cap = 256;
-    size_t sources_cap = 512;
-    if (descriptor != NULL && descriptor->params_len > 0) {
-        size_t p = descriptor->params_len + 1;
-        if (p > outputs_cap) outputs_cap = p;
-        if (p > sources_cap) sources_cap = p;
-    }
-    /* clamp to reasonable bounds */
-    if (outputs_cap < 256) outputs_cap = 256;
-    if (sources_cap < 512) sources_cap = 512;
-    if (outputs_cap > 65536) outputs_cap = 65536;
-    if (sources_cap > 65536) sources_cap = 65536;
-    outputs_csv = (char *)malloc(outputs_cap);
-    if (outputs_csv == NULL) {
-        _rc = -1;
-        goto cleanup_run_controller_node;
-    }
-    register_alloc(outputs_csv, outputs_cap);
-    sources_csv = (char *)malloc(sources_cap);
-    if (sources_csv == NULL) {
-        _rc = -1;
-        goto cleanup_run_controller_node;
-    }
-    register_alloc(sources_csv, sources_cap);
-    output_names = (char (*)[64])malloc((size_t)32 * 64);
-    if (output_names == NULL) {
-        _rc = -1;
-        goto cleanup_run_controller_node;
-    }
-    register_alloc(output_names, (size_t)32 * 64);
-    mappings = (controller_source_t *)malloc((size_t)32 * sizeof(controller_source_t));
-    if (mappings == NULL) {
-        _rc = -1;
-        goto cleanup_run_controller_node;
-    }
-    register_alloc(mappings, (size_t)32 * sizeof(controller_source_t));
-    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_outputs__", outputs_csv, outputs_cap)) {
+    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_outputs__", outputs_csv, sizeof(outputs_csv))) {
         output_count = parse_csv_tokens(outputs_csv, output_names, 32);
     }
     if (output_count <= 0 && inputs != NULL) {
@@ -2945,11 +2725,10 @@ static int run_controller_node(
         }
     }
     if (output_count <= 0) {
-        _rc = -1;
-        goto cleanup_run_controller_node;
+        return -1;
     }
     int mapping_count = 0;
-    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_sources__", sources_csv, sources_cap)) {
+    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_sources__", sources_csv, sizeof(sources_csv))) {
         mapping_count = parse_controller_sources(sources_csv, mappings, 32);
     }
     int resolved_channels = output_count;
@@ -2972,8 +2751,7 @@ static int run_controller_node(
     double *buffer = (double *)malloc(total * sizeof(double));
     amp_last_alloc_count = total;
     if (buffer == NULL) {
-        _rc = -1;
-        goto cleanup_run_controller_node;
+        return -1;
     }
     for (int c = 0; c < resolved_channels; ++c) {
         const char *source_name = output_names[c];
@@ -2989,8 +2767,7 @@ static int run_controller_node(
         const double *data = ensure_param_plane(view, batches, frames, 0.0, &owned);
         if (data == NULL) {
             free(buffer);
-            _rc = -1;
-            goto cleanup_run_controller_node;
+            return -1;
         }
         if (view_missing && owned != NULL && history != NULL) {
             const EdgeRunnerControlCurve *curve = find_history_curve(history, source_name, strlen(source_name));
@@ -3003,25 +2780,7 @@ static int run_controller_node(
             for (int f = 0; f < frames; ++f) {
                 size_t src_idx = (size_t)b * (size_t)frames + (size_t)f;
                 size_t dst_idx = ((size_t)b * (size_t)resolved_channels + (size_t)c) * (size_t)frames + (size_t)f;
-                /* bounds checks and durable logging for write operations */
-                size_t total_len = total; /* copied to local for clarity */
-                if (dst_idx >= total_len) {
-                    ensure_log_files_open();
-                    if (log_f_memops) {
-                        fprintf(log_f_memops, "BAD_WRITE run_controller_node dst_idx=%zu total=%zu src_idx=%zu c=%d b=%d f=%d resolved_channels=%d frames=%d\n", dst_idx, total_len, src_idx, c, b, f, resolved_channels, frames);
-                        fflush(log_f_memops);
-                    }
-                    /* attempt to continue safely */
-                    continue;
-                }
-                /* ensure src_idx is in range of the data plane */
-                /* we don't know 'data' length statically; we will conservatively attempt to log if src_idx seems large */
                 buffer[dst_idx] = data[src_idx];
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    fprintf(log_f_memops, "POSTWRITE run_controller_node dest=%p dst_idx=%zu wrote=1 src_idx=%zu node=%s\n", (void*)buffer, dst_idx, src_idx, descriptor->name ? descriptor->name : "<noname>");
-                    fflush(log_f_memops);
-                }
             }
         }
         if (owned != NULL) {
@@ -3030,31 +2789,7 @@ static int run_controller_node(
     }
     *out_buffer = buffer;
     *out_channels = resolved_channels;
-    _rc = 0;
-
-cleanup_run_controller_node:
-    /* Free and unregister any heap buffers allocated above. Keep this idempotent. */
-    if (outputs_csv != NULL) {
-        unregister_alloc(outputs_csv);
-        free(outputs_csv);
-        outputs_csv = NULL;
-    }
-    if (sources_csv != NULL) {
-        unregister_alloc(sources_csv);
-        free(sources_csv);
-        sources_csv = NULL;
-    }
-    if (output_names != NULL) {
-        unregister_alloc(output_names);
-        free(output_names);
-        output_names = NULL;
-    }
-    if (mappings != NULL) {
-        unregister_alloc(mappings);
-        free(mappings);
-        mappings = NULL;
-    }
-    return _rc;
+    return 0;
 }
 
 static int run_lfo_node(
@@ -4063,7 +3798,6 @@ AMP_CAPI int amp_run_node(
 
 AMP_CAPI void amp_free(double *buffer) {
     _log_native_call("amp_free", (size_t)(buffer != NULL), 0);
-    _gen_wrapper_log("amp_free", (size_t)buffer, 0);
     if (buffer != NULL) {
         free(buffer);
     }
@@ -4071,1225 +3805,1928 @@ AMP_CAPI void amp_free(double *buffer) {
 
 AMP_CAPI void amp_release_state(void *state_ptr) {
     _log_native_call("amp_release_state", (size_t)(state_ptr != NULL), 0);
-    _gen_wrapper_log("amp_release_state", (size_t)state_ptr, 0);
     if (state_ptr == NULL) {
         return;
     }
     node_state_t *node_state = (node_state_t *)state_ptr;
     release_node_state(node_state);
 }
-"""
-    try:
-        ffi.set_source("_amp_ckernels_cffi", C_SRC)
-        # compile lazy; this will create a module in-place and return its path
-        module_path = ffi.compile(verbose=False)
-        # DEBUG: expose where cffi wrote the compiled module so post-processing
-        # can reliably find and mutate the generated C file.
-        try:
-            print("[c_kernels] cffi compiled module_path:", module_path)
-        except Exception:
-            pass
-        import importlib.util
-        import sys
-        from pathlib import Path
 
-        compiled_path = Path(module_path)
-        target_path = Path(__file__).resolve().parent / compiled_path.name
-        if compiled_path.exists() and compiled_path != target_path:
-            try:
-                target_path.write_bytes(compiled_path.read_bytes())
-            except Exception:
-                # best-effort copy; continue even if it fails so runtime can still load from module_path
-                target_path = compiled_path
-        else:
-            target_path = compiled_path
+#include <ctype.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
-        # Post-process the generated C file to insert extra logging at the
-        # start of native wrapper entry points. Try several candidate paths
-        # where cffi may have emitted the generated C so this works reliably.
-        try:
-            candidates = [
-                compiled_path,  # whatever ffi.compile returned
-                target_path,    # the copied location next to this Python file
-                Path.cwd() / "_amp_ckernels_cffi.c",  # common filename in cwd
-                Path(__file__).resolve().parent / "_amp_ckernels_cffi.c",
-            ]
-            for gen_c in candidates:
-                try:
-                    if not gen_c.exists():
-                        continue
-                    src = gen_c.read_text(encoding="utf-8", errors="ignore")
-                    insert_marker = "#include <Python.h>"
-                    if insert_marker not in src:
-                        continue
-                    helper = '''
-// Injected generated-wrapper logger
-extern void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b);
-static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
-#ifdef PyThreadState_Get
-    void *py_ts = (void *)PyThreadState_Get();
+#if defined(_WIN32) || defined(_WIN64)
+#define AMP_API __declspec(dllexport)
 #else
-    void *py_ts = (void*)0;
+#define AMP_API
 #endif
-    amp_log_generated(fn, py_ts, a, b);
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+typedef struct EdgeRunnerControlHistory EdgeRunnerControlHistory;
+typedef EdgeRunnerControlHistory AmpGraphControlHistory;
+typedef struct EdgeRunnerParamView EdgeRunnerParamView;
+typedef struct EdgeRunnerNodeInputs EdgeRunnerNodeInputs;
+typedef struct EdgeRunnerNodeDescriptor EdgeRunnerNodeDescriptor;
+
+extern EdgeRunnerControlHistory *amp_load_control_history(const uint8_t *blob, size_t blob_len, int frames_hint);
+extern void amp_release_control_history(EdgeRunnerControlHistory *history);
+extern int amp_run_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    void **state,
+    const EdgeRunnerControlHistory *history
+);
+extern void amp_free(double *buffer);
+extern void amp_release_state(void *state);
+
+typedef struct {
+    double *data;
+    size_t capacity;
+    int in_use;
+} buffer_pool_entry_t;
+
+typedef struct {
+    buffer_pool_entry_t *entries;
+    size_t count;
+} buffer_pool_t;
+
+typedef struct {
+    char *name;
+    char *source_name;
+    uint32_t source_index;
+    double scale;
+    int mode;  /* 0 -> add, 1 -> mul */
+    int channel;
+} mod_connection_t;
+
+typedef struct {
+    char *name;
+    double *data;
+    uint32_t batches;
+    uint32_t channels;
+    uint32_t frames;
+} param_binding_t;
+
+typedef struct {
+    char *name;
+    size_t name_len;
+    char *type_name;
+    size_t type_name_len;
+    uint32_t type_id;
+    char **audio_inputs;
+    uint32_t audio_input_count;
+    uint32_t *audio_indices;
+    mod_connection_t *mod_connections;
+    uint32_t mod_connection_count;
+    char *params_json;
+    size_t params_json_len;
+    uint32_t channel_hint;
+    param_binding_t *param_bindings;
+    size_t param_binding_count;
+    void *state;
+    double *output;
+    uint32_t batches;
+    uint32_t channels;
+    uint32_t frames;
+    EdgeRunnerNodeDescriptor descriptor;
+} runtime_node_t;
+
+typedef struct AmpGraphRuntime {
+    runtime_node_t *nodes;
+    uint32_t node_count;
+    uint32_t *execution_order;
+    uint32_t sink_index;
+    buffer_pool_t pool;
+    uint32_t default_batches;
+    uint32_t default_frames;
+} AmpGraphRuntime;
+
+static char *dup_string(const char *src, size_t length) {
+    if (src == NULL || length == 0) {
+        return NULL;
+    }
+    char *dest = (char *)malloc(length + 1);
+    if (dest == NULL) {
+        return NULL;
+    }
+    memcpy(dest, src, length);
+    dest[length] = '\0';
+    return dest;
 }
-'''
-                    src = src.replace(insert_marker, insert_marker + "\n" + helper)
-
-                    wrappers = [
-                        'amp_load_compiled_plan',
-                        'amp_release_compiled_plan',
-                        'amp_load_control_history',
-                        'amp_release_control_history',
-                        'amp_run_node',
-                        'amp_free',
-                        'amp_release_state'
-                    ]
-                    for name in wrappers:
-                        pattern = name + '('
-                        idx = src.find(pattern)
-                        if idx == -1:
-                            continue
-                        brace = src.find('{', idx)
-                        if brace == -1:
-                            continue
-                        injection = f'\n    _gen_wrapper_log("{name}", (size_t)0, (size_t)0);\n'
-                        src = src[:brace+1] + injection + src[brace+1:]
-
-                    gen_c.write_text(src, encoding="utf-8")
-                    # stop after first successful injection
-                    break
-                except Exception:
-                    continue
-        except Exception:
-            # best-effort only
-            pass
-
-        spec = importlib.util.spec_from_file_location("_amp_ckernels_cffi", str(target_path))
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Unable to load compiled module from {target_path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["_amp_ckernels_cffi"] = module
-        spec.loader.exec_module(module)
-        _impl = module
-        AVAILABLE = True
-        UNAVAILABLE_REASON = None
-    except Exception as exc:
-        # any compile/import error -> disable C backend
-        AVAILABLE = False
-        detail = traceback.format_exc()
-        UNAVAILABLE_REASON = (
-            "Failed to compile C kernels via cffi: "
-            f"{exc}\n{detail}"
-        )
-except ModuleNotFoundError as exc:
-    AVAILABLE = False
-    UNAVAILABLE_REASON = f"cffi is not installed ({exc})"
-except Exception as exc:
-    AVAILABLE = False
-    UNAVAILABLE_REASON = (
-        "Unexpected error initialising cffi for C kernels: "
-        f"{exc}"
-    )
-
-
-def _require_ctypes_ready(arr: np.ndarray, dtype: np.dtype, *, writable: bool) -> np.ndarray:
-    """Validate that ``arr`` can be passed directly to a C kernel."""
-
-    if arr.dtype != dtype:
-        raise TypeError(f"expected dtype {dtype}, got {arr.dtype}")
-    if not arr.flags.c_contiguous:
-        raise ValueError("arrays passed to C kernels must be C-contiguous")
-    if writable and not arr.flags.writeable:
-        raise ValueError("writable arrays passed to C kernels must be writeable")
-    return arr
-
-
-DTYPE_FLOAT = np.dtype(np.float64)
-DTYPE_INT32 = np.dtype(np.int32)
-DTYPE_INT64 = np.dtype(np.int64)
-
-
-def lfo_slew_c(
-    x: np.ndarray,
-    r: float,
-    alpha: float,
-    z0: Optional[np.ndarray],
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    """Call the compiled C kernel to compute exponential smoothing.
-
-    x: (B, F) contiguous C-order array of doubles
-    r: feedback coefficient
-    alpha: feed coefficient
-    z0: optional (B,) array of initial states (modified in-place)
-
-    Returns out (B, F) same dtype.
-    Raises RuntimeError if C backend is unavailable.
-    """
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-    x_buf = _require_ctypes_ready(np.asarray(x), DTYPE_FLOAT, writable=False)
-    B, F = x_buf.shape
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for lfo_slew_c")
-        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
-
-    if z0 is not None:
-        if z0.shape != (B,):
-            raise ValueError("z0 must have shape (B,)")
-        z_buf = _require_ctypes_ready(z0, DTYPE_FLOAT, writable=True)
-        z_ptr = ffi.cast("double *", z_buf.ctypes.data)
-    else:
-        z_ptr = ffi.cast("double *", ffi.NULL)
-
-    x_ptr = ffi.cast("const double *", x_buf.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    _impl.lib.lfo_slew(x_ptr, out_ptr, int(B), int(F), float(r), float(alpha), z_ptr)
-    return out
-
-
-def lfo_slew_py(
-    x: np.ndarray,
-    r: float,
-    alpha: float,
-    z0: Optional[np.ndarray],
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    """Pure-Python sample-sequential fallback (fast with numpy per-row ops).
-
-    Semantics: iterative recurrence z[n] = r*z[n-1] + alpha * x[n].
-    """
-    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
-    B, F = x_buf.shape
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for lfo_slew_py")
-    if z0 is None:
-        z = np.zeros(B, dtype=DTYPE_FLOAT)
-    else:
-        z = np.asarray(z0, dtype=DTYPE_FLOAT)
-    for i in range(F):
-        xi = x_buf[:, i]
-        z = r * z + alpha * xi
-        out[:, i] = z
-    if z0 is not None:
-        z0[:] = z
-    return out
-
-
-def lfo_slew_vector(
-    x: np.ndarray,
-    r: float,
-    alpha: float,
-    z0: Optional[np.ndarray],
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    """Vectorized closed-form solution equivalent to iterative recurrence.
-
-    z[n] = r^n * z0 + alpha * r^n * sum_{k=0..n} r^{-k} * x[k]
-    Implemented using np.cumsum on axis 1.
-    """
-    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
-    B, F = x_buf.shape
-    idx = np.arange(F, dtype=DTYPE_FLOAT)
-    r_pow = r ** idx
-    # handle r==0
-    with np.errstate(divide='ignore', invalid='ignore'):
-        r_inv = np.where(r == 0.0, 0.0, r ** (-idx))
-    accum = np.cumsum(x_buf * r_inv[None, :], axis=1)
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for lfo_slew_vector")
-    out[:] = r_pow[None, :] * (alpha * accum)
-    if z0 is not None:
-        out += r_pow[None, :] * z0[:, None]
-        z0[:] = out[:, -1]
-    return out
-
-
-def safety_filter_c(
-    x: np.ndarray,
-    a: float,
-    prev_in: Optional[np.ndarray],
-    prev_dc: Optional[np.ndarray],
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    """Call compiled ``safety_filter`` kernel without intermediate copies."""
-
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-
-    x_buf = _require_ctypes_ready(np.asarray(x), DTYPE_FLOAT, writable=False)
-    B, C, F = x_buf.shape
-    if out is None:
-        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, C, F):
-            raise ValueError("out has incorrect shape for safety_filter_c")
-        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
-
-    if prev_in is not None:
-        if prev_in.shape != (B, C):
-            raise ValueError("prev_in must have shape (B, C)")
-        prev_in_buf = _require_ctypes_ready(prev_in, DTYPE_FLOAT, writable=True)
-        prev_in_ptr = ffi.cast("double *", prev_in_buf.ctypes.data)
-    else:
-        prev_in_ptr = ffi.cast("double *", ffi.NULL)
-
-    if prev_dc is not None:
-        if prev_dc.shape != (B, C):
-            raise ValueError("prev_dc must have shape (B, C)")
-        prev_dc_buf = _require_ctypes_ready(prev_dc, DTYPE_FLOAT, writable=True)
-        prev_dc_ptr = ffi.cast("double *", prev_dc_buf.ctypes.data)
-    else:
-        prev_dc_ptr = ffi.cast("double *", ffi.NULL)
-
-    x_ptr = ffi.cast("const double *", x_buf.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    _impl.lib.safety_filter(x_ptr, out_ptr, int(B), int(C), int(F), float(a), prev_in_ptr, prev_dc_ptr)
-    return out
-
-
-def safety_filter_py(
-    x: np.ndarray,
-    a: float,
-    prev_in: Optional[np.ndarray],
-    prev_dc: Optional[np.ndarray],
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
-    B, C, F = x_buf.shape
-    if out is None:
-        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, C, F):
-            raise ValueError("out has incorrect shape for safety_filter_py")
-    pi = np.zeros((B, C), dtype=DTYPE_FLOAT) if prev_in is None else np.asarray(prev_in, dtype=DTYPE_FLOAT)
-    pd = np.zeros((B, C), dtype=DTYPE_FLOAT) if prev_dc is None else np.asarray(prev_dc, dtype=DTYPE_FLOAT)
-    for b in range(B):
-        for c in range(C):
-            if F <= 0:
-                continue
-            # compute diffs
-            diffs = np.empty(F, dtype=DTYPE_FLOAT)
-            diffs[0] = x_buf[b, c, 0] - pi[b, c]
-            if F > 1:
-                diffs[1:] = x_buf[b, c, 1:] - x_buf[b, c, :-1]
-            powers = a ** np.arange(F, dtype=DTYPE_FLOAT)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                inv_p = 1.0 / powers
-            accum = np.cumsum(diffs * inv_p) + (a * pd[b, c])
-            y = accum * powers
-            out[b, c, :] = y
-            pi[b, c] = x_buf[b, c, -1]
-            pd[b, c] = y[-1]
-    if prev_in is not None:
-        prev_in[:] = pi
-    if prev_dc is not None:
-        prev_dc[:] = pd
-    return out
-
-
-def dc_block_c(
-    x: np.ndarray,
-    a: float,
-    state: Optional[np.ndarray],
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-
-    x_buf = _require_ctypes_ready(np.asarray(x), DTYPE_FLOAT, writable=False)
-    B, C, F = x_buf.shape
-    if out is None:
-        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, C, F):
-            raise ValueError("out has incorrect shape for dc_block_c")
-        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
-
-    if state is not None:
-        if state.shape != (B, C):
-            raise ValueError("state must have shape (B, C)")
-        state_buf = _require_ctypes_ready(state, DTYPE_FLOAT, writable=True)
-        state_ptr = ffi.cast("double *", state_buf.ctypes.data)
-    else:
-        state_ptr = ffi.cast("double *", ffi.NULL)
-
-    x_ptr = ffi.cast("const double *", x_buf.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    _impl.lib.dc_block(x_ptr, out_ptr, int(B), int(C), int(F), float(a), state_ptr)
-    return out
-
-
-def dc_block_py(
-    x: np.ndarray,
-    a: float,
-    state: Optional[np.ndarray],
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    x_buf = np.asarray(x, dtype=DTYPE_FLOAT)
-    B, C, F = x_buf.shape
-    if out is None:
-        out = np.empty((B, C, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, C, F):
-            raise ValueError("out has incorrect shape for dc_block_py")
-    st = np.zeros((B, C), dtype=DTYPE_FLOAT) if state is None else np.asarray(state, dtype=DTYPE_FLOAT)
-    for b in range(B):
-        for c in range(C):
-            dc = st[b, c]
-            for i in range(F):
-                xi = x_buf[b, c, i]
-                dc = a * dc + (1.0 - a) * xi
-                out[b, c, i] = xi - dc
-            st[b, c] = dc
-    if state is not None:
-        state[:] = st
-    return out
-
-
-def subharmonic_process_c(
-    x: np.ndarray,
-    a_hp_in: float,
-    a_lp_in: float,
-    a_sub2: float,
-    use_div4: bool,
-    a_sub4: float,
-    a_env_attack: float,
-    a_env_release: float,
-    a_hp_out: float,
-    drive: float,
-    mix: float,
-    hp_y: np.ndarray,
-    lp_y: np.ndarray,
-    prev: np.ndarray,
-    sign: np.ndarray,
-    ff2: np.ndarray,
-    ff4: np.ndarray | None,
-    ff4_count: np.ndarray | None,
-    sub2_lp: np.ndarray,
-    sub4_lp: np.ndarray | None,
-    env: np.ndarray,
-    hp_out_y: np.ndarray,
-    hp_out_x: np.ndarray,
-) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-    B, C, F = x.shape
-    xb = np.ascontiguousarray(x)
-    out = np.empty_like(xb)
-    outb = np.ascontiguousarray(out)
-
-    # ensure buffers
-    hp_y_b = np.ascontiguousarray(hp_y)
-    lp_y_b = np.ascontiguousarray(lp_y)
-    prev_b = np.ascontiguousarray(prev)
-    sign_b = np.ascontiguousarray(sign.astype(np.int8))
-    ff2_b = np.ascontiguousarray(ff2.astype(np.int8))
-    ff4_b = np.ascontiguousarray(ff4.astype(np.int8)) if ff4 is not None else ffi.cast("int8_t *", ffi.NULL)
-    ff4_count_b = np.ascontiguousarray(ff4_count.astype(np.int32)) if ff4_count is not None else ffi.cast("int32_t *", ffi.NULL)
-    sub2_lp_b = np.ascontiguousarray(sub2_lp)
-    sub4_lp_b = np.ascontiguousarray(sub4_lp) if sub4_lp is not None else ffi.cast("double *", ffi.NULL)
-    env_b = np.ascontiguousarray(env)
-    hp_out_y_b = np.ascontiguousarray(hp_out_y)
-    hp_out_x_b = np.ascontiguousarray(hp_out_x)
-
-    x_ptr = ffi.cast("const double *", xb.ctypes.data)
-    y_ptr = ffi.cast("double *", outb.ctypes.data)
-    hp_y_ptr = ffi.cast("double *", hp_y_b.ctypes.data)
-    lp_y_ptr = ffi.cast("double *", lp_y_b.ctypes.data)
-    prev_ptr = ffi.cast("double *", prev_b.ctypes.data)
-    sign_ptr = ffi.cast("int8_t *", sign_b.ctypes.data)
-    ff2_ptr = ffi.cast("int8_t *", ff2_b.ctypes.data)
-    ff4_ptr = ffi.cast("int8_t *", ff4_b.ctypes.data) if ff4 is not None else ffi.cast("int8_t *", ffi.NULL)
-    ff4_count_ptr = ffi.cast("int32_t *", ff4_count_b.ctypes.data) if ff4_count is not None else ffi.cast("int32_t *", ffi.NULL)
-    sub2_lp_ptr = ffi.cast("double *", sub2_lp_b.ctypes.data)
-    sub4_lp_ptr = ffi.cast("double *", sub4_lp_b.ctypes.data) if sub4_lp is not None else ffi.cast("double *", ffi.NULL)
-    env_ptr = ffi.cast("double *", env_b.ctypes.data)
-    hp_out_y_ptr = ffi.cast("double *", hp_out_y_b.ctypes.data)
-    hp_out_x_ptr = ffi.cast("double *", hp_out_x_b.ctypes.data)
-
-    _impl.lib.subharmonic_process(
-        x_ptr,
-        y_ptr,
-        int(B),
-        int(C),
-        int(F),
-        float(a_hp_in),
-        float(a_lp_in),
-        float(a_sub2),
-        int(1 if use_div4 else 0),
-        float(a_sub4),
-        float(a_env_attack),
-        float(a_env_release),
-        float(a_hp_out),
-        float(drive),
-        float(mix),
-        hp_y_ptr,
-        lp_y_ptr,
-        prev_ptr,
-        sign_ptr,
-        ff2_ptr,
-        ff4_ptr,
-        ff4_count_ptr,
-        sub2_lp_ptr,
-        sub4_lp_ptr,
-        env_ptr,
-        hp_out_y_ptr,
-        hp_out_x_ptr,
-    )
-
-    # copy back mutable state
-    hp_y[:] = hp_y_b
-    lp_y[:] = lp_y_b
-    prev[:] = prev_b
-    sign[:] = sign_b
-    ff2[:] = ff2_b
-    if ff4 is not None:
-        ff4[:] = ff4_b
-    if ff4_count is not None:
-        ff4_count[:] = ff4_count_b
-    sub2_lp[:] = sub2_lp_b
-    if sub4_lp is not None:
-        sub4_lp[:] = sub4_lp_b
-    env[:] = env_b
-    hp_out_y[:] = hp_out_y_b
-    hp_out_x[:] = hp_out_x_b
-
-    return outb
-
-
-def subharmonic_process_py(
-    x: np.ndarray,
-    a_hp_in: float,
-    a_lp_in: float,
-    a_sub2: float,
-    use_div4: bool,
-    a_sub4: float,
-    a_env_attack: float,
-    a_env_release: float,
-    a_hp_out: float,
-    drive: float,
-    mix: float,
-    hp_y: np.ndarray,
-    lp_y: np.ndarray,
-    prev: np.ndarray,
-    sign: np.ndarray,
-    ff2: np.ndarray,
-    ff4: np.ndarray | None,
-    ff4_count: np.ndarray | None,
-    sub2_lp: np.ndarray,
-    sub4_lp: np.ndarray | None,
-    env: np.ndarray,
-    hp_out_y: np.ndarray,
-    hp_out_x: np.ndarray,
-) -> np.ndarray:
-    B, C, F = x.shape
-    y = np.empty_like(x)
-    for t in range(F):
-        xt = x[:, :, t]
-
-        # Bandpass driver: simple HP then LP
-        hp_y[:] = a_hp_in * (hp_y + xt - prev)
-        prev[:] = xt
-        bp = lp_y + a_lp_in * (hp_y - lp_y)
-        lp_y[:] = bp
-
-        abs_bp = np.abs(bp)
-        env[:] = np.where(
-            abs_bp > env,
-            env + a_env_attack * (abs_bp - env),
-            env + a_env_release * (abs_bp - env),
-        )
-
-        prev_sign = sign.copy()
-        sign_now = (bp > 0.0).astype(np.int8) * 2 - 1
-        pos_zc = (prev_sign < 0) & (sign_now > 0)
-        sign[:] = sign_now
-
-        ff2[:] = np.where(pos_zc, -ff2, ff2)
-
-        if use_div4 and ff4 is not None and ff4_count is not None:
-            ff4_count[:] = np.where(pos_zc, ff4_count + 1, ff4_count)
-            toggle4 = pos_zc & (ff4_count >= 2)
-            ff4[:] = np.where(toggle4, -ff4, ff4)
-            ff4_count[:] = np.where(toggle4, 0, ff4_count)
-
-        sq2 = ff2.astype(x.dtype)
-        sub2_lp[:] = sub2_lp + a_sub2 * (sq2 - sub2_lp)
-        sub = sub2_lp.copy()
-
-        if use_div4 and sub4_lp is not None and ff4 is not None:
-            sq4 = ff4.astype(x.dtype)
-            sub4_lp[:] = sub4_lp + a_sub4 * (sq4 - sub4_lp)
-            sub = sub + 0.6 * sub4_lp
-
-        sub = np.tanh(drive * sub) * (env + 1e-6)
-
-        dry = xt
-        wet = sub
-        out_t = (1.0 - mix) * dry + mix * wet
-
-        y_prev = hp_out_y.copy()
-        x_prev = hp_out_x.copy()
-        hp = a_hp_out * (y_prev + out_t - x_prev)
-        hp_out_y[:] = hp
-        hp_out_x[:] = out_t
-        y[:, :, t] = hp
-
-    return y
-
-
-def phase_advance_c(
-    dphi: np.ndarray,
-    reset: np.ndarray | None,
-    phase_state: np.ndarray | None,
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-
-    dphi_buf = _require_ctypes_ready(np.asarray(dphi), DTYPE_FLOAT, writable=False)
-    B, F = dphi_buf.shape
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for phase_advance_c")
-        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
-
-    if phase_state is not None:
-        if phase_state.shape != (B,):
-            raise ValueError("phase_state must have shape (B,)")
-        phase_buf = _require_ctypes_ready(phase_state, DTYPE_FLOAT, writable=True)
-        state_ptr = ffi.cast("double *", phase_buf.ctypes.data)
-    else:
-        state_ptr = ffi.cast("double *", ffi.NULL)
-
-    if reset is not None:
-        reset_buf = _require_ctypes_ready(np.asarray(reset), DTYPE_FLOAT, writable=False)
-        if reset_buf.shape != (B, F):
-            raise ValueError("reset must have shape (B, F)")
-        reset_ptr = ffi.cast("const double *", reset_buf.ctypes.data)
-    else:
-        reset_ptr = ffi.cast("const double *", ffi.NULL)
-
-    dphi_ptr = ffi.cast("const double *", dphi_buf.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    _impl.lib.phase_advance(dphi_ptr, out_ptr, int(B), int(F), state_ptr, reset_ptr)
-    return out
-
-
-def phase_advance_py(
-    dphi: np.ndarray,
-    reset: np.ndarray | None,
-    phase_state: np.ndarray | None,
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    dphi_buf = np.asarray(dphi, dtype=DTYPE_FLOAT)
-    B, F = dphi_buf.shape
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for phase_advance_py")
-    if phase_state is None:
-        cur = np.zeros(B, dtype=DTYPE_FLOAT)
-    else:
-        cur = np.asarray(phase_state, dtype=DTYPE_FLOAT)
-    if reset is not None:
-        reset_buf = np.asarray(reset, dtype=DTYPE_FLOAT)
-    else:
-        reset_buf = None
-    for i in range(F):
-        if reset_buf is not None:
-            mask = reset_buf[:, i] > 0.5
-            if np.any(mask):
-                cur = np.where(mask, 0.0, cur)
-        cur = (cur + dphi_buf[:, i]) % 1.0
-        out[:, i] = cur
-    if phase_state is not None:
-        phase_state[:] = cur
-    return out
-
-
-def portamento_smooth_c(
-    freq_target: np.ndarray,
-    port_mask: np.ndarray | None,
-    slide_time: np.ndarray | None,
-    slide_damp: np.ndarray | None,
-    sr: int,
-    freq_state: np.ndarray | None,
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-
-    freq_buf = _require_ctypes_ready(np.asarray(freq_target), DTYPE_FLOAT, writable=False)
-    B, F = freq_buf.shape
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for portamento_smooth_c")
-        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
-
-    if port_mask is not None:
-        port_buf = _require_ctypes_ready(np.asarray(port_mask), DTYPE_FLOAT, writable=False)
-        if port_buf.shape != (B, F):
-            raise ValueError("port_mask must have shape (B, F)")
-        port_ptr = ffi.cast("const double *", port_buf.ctypes.data)
-    else:
-        port_ptr = ffi.cast("const double *", ffi.NULL)
-
-    if slide_time is not None:
-        st_buf = _require_ctypes_ready(np.asarray(slide_time), DTYPE_FLOAT, writable=False)
-        if st_buf.shape != (B, F):
-            raise ValueError("slide_time must have shape (B, F)")
-        st_ptr = ffi.cast("const double *", st_buf.ctypes.data)
-    else:
-        st_ptr = ffi.cast("const double *", ffi.NULL)
-
-    if slide_damp is not None:
-        sd_buf = _require_ctypes_ready(np.asarray(slide_damp), DTYPE_FLOAT, writable=False)
-        if sd_buf.shape != (B, F):
-            raise ValueError("slide_damp must have shape (B, F)")
-        sd_ptr = ffi.cast("const double *", sd_buf.ctypes.data)
-    else:
-        sd_ptr = ffi.cast("const double *", ffi.NULL)
-
-    if freq_state is not None:
-        if freq_state.shape != (B,):
-            raise ValueError("freq_state must have shape (B,)")
-        state_buf = _require_ctypes_ready(freq_state, DTYPE_FLOAT, writable=True)
-        state_ptr = ffi.cast("double *", state_buf.ctypes.data)
-    else:
-        state_ptr = ffi.cast("double *", ffi.NULL)
-
-    ft_ptr = ffi.cast("const double *", freq_buf.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    _impl.lib.portamento_smooth(ft_ptr, port_ptr, st_ptr, sd_ptr, int(B), int(F), int(sr), state_ptr, out_ptr)
-    return out
-
-
-def portamento_smooth_py(
-    freq_target: np.ndarray,
-    port_mask: np.ndarray | None,
-    slide_time: np.ndarray | None,
-    slide_damp: np.ndarray | None,
-    sr: int,
-    freq_state: np.ndarray | None,
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    freq_buf = np.asarray(freq_target, dtype=DTYPE_FLOAT)
-    B, F = freq_buf.shape
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for portamento_smooth_py")
-    if freq_state is None:
-        cur = np.zeros(B, dtype=DTYPE_FLOAT)
-    else:
-        cur = np.asarray(freq_state, dtype=DTYPE_FLOAT)
-    port_buf = None if port_mask is None else np.asarray(port_mask, dtype=DTYPE_FLOAT)
-    st_buf = None if slide_time is None else np.asarray(slide_time, dtype=DTYPE_FLOAT)
-    sd_buf = None if slide_damp is None else np.asarray(slide_damp, dtype=DTYPE_FLOAT)
-    for i in range(F):
-        target = freq_buf[:, i]
-        if port_buf is not None:
-            active = port_buf[:, i] > 0.5
-        else:
-            active = np.zeros(B, dtype=bool)
-        frames_const = np.maximum(st_buf[:, i] * float(sr) if st_buf is not None else 1.0, 1.0)
-        alpha = np.exp(-1.0 / frames_const)
-        if sd_buf is not None:
-            alpha = alpha ** (1.0 + np.clip(sd_buf[:, i], 0.0, None))
-        cur = np.where(active, alpha * cur + (1.0 - alpha) * target, target)
-        out[:, i] = cur
-    if freq_state is not None:
-        freq_state[:] = cur
-    return out
-
-
-def arp_advance_c(
-    seq: np.ndarray,
-    seq_len: int,
-    B: int,
-    F: int,
-    step_state: np.ndarray,
-    timer_state: np.ndarray,
-    fps: int,
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-
-    seq_buf = _require_ctypes_ready(np.asarray(seq), DTYPE_FLOAT, writable=False)
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for arp_advance_c")
-        _require_ctypes_ready(out, DTYPE_FLOAT, writable=True)
-
-    step_buf = _require_ctypes_ready(np.asarray(step_state), DTYPE_INT32, writable=True)
-    timer_buf = _require_ctypes_ready(np.asarray(timer_state), DTYPE_INT32, writable=True)
-
-    seq_ptr = ffi.cast("const double *", seq_buf.ctypes.data)
-    out_ptr = ffi.cast("double *", out.ctypes.data)
-    step_ptr = ffi.cast("int *", step_buf.ctypes.data)
-    timer_ptr = ffi.cast("int *", timer_buf.ctypes.data)
-    _impl.lib.arp_advance(seq_ptr, int(seq_len), out_ptr, int(B), int(F), step_ptr, timer_ptr, int(fps))
-    return out
-
-
-def arp_advance_py(
-    seq: np.ndarray,
-    seq_len: int,
-    B: int,
-    F: int,
-    step_state: np.ndarray,
-    timer_state: np.ndarray,
-    fps: int,
-    *,
-    out: np.ndarray | None = None,
-) -> np.ndarray:
-    if out is None:
-        out = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out.shape != (B, F):
-            raise ValueError("out has incorrect shape for arp_advance_py")
-        out.fill(0.0)
-    seq_list = list(np.asarray(seq, dtype=DTYPE_FLOAT).ravel())
-    if len(seq_list) == 0:
-        seq_list = [0.0]
-    seq_vals = np.asarray(seq_list, dtype=DTYPE_FLOAT)
-    step = np.asarray(step_state, dtype=DTYPE_INT32)
-    timer = np.asarray(timer_state, dtype=DTYPE_INT32)
-    for i in range(F):
-        idx = step % seq_vals.size
-        out[:, i] = seq_vals[idx]
-        timer += 1
-        reached = timer >= fps
-        if np.any(reached):
-            timer[reached] = 0
-            step[reached] = (step[reached] + 1) % len(seq_list)
-    step_state[:] = step
-    timer_state[:] = timer
-    return out
-
-
-def _polyblep_arr_c(t: np.ndarray, dt: np.ndarray) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-    t_b = np.ascontiguousarray(t)
-    dt_b = np.ascontiguousarray(dt)
-    out = np.empty_like(t_b)
-    _impl.lib.polyblep_arr(ffi.cast("const double *", t_b.ctypes.data), ffi.cast("const double *", dt_b.ctypes.data), ffi.cast("double *", out.ctypes.data), int(out.size))
-    return out
-
-
-def osc_saw_blep_c(ph: np.ndarray, dphi: np.ndarray) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-    B, F = ph.shape
-    out = np.empty((B, F), dtype=ph.dtype)
-    _impl.lib.osc_saw_blep_c(ffi.cast("const double *", np.ascontiguousarray(ph).ctypes.data), ffi.cast("const double *", np.ascontiguousarray(dphi).ctypes.data), ffi.cast("double *", out.ctypes.data), int(B), int(F))
-    return out
-
-
-def osc_saw_blep_py(ph: np.ndarray, dphi: np.ndarray) -> np.ndarray:
-    t = ph
-    y = 2.0 * t - 1.0
-    # reuse _polyblep_arr implementation
-    pb = _polyblep_arr_py(t, dphi)
-    return y - pb
-
-
-def osc_square_blep_c(ph: np.ndarray, dphi: np.ndarray, pw: float = 0.5) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-    B, F = ph.shape
-    out = np.empty((B, F), dtype=ph.dtype)
-    _impl.lib.osc_square_blep_c(ffi.cast("const double *", np.ascontiguousarray(ph).ctypes.data), ffi.cast("const double *", np.ascontiguousarray(dphi).ctypes.data), float(pw), ffi.cast("double *", out.ctypes.data), int(B), int(F))
-    return out
-
-
-def osc_square_blep_py(ph: np.ndarray, dphi: np.ndarray, pw: float = 0.5) -> np.ndarray:
-    t = ph
-    y = np.where(t < pw, 1.0, -1.0)
-    y = y - _polyblep_arr_py(t, dphi)
-    t2 = (t + (1.0 - pw)) % 1.0
-    y = y + _polyblep_arr_py(t2, dphi)
-    return y
-
-
-def osc_triangle_blep_c(ph: np.ndarray, dphi: np.ndarray, tri_state: np.ndarray | None = None) -> np.ndarray:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-    B, F = ph.shape
-    out = np.empty((B, F), dtype=ph.dtype)
-    if tri_state is not None:
-        tri_buf = np.ascontiguousarray(tri_state.astype(np.float64))
-        tri_ptr = ffi.cast("double *", tri_buf.ctypes.data)
-    else:
-        tri_buf = None
-        tri_ptr = ffi.cast("double *", ffi.NULL)
-    _impl.lib.osc_triangle_blep_c(
-        ffi.cast("const double *", np.ascontiguousarray(ph).ctypes.data),
-        ffi.cast("const double *", np.ascontiguousarray(dphi).ctypes.data),
-        ffi.cast("double *", out.ctypes.data),
-        int(B),
-        int(F),
-        tri_ptr,
-    )
-    if tri_state is not None:
-        tri_state[:] = tri_buf[:B]
-    return out
-
-
-def _polyblep_arr_py(t: np.ndarray, dt: np.ndarray) -> np.ndarray:
-    out = np.zeros_like(t)
-    m = t < dt
-    if np.any(m):
-        x = t[m] / np.maximum(dt[m], 1e-20)
-        out[m] = x + x - x * x - 1.0
-    m = t > (1.0 - dt)
-    if np.any(m):
-        x = (t[m] - 1.0) / np.maximum(dt[m], 1e-20)
-        out[m] = x * x + x + x + 1.0
-    return out
-
-def envelope_process_c(
-    trigger: np.ndarray,
-    gate: np.ndarray,
-    drone: np.ndarray,
-    velocity: np.ndarray,
-    atk_frames: int,
-    hold_frames: int,
-    dec_frames: int,
-    sus_frames: int,
-    rel_frames: int,
-    sustain_level: float,
-    send_resets: bool,
-    stage: np.ndarray,
-    value: np.ndarray,
-    timer: np.ndarray,
-    vel_state: np.ndarray,
-    activations: np.ndarray,
-    release_start: np.ndarray,
-    *,
-    out_amp: np.ndarray | None = None,
-    out_reset: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    if not AVAILABLE or _impl is None:
-        raise RuntimeError("C kernel not available")
-    B = trigger.shape[0]
-    F = trigger.shape[1]
-    dtype_float = np.dtype(np.float64)
-    dtype_stage = np.dtype(np.int32)
-    dtype_acts = np.dtype(np.int64)
-
-    trig_b = _require_ctypes_ready(trigger, dtype_float, writable=False)
-    gate_b = _require_ctypes_ready(gate, dtype_float, writable=False)
-    drone_b = _require_ctypes_ready(drone, dtype_float, writable=False)
-    vel_b = _require_ctypes_ready(velocity, dtype_float, writable=False)
-    stage_b = _require_ctypes_ready(stage, dtype_stage, writable=True)
-    value_b = _require_ctypes_ready(value, dtype_float, writable=True)
-    timer_b = _require_ctypes_ready(timer, dtype_float, writable=True)
-    vel_state_b = _require_ctypes_ready(vel_state, dtype_float, writable=True)
-    activ_b = _require_ctypes_ready(activations, dtype_acts, writable=True)
-    rel_b = _require_ctypes_ready(release_start, dtype_float, writable=True)
-
-    if out_amp is None:
-        out_amp = np.empty((B, F), dtype=dtype_float)
-    else:
-        if out_amp.shape != (B, F):
-            raise ValueError("out_amp has incorrect shape")
-        _require_ctypes_ready(out_amp, dtype_float, writable=True)
-    if out_reset is None:
-        out_reset = np.empty((B, F), dtype=dtype_float)
-    else:
-        if out_reset.shape != (B, F):
-            raise ValueError("out_reset has incorrect shape")
-        _require_ctypes_ready(out_reset, dtype_float, writable=True)
-
-    amp_ptr = ffi.cast("double *", out_amp.ctypes.data)
-    reset_ptr = ffi.cast("double *", out_reset.ctypes.data)
-    trig_ptr = ffi.cast("const double *", trig_b.ctypes.data)
-    gate_ptr = ffi.cast("const double *", gate_b.ctypes.data)
-    drone_ptr = ffi.cast("const double *", drone_b.ctypes.data)
-    vel_ptr = ffi.cast("const double *", vel_b.ctypes.data)
-    stage_ptr = ffi.cast("int *", stage_b.ctypes.data)
-    value_ptr = ffi.cast("double *", value_b.ctypes.data)
-    timer_ptr = ffi.cast("double *", timer_b.ctypes.data)
-    vel_state_ptr = ffi.cast("double *", vel_state_b.ctypes.data)
-    activ_ptr = ffi.cast("int64_t *", activ_b.ctypes.data)
-    rel_ptr = ffi.cast("double *", rel_b.ctypes.data)
-
-    _impl.lib.envelope_process(
-        trig_ptr,
-        gate_ptr,
-        drone_ptr,
-        vel_ptr,
-        int(B),
-        int(F),
-        int(atk_frames),
-        int(hold_frames),
-        int(dec_frames),
-        int(sus_frames),
-        int(rel_frames),
-        float(sustain_level),
-        int(1 if send_resets else 0),
-        stage_ptr,
-        value_ptr,
-        timer_ptr,
-        vel_state_ptr,
-        activ_ptr,
-        rel_ptr,
-        amp_ptr,
-        reset_ptr,
-    )
-
-    return out_amp, out_reset
-
-
-def envelope_process_py(
-    trigger: np.ndarray,
-    gate: np.ndarray,
-    drone: np.ndarray,
-    velocity: np.ndarray,
-    atk_frames: int,
-    hold_frames: int,
-    dec_frames: int,
-    sus_frames: int,
-    rel_frames: int,
-    sustain_level: float,
-    send_resets: bool,
-    stage: np.ndarray,
-    value: np.ndarray,
-    timer: np.ndarray,
-    vel_state: np.ndarray,
-    activations: np.ndarray,
-    release_start: np.ndarray,
-    *,
-    out_amp: np.ndarray | None = None,
-    out_reset: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Pure-Python fallback envelope processor."""
-
-    trigger_buf = np.asarray(trigger, dtype=DTYPE_FLOAT)
-    gate_buf = np.asarray(gate, dtype=DTYPE_FLOAT)
-    drone_buf = np.asarray(drone, dtype=DTYPE_FLOAT)
-    velocity_buf = np.asarray(velocity, dtype=DTYPE_FLOAT)
-
-    B, F = trigger_buf.shape
-
-    if stage.dtype != DTYPE_INT32:
-        raise TypeError("stage must have dtype int32")
-    stage_buf = stage
-    if value.dtype != DTYPE_FLOAT:
-        raise TypeError("value must have dtype float64")
-    value_buf = value
-    if timer.dtype != DTYPE_FLOAT:
-        raise TypeError("timer must have dtype float64")
-    timer_buf = timer
-    if vel_state.dtype != DTYPE_FLOAT:
-        raise TypeError("vel_state must have dtype float64")
-    vel_state_buf = vel_state
-    if activations.dtype != DTYPE_INT64:
-        raise TypeError("activations must have dtype int64")
-    activ_buf = activations
-    if release_start.dtype != DTYPE_FLOAT:
-        raise TypeError("release_start must have dtype float64")
-    rel_buf = release_start
-
-    if out_amp is None:
-        out_amp = np.empty((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out_amp.shape != (B, F):
-            raise ValueError("out_amp has incorrect shape")
-        out_amp = np.asarray(out_amp, dtype=DTYPE_FLOAT)
-
-    if out_reset is None:
-        out_reset = np.zeros((B, F), dtype=DTYPE_FLOAT)
-    else:
-        if out_reset.shape != (B, F):
-            raise ValueError("out_reset has incorrect shape")
-        out_reset = np.asarray(out_reset, dtype=DTYPE_FLOAT)
-        out_reset.fill(0.0)
-
-    for b in range(B):
-        st = int(stage_buf[b])
-        val = float(value_buf[b])
-        tim = float(timer_buf[b])
-        vel = float(vel_state_buf[b])
-        acts = int(activ_buf[b])
-        rel_start_val = float(rel_buf[b])
-
-        trig_line = trigger_buf[b] > 0.5
-        gate_line = gate_buf[b] > 0.5
-        drone_line = drone_buf[b] > 0.5
-
-        for i in range(F):
-            trig = bool(trig_line[i])
-            gate_on = bool(gate_line[i])
-            drone_on = bool(drone_line[i])
-
-            if trig:
-                st = 1
-                tim = 0.0
-                val = 0.0
-                vel = float(velocity_buf[b, i])
-                if vel < 0.0:
-                    vel = 0.0
-                rel_start_val = vel
-                acts += 1
-                if send_resets:
-                    out_reset[b, i] = 1.0
-            elif st == 0 and (gate_on or drone_on):
-                st = 1
-                tim = 0.0
-                val = 0.0
-                vel = float(velocity_buf[b, i])
-                if vel < 0.0:
-                    vel = 0.0
-                rel_start_val = vel
-                acts += 1
-                if send_resets:
-                    out_reset[b, i] = 1.0
-
-            if st == 1:
-                if atk_frames <= 0:
-                    val = vel
-                    if hold_frames > 0:
-                        st = 2
-                    elif dec_frames > 0:
-                        st = 3
-                    else:
-                        st = 4
-                    tim = 0.0
-                else:
-                    step = vel / float(atk_frames if atk_frames > 0 else 1)
-                    val += step
-                    if val > vel:
-                        val = vel
-                    tim += 1.0
-                    if tim >= atk_frames:
-                        val = vel
-                        if hold_frames > 0:
-                            st = 2
-                        elif dec_frames > 0:
-                            st = 3
-                        else:
-                            st = 4
-                        tim = 0.0
-            elif st == 2:
-                val = vel
-                if hold_frames <= 0:
-                    if dec_frames > 0:
-                        st = 3
-                    else:
-                        st = 4
-                    tim = 0.0
-                else:
-                    tim += 1.0
-                    if tim >= hold_frames:
-                        if dec_frames > 0:
-                            st = 3
-                        else:
-                            st = 4
-                        tim = 0.0
-            elif st == 3:
-                target = vel * sustain_level
-                if dec_frames <= 0:
-                    val = target
-                    st = 4
-                    tim = 0.0
-                else:
-                    delta = (vel - target) / float(dec_frames if dec_frames > 0 else 1)
-                    candidate = val - delta
-                    if candidate < target:
-                        candidate = target
-                    val = candidate
-                    tim += 1.0
-                    if tim >= dec_frames:
-                        val = target
-                        st = 4
-                        tim = 0.0
-            elif st == 4:
-                val = vel * sustain_level
-                if sus_frames > 0:
-                    tim += 1.0
-                    if tim >= sus_frames:
-                        st = 5
-                        rel_start_val = val
-                        tim = 0.0
-                elif not gate_on and not drone_on:
-                    st = 5
-                    rel_start_val = val
-                    tim = 0.0
-            elif st == 5:
-                if rel_frames <= 0:
-                    val = 0.0
-                    st = 0
-                    tim = 0.0
-                else:
-                    step = rel_start_val / float(rel_frames if rel_frames > 0 else 1)
-                    candidate = val - step
-                    if candidate < 0.0:
-                        candidate = 0.0
-                    val = candidate
-                    tim += 1.0
-                    if tim >= rel_frames:
-                        val = 0.0
-                        st = 0
-                        tim = 0.0
-                if gate_on or drone_on:
-                    st = 1
-                    tim = 0.0
-                    val = 0.0
-                    vel = float(velocity_buf[b, i])
-                    if vel < 0.0:
-                        vel = 0.0
-                    rel_start_val = vel
-                    acts += 1
-                    if send_resets:
-                        out_reset[b, i] = 1.0
-
-            if val < 0.0:
-                val = 0.0
-            out_amp[b, i] = val
-
-        stage_buf[b] = st
-        value_buf[b] = val
-        timer_buf[b] = tim
-        vel_state_buf[b] = vel
-        activ_buf[b] = acts
-        rel_buf[b] = rel_start_val
-
-    return out_amp, out_reset
 
-
+/* Lightweight native-entry logger. Appends one-line records to logs/native_c_calls.log
+   Format: <timestamp> <py_thread_state_ptr> <function> <arg1> <arg2>\n
+   Keep this function minimal and tolerant of failures (best-effort logging only).
+*/
+/* If amp_log_native_call_external is provided by the main c_kernels module, use
+   it to avoid repeated fopen/fclose. Otherwise fall back to the original
+   best-effort fopen-based logging. */
+extern void amp_log_native_call_external(const char *fn, size_t a, size_t b);
+static void _log_native_call(const char *fn, size_t a, size_t b) {
+    /* Prefer the external cached logger when available. We call it unconditionally
+       — if the symbol isn't resolved at link/load time the loader will fail, so
+       to remain defensive we fall back to fopen-based logging below. */
+    if (&amp_log_native_call_external) {
+        amp_log_native_call_external(fn, a, b);
+        return;
+    }
+    FILE *f = NULL;
+    /* Best-effort: create/appends to logs/native_c_calls.log */
+    f = fopen("logs/native_c_calls.log", "a");
+    if (f == NULL) {
+        return;
+    }
+    /* timestamp in seconds (wall-clock) */
+    double t = (double)time(NULL);
+    /* log the Python thread-state pointer (unique per Python thread) when available */
+    void *py_ts = NULL;
+    /* PyThreadState_Get is available because Python.h is included earlier in the file */
+    py_ts = (void *)PyThreadState_Get();
+    fprintf(f, "%.3f %p %s %zu %zu\n", t, py_ts, fn, a, b);
+    fclose(f);
+}
+
+static void buffer_pool_destroy(buffer_pool_t *pool) {
+    if (pool == NULL) {
+        return;
+    }
+    if (pool->entries != NULL) {
+        for (size_t i = 0; i < pool->count; ++i) {
+            free(pool->entries[i].data);
+            pool->entries[i].data = NULL;
+            pool->entries[i].capacity = 0;
+            pool->entries[i].in_use = 0;
+        }
+        free(pool->entries);
+        pool->entries = NULL;
+        pool->count = 0;
+    }
+}
+
+static double *buffer_pool_acquire(buffer_pool_t *pool, size_t elements) {
+    if (pool == NULL || elements == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < pool->count; ++i) {
+        buffer_pool_entry_t *entry = &pool->entries[i];
+        if (!entry->in_use && entry->capacity >= elements) {
+            entry->in_use = 1;
+            return entry->data;
+        }
+    }
+    size_t new_index = pool->count;
+    buffer_pool_entry_t *new_entries = (buffer_pool_entry_t *)realloc(
+        pool->entries,
+        (pool->count + 1) * sizeof(buffer_pool_entry_t)
+    );
+    if (new_entries == NULL) {
+        return NULL;
+    }
+    pool->entries = new_entries;
+    buffer_pool_entry_t *entry = &pool->entries[new_index];
+    entry->data = (double *)malloc(elements * sizeof(double));
+    if (entry->data == NULL) {
+        return NULL;
+    }
+    entry->capacity = elements;
+    entry->in_use = 1;
+    pool->count += 1;
+    return entry->data;
+}
+
+static void buffer_pool_reset(buffer_pool_t *pool) {
+    if (pool == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < pool->count; ++i) {
+        pool->entries[i].in_use = 0;
+    }
+}
+
+static void buffer_pool_release(buffer_pool_t *pool, double *data) {
+    if (pool == NULL || data == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < pool->count; ++i) {
+        buffer_pool_entry_t *entry = &pool->entries[i];
+        if (entry->data == data) {
+            entry->in_use = 0;
+            return;
+        }
+    }
+}
+
+static void destroy_runtime_node(runtime_node_t *node) {
+    if (node == NULL) {
+        return;
+    }
+    if (node->output != NULL) {
+        amp_free(node->output);
+        node->output = NULL;
+    }
+    if (node->state != NULL) {
+        amp_release_state(node->state);
+        node->state = NULL;
+    }
+    if (node->audio_inputs != NULL) {
+        for (uint32_t i = 0; i < node->audio_input_count; ++i) {
+            free(node->audio_inputs[i]);
+        }
+        free(node->audio_inputs);
+    }
+    free(node->audio_indices);
+    if (node->mod_connections != NULL) {
+        for (uint32_t i = 0; i < node->mod_connection_count; ++i) {
+            free(node->mod_connections[i].name);
+            free(node->mod_connections[i].source_name);
+        }
+        free(node->mod_connections);
+    }
+    if (node->param_bindings != NULL) {
+        for (size_t i = 0; i < node->param_binding_count; ++i) {
+            free(node->param_bindings[i].name);
+            free(node->param_bindings[i].data);
+        }
+        free(node->param_bindings);
+    }
+    free(node->name);
+    free(node->type_name);
+    free(node->params_json);
+}
+
+static void release_runtime(AmpGraphRuntime *runtime) {
+    if (runtime == NULL) {
+        return;
+    }
+    if (runtime->nodes != NULL) {
+        for (uint32_t i = 0; i < runtime->node_count; ++i) {
+            destroy_runtime_node(&runtime->nodes[i]);
+        }
+        free(runtime->nodes);
+    }
+    free(runtime->execution_order);
+    buffer_pool_destroy(&runtime->pool);
+    free(runtime);
+}
+
+static int read_u32(const uint8_t **cursor, size_t *remaining, uint32_t *out) {
+    if (cursor == NULL || remaining == NULL || out == NULL) {
+        return 0;
+    }
+    if (*remaining < 4) {
+        return 0;
+    }
+    const uint8_t *ptr = *cursor;
+    *out = (uint32_t)ptr[0] | ((uint32_t)ptr[1] << 8) | ((uint32_t)ptr[2] << 16) | ((uint32_t)ptr[3] << 24);
+    *cursor += 4;
+    *remaining -= 4;
+    return 1;
+}
+
+static int read_i32(const uint8_t **cursor, size_t *remaining, int32_t *out) {
+    uint32_t value = 0;
+    if (!read_u32(cursor, remaining, &value)) {
+        return 0;
+    }
+    *out = (int32_t)value;
+    return 1;
+}
+
+static int read_f32(const uint8_t **cursor, size_t *remaining, float *out) {
+    if (cursor == NULL || remaining == NULL || out == NULL) {
+        return 0;
+    }
+    if (*remaining < 4) {
+        return 0;
+    }
+    uint32_t bits = 0;
+    memcpy(&bits, *cursor, sizeof(uint32_t));
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(float));
+    *cursor += 4;
+    *remaining -= 4;
+    *out = value;
+    return 1;
+}
+
+static int json_find_key(const char *json, size_t json_len, const char *key, const char **value) {
+    if (json == NULL || key == NULL || value == NULL) {
+        return 0;
+    }
+    size_t key_len = strlen(key);
+    const char *cursor = json;
+    const char *end = json + json_len;
+    while (cursor < end) {
+        const char *found = strstr(cursor, key);
+        if (found == NULL || found >= end) {
+            break;
+        }
+        const char *colon = strchr(found + key_len, ':');
+        if (colon == NULL || colon >= end) {
+            break;
+        }
+        cursor = colon + 1;
+        while (cursor < end && isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (cursor < end) {
+            *value = cursor;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static double json_get_double(const char *json, size_t json_len, const char *key, double default_value) {
+    const char *cursor = NULL;
+    if (!json_find_key(json, json_len, key, &cursor)) {
+        return default_value;
+    }
+    char *endptr = NULL;
+    double value = strtod(cursor, &endptr);
+    if (endptr == cursor) {
+        return default_value;
+    }
+    return value;
+}
+
+static int json_get_int(const char *json, size_t json_len, const char *key, int default_value) {
+    double value = json_get_double(json, json_len, key, (double)default_value);
+    return (int)lrint(value);
+}
+
+static int32_t find_node_index(AmpGraphRuntime *runtime, const char *name) {
+    if (runtime == NULL || name == NULL) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < runtime->node_count; ++i) {
+        if (runtime->nodes[i].name != NULL && strcmp(runtime->nodes[i].name, name) == 0) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static runtime_node_t *find_node_by_name(AmpGraphRuntime *runtime, const char *name) {
+    int32_t idx = find_node_index(runtime, name);
+    if (idx < 0) {
+        return NULL;
+    }
+    return &runtime->nodes[idx];
+}
+
+static int resolve_node_references(AmpGraphRuntime *runtime) {
+    if (runtime == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < runtime->node_count; ++i) {
+        runtime_node_t *node = &runtime->nodes[i];
+        if (node->audio_input_count > 0U) {
+            node->audio_indices = (uint32_t *)calloc(node->audio_input_count, sizeof(uint32_t));
+            if (node->audio_indices == NULL) {
+                return 0;
+            }
+            for (uint32_t j = 0; j < node->audio_input_count; ++j) {
+                int32_t idx = find_node_index(runtime, node->audio_inputs[j]);
+                if (idx < 0) {
+                    return 0;
+                }
+                node->audio_indices[j] = (uint32_t)idx;
+            }
+        }
+        for (uint32_t m = 0; m < node->mod_connection_count; ++m) {
+            mod_connection_t *conn = &node->mod_connections[m];
+            int32_t idx = find_node_index(runtime, conn->source_name);
+            if (idx < 0) {
+                return 0;
+            }
+            conn->source_index = (uint32_t)idx;
+        }
+        node->channel_hint = (uint32_t)json_get_int(node->params_json, node->params_json_len, "channels", 1);
+        if (node->channel_hint == 0U) {
+            node->channel_hint = 1U;
+        }
+        node->descriptor.name = node->name;
+        node->descriptor.name_len = node->name_len;
+        node->descriptor.type_name = node->type_name;
+        node->descriptor.type_len = node->type_name_len;
+        node->descriptor.params_json = node->params_json;
+        node->descriptor.params_len = node->params_json_len;
+    }
+    return 1;
+}
+
+static int parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_t blob_len) {
+    if (runtime == NULL || blob == NULL) {
+        return 0;
+    }
+    const uint8_t *cursor = blob;
+    size_t remaining = blob_len;
+    uint32_t node_count = 0;
+    if (!read_u32(&cursor, &remaining, &node_count)) {
+        return 0;
+    }
+    runtime->node_count = node_count;
+    runtime->nodes = (runtime_node_t *)calloc(node_count, sizeof(runtime_node_t));
+    if (runtime->nodes == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < node_count; ++i) {
+        runtime_node_t *node = &runtime->nodes[i];
+        uint32_t header[8];
+        for (size_t h = 0; h < 8; ++h) {
+            if (!read_u32(&cursor, &remaining, &header[h])) {
+                return 0;
+            }
+        }
+        uint32_t type_id = header[0];
+        uint32_t name_len = header[1];
+        uint32_t type_len = header[2];
+        uint32_t audio_count = header[3];
+        uint32_t mod_count = header[4];
+        uint32_t param_buffer_count = header[5];
+        uint32_t buffer_shape_count = header[6];
+        uint32_t params_json_len = header[7];
+        if (remaining < name_len + type_len) {
+            return 0;
+        }
+        node->type_id = type_id;
+        node->name = dup_string((const char *)cursor, name_len);
+        node->name_len = name_len;
+        cursor += name_len;
+        remaining -= name_len;
+        node->type_name = dup_string((const char *)cursor, type_len);
+        node->type_name_len = type_len;
+        cursor += type_len;
+        remaining -= type_len;
+        node->audio_input_count = audio_count;
+        if (audio_count > 0U) {
+            node->audio_inputs = (char **)calloc(audio_count, sizeof(char *));
+            if (node->audio_inputs == NULL) {
+                return 0;
+            }
+            for (uint32_t a = 0; a < audio_count; ++a) {
+                uint32_t src_len = 0;
+                if (!read_u32(&cursor, &remaining, &src_len)) {
+                    return 0;
+                }
+                if (remaining < src_len) {
+                    return 0;
+                }
+                node->audio_inputs[a] = dup_string((const char *)cursor, src_len);
+                cursor += src_len;
+                remaining -= src_len;
+            }
+        }
+        node->mod_connection_count = mod_count;
+        if (mod_count > 0U) {
+            node->mod_connections = (mod_connection_t *)calloc(mod_count, sizeof(mod_connection_t));
+            if (node->mod_connections == NULL) {
+                return 0;
+            }
+            for (uint32_t m = 0; m < mod_count; ++m) {
+                uint32_t source_len = 0;
+                uint32_t param_len = 0;
+                uint32_t mode_code = 0;
+                float scale = 0.0f;
+                int32_t channel = -1;
+                if (!read_u32(&cursor, &remaining, &source_len) ||
+                    !read_u32(&cursor, &remaining, &param_len) ||
+                    !read_u32(&cursor, &remaining, &mode_code) ||
+                    !read_f32(&cursor, &remaining, &scale) ||
+                    !read_i32(&cursor, &remaining, &channel)) {
+                    return 0;
+                }
+                if (remaining < source_len + param_len) {
+                    return 0;
+                }
+                mod_connection_t *conn = &node->mod_connections[m];
+                conn->source_name = dup_string((const char *)cursor, source_len);
+                cursor += source_len;
+                remaining -= source_len;
+                conn->name = dup_string((const char *)cursor, param_len);
+                cursor += param_len;
+                remaining -= param_len;
+                conn->scale = (double)scale;
+                conn->mode = (mode_code == 1U) ? 1 : 0;
+                conn->channel = (int)channel;
+                conn->source_index = 0U;
+            }
+        }
+        for (uint32_t p = 0; p < param_buffer_count; ++p) {
+            uint32_t name_size = 0;
+            if (!read_u32(&cursor, &remaining, &name_size)) {
+                return 0;
+            }
+            int32_t dims[3];
+            int32_t byte_len = 0;
+            if (!read_i32(&cursor, &remaining, &dims[0]) ||
+                !read_i32(&cursor, &remaining, &dims[1]) ||
+                !read_i32(&cursor, &remaining, &dims[2]) ||
+                !read_i32(&cursor, &remaining, &byte_len)) {
+                return 0;
+            }
+            if (remaining < name_size + (size_t)byte_len) {
+                return 0;
+            }
+            cursor += name_size + (size_t)byte_len;
+            remaining -= name_size + (size_t)byte_len;
+        }
+        size_t shapes_bytes = (size_t)buffer_shape_count * 3U * sizeof(uint32_t);
+        if (remaining < shapes_bytes) {
+            return 0;
+        }
+        cursor += shapes_bytes;
+        remaining -= shapes_bytes;
+        if (remaining < params_json_len) {
+            return 0;
+        }
+        node->params_json = dup_string((const char *)cursor, params_json_len);
+        node->params_json_len = params_json_len;
+        cursor += params_json_len;
+        remaining -= params_json_len;
+    }
+    return resolve_node_references(runtime);
+}
+
+static int parse_plan_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_t blob_len) {
+    if (runtime == NULL || blob == NULL) {
+        return 0;
+    }
+    if (blob_len < 12) {
+        return 0;
+    }
+    if (memcmp(blob, "AMPL", 4) != 0) {
+        return 0;
+    }
+    const uint8_t *cursor = blob + 4;
+    size_t remaining = blob_len - 4;
+    uint32_t version = 0;
+    uint32_t node_count = 0;
+    if (!read_u32(&cursor, &remaining, &version) || !read_u32(&cursor, &remaining, &node_count)) {
+        return 0;
+    }
+    if (node_count != runtime->node_count) {
+        return 0;
+    }
+    runtime->execution_order = (uint32_t *)calloc(node_count, sizeof(uint32_t));
+    if (runtime->execution_order == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < node_count; ++i) {
+        uint32_t function_id = 0;
+        uint32_t name_len = 0;
+        uint32_t audio_offset = 0;
+        uint32_t audio_span = 0;
+        uint32_t param_count = 0;
+        if (!read_u32(&cursor, &remaining, &function_id) ||
+            !read_u32(&cursor, &remaining, &name_len) ||
+            !read_u32(&cursor, &remaining, &audio_offset) ||
+            !read_u32(&cursor, &remaining, &audio_span) ||
+            !read_u32(&cursor, &remaining, &param_count)) {
+            return 0;
+        }
+        if (remaining < name_len) {
+            return 0;
+        }
+        char *name = dup_string((const char *)cursor, name_len);
+        cursor += name_len;
+        remaining -= name_len;
+        for (uint32_t p = 0; p < param_count; ++p) {
+            uint32_t param_name_len = 0;
+            uint32_t offset = 0;
+            uint32_t span = 0;
+            if (!read_u32(&cursor, &remaining, &param_name_len) ||
+                !read_u32(&cursor, &remaining, &offset) ||
+                !read_u32(&cursor, &remaining, &span)) {
+                free(name);
+                return 0;
+            }
+            if (remaining < param_name_len) {
+                free(name);
+                return 0;
+            }
+            cursor += param_name_len;
+            remaining -= param_name_len;
+        }
+        int32_t idx = find_node_index(runtime, name);
+        free(name);
+        if (idx < 0 || function_id >= node_count) {
+            return 0;
+        }
+        runtime->execution_order[function_id] = (uint32_t)idx;
+    }
+    runtime->sink_index = runtime->node_count > 0U ? runtime->execution_order[runtime->node_count - 1U] : 0U;
+    (void)version;
+    return 1;
+}
+
+static param_binding_t *find_param_binding(runtime_node_t *node, const char *name) {
+    if (node == NULL || name == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < node->param_binding_count; ++i) {
+        if (node->param_bindings[i].name != NULL && strcmp(node->param_bindings[i].name, name) == 0) {
+            return &node->param_bindings[i];
+        }
+    }
+    return NULL;
+}
+
+static double *copy_param_binding(buffer_pool_t *pool, const param_binding_t *binding) {
+    if (pool == NULL || binding == NULL) {
+        return NULL;
+    }
+    size_t total = (size_t)binding->batches * (size_t)binding->channels * (size_t)binding->frames;
+    if (total == 0) {
+        return NULL;
+    }
+    double *dest = buffer_pool_acquire(pool, total);
+    if (dest == NULL) {
+        return NULL;
+    }
+    memcpy(dest, binding->data, total * sizeof(double));
+    return dest;
+}
+
+static int apply_mod_connections(
+    AmpGraphRuntime *runtime,
+    runtime_node_t *node,
+    const char *param_name,
+    double *buffer,
+    size_t total,
+    uint32_t batches,
+    uint32_t channels,
+    uint32_t frames
+) {
+    if (runtime == NULL || node == NULL || param_name == NULL || buffer == NULL) {
+        return 0;
+    }
+    (void)total;
+    for (uint32_t i = 0; i < node->mod_connection_count; ++i) {
+        mod_connection_t *conn = &node->mod_connections[i];
+        if (conn->name == NULL || strcmp(conn->name, param_name) != 0) {
+            continue;
+        }
+        if (conn->source_index >= runtime->node_count) {
+            return 0;
+        }
+        runtime_node_t *source = &runtime->nodes[conn->source_index];
+        if (source->output == NULL) {
+            return 0;
+        }
+        uint32_t src_batches = source->batches;
+        uint32_t src_channels = source->channels;
+        uint32_t src_frames = source->frames;
+        if (src_batches != batches || src_frames != frames) {
+            return 0;
+        }
+        const double *src = source->output;
+        if (conn->channel >= 0) {
+            if ((uint32_t)conn->channel >= src_channels) {
+                return 0;
+            }
+            for (uint32_t b = 0; b < batches; ++b) {
+                for (uint32_t c = 0; c < channels; ++c) {
+                    for (uint32_t f = 0; f < frames; ++f) {
+                        size_t dst_idx = ((size_t)b * (size_t)channels + (size_t)c) * (size_t)frames + (size_t)f;
+                        size_t src_idx = ((size_t)b * (size_t)src_channels + (size_t)conn->channel) * (size_t)frames + (size_t)f;
+                        if (conn->mode == 0) {
+                            buffer[dst_idx] += conn->scale * src[src_idx];
+                        } else {
+                            buffer[dst_idx] *= 1.0 + conn->scale * src[src_idx];
+                        }
+                    }
+                }
+            }
+        } else {
+            if (src_channels != channels && src_channels != 1U) {
+                return 0;
+            }
+            for (uint32_t b = 0; b < batches; ++b) {
+                for (uint32_t c = 0; c < channels; ++c) {
+                    uint32_t src_c = src_channels == 1U ? 0U : c;
+                    for (uint32_t f = 0; f < frames; ++f) {
+                        size_t dst_idx = ((size_t)b * (size_t)channels + (size_t)c) * (size_t)frames + (size_t)f;
+                        size_t src_idx = ((size_t)b * (size_t)src_channels + (size_t)src_c) * (size_t)frames + (size_t)f;
+                        if (conn->mode == 0) {
+                            buffer[dst_idx] += conn->scale * src[src_idx];
+                        } else {
+                            buffer[dst_idx] *= 1.0 + conn->scale * src[src_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+static int prepare_param_buffer(
+    AmpGraphRuntime *runtime,
+    runtime_node_t *node,
+    const char *param_name,
+    buffer_pool_t *pool,
+    uint32_t batches,
+    uint32_t channels,
+    uint32_t frames,
+    double default_value,
+    double **out_buffer
+) {
+    if (out_buffer == NULL) {
+        return 0;
+    }
+    size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+    if (total == 0) {
+        return 0;
+    }
+    param_binding_t *binding = find_param_binding(node, param_name);
+    double *buffer = NULL;
+    if (binding != NULL) {
+        if (binding->batches != batches || binding->channels != channels || binding->frames != frames) {
+            return 0;
+        }
+        buffer = copy_param_binding(pool, binding);
+    } else {
+        buffer = buffer_pool_acquire(pool, total);
+        if (buffer != NULL) {
+            for (size_t i = 0; i < total; ++i) {
+                buffer[i] = default_value;
+            }
+        }
+    }
+    if (buffer == NULL) {
+        return 0;
+    }
+    if (!apply_mod_connections(runtime, node, param_name, buffer, total, batches, channels, frames)) {
+        buffer_pool_release(pool, buffer);
+        return 0;
+    }
+    *out_buffer = buffer;
+    return 1;
+}
+
+static int collect_param_names(runtime_node_t *node, const char ***names_out, size_t *count_out) {
+    if (node == NULL || names_out == NULL || count_out == NULL) {
+        return 0;
+    }
+    size_t capacity = node->param_binding_count + node->mod_connection_count + 4U;
+    if (capacity == 0) {
+        *names_out = NULL;
+        *count_out = 0;
+        return 1;
+    }
+    const char **names = (const char **)calloc(capacity, sizeof(const char *));
+    if (names == NULL) {
+        return 0;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < node->param_binding_count; ++i) {
+        const char *name = node->param_bindings[i].name;
+        if (name == NULL) {
+            continue;
+        }
+        int seen = 0;
+        for (size_t j = 0; j < count; ++j) {
+            if (strcmp(names[j], name) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            names[count++] = name;
+        }
+    }
+    for (uint32_t i = 0; i < node->mod_connection_count; ++i) {
+        const char *name = node->mod_connections[i].name;
+        if (name == NULL) {
+            continue;
+        }
+        int seen = 0;
+        for (size_t j = 0; j < count; ++j) {
+            if (strcmp(names[j], name) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            if (count >= capacity) {
+                const char **new_names = (const char **)realloc(names, (capacity + 4U) * sizeof(const char *));
+                if (new_names == NULL) {
+                    free(names);
+                    return 0;
+                }
+                names = new_names;
+                capacity += 4U;
+            }
+            names[count++] = name;
+        }
+    }
+    *names_out = names;
+    *count_out = count;
+    return 1;
+}
+
+static int build_param_views(
+    AmpGraphRuntime *runtime,
+    runtime_node_t *node,
+    uint32_t batches,
+    uint32_t channels,
+    uint32_t frames,
+    EdgeRunnerParamView **views_out,
+    uint32_t *count_out,
+    double ***owned_buffers_out,
+    uint32_t *owned_count_out
+) {
+    if (runtime == NULL || node == NULL || views_out == NULL || count_out == NULL || owned_buffers_out == NULL || owned_count_out == NULL) {
+        return 0;
+    }
+    const char **names = NULL;
+    size_t name_count = 0;
+    if (!collect_param_names(node, &names, &name_count)) {
+        return 0;
+    }
+    if (name_count == 0) {
+        *views_out = NULL;
+        *count_out = 0;
+        *owned_buffers_out = NULL;
+        *owned_count_out = 0;
+        free(names);
+        return 1;
+    }
+    EdgeRunnerParamView *views = (EdgeRunnerParamView *)calloc(name_count, sizeof(EdgeRunnerParamView));
+    if (views == NULL) {
+        free(names);
+        return 0;
+    }
+    double **owned = (double **)calloc(name_count, sizeof(double *));
+    if (owned == NULL) {
+        free(views);
+        free(names);
+        return 0;
+    }
+    uint32_t owned_count = 0;
+    for (size_t i = 0; i < name_count; ++i) {
+        const char *param_name = names[i];
+        double default_value = json_get_double(node->params_json, node->params_json_len, param_name, 0.0);
+        double *buffer = NULL;
+        if (!prepare_param_buffer(runtime, node, param_name, &runtime->pool, batches, channels, frames, default_value, &buffer)) {
+            free(owned);
+            free(views);
+            free(names);
+            return 0;
+        }
+        views[i].name = param_name;
+        views[i].batches = batches;
+        views[i].channels = channels;
+        views[i].frames = frames;
+        views[i].data = buffer;
+        owned[owned_count++] = buffer;
+    }
+    free(names);
+    *views_out = views;
+    *count_out = (uint32_t)name_count;
+    *owned_buffers_out = owned;
+    *owned_count_out = owned_count;
+    return 1;
+}
+
+static void release_param_views(buffer_pool_t *pool, EdgeRunnerParamView *views, uint32_t count, double **owned, uint32_t owned_count) {
+    (void)count;
+    if (owned != NULL) {
+        for (uint32_t i = 0; i < owned_count; ++i) {
+            buffer_pool_release(pool, owned[i]);
+        }
+        free(owned);
+    }
+    free(views);
+}
+
+static double *merge_audio_inputs(
+    AmpGraphRuntime *runtime,
+    runtime_node_t *node,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames,
+    double ***scratch_buffers,
+    uint32_t *scratch_count
+) {
+    if (runtime == NULL || node == NULL || out_batches == NULL || out_channels == NULL || out_frames == NULL || scratch_buffers == NULL || scratch_count == NULL) {
+        return NULL;
+    }
+    *scratch_buffers = NULL;
+    *scratch_count = 0;
+    if (node->audio_input_count == 0U) {
+        *out_batches = runtime->default_batches > 0U ? runtime->default_batches : 1U;
+        *out_channels = node->channel_hint > 0U ? node->channel_hint : 1U;
+        *out_frames = runtime->default_frames > 0U ? runtime->default_frames : 1U;
+        return NULL;
+    }
+    double **owned = NULL;
+    uint32_t owned_count = 0;
+    uint32_t batches = 0;
+    uint32_t frames = 0;
+    uint32_t total_channels = 0;
+    for (uint32_t i = 0; i < node->audio_input_count; ++i) {
+        uint32_t src_idx = node->audio_indices[i];
+        if (src_idx >= runtime->node_count) {
+            free(owned);
+            return NULL;
+        }
+        runtime_node_t *source = &runtime->nodes[src_idx];
+        if (source->output == NULL) {
+            free(owned);
+            return NULL;
+        }
+        if (i == 0) {
+            batches = source->batches;
+            frames = source->frames;
+        } else {
+            if (source->batches != batches || source->frames != frames) {
+                free(owned);
+                return NULL;
+            }
+        }
+        total_channels += source->channels;
+    }
+    if (total_channels == 0U) {
+        free(owned);
+        return NULL;
+    }
+    if (node->audio_input_count == 1U) {
+        runtime_node_t *source = &runtime->nodes[node->audio_indices[0]];
+        *out_batches = source->batches;
+        *out_channels = source->channels;
+        *out_frames = source->frames;
+        return source->output;
+    }
+    size_t total = (size_t)batches * (size_t)total_channels * (size_t)frames;
+    double *buffer = buffer_pool_acquire(&runtime->pool, total);
+    if (buffer == NULL) {
+        free(owned);
+        return NULL;
+    }
+    size_t offset = 0;
+    for (uint32_t i = 0; i < node->audio_input_count; ++i) {
+        runtime_node_t *source = &runtime->nodes[node->audio_indices[i]];
+        size_t block = (size_t)source->batches * (size_t)source->channels * (size_t)source->frames;
+        memcpy(buffer + offset, source->output, block * sizeof(double));
+        offset += block;
+    }
+    owned = (double **)calloc(1, sizeof(double *));
+    if (owned == NULL) {
+        buffer_pool_release(&runtime->pool, buffer);
+        return NULL;
+    }
+    owned[0] = buffer;
+    *scratch_buffers = owned;
+    *scratch_count = 1U;
+    *out_batches = batches;
+    *out_channels = total_channels;
+    *out_frames = frames;
+    return buffer;
+}
+
+AMP_API AmpGraphRuntime *amp_graph_runtime_create(
+    const uint8_t *descriptor_blob,
+    size_t descriptor_len,
+    const uint8_t *plan_blob,
+    size_t plan_len
+) {
+    AmpGraphRuntime *runtime = (AmpGraphRuntime *)calloc(1, sizeof(AmpGraphRuntime));
+    if (runtime == NULL) {
+        return NULL;
+    }
+    runtime->default_batches = 1U;
+    runtime->default_frames = 0U;
+    if (!parse_node_blob(runtime, descriptor_blob, descriptor_len)) {
+        release_runtime(runtime);
+        return NULL;
+    }
+    if (!parse_plan_blob(runtime, plan_blob, plan_len)) {
+        release_runtime(runtime);
+        return NULL;
+    }
+    return runtime;
+}
+
+AMP_API void amp_graph_runtime_destroy(AmpGraphRuntime *runtime) {
+    release_runtime(runtime);
+}
+
+AMP_API int amp_graph_runtime_configure(AmpGraphRuntime *runtime, uint32_t batches, uint32_t frames) {
+    if (runtime == NULL) {
+        return -1;
+    }
+    runtime->default_batches = batches > 0U ? batches : 1U;
+    runtime->default_frames = frames;
+    return 0;
+}
+
+AMP_API void amp_graph_runtime_clear_params(AmpGraphRuntime *runtime) {
+    if (runtime == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < runtime->node_count; ++i) {
+        runtime_node_t *node = &runtime->nodes[i];
+        if (node->param_bindings != NULL) {
+            for (size_t j = 0; j < node->param_binding_count; ++j) {
+                free(node->param_bindings[j].name);
+                free(node->param_bindings[j].data);
+            }
+            free(node->param_bindings);
+            node->param_bindings = NULL;
+            node->param_binding_count = 0;
+        }
+    }
+}
+
+AMP_API int amp_graph_runtime_set_param(
+    AmpGraphRuntime *runtime,
+    const char *node_name,
+    const char *param_name,
+    const double *data,
+    uint32_t batches,
+    uint32_t channels,
+    uint32_t frames
+) {
+    if (runtime == NULL || node_name == NULL || param_name == NULL || data == NULL) {
+        return -1;
+    }
+    runtime_node_t *node = find_node_by_name(runtime, node_name);
+    if (node == NULL) {
+        return -1;
+    }
+    size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+    if (total == 0) {
+        return -1;
+    }
+    double *copy = (double *)malloc(total * sizeof(double));
+    if (copy == NULL) {
+        return -1;
+    }
+    memcpy(copy, data, total * sizeof(double));
+    param_binding_t *binding = find_param_binding(node, param_name);
+    if (binding != NULL) {
+        free(binding->data);
+        binding->data = copy;
+        binding->batches = batches;
+        binding->channels = channels;
+        binding->frames = frames;
+        return 0;
+    }
+    param_binding_t *new_bindings = (param_binding_t *)realloc(
+        node->param_bindings,
+        (node->param_binding_count + 1U) * sizeof(param_binding_t)
+    );
+    if (new_bindings == NULL) {
+        free(copy);
+        return -1;
+    }
+    node->param_bindings = new_bindings;
+    binding = &node->param_bindings[node->param_binding_count];
+    binding->name = dup_string(param_name, strlen(param_name));
+    if (binding->name == NULL) {
+        free(copy);
+        return -1;
+    }
+    binding->data = copy;
+    binding->batches = batches;
+    binding->channels = channels;
+    binding->frames = frames;
+    node->param_binding_count += 1U;
+    return 0;
+}
+
+AMP_API int amp_graph_runtime_execute(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    double **out_buffer,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+) {
+    if (runtime == NULL || out_buffer == NULL || out_batches == NULL || out_channels == NULL || out_frames == NULL) {
+        return -1;
+    }
+    EdgeRunnerControlHistory *history = NULL;
+    if (control_blob != NULL && control_len > 0U) {
+        history = amp_load_control_history(control_blob, control_len, frames_hint);
+        if (history == NULL) {
+            return -1;
+        }
+    }
+    for (uint32_t i = 0; i < runtime->node_count; ++i) {
+        runtime_node_t *node = &runtime->nodes[i];
+        if (node->output != NULL) {
+            amp_free(node->output);
+            node->output = NULL;
+        }
+        node->batches = 0;
+        node->channels = 0;
+        node->frames = 0;
+    }
+    buffer_pool_reset(&runtime->pool);
+    int status = 0;
+    for (uint32_t order = 0; order < runtime->node_count; ++order) {
+        uint32_t node_idx = runtime->execution_order[order];
+        runtime_node_t *node = &runtime->nodes[node_idx];
+        uint32_t batches = runtime->default_batches > 0U ? runtime->default_batches : 1U;
+        uint32_t frames = runtime->default_frames > 0U ? runtime->default_frames : 1U;
+        uint32_t input_channels = node->channel_hint > 0U ? node->channel_hint : 1U;
+        double **audio_owned = NULL;
+        uint32_t audio_owned_count = 0;
+        double *audio_data = merge_audio_inputs(runtime, node, &batches, &input_channels, &frames, &audio_owned, &audio_owned_count);
+        EdgeRunnerParamView *param_views = NULL;
+        uint32_t param_count = 0;
+        double **owned_buffers = NULL;
+        uint32_t owned_count = 0;
+        if (!build_param_views(runtime, node, batches, input_channels, frames, &param_views, &param_count, &owned_buffers, &owned_count)) {
+            status = -1;
+            if (audio_owned != NULL) {
+                for (uint32_t i = 0; i < audio_owned_count; ++i) {
+                    buffer_pool_release(&runtime->pool, audio_owned[i]);
+                }
+                free(audio_owned);
+            }
+            break;
+        }
+        EdgeRunnerNodeInputs inputs;
+        memset(&inputs, 0, sizeof(inputs));
+        if (audio_data != NULL) {
+            inputs.audio.has_audio = 1;
+            inputs.audio.batches = batches;
+            inputs.audio.channels = input_channels;
+            inputs.audio.frames = frames;
+            inputs.audio.data = audio_data;
+        } else {
+            inputs.audio.has_audio = 0;
+            inputs.audio.batches = batches;
+            inputs.audio.channels = 0;
+            inputs.audio.frames = frames;
+            inputs.audio.data = NULL;
+        }
+        if (param_count > 0) {
+            inputs.params.count = param_count;
+            inputs.params.items = param_views;
+        } else {
+            inputs.params.count = 0;
+            inputs.params.items = NULL;
+        }
+        double *out_ptr = NULL;
+        int out_ch = 0;
+        void *state = node->state;
+        status = amp_run_node(
+            &node->descriptor,
+            &inputs,
+            (int)batches,
+            (int)input_channels,
+            (int)frames,
+            sample_rate,
+            &out_ptr,
+            &out_ch,
+            &state,
+            history
+        );
+        if (status != 0) {
+            release_param_views(&runtime->pool, param_views, param_count, owned_buffers, owned_count);
+            if (audio_owned != NULL) {
+                for (uint32_t i = 0; i < audio_owned_count; ++i) {
+                    buffer_pool_release(&runtime->pool, audio_owned[i]);
+                }
+                free(audio_owned);
+            }
+            break;
+        }
+        if (node->state != state) {
+            if (node->state != NULL) {
+                amp_release_state(node->state);
+            }
+            node->state = state;
+        }
+        node->output = out_ptr;
+        node->batches = batches;
+        node->channels = (uint32_t)out_ch;
+        node->frames = frames;
+        release_param_views(&runtime->pool, param_views, param_count, owned_buffers, owned_count);
+        if (audio_owned != NULL) {
+            for (uint32_t i = 0; i < audio_owned_count; ++i) {
+                buffer_pool_release(&runtime->pool, audio_owned[i]);
+            }
+            free(audio_owned);
+        }
+    }
+    if (history != NULL) {
+        amp_release_control_history(history);
+    }
+    if (status != 0) {
+        return status;
+    }
+    runtime_node_t *sink = &runtime->nodes[runtime->sink_index];
+    if (sink->output == NULL) {
+        return -1;
+    }
+    *out_buffer = sink->output;
+    *out_batches = sink->batches;
+    *out_channels = sink->channels;
+    *out_frames = sink->frames;
+    return 0;
+}
+
+AMP_API void amp_graph_runtime_buffer_free(double *buffer) {
+    if (buffer != NULL) {
+        amp_free(buffer);
+    }
+}
+
+AMP_API AmpGraphControlHistory *amp_graph_history_load(
+    const uint8_t *blob,
+    size_t blob_len,
+    int frames_hint
+) {
+    return amp_load_control_history(blob, blob_len, frames_hint);
+}
+
+AMP_API void amp_graph_history_destroy(AmpGraphControlHistory *history) {
+    amp_release_control_history(history);
+}
+
+
+/************************************************************/
+
+static void *_cffi_types[] = {
+/*  0 */ _CFFI_OP(_CFFI_OP_FUNCTION, 37), // AmpGraphControlHistory *()(unsigned char const *, size_t, int)
+/*  1 */ _CFFI_OP(_CFFI_OP_POINTER, 48), // unsigned char const *
+/*  2 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28), // size_t
+/*  3 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7), // int
+/*  4 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/*  5 */ _CFFI_OP(_CFFI_OP_FUNCTION, 12), // AmpGraphRuntime *()(unsigned char const *, size_t, unsigned char const *, size_t)
+/*  6 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
+/*  7 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28),
+/*  8 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
+/*  9 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28),
+/* 10 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 11 */ _CFFI_OP(_CFFI_OP_FUNCTION, 3), // int()(AmpGraphRuntime *, char const *, char const *, double const *, unsigned int, unsigned int, unsigned int)
+/* 12 */ _CFFI_OP(_CFFI_OP_POINTER, 46), // AmpGraphRuntime *
+/* 13 */ _CFFI_OP(_CFFI_OP_POINTER, 47), // char const *
+/* 14 */ _CFFI_OP(_CFFI_OP_NOOP, 13),
+/* 15 */ _CFFI_OP(_CFFI_OP_POINTER, 25), // double const *
+/* 16 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8), // unsigned int
+/* 17 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8),
+/* 18 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8),
+/* 19 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 20 */ _CFFI_OP(_CFFI_OP_FUNCTION, 3), // int()(AmpGraphRuntime *, unsigned char const *, size_t, int, double, double * *, unsigned int *, unsigned int *, unsigned int *)
+/* 21 */ _CFFI_OP(_CFFI_OP_NOOP, 12),
+/* 22 */ _CFFI_OP(_CFFI_OP_NOOP, 1),
+/* 23 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 28),
+/* 24 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 7),
+/* 25 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 14), // double
+/* 26 */ _CFFI_OP(_CFFI_OP_POINTER, 43), // double * *
+/* 27 */ _CFFI_OP(_CFFI_OP_POINTER, 16), // unsigned int *
+/* 28 */ _CFFI_OP(_CFFI_OP_NOOP, 27),
+/* 29 */ _CFFI_OP(_CFFI_OP_NOOP, 27),
+/* 30 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 31 */ _CFFI_OP(_CFFI_OP_FUNCTION, 3), // int()(AmpGraphRuntime *, unsigned int, unsigned int)
+/* 32 */ _CFFI_OP(_CFFI_OP_NOOP, 12),
+/* 33 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8),
+/* 34 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 8),
+/* 35 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 36 */ _CFFI_OP(_CFFI_OP_FUNCTION, 49), // void()(AmpGraphControlHistory *)
+/* 37 */ _CFFI_OP(_CFFI_OP_POINTER, 45), // AmpGraphControlHistory *
+/* 38 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 39 */ _CFFI_OP(_CFFI_OP_FUNCTION, 49), // void()(AmpGraphRuntime *)
+/* 40 */ _CFFI_OP(_CFFI_OP_NOOP, 12),
+/* 41 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 42 */ _CFFI_OP(_CFFI_OP_FUNCTION, 49), // void()(double *)
+/* 43 */ _CFFI_OP(_CFFI_OP_POINTER, 25), // double *
+/* 44 */ _CFFI_OP(_CFFI_OP_FUNCTION_END, 0),
+/* 45 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 0), // AmpGraphControlHistory
+/* 46 */ _CFFI_OP(_CFFI_OP_STRUCT_UNION, 1), // AmpGraphRuntime
+/* 47 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 2), // char
+/* 48 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 4), // unsigned char
+/* 49 */ _CFFI_OP(_CFFI_OP_PRIMITIVE, 0), // void
+};
+
+static void _cffi_d_amp_graph_history_destroy(AmpGraphControlHistory * x0)
+{
+  amp_graph_history_destroy(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_history_destroy(PyObject *self, PyObject *arg0)
+{
+  AmpGraphControlHistory * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(37), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (AmpGraphControlHistory *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(37), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_graph_history_destroy(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_graph_history_destroy _cffi_d_amp_graph_history_destroy
+#endif
+
+static AmpGraphControlHistory * _cffi_d_amp_graph_history_load(unsigned char const * x0, size_t x1, int x2)
+{
+  return amp_graph_history_load(x0, x1, x2);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_history_load(PyObject *self, PyObject *args)
+{
+  unsigned char const * x0;
+  size_t x1;
+  int x2;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  AmpGraphControlHistory * result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+
+  if (!PyArg_UnpackTuple(args, "amp_graph_history_load", 3, 3, &arg0, &arg1, &arg2))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(1), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (unsigned char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x1 = _cffi_to_c_int(arg1, size_t);
+  if (x1 == (size_t)-1 && PyErr_Occurred())
+    return NULL;
+
+  x2 = _cffi_to_c_int(arg2, int);
+  if (x2 == (int)-1 && PyErr_Occurred())
+    return NULL;
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_graph_history_load(x0, x1, x2); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(37));
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_graph_history_load _cffi_d_amp_graph_history_load
+#endif
+
+static void _cffi_d_amp_graph_runtime_buffer_free(double * x0)
+{
+  amp_graph_runtime_buffer_free(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_runtime_buffer_free(PyObject *self, PyObject *arg0)
+{
+  double * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(43), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (double *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(43), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_graph_runtime_buffer_free(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_graph_runtime_buffer_free _cffi_d_amp_graph_runtime_buffer_free
+#endif
+
+static void _cffi_d_amp_graph_runtime_clear_params(AmpGraphRuntime * x0)
+{
+  amp_graph_runtime_clear_params(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_runtime_clear_params(PyObject *self, PyObject *arg0)
+{
+  AmpGraphRuntime * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(12), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (AmpGraphRuntime *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(12), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_graph_runtime_clear_params(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_graph_runtime_clear_params _cffi_d_amp_graph_runtime_clear_params
+#endif
+
+static int _cffi_d_amp_graph_runtime_configure(AmpGraphRuntime * x0, unsigned int x1, unsigned int x2)
+{
+  return amp_graph_runtime_configure(x0, x1, x2);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_runtime_configure(PyObject *self, PyObject *args)
+{
+  AmpGraphRuntime * x0;
+  unsigned int x1;
+  unsigned int x2;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  int result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+
+  if (!PyArg_UnpackTuple(args, "amp_graph_runtime_configure", 3, 3, &arg0, &arg1, &arg2))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(12), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (AmpGraphRuntime *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(12), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x1 = _cffi_to_c_int(arg1, unsigned int);
+  if (x1 == (unsigned int)-1 && PyErr_Occurred())
+    return NULL;
+
+  x2 = _cffi_to_c_int(arg2, unsigned int);
+  if (x2 == (unsigned int)-1 && PyErr_Occurred())
+    return NULL;
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_graph_runtime_configure(x0, x1, x2); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_int(result, int);
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_graph_runtime_configure _cffi_d_amp_graph_runtime_configure
+#endif
+
+static AmpGraphRuntime * _cffi_d_amp_graph_runtime_create(unsigned char const * x0, size_t x1, unsigned char const * x2, size_t x3)
+{
+  return amp_graph_runtime_create(x0, x1, x2, x3);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_runtime_create(PyObject *self, PyObject *args)
+{
+  unsigned char const * x0;
+  size_t x1;
+  unsigned char const * x2;
+  size_t x3;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  AmpGraphRuntime * result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+  PyObject *arg3;
+
+  if (!PyArg_UnpackTuple(args, "amp_graph_runtime_create", 4, 4, &arg0, &arg1, &arg2, &arg3))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(1), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (unsigned char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(1), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x1 = _cffi_to_c_int(arg1, size_t);
+  if (x1 == (size_t)-1 && PyErr_Occurred())
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(1), arg2, (char **)&x2);
+  if (datasize != 0) {
+    x2 = ((size_t)datasize) <= 640 ? (unsigned char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(1), arg2, (char **)&x2,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x3 = _cffi_to_c_int(arg3, size_t);
+  if (x3 == (size_t)-1 && PyErr_Occurred())
+    return NULL;
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_graph_runtime_create(x0, x1, x2, x3); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_pointer((char *)result, _cffi_type(12));
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_graph_runtime_create _cffi_d_amp_graph_runtime_create
+#endif
+
+static void _cffi_d_amp_graph_runtime_destroy(AmpGraphRuntime * x0)
+{
+  amp_graph_runtime_destroy(x0);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_runtime_destroy(PyObject *self, PyObject *arg0)
+{
+  AmpGraphRuntime * x0;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(12), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (AmpGraphRuntime *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(12), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { amp_graph_runtime_destroy(x0); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+#else
+#  define _cffi_f_amp_graph_runtime_destroy _cffi_d_amp_graph_runtime_destroy
+#endif
+
+static int _cffi_d_amp_graph_runtime_execute(AmpGraphRuntime * x0, unsigned char const * x1, size_t x2, int x3, double x4, double * * x5, unsigned int * x6, unsigned int * x7, unsigned int * x8)
+{
+  return amp_graph_runtime_execute(x0, x1, x2, x3, x4, x5, x6, x7, x8);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_runtime_execute(PyObject *self, PyObject *args)
+{
+  AmpGraphRuntime * x0;
+  unsigned char const * x1;
+  size_t x2;
+  int x3;
+  double x4;
+  double * * x5;
+  unsigned int * x6;
+  unsigned int * x7;
+  unsigned int * x8;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  int result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+  PyObject *arg3;
+  PyObject *arg4;
+  PyObject *arg5;
+  PyObject *arg6;
+  PyObject *arg7;
+  PyObject *arg8;
+
+  if (!PyArg_UnpackTuple(args, "amp_graph_runtime_execute", 9, 9, &arg0, &arg1, &arg2, &arg3, &arg4, &arg5, &arg6, &arg7, &arg8))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(12), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (AmpGraphRuntime *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(12), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(1), arg1, (char **)&x1);
+  if (datasize != 0) {
+    x1 = ((size_t)datasize) <= 640 ? (unsigned char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(1), arg1, (char **)&x1,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x2 = _cffi_to_c_int(arg2, size_t);
+  if (x2 == (size_t)-1 && PyErr_Occurred())
+    return NULL;
+
+  x3 = _cffi_to_c_int(arg3, int);
+  if (x3 == (int)-1 && PyErr_Occurred())
+    return NULL;
+
+  x4 = (double)_cffi_to_c_double(arg4);
+  if (x4 == (double)-1 && PyErr_Occurred())
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(26), arg5, (char **)&x5);
+  if (datasize != 0) {
+    x5 = ((size_t)datasize) <= 640 ? (double * *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(26), arg5, (char **)&x5,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(27), arg6, (char **)&x6);
+  if (datasize != 0) {
+    x6 = ((size_t)datasize) <= 640 ? (unsigned int *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(27), arg6, (char **)&x6,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(27), arg7, (char **)&x7);
+  if (datasize != 0) {
+    x7 = ((size_t)datasize) <= 640 ? (unsigned int *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(27), arg7, (char **)&x7,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(27), arg8, (char **)&x8);
+  if (datasize != 0) {
+    x8 = ((size_t)datasize) <= 640 ? (unsigned int *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(27), arg8, (char **)&x8,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_graph_runtime_execute(x0, x1, x2, x3, x4, x5, x6, x7, x8); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_int(result, int);
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_graph_runtime_execute _cffi_d_amp_graph_runtime_execute
+#endif
+
+static int _cffi_d_amp_graph_runtime_set_param(AmpGraphRuntime * x0, char const * x1, char const * x2, double const * x3, unsigned int x4, unsigned int x5, unsigned int x6)
+{
+  return amp_graph_runtime_set_param(x0, x1, x2, x3, x4, x5, x6);
+}
+#ifndef PYPY_VERSION
+static PyObject *
+_cffi_f_amp_graph_runtime_set_param(PyObject *self, PyObject *args)
+{
+  AmpGraphRuntime * x0;
+  char const * x1;
+  char const * x2;
+  double const * x3;
+  unsigned int x4;
+  unsigned int x5;
+  unsigned int x6;
+  Py_ssize_t datasize;
+  struct _cffi_freeme_s *large_args_free = NULL;
+  int result;
+  PyObject *pyresult;
+  PyObject *arg0;
+  PyObject *arg1;
+  PyObject *arg2;
+  PyObject *arg3;
+  PyObject *arg4;
+  PyObject *arg5;
+  PyObject *arg6;
+
+  if (!PyArg_UnpackTuple(args, "amp_graph_runtime_set_param", 7, 7, &arg0, &arg1, &arg2, &arg3, &arg4, &arg5, &arg6))
+    return NULL;
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(12), arg0, (char **)&x0);
+  if (datasize != 0) {
+    x0 = ((size_t)datasize) <= 640 ? (AmpGraphRuntime *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(12), arg0, (char **)&x0,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(13), arg1, (char **)&x1);
+  if (datasize != 0) {
+    x1 = ((size_t)datasize) <= 640 ? (char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(13), arg1, (char **)&x1,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(13), arg2, (char **)&x2);
+  if (datasize != 0) {
+    x2 = ((size_t)datasize) <= 640 ? (char const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(13), arg2, (char **)&x2,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  datasize = _cffi_prepare_pointer_call_argument(
+      _cffi_type(15), arg3, (char **)&x3);
+  if (datasize != 0) {
+    x3 = ((size_t)datasize) <= 640 ? (double const *)alloca((size_t)datasize) : NULL;
+    if (_cffi_convert_array_argument(_cffi_type(15), arg3, (char **)&x3,
+            datasize, &large_args_free) < 0)
+      return NULL;
+  }
+
+  x4 = _cffi_to_c_int(arg4, unsigned int);
+  if (x4 == (unsigned int)-1 && PyErr_Occurred())
+    return NULL;
+
+  x5 = _cffi_to_c_int(arg5, unsigned int);
+  if (x5 == (unsigned int)-1 && PyErr_Occurred())
+    return NULL;
+
+  x6 = _cffi_to_c_int(arg6, unsigned int);
+  if (x6 == (unsigned int)-1 && PyErr_Occurred())
+    return NULL;
+
+  Py_BEGIN_ALLOW_THREADS
+  _cffi_restore_errno();
+  { result = amp_graph_runtime_set_param(x0, x1, x2, x3, x4, x5, x6); }
+  _cffi_save_errno();
+  Py_END_ALLOW_THREADS
+
+  (void)self; /* unused */
+  pyresult = _cffi_from_c_int(result, int);
+  if (large_args_free != NULL) _cffi_free_array_arguments(large_args_free);
+  return pyresult;
+}
+#else
+#  define _cffi_f_amp_graph_runtime_set_param _cffi_d_amp_graph_runtime_set_param
+#endif
+
+static const struct _cffi_global_s _cffi_globals[] = {
+  { "amp_graph_history_destroy", (void *)_cffi_f_amp_graph_history_destroy, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 36), (void *)_cffi_d_amp_graph_history_destroy },
+  { "amp_graph_history_load", (void *)_cffi_f_amp_graph_history_load, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 0), (void *)_cffi_d_amp_graph_history_load },
+  { "amp_graph_runtime_buffer_free", (void *)_cffi_f_amp_graph_runtime_buffer_free, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 42), (void *)_cffi_d_amp_graph_runtime_buffer_free },
+  { "amp_graph_runtime_clear_params", (void *)_cffi_f_amp_graph_runtime_clear_params, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 39), (void *)_cffi_d_amp_graph_runtime_clear_params },
+  { "amp_graph_runtime_configure", (void *)_cffi_f_amp_graph_runtime_configure, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 31), (void *)_cffi_d_amp_graph_runtime_configure },
+  { "amp_graph_runtime_create", (void *)_cffi_f_amp_graph_runtime_create, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 5), (void *)_cffi_d_amp_graph_runtime_create },
+  { "amp_graph_runtime_destroy", (void *)_cffi_f_amp_graph_runtime_destroy, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_O, 39), (void *)_cffi_d_amp_graph_runtime_destroy },
+  { "amp_graph_runtime_execute", (void *)_cffi_f_amp_graph_runtime_execute, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 20), (void *)_cffi_d_amp_graph_runtime_execute },
+  { "amp_graph_runtime_set_param", (void *)_cffi_f_amp_graph_runtime_set_param, _CFFI_OP(_CFFI_OP_CPYTHON_BLTN_V, 11), (void *)_cffi_d_amp_graph_runtime_set_param },
+};
+
+static const struct _cffi_struct_union_s _cffi_struct_unions[] = {
+  { "AmpGraphControlHistory", 45, _CFFI_F_OPAQUE,
+    (size_t)-1, -1, -1, 0 /* opaque */ },
+  { "AmpGraphRuntime", 46, _CFFI_F_OPAQUE,
+    (size_t)-1, -1, -1, 0 /* opaque */ },
+};
+
+static const struct _cffi_typename_s _cffi_typenames[] = {
+  { "AmpGraphControlHistory", 45 },
+  { "AmpGraphRuntime", 46 },
+  { "uint32_t", 16 },
+  { "uint8_t", 48 },
+};
+
+static const struct _cffi_type_context_s _cffi_type_context = {
+  _cffi_types,
+  _cffi_globals,
+  NULL,  /* no fields */
+  _cffi_struct_unions,
+  NULL,  /* no enums */
+  _cffi_typenames,
+  9,  /* num_globals */
+  2,  /* num_struct_unions */
+  0,  /* num_enums */
+  4,  /* num_typenames */
+  NULL,  /* no includes */
+  50,  /* num_types */
+  0,  /* flags */
+};
+
+#ifdef __GNUC__
+#  pragma GCC visibility push(default)  /* for -fvisibility= */
+#endif
+
+#ifdef PYPY_VERSION
+PyMODINIT_FUNC
+_cffi_pypyinit__amp_graph_runtime(const void *p[])
+{
+    p[0] = (const void *)0x2601;
+    p[1] = &_cffi_type_context;
+#if PY_MAJOR_VERSION >= 3
+    return NULL;
+#endif
+}
+#  ifdef _MSC_VER
+     PyMODINIT_FUNC
+#  if PY_MAJOR_VERSION >= 3
+     PyInit__amp_graph_runtime(void) { return NULL; }
+#  else
+     init_amp_graph_runtime(void) { }
+#  endif
+#  endif
+#elif PY_MAJOR_VERSION >= 3
+PyMODINIT_FUNC
+PyInit__amp_graph_runtime(void)
+{
+  return _cffi_init("_amp_graph_runtime", 0x2601, &_cffi_type_context);
+}
+#else
+PyMODINIT_FUNC
+init_amp_graph_runtime(void)
+{
+  _cffi_init("_amp_graph_runtime", 0x2601, &_cffi_type_context);
+}
+#endif
+
+#ifdef __GNUC__
+#  pragma GCC visibility pop
+#endif
