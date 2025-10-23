@@ -414,6 +414,69 @@ def build_base_params(
 from .config import DEFAULT_CONFIG_PATH, load_configuration
 
 
+def _run_headless_diagnostic(
+    *,
+    config_path: str,
+    frames_override: int | None,
+    iterations: int | None,
+    warmup: int | None,
+    batch_blocks: int | None,
+    ema_alpha: float | None,
+) -> int:
+    cfg = load_configuration(config_path)
+    frames = int(frames_override) if frames_override is not None else int(cfg.runtime.frames_per_chunk)
+    iterations = int(iterations) if iterations is not None else 64
+    warmup = int(warmup) if warmup is not None else max(0, iterations // 8)
+    batch_blocks = int(batch_blocks) if batch_blocks is not None else 8
+    ema_alpha = float(ema_alpha) if ema_alpha is not None else 0.02
+
+    if frames <= 0:
+        STATUS_PRINTER.emit("Headless diagnostics require a positive frame count", force=True)
+        STATUS_PRINTER.flush()
+        return 1
+    if iterations <= 0:
+        STATUS_PRINTER.emit("Headless diagnostics require at least one iteration", force=True)
+        STATUS_PRINTER.flush()
+        return 1
+    if batch_blocks <= 0:
+        STATUS_PRINTER.emit("Headless diagnostics require batch_blocks >= 1", force=True)
+        STATUS_PRINTER.flush()
+        return 1
+    if not (0.0 < ema_alpha <= 1.0):
+        STATUS_PRINTER.emit("Headless diagnostics require 0 < ema_alpha <= 1", force=True)
+        STATUS_PRINTER.flush()
+        return 1
+
+    from .system import (
+        benchmark_default_graph,
+        require_native_graph_runtime,
+        summarise_benchmark_timeline,
+    )
+
+    try:
+        require_native_graph_runtime()
+    except RuntimeError as exc:
+        STATUS_PRINTER.emit(str(exc), force=True)
+        STATUS_PRINTER.flush()
+        return 1
+
+    timeline = benchmark_default_graph(
+        frames=frames,
+        iterations=iterations,
+        sample_rate=float(cfg.sample_rate),
+        ema_alpha=ema_alpha,
+        warmup=max(0, min(warmup, iterations)),
+        joystick_mode="switch",
+        joystick_script_path=None,
+        batch_blocks=batch_blocks,
+    )
+
+    for line in summarise_benchmark_timeline(timeline, ema_alpha=ema_alpha):
+        STATUS_PRINTER.emit(line, force=True)
+    STATUS_PRINTER.flush()
+    return 0
+
+
 class _NullJoystick:
     """Fallback joystick that returns neutral values."""
 
@@ -478,6 +541,11 @@ def run(
     no_audio: bool = False,
     headless: bool = False,
     config_path: str | None = None,
+    headless_frames: int | None = None,
+    headless_iterations: int | None = None,
+    headless_warmup: int | None = None,
+    headless_batch: int | None = None,
+    headless_alpha: float | None = None,
 ) -> int:
     """Launch the synthesiser.
 
@@ -533,7 +601,14 @@ def run(
         return 0
 
     if headless:
-        return render_summary("Headless run requested.")
+        return _run_headless_diagnostic(
+            config_path=cfg_path,
+            frames_override=headless_frames,
+            iterations=headless_iterations,
+            warmup=headless_warmup,
+            batch_blocks=headless_batch,
+            ema_alpha=headless_alpha,
+        )
 
     # Attach a run identifier to correlate logs and diagnostics across files
     run_start_time = time.time()
