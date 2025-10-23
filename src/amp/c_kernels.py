@@ -185,6 +185,7 @@ try:
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #endif
@@ -301,42 +302,72 @@ typedef struct {
     EdgeRunnerControlCurve *curves;
 } EdgeRunnerControlHistory;
 
+/* Persistent log file handles. Lazily opened on first use so builds that run
+   in read-only or log-less environments can continue without crashing. */
+static FILE *log_f_ccalls = NULL;
+static FILE *log_f_cgenerated = NULL;
+
+static void ensure_log_files_open(void) {
+    if (log_f_ccalls == NULL) {
+        FILE *candidate = fopen("logs/native_c_calls.log", "a");
+        if (candidate != NULL) {
+#if defined(_WIN32) || defined(_WIN64)
+            setvbuf(candidate, NULL, _IONBF, 0);
+#else
+            setvbuf(candidate, NULL, _IOLBF, 0);
+#endif
+            log_f_ccalls = candidate;
+        }
+    }
+    if (log_f_cgenerated == NULL) {
+        FILE *candidate = fopen("logs/native_c_generated.log", "a");
+        if (candidate != NULL) {
+#if defined(_WIN32) || defined(_WIN64)
+            setvbuf(candidate, NULL, _IONBF, 0);
+#else
+            setvbuf(candidate, NULL, _IOLBF, 0);
+#endif
+            log_f_cgenerated = candidate;
+        }
+    }
+}
+
 /* Lightweight native-entry logger. Appends one-line records to logs/native_c_calls.log
    Format: <timestamp> <py_thread_state_ptr_or_tid> <function> <arg1> <arg2>\n
    Keep this function minimal and tolerant of failures (best-effort logging only).
 */
 static void _log_native_call(const char *fn, size_t a, size_t b) {
-    FILE *f = fopen("logs/native_c_calls.log", "a");
-    if (f == NULL) {
+    ensure_log_files_open();
+    if (log_f_ccalls == NULL) {
         return;
     }
     double t = (double)time(NULL);
 #ifdef PyThreadState_Get
     void *py_ts = (void *)PyThreadState_Get();
-    fprintf(f, "%.3f %p %s %zu %zu\n", t, py_ts, fn, a, b);
+    fprintf(log_f_ccalls, "%.3f %p %s %zu %zu\n", t, py_ts, fn, a, b);
 #else
 #if defined(_WIN32) || defined(_WIN64)
     unsigned long tid = (unsigned long) GetCurrentThreadId();
-    fprintf(f, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
+    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
 #else
     unsigned long tid = (unsigned long) pthread_self();
-    fprintf(f, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
+    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
 #endif
 #endif
-    fclose(f);
+    fflush(log_f_ccalls);
 }
 
 /* Generated-wrapper logger: record wrapper entry and a couple numeric args. */
 static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
-    FILE *f = fopen("logs/native_c_generated.log", "a");
-    if (f == NULL) return;
+    ensure_log_files_open();
+    if (log_f_cgenerated == NULL) return;
 #ifdef PyThreadState_Get
     void *py_ts = (void *)PyThreadState_Get();
-    fprintf(f, "%s %p %zu %zu\n", fn, py_ts, a, b);
+    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, py_ts, a, b);
 #else
-    fprintf(f, "%s %p %zu %zu\n", fn, (void*)0, a, b);
+    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, (void*)0, a, b);
 #endif
-    fclose(f);
+    fflush(log_f_cgenerated);
 }
 
 /*
