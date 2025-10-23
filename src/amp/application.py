@@ -40,25 +40,27 @@ class SynthApplication:
         graph: AudioGraph
         try:
             cfg_nodes = getattr(config.graph, "nodes", None) or []
-            if cfg_nodes:
-                graph = AudioGraph.from_config(config.graph, config.sample_rate, config.runtime.output_channels)
-            else:
-                runtime_state = {
-                    "root_midi": 60,
-                    "free_variant": "continuous",
-                    "base_token": "12tet/full",
-                    "waves": ["sine", "square", "saw"],
-                    "wave_idx": 0,
-                    "filter_type": "lowpass",
-                    "mod_wave_types": ["sine", "square", "saw"],
-                    "mod_wave_idx": 0,
-                    "mod_rate_hz": 4.0,
-                    "mod_depth": 0.5,
-                    "mod_use_input": False,
-                    "polyphony_mode": "strings",
-                    "polyphony_voices": 3,
-                }
+            runtime_state = {
+                "root_midi": 60,
+                "free_variant": "continuous",
+                "base_token": "12tet/full",
+                "waves": ["sine", "square", "saw"],
+                "wave_idx": 0,
+                "filter_type": "lowpass",
+                "mod_wave_types": ["sine", "square", "saw"],
+                "mod_wave_idx": 0,
+                "mod_rate_hz": 4.0,
+                "mod_depth": 0.5,
+                "mod_use_input": False,
+                "polyphony_mode": "strings",
+                "polyphony_voices": 3,
+            }
+            if getattr(config.graph, "use_runtime_graph", False) or not cfg_nodes:
                 graph, _, _ = build_runtime_graph(config.sample_rate, runtime_state)
+            else:
+                graph = AudioGraph.from_config(
+                    config.graph, config.sample_rate, config.runtime.output_channels
+                )
         except Exception:
             # Fallback to config-driven construction on any error
             graph = AudioGraph.from_config(config.graph, config.sample_rate, config.runtime.output_channels)
