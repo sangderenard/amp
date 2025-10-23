@@ -6,13 +6,14 @@ import json
 from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, RLock
 from typing import TYPE_CHECKING, Deque, Dict, Iterable, List, Mapping, Sequence, Tuple
 import struct
 import time
 import zlib
 
 import numpy as np
+from pathlib import Path
 
 from .config import GraphConfig
 from .nodes import NODE_TYPES, Node as AudioNode
@@ -145,8 +146,9 @@ class ControlDelay:
         Serialize all control events (timestamps, axes/buttons, etc.) in [start_time, end_time) into a C-compatible binary blob.
         Each event includes timestamp and all extras (axes/buttons as curves). No upsampling or derived signals.
         """
-        # Gather relevant events
-        events = [e for e in self._events if start_time <= e.timestamp < end_time]
+        # Gather relevant events (snapshot under lock to avoid concurrent mutation)
+        with getattr(self, "_lock", Lock()):
+            events = [e for e in self._events if start_time <= e.timestamp < end_time]
         # Determine all axes/buttons present in any event
         all_keys = set()
         for e in events:
@@ -180,16 +182,21 @@ class ControlDelay:
         sample_rate: float,
         *,
         history_seconds: float = 1.0,
-        lookahead_seconds: float = 0.25,
+        control_delay_seconds: float = 0.25,
     ) -> None:
         self.sample_rate = float(sample_rate)
         self.history_seconds = float(history_seconds)
-        self.lookahead_seconds = float(lookahead_seconds)
+        # The configured controller delay (how late control events are logged
+        # relative to the audio they affect).
+        self.control_delay_seconds = float(control_delay_seconds)
         self._events: Deque[ControlEvent] = deque()
         self._pcm: Deque[PcmChunk] = deque()
         self._latest_time: float = 0.0
         self._pitch_dim: int | None = None
         self._env_dim: int | None = None
+        # Lock protecting writers; readers take a short snapshot under the lock
+        # Use RLock so re-entrant acquisitions by the same thread are safe.
+        self._lock: RLock = RLock()
 
     @property
     def events(self) -> Tuple[ControlEvent, ...]:
@@ -212,6 +219,7 @@ class ControlDelay:
         extras: Mapping[str, np.ndarray] | None = None,
     ) -> ControlEvent:
         event = ControlEvent(timestamp, pitch, envelope, extras)
+        # Insert under lock and update latest_time/trim while holding lock to avoid races
         self._insert_event(event)
         self._pitch_dim = event.pitch.shape[0] if self._pitch_dim is None else self._pitch_dim
         self._env_dim = event.envelope.shape[0] if self._env_dim is None else self._env_dim
@@ -219,8 +227,9 @@ class ControlDelay:
             raise ValueError("pitch dimensionality mismatch in control history")
         if event.envelope.shape[0] != self._env_dim:
             raise ValueError("envelope dimensionality mismatch in control history")
-        self._latest_time = max(self._latest_time, event.timestamp)
-        self._trim_history()
+        with self._lock:
+            self._latest_time = max(self._latest_time, event.timestamp)
+            self._trim_history()
         return event
 
     def add_pcm(
@@ -234,8 +243,9 @@ class ControlDelay:
         if not np.isclose(chunk.sample_rate, self.sample_rate):
             raise ValueError("PCM chunk sample rate must match the graph sample rate")
         self._insert_pcm(chunk)
-        self._latest_time = max(self._latest_time, chunk.end_time)
-        self._trim_history()
+        with self._lock:
+            self._latest_time = max(self._latest_time, chunk.end_time)
+            self._trim_history()
         return chunk
 
     def sample(
@@ -250,11 +260,18 @@ class ControlDelay:
         update_rate = float(update_hz or self.sample_rate)
         step = 1.0 / update_rate
         times = start_time + np.arange(frames, dtype=RAW_DTYPE) * step
-        pitch = self._interpolate_series(times, "pitch", self._pitch_dim)
-        envelope = self._interpolate_series(times, "envelope", self._env_dim)
+        # Snapshot events/pcm under lock to avoid torn reads while writers mutate
+        with self._lock:
+            events_snapshot = list(self._events)
+            pcm_snapshot = list(self._pcm)
+            pitch_dim = self._pitch_dim
+            env_dim = self._env_dim
+
+        pitch = self._interpolate_series(times, "pitch", pitch_dim, events=events_snapshot)
+        envelope = self._interpolate_series(times, "envelope", env_dim, events=events_snapshot)
         timestamps = times[:, None]
         controls = np.concatenate([pitch, envelope, timestamps], axis=1)
-        pcm = self._gather_pcm(start_time, frames)
+        pcm = self._gather_pcm(start_time, frames, pcm_list=pcm_snapshot)
 
         # Provide a simple sampling of any extras attached to the latest
         # control event at or before the requested start_time. Headless
@@ -266,8 +283,8 @@ class ControlDelay:
         extras_out: dict[str, np.ndarray] = {}
         if self._events:
             # Prefer the most-recent event at or before start_time
-            candidates = [e for e in self._events if e.timestamp <= start_time]
-            latest = candidates[-1] if candidates else self._events[0]
+            candidates = [e for e in events_snapshot if e.timestamp <= start_time]
+            latest = candidates[-1] if candidates else events_snapshot[0]
             if latest.extras:
                 for key, val in latest.extras.items():
                     arr = np.asarray(val, dtype=RAW_DTYPE)
@@ -382,44 +399,59 @@ class ControlDelay:
         )
         return bytes(payload)
 
-    def lookahead_events(self, start_time: float) -> Tuple[ControlEvent, ...]:
-        window_end = start_time + self.lookahead_seconds
-        return tuple(event for event in self._events if start_time <= event.timestamp <= window_end)
+    def control_delay_events(self, start_time: float) -> Tuple[ControlEvent, ...]:
+        # Return events recorded in the controller delay window following
+        # `start_time` (i.e. the historical window used to shape the next
+        # audio block).
+        window_end = start_time + self.control_delay_seconds
+        # Snapshot under lock to avoid races with writers
+        with self._lock:
+            events = tuple(event for event in self._events if start_time <= event.timestamp <= window_end)
+        return events
 
     def _insert_event(self, event: ControlEvent) -> None:
-        if not self._events or event.timestamp >= self._events[-1].timestamp:
-            self._events.append(event)
-            return
-        timestamps = [entry.timestamp for entry in self._events]
-        idx = bisect_right(timestamps, event.timestamp)
-        self._events.insert(idx, event)
+        # Protect mutation with lock to avoid races with readers taking snapshots
+        with self._lock:
+            if not self._events or event.timestamp >= self._events[-1].timestamp:
+                self._events.append(event)
+                return
+            timestamps = [entry.timestamp for entry in self._events]
+            idx = bisect_right(timestamps, event.timestamp)
+            self._events.insert(idx, event)
 
     def _insert_pcm(self, chunk: PcmChunk) -> None:
-        if not self._pcm or chunk.timestamp >= self._pcm[-1].timestamp:
-            self._pcm.append(chunk)
-            return
-        timestamps = [entry.timestamp for entry in self._pcm]
-        idx = bisect_right(timestamps, chunk.timestamp)
-        self._pcm.insert(idx, chunk)
+        # Protect mutation with lock to avoid races with readers taking snapshots
+        with self._lock:
+            if not self._pcm or chunk.timestamp >= self._pcm[-1].timestamp:
+                self._pcm.append(chunk)
+                return
+            timestamps = [entry.timestamp for entry in self._pcm]
+            idx = bisect_right(timestamps, chunk.timestamp)
+            self._pcm.insert(idx, chunk)
 
     def _trim_history(self) -> None:
-        cutoff = self._latest_time - self.history_seconds
-        while self._events and self._events[0].timestamp < cutoff:
-            self._events.popleft()
-        while self._pcm and self._pcm[0].end_time < cutoff:
-            self._pcm.popleft()
+        # Trim while holding lock to avoid removing items concurrently with readers
+        with self._lock:
+            cutoff = self._latest_time - self.history_seconds
+            while self._events and self._events[0].timestamp < cutoff:
+                self._events.popleft()
+            while self._pcm and self._pcm[0].end_time < cutoff:
+                self._pcm.popleft()
 
     def _interpolate_series(
         self,
         times: np.ndarray,
         attr: str,
         expected_dim: int | None,
+        *,
+        events: Iterable[ControlEvent] | None = None,
     ) -> np.ndarray:
-        if not self._events:
+        events = tuple(events) if events is not None else tuple(self._events)
+        if not events:
             dim = expected_dim or 1
             return np.zeros((times.size, dim), dtype=RAW_DTYPE)
-        event_times = np.array([event.timestamp for event in self._events], dtype=RAW_DTYPE)
-        values = np.stack([getattr(event, attr) for event in self._events])
+        event_times = np.array([event.timestamp for event in events], dtype=RAW_DTYPE)
+        values = np.stack([getattr(event, attr) for event in events])
         if values.ndim == 1:
             values = values[:, None]
         result = np.zeros((times.size, values.shape[1]), dtype=RAW_DTYPE)
@@ -433,14 +465,15 @@ class ControlDelay:
             )
         return result
 
-    def _gather_pcm(self, start_time: float, frames: int) -> np.ndarray:
-        if not self._pcm:
+    def _gather_pcm(self, start_time: float, frames: int, *, pcm_list: Iterable[PcmChunk] | None = None) -> np.ndarray:
+        pcm_list = tuple(pcm_list) if pcm_list is not None else tuple(self._pcm)
+        if not pcm_list:
             return np.zeros((1, frames), dtype=RAW_DTYPE)
-        out_channels = self._pcm[-1].channels
+        out_channels = pcm_list[-1].channels
         output_buffer = np.zeros((out_channels, frames), dtype=RAW_DTYPE)
         frame_step = 1.0 / self.sample_rate
         end_time = start_time + frames * frame_step
-        for chunk in self._pcm:
+        for chunk in pcm_list:
             chunk_start = chunk.timestamp
             chunk_end = chunk.end_time
             if chunk_end <= start_time or chunk_start >= end_time:
@@ -497,6 +530,13 @@ class AudioGraph:
         self._audio_workspaces: Dict[Tuple[int, int, int], np.ndarray] = {}
         self._last_node_timings: Dict[str, float] = {}
         self._edge_runner: "CffiEdgeRunner" | None = None
+        # Protect access to the CFFI edge runner (compile/run) to avoid
+        # concurrent native calls from multiple Python threads which can
+        # lead to native heap corruption on some platforms.
+        self._runner_lock: Lock = Lock()
+        # Sequence counter for diagnostic control-blob dumps; incremented
+        # per render so logs can be correlated to a specific render run.
+        self._blob_seq = 0
 
     @classmethod
     def from_config(cls, config: GraphConfig, sample_rate: int, output_channels: int) -> "AudioGraph":
@@ -769,14 +809,17 @@ class AudioGraph:
                 from .graph_edge_runner import CffiEdgeRunner
             except Exception as exc:  # pragma: no cover - defensive import guard
                 raise RuntimeError("cffi edge runner is required for graph rendering") from exc
-            self._edge_runner = CffiEdgeRunner(self)
-            # Compile the edge runner once when it's created (i.e., when the plan changes)
-            try:
-                self._edge_runner.compile()
-            except Exception:
-                # If compilation fails, ensure runner isn't left in a partial state
-                self._edge_runner = None
-                raise
+            # Instantiate the runner and compile it while holding the runner
+            # lock so no other thread can invoke native code until compilation
+            # is complete.
+            with self._runner_lock:
+                self._edge_runner = CffiEdgeRunner(self)
+                try:
+                    self._edge_runner.compile()
+                except Exception:
+                    # If compilation fails, ensure runner isn't left in a partial state
+                    self._edge_runner = None
+                    raise
         return self._edge_runner
 
     def render_block(
@@ -793,12 +836,81 @@ class AudioGraph:
             raise RuntimeError("Sink node has not been configured")
         sr = int(sample_rate or self.sample_rate)
         runner = self._ensure_edge_runner()
-        # Serialize raw control history for the relevant window
+        # Serialize raw control history for the relevant window.
+        # Control events are recorded with a deliberate controller delay
+        # (historical samples) and therefore the control history window
+        # used by the renderer must be offset *earlier* by that delay.
+        # Requesting control events up to the present (or future) is
+        # invalid — clamp the requested window to the latest available
+        # control timestamp to avoid exposing present/future events to C.
         start_time = getattr(self, "_last_block_time", 0.0)
         end_time = start_time + (frames / sr)
-        control_history_blob = self.control_delay.export_control_history_blob(start_time, end_time)
-        runner.begin_block(frames, sample_rate=sr, base_params=base_params or {})
-        output = runner.run_c_graph(control_history_blob)
+        # Support older code that may have used the previous attribute
+        # name by falling back to it if present for compatibility.
+        ctrl_delay = float(getattr(self.control_delay, "control_delay_seconds", 0.0))
+        # Shift window earlier by the configured controller delay
+        req_start = start_time - ctrl_delay
+        req_end = end_time - ctrl_delay
+        # Do not request times outside available history. Clamp both start/end
+        # into [0, latest_time] and ensure the window is non-inverted.
+        latest = float(getattr(self.control_delay, "latest_time", 0.0))
+        # Clamp to [0, latest]
+        req_start = max(0.0, min(req_start, latest))
+        req_end = max(0.0, min(req_end, latest))
+        # Ensure non-inverted window
+        if req_end < req_start:
+            req_end = req_start
+        control_history_blob = self.control_delay.export_control_history_blob(req_start, req_end)
+
+        # Diagnostic: dump last control-history blob and metadata to logs so we can
+        # inspect the exact bytes passed to the C kernel when a native crash occurs.
+        try:
+            logs_dir = Path("logs")
+            logs_dir.mkdir(exist_ok=True)
+            blob_path = logs_dir / "last_control_blob.bin"
+            meta_path = logs_dir / "last_control_blob.json"
+            with open(blob_path, "wb") as bf:
+                bf.write(control_history_blob)
+            meta = {
+                "req_start": float(req_start),
+                "req_end": float(req_end),
+                "start_time": float(start_time),
+                "end_time": float(end_time),
+                "ctrl_delay": float(ctrl_delay),
+                "latest_time": float(latest),
+                "blob_len": len(control_history_blob),
+            }
+            # Include graph descriptor/plan sizes to help triage mismatches
+            try:
+                meta["descriptor_len"] = len(self.serialize_node_descriptors())
+                runner = getattr(self, "_edge_runner", None)
+                meta["compiled_plan_len"] = len(getattr(runner, "_compiled_plan", b"") or b"")
+            except Exception:
+                pass
+            with open(meta_path, "w", encoding="utf-8") as mf:
+                json.dump(meta, mf)
+        except Exception:
+            # Diagnostics must never interfere with runtime; swallow errors.
+            pass
+        # Serialize access to the native runner to avoid simultaneous
+        # invocations from multiple Python threads (producer/consumer/UI).
+        try:
+            try:
+                with open("logs/py_c_calls.log", "a") as _pf:
+                    _pf.write(f"{time.time()} {threading.get_ident()} render_block.enter frames={frames} sample_rate={sr} base_params_keys={list((base_params or {}).keys())}\n")
+            except Exception:
+                pass
+            with self._runner_lock:
+                runner.begin_block(frames, sample_rate=sr, base_params=base_params or {})
+                output = runner.run_c_graph(control_history_blob)
+            try:
+                with open("logs/py_c_calls.log", "a") as _pf:
+                    _pf.write(f"{time.time()} {threading.get_ident()} render_block.exit frames={frames} sample_rate={sr} output_shape={getattr(output, 'shape', None)}\n")
+            except Exception:
+                pass
+        except Exception:
+            # propagate after logging attempt
+            raise
         self._last_block_time = end_time
         return output
 

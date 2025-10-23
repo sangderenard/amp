@@ -185,6 +185,9 @@ try:
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#endif
 
 #if defined(_WIN32) || defined(_WIN64)
 #define AMP_CAPI __declspec(dllexport)
@@ -298,6 +301,295 @@ typedef struct {
     EdgeRunnerControlCurve *curves;
 } EdgeRunnerControlHistory;
 
+/* Lightweight native-entry logger. Appends one-line records to logs/native_c_calls.log
+   Format: <timestamp> <py_thread_state_ptr_or_tid> <function> <arg1> <arg2>\n
+   Keep this function minimal and tolerant of failures (best-effort logging only).
+*/
+static void _log_native_call(const char *fn, size_t a, size_t b) {
+    FILE *f = fopen("logs/native_c_calls.log", "a");
+    if (f == NULL) {
+        return;
+    }
+    double t = (double)time(NULL);
+#ifdef PyThreadState_Get
+    void *py_ts = (void *)PyThreadState_Get();
+    fprintf(f, "%.3f %p %s %zu %zu\n", t, py_ts, fn, a, b);
+#else
+#if defined(_WIN32) || defined(_WIN64)
+    unsigned long tid = (unsigned long) GetCurrentThreadId();
+    fprintf(f, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
+#else
+    unsigned long tid = (unsigned long) pthread_self();
+    fprintf(f, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
+#endif
+#endif
+    fclose(f);
+}
+
+/* Generated-wrapper logger: record wrapper entry and a couple numeric args. */
+static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
+    FILE *f = fopen("logs/native_c_generated.log", "a");
+    if (f == NULL) return;
+#ifdef PyThreadState_Get
+    void *py_ts = (void *)PyThreadState_Get();
+    fprintf(f, "%s %p %zu %zu\n", fn, py_ts, a, b);
+#else
+    fprintf(f, "%s %p %zu %zu\n", fn, (void*)0, a, b);
+#endif
+    fclose(f);
+}
+
+/*
+ * Debug allocation wrappers that capture caller file/line/function.
+ * To ensure the wrappers call the real libc allocation functions we
+ * temporarily undef the common allocation macros, declare wrappers that
+ * accept caller metadata, then re-map the allocation names to pass
+ * __FILE__/__LINE__/__func__ automatically.
+ */
+#undef malloc
+#undef calloc
+#undef realloc
+#undef free
+
+#undef memcpy
+#undef memset
+
+/* Simple in-memory allocation registry to detect writes into freed or
+   undersized buffers. This is intentionally lightweight and only used
+   in debug runs. We maintain a singly-linked list of allocation records
+   updated by the allocation wrappers and consulted by the mem-op wrappers. */
+typedef struct alloc_rec {
+    void *ptr;
+    size_t size;
+    struct alloc_rec *next;
+} alloc_rec;
+
+static alloc_rec *alloc_list = NULL;
+
+static void register_alloc(void *ptr, size_t size) {
+    if (ptr == NULL) return;
+    alloc_rec *r = (alloc_rec *)malloc(sizeof(alloc_rec));
+    if (r == NULL) return;
+    r->ptr = ptr;
+    r->size = size;
+    r->next = alloc_list;
+    alloc_list = r;
+    /* Durable log so post-processing can see registrations that
+       originate from stack-local buffers or manual calls to register_alloc. */
+    FILE *f = fopen("logs/native_alloc_trace.log", "a");
+    if (f) {
+        fprintf(f, "REGISTER %p size=%zu\n", ptr, size);
+        fclose(f);
+    }
+}
+
+static void unregister_alloc(void *ptr) {
+    if (ptr == NULL) return;
+    alloc_rec **pp = &alloc_list;
+    while (*pp) {
+        if ((*pp)->ptr == ptr) {
+            alloc_rec *remove = *pp;
+            *pp = remove->next;
+            /* Log unregister so post-processing can match frees of stack
+               registrations as well. */
+            FILE *f = fopen("logs/native_alloc_trace.log", "a");
+            if (f) {
+                fprintf(f, "UNREGISTER %p\n", ptr);
+                fclose(f);
+            }
+            free(remove);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* Check whether [addr, addr+len) is fully contained inside a known
+   allocated record. Returns 1 if contained, 0 otherwise. */
+static int range_within_alloc(void *addr, size_t len) {
+    if (addr == NULL) return 0;
+    unsigned char *a = (unsigned char *)addr;
+    alloc_rec *r = alloc_list;
+    while (r) {
+        unsigned char *base = (unsigned char *)r->ptr;
+        if (a >= base && (a + len) <= (base + r->size)) return 1;
+        r = r->next;
+    }
+    return 0;
+}
+
+/* Portable backtrace dumper: prints a compact list of return addresses or
+   symbolified strings (where available) to the provided file stream. This
+   is intentionally small and best-effort: the presence of addresses in the
+   BAD_* logs will significantly speed offline correlation even without
+   symbol resolution. */
+static void dump_backtrace(FILE *g) {
+    if (g == NULL) return;
+#if defined(_WIN32) || defined(_WIN64)
+    /* Use CaptureStackBackTrace which is available on Windows. We print
+       raw return addresses; symbol resolution can be done offline if
+       required. */
+    void *frames[64];
+    USHORT count = CaptureStackBackTrace(0, (ULONG) (sizeof(frames)/sizeof(frames[0])), frames, NULL);
+    fprintf(g, "BACKTRACE_FRAMES %u\n", (unsigned)count);
+    for (USHORT i = 0; i < count; ++i) {
+        fprintf(g, "BT %p\n", frames[i]);
+    }
+#else
+    /* POSIX: use backtrace/backtrace_symbols where available. */
+#ifdef __GNUC__
+    void *frames[64];
+    int count = backtrace(frames, (int)(sizeof(frames)/sizeof(frames[0])));
+    char **symbols = backtrace_symbols(frames, count);
+    if (symbols != NULL) {
+        fprintf(g, "BACKTRACE_FRAMES %d\n", count);
+        for (int i = 0; i < count; ++i) {
+            fprintf(g, "BT %s\n", symbols[i]);
+        }
+        free(symbols);
+    } else {
+        fprintf(g, "BACKTRACE_FRAMES %d\n", count);
+        for (int i = 0; i < count; ++i) fprintf(g, "BT %p\n", frames[i]);
+    }
+#else
+    (void)g; /* no-op if backtrace APIs unavailable */
+#endif
+#endif
+}
+
+static void *_dbg_malloc(size_t s, const char *file, int line, const char *func) {
+    void *p = malloc(s); /* calls real malloc because we undef'd macro above */
+    /* log: op=malloc, size, ptr, caller */
+    _log_native_call("malloc", (size_t)s, (size_t)(uintptr_t)p);
+    FILE *f = fopen("logs/native_alloc_trace.log", "a");
+    if (f) {
+        fprintf(f, "MALLOC %s:%d %s size=%zu ptr=%p\n", file, line, func, s, p);
+        fclose(f);
+    }
+    if (p != NULL) register_alloc(p, s);
+    return p;
+}
+
+static void *_dbg_calloc(size_t n, size_t size, const char *file, int line, const char *func) {
+    void *p = calloc(n, size);
+    _log_native_call("calloc", (size_t)(n * size), (size_t)(uintptr_t)p);
+    FILE *f = fopen("logs/native_alloc_trace.log", "a");
+    if (f) {
+        fprintf(f, "CALLOC %s:%d %s nmemb=%zu size=%zu ptr=%p\n", file, line, func, n, size, p);
+        fclose(f);
+    }
+    if (p != NULL) register_alloc(p, n * size);
+    return p;
+}
+
+static void *_dbg_realloc(void *ptr, size_t s, const char *file, int line, const char *func) {
+    void *p = realloc(ptr, s);
+    _log_native_call("realloc_old", (size_t)(uintptr_t)ptr, (size_t)(uintptr_t)p);
+    _log_native_call("realloc_new", (size_t)s, (size_t)(uintptr_t)p);
+    FILE *f = fopen("logs/native_alloc_trace.log", "a");
+    if (f) {
+        fprintf(f, "REALLOC %s:%d %s old=%p new=%p size=%zu\n", file, line, func, ptr, p, s);
+        fclose(f);
+    }
+    /* update registry: remove old entry and register new pointer */
+    if (ptr != NULL) unregister_alloc(ptr);
+    if (p != NULL) register_alloc(p, s);
+    return p;
+}
+
+static void _dbg_free(void *ptr, const char *file, int line, const char *func) {
+    _log_native_call("free", (size_t)(uintptr_t)ptr, 0);
+    FILE *f = fopen("logs/native_alloc_trace.log", "a");
+    if (f) {
+        fprintf(f, "FREE %s:%d %s ptr=%p\n", file, line, func, ptr);
+        fclose(f);
+    }
+    if (ptr != NULL) {
+        unregister_alloc(ptr);
+        free(ptr);
+    }
+}
+
+/* Debug wrappers for memcpy/memset to log memory writes/copies. These use
+   simple byte loops to avoid calling the (possibly macro-redirected)
+   libc functions and to keep the logging minimal and self-contained. */
+static void *_dbg_memcpy(void *dest, const void *src, size_t n, const char *file, int line, const char *func) {
+    FILE *f = fopen("logs/native_mem_ops.log", "a");
+    if (f) {
+        fprintf(f, "MEMCPY %s:%d %s dest=%p src=%p n=%zu\n", file, line, func, dest, src, n);
+        fclose(f);
+    }
+    if (dest == NULL || src == NULL || n == 0) {
+        return dest;
+    }
+    /* Check destination range against known allocations. If not found,
+       allow destinations that are likely on the current stack to avoid
+       false positives for local buffers. We use a heuristic window around
+       the current stack pointer. */
+        if (!range_within_alloc(dest, n)) {
+        uintptr_t stack_probe = (uintptr_t)&stack_probe;
+        uintptr_t d = (uintptr_t)dest;
+        const uintptr_t STACK_WINDOW = 0x100000; /* 1MB */
+        if (!(d >= stack_probe - STACK_WINDOW && d <= stack_probe + STACK_WINDOW)) {
+            FILE *g = fopen("logs/native_mem_ops.log", "a");
+            if (g) {
+                fprintf(g, "BAD_MEMCPY %s:%d %s dest=%p n=%zu stack_probe=%p (no matching alloc or too small)\n", file, line, func, dest, n, (void*)stack_probe);
+                /* dump live allocation registry snapshot for post-mortem correlation */
+                alloc_rec *it = alloc_list;
+                while (it) {
+                    fprintf(g, "ALLOC_SNAPSHOT ptr=%p size=%zu\n", it->ptr, it->size);
+                    it = it->next;
+                }
+                /* Append a backtrace; best-effort and compact. */
+                dump_backtrace(g);
+                fclose(g);
+            }
+        }
+    }
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    for (size_t i = 0; i < n; ++i) {
+        d[i] = s[i];
+    }
+    return dest;
+}
+
+static void *_dbg_memset(void *s_ptr, int c, size_t n, const char *file, int line, const char *func) {
+    FILE *f = fopen("logs/native_mem_ops.log", "a");
+    if (f) {
+        fprintf(f, "MEMSET %s:%d %s ptr=%p val=%d n=%zu\n", file, line, func, s_ptr, c, n);
+        fclose(f);
+    }
+    if (s_ptr == NULL || n == 0) return s_ptr;
+    if (!range_within_alloc(s_ptr, n)) {
+        uintptr_t stack_probe = (uintptr_t)&stack_probe;
+        uintptr_t d = (uintptr_t)s_ptr;
+        const uintptr_t STACK_WINDOW = 0x100000; /* 1MB */
+        if (!(d >= stack_probe - STACK_WINDOW && d <= stack_probe + STACK_WINDOW)) {
+            FILE *g = fopen("logs/native_mem_ops.log", "a");
+            if (g) {
+                fprintf(g, "BAD_MEMSET %s:%d %s ptr=%p n=%zu stack_probe=%p (no matching alloc or too small)\n", file, line, func, s_ptr, n, (void*)stack_probe);
+                dump_backtrace(g);
+                fclose(g);
+            }
+        }
+    }
+    unsigned char *p = (unsigned char *)s_ptr;
+    unsigned char v = (unsigned char)c;
+    for (size_t i = 0; i < n; ++i) p[i] = v;
+    return s_ptr;
+}
+
+/* Re-map the allocation names so callers automatically pass caller metadata. */
+#define malloc(s) _dbg_malloc((s), __FILE__, __LINE__, __func__)
+#define calloc(n,s) _dbg_calloc((n),(s), __FILE__, __LINE__, __func__)
+#define realloc(p,s) _dbg_realloc((p),(s), __FILE__, __LINE__, __func__)
+#define free(p) _dbg_free((p), __FILE__, __LINE__, __func__)
+
+/* Redirect memcpy/memset to debug wrappers so we capture large buffer writes */
+#define memcpy(d,s,n) _dbg_memcpy((d),(s),(n), __FILE__, __LINE__, __func__)
+#define memset(p,c,n) _dbg_memset((p),(c),(n), __FILE__, __LINE__, __func__)
+
 static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     if (plan == NULL) {
         return;
@@ -350,6 +642,8 @@ AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
     const uint8_t *plan_blob,
     size_t plan_len
 ) {
+    _log_native_call("amp_load_compiled_plan", descriptor_len, plan_len);
+    _gen_wrapper_log("amp_load_compiled_plan", (size_t)descriptor_blob, (size_t)plan_blob);
     if (descriptor_blob == NULL || plan_blob == NULL) {
         return NULL;
     }
@@ -484,6 +778,8 @@ AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
 }
 
 AMP_CAPI void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+    _log_native_call("amp_release_compiled_plan", (size_t)(plan != NULL), 0);
+    _gen_wrapper_log("amp_release_compiled_plan", (size_t)plan, 0);
     destroy_compiled_plan(plan);
 }
 
@@ -571,6 +867,8 @@ AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
     size_t blob_len,
     int frames_hint
 ) {
+    _log_native_call("amp_load_control_history", blob_len, (size_t)frames_hint);
+    _gen_wrapper_log("amp_load_control_history", (size_t)blob, (size_t)frames_hint);
     if (blob == NULL || blob_len < 8) {
         return NULL;
     }
@@ -683,6 +981,8 @@ AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
 }
 
 AMP_CAPI void amp_release_control_history(EdgeRunnerControlHistory *history) {
+    _log_native_call("amp_release_control_history", (size_t)(history != NULL), 0);
+    _gen_wrapper_log("amp_release_control_history", (size_t)history, 0);
     destroy_control_history(history);
 }
 
@@ -1928,6 +2228,8 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
     if (out == NULL || out_len == 0) {
         return 0;
     }
+    /* Register destination buffer so mem-op logging can correlate writes. */
+    register_alloc(out, out_len);
     out[0] = '\0';
     if (json == NULL || key == NULL) {
         return 0;
@@ -1964,13 +2266,39 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
             cursor++;
         }
         size_t length = (size_t)(cursor - start);
-        if (length >= out_len) {
-            length = out_len - 1;
-        }
-        memcpy(out, start, length);
-        out[length] = '\0';
-        return 1;
+            if (length >= out_len) {
+                /* log attempted oversize copy */
+                FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+                if (fdbg) {
+                    void *stack_probe = (void*)&pattern;
+                    /* log the destination and a stack probe so we can detect stack-derived buffers */
+                    fprintf(fdbg, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
+                    fclose(fdbg);
+                }
+                length = out_len > 0 ? out_len - 1 : 0;
+            } else {
+                FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+                if (fdbg) {
+                    void *stack_probe = (void*)&pattern;
+                    fprintf(fdbg, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
+                    fclose(fdbg);
+                }
+            }
+            /* use safe copy that respects the provided destination capacity */
+            if (out_len > 0 && length > 0) {
+                memcpy(out, start, length);
+                /* POSTCOPY: record that we actually wrote to 'out' */
+                FILE *fpost = fopen("logs/native_mem_ops.log", "a");
+                if (fpost) {
+                    fprintf(fpost, "POSTCOPY json_copy_string dest=%p wrote=%zu\n", out, length);
+                    fclose(fpost);
+                }
+            }
+            out[length] = '\0';
+            unregister_alloc(out);
+            return 1;
     }
+    unregister_alloc(out);
     return 0;
 }
 
@@ -1998,6 +2326,8 @@ static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) 
     if (csv == NULL || tokens == NULL || max_tokens <= 0) {
         return 0;
     }
+    /* Register tokens buffer for correlation of PRECOPY/MEMCPY events */
+    register_alloc(tokens, (size_t)max_tokens * 64);
     int count = 0;
     const char *cursor = csv;
     while (*cursor != '\0' && count < max_tokens) {
@@ -2013,12 +2343,35 @@ static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) 
         }
         size_t len = (size_t)(cursor - start);
         if (len >= 63) {
+            FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+            if (fdbg) {
+                void *base = (void*)tokens;
+                /* log both the tokens base and per-token dest so we can map to allocations */
+                fprintf(fdbg, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
+                fclose(fdbg);
+            }
             len = 63;
+        } else {
+            FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+            if (fdbg) {
+                void *base = (void*)tokens;
+                fprintf(fdbg, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
+                fclose(fdbg);
+            }
         }
-        memcpy(tokens[count], start, len);
+        if (len > 0) {
+            /* write with postcopy logging and bounds assertion */
+            memcpy(tokens[count], start, len);
+            FILE *fpost = fopen("logs/native_mem_ops.log", "a");
+            if (fpost) {
+                fprintf(fpost, "POSTCOPY parse_csv_tokens dest=%p wrote=%zu token_idx=%d\n", tokens[count], len, count);
+                fclose(fpost);
+            }
+        }
         tokens[count][len] = '\0';
         count++;
     }
+    unregister_alloc(tokens);
     return count;
 }
 
@@ -2026,6 +2379,8 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
     if (csv == NULL || items == NULL || max_items <= 0) {
         return 0;
     }
+    /* Register items buffer so writes to items->output/source are tracked */
+    register_alloc(items, (size_t)max_items * sizeof(controller_source_t));
     int count = 0;
     const char *cursor = csv;
     while (*cursor != '\0' && count < max_items) {
@@ -2041,9 +2396,29 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
         }
         size_t key_len = (size_t)(eq - cursor);
         if (key_len >= sizeof(items[count].output)) {
+            FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+            if (fdbg) {
+                void *base = (void*)items;
+                fprintf(fdbg, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
+                fclose(fdbg);
+            }
             key_len = sizeof(items[count].output) - 1;
+        } else {
+            FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+            if (fdbg) {
+                void *base = (void*)items;
+                fprintf(fdbg, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
+                fclose(fdbg);
+            }
         }
-        memcpy(items[count].output, cursor, key_len);
+        if (key_len > 0) {
+            memcpy(items[count].output, cursor, key_len);
+            FILE *fpost = fopen("logs/native_mem_ops.log", "a");
+            if (fpost) {
+                fprintf(fpost, "POSTCOPY parse_controller_sources.output dest=%p wrote=%zu idx=%d\n", items[count].output, key_len, count);
+                fclose(fpost);
+            }
+        }
         items[count].output[key_len] = '\0';
         cursor = eq + 1;
         const char *end = strchr(cursor, ',');
@@ -2052,13 +2427,34 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
         }
         size_t value_len = (size_t)(end - cursor);
         if (value_len >= sizeof(items[count].source)) {
+            FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+            if (fdbg) {
+                void *base = (void*)items;
+                fprintf(fdbg, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
+                fclose(fdbg);
+            }
             value_len = sizeof(items[count].source) - 1;
+        } else {
+            FILE *fdbg = fopen("logs/native_mem_ops.log", "a");
+            if (fdbg) {
+                void *base = (void*)items;
+                fprintf(fdbg, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
+                fclose(fdbg);
+            }
         }
-        memcpy(items[count].source, cursor, value_len);
+        if (value_len > 0) {
+            memcpy(items[count].source, cursor, value_len);
+            FILE *fpost2 = fopen("logs/native_mem_ops.log", "a");
+            if (fpost2) {
+                fprintf(fpost2, "POSTCOPY parse_controller_sources.source dest=%p wrote=%zu idx=%d\n", items[count].source, value_len, count);
+                fclose(fpost2);
+            }
+        }
         items[count].source[value_len] = '\0';
         cursor = end;
         count++;
     }
+    unregister_alloc(items);
     return count;
 }
 
@@ -2309,12 +2705,53 @@ static int run_controller_node(
     if (out_buffer == NULL || out_channels == NULL) {
         return -1;
     }
-    char outputs_csv[256];
-    char sources_csv[512];
-    char output_names[32][64];
-    controller_source_t mappings[32];
+    /* allocate parsing buffers on the heap so they can be registered
+       and reliably observed by the debug registry (avoids untracked
+       stack writes and lifetime confusion). Sizes are chosen from the
+       descriptor length with safe defaults and caps. */
+    char *outputs_csv = NULL;
+    char *sources_csv = NULL;
+    char (*output_names)[64] = NULL;
+    controller_source_t *mappings = NULL;
     int output_count = 0;
-    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_outputs__", outputs_csv, sizeof(outputs_csv))) {
+    int _rc = -1;
+    size_t outputs_cap = 256;
+    size_t sources_cap = 512;
+    if (descriptor != NULL && descriptor->params_len > 0) {
+        size_t p = descriptor->params_len + 1;
+        if (p > outputs_cap) outputs_cap = p;
+        if (p > sources_cap) sources_cap = p;
+    }
+    /* clamp to reasonable bounds */
+    if (outputs_cap < 256) outputs_cap = 256;
+    if (sources_cap < 512) sources_cap = 512;
+    if (outputs_cap > 65536) outputs_cap = 65536;
+    if (sources_cap > 65536) sources_cap = 65536;
+    outputs_csv = (char *)malloc(outputs_cap);
+    if (outputs_csv == NULL) {
+        _rc = -1;
+        goto cleanup_run_controller_node;
+    }
+    register_alloc(outputs_csv, outputs_cap);
+    sources_csv = (char *)malloc(sources_cap);
+    if (sources_csv == NULL) {
+        _rc = -1;
+        goto cleanup_run_controller_node;
+    }
+    register_alloc(sources_csv, sources_cap);
+    output_names = (char (*)[64])malloc((size_t)32 * 64);
+    if (output_names == NULL) {
+        _rc = -1;
+        goto cleanup_run_controller_node;
+    }
+    register_alloc(output_names, (size_t)32 * 64);
+    mappings = (controller_source_t *)malloc((size_t)32 * sizeof(controller_source_t));
+    if (mappings == NULL) {
+        _rc = -1;
+        goto cleanup_run_controller_node;
+    }
+    register_alloc(mappings, (size_t)32 * sizeof(controller_source_t));
+    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_outputs__", outputs_csv, outputs_cap)) {
         output_count = parse_csv_tokens(outputs_csv, output_names, 32);
     }
     if (output_count <= 0 && inputs != NULL) {
@@ -2329,10 +2766,11 @@ static int run_controller_node(
         }
     }
     if (output_count <= 0) {
-        return -1;
+        _rc = -1;
+        goto cleanup_run_controller_node;
     }
     int mapping_count = 0;
-    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_sources__", sources_csv, sizeof(sources_csv))) {
+    if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_sources__", sources_csv, sources_cap)) {
         mapping_count = parse_controller_sources(sources_csv, mappings, 32);
     }
     int resolved_channels = output_count;
@@ -2355,7 +2793,8 @@ static int run_controller_node(
     double *buffer = (double *)malloc(total * sizeof(double));
     amp_last_alloc_count = total;
     if (buffer == NULL) {
-        return -1;
+        _rc = -1;
+        goto cleanup_run_controller_node;
     }
     for (int c = 0; c < resolved_channels; ++c) {
         const char *source_name = output_names[c];
@@ -2371,7 +2810,8 @@ static int run_controller_node(
         const double *data = ensure_param_plane(view, batches, frames, 0.0, &owned);
         if (data == NULL) {
             free(buffer);
-            return -1;
+            _rc = -1;
+            goto cleanup_run_controller_node;
         }
         if (view_missing && owned != NULL && history != NULL) {
             const EdgeRunnerControlCurve *curve = find_history_curve(history, source_name, strlen(source_name));
@@ -2384,7 +2824,25 @@ static int run_controller_node(
             for (int f = 0; f < frames; ++f) {
                 size_t src_idx = (size_t)b * (size_t)frames + (size_t)f;
                 size_t dst_idx = ((size_t)b * (size_t)resolved_channels + (size_t)c) * (size_t)frames + (size_t)f;
+                /* bounds checks and durable logging for write operations */
+                size_t total_len = total; /* copied to local for clarity */
+                if (dst_idx >= total_len) {
+                    FILE *g = fopen("logs/native_mem_ops.log", "a");
+                    if (g) {
+                        fprintf(g, "BAD_WRITE run_controller_node dst_idx=%zu total=%zu src_idx=%zu c=%d b=%d f=%d resolved_channels=%d frames=%d\n", dst_idx, total_len, src_idx, c, b, f, resolved_channels, frames);
+                        fclose(g);
+                    }
+                    /* attempt to continue safely */
+                    continue;
+                }
+                /* ensure src_idx is in range of the data plane */
+                /* we don't know 'data' length statically; we will conservatively attempt to log if src_idx seems large */
                 buffer[dst_idx] = data[src_idx];
+                FILE *fpost = fopen("logs/native_mem_ops.log", "a");
+                if (fpost) {
+                    fprintf(fpost, "POSTWRITE run_controller_node dest=%p dst_idx=%zu wrote=1 src_idx=%zu node=%s\n", (void*)buffer, dst_idx, src_idx, descriptor->name ? descriptor->name : "<noname>");
+                    fclose(fpost);
+                }
             }
         }
         if (owned != NULL) {
@@ -2393,7 +2851,31 @@ static int run_controller_node(
     }
     *out_buffer = buffer;
     *out_channels = resolved_channels;
-    return 0;
+    _rc = 0;
+
+cleanup_run_controller_node:
+    /* Free and unregister any heap buffers allocated above. Keep this idempotent. */
+    if (outputs_csv != NULL) {
+        unregister_alloc(outputs_csv);
+        free(outputs_csv);
+        outputs_csv = NULL;
+    }
+    if (sources_csv != NULL) {
+        unregister_alloc(sources_csv);
+        free(sources_csv);
+        sources_csv = NULL;
+    }
+    if (output_names != NULL) {
+        unregister_alloc(output_names);
+        free(output_names);
+        output_names = NULL;
+    }
+    if (mappings != NULL) {
+        unregister_alloc(mappings);
+        free(mappings);
+        mappings = NULL;
+    }
+    return _rc;
 }
 
 static int run_lfo_node(
@@ -3327,6 +3809,7 @@ AMP_CAPI int amp_run_node(
     void **state,
     const EdgeRunnerControlHistory *history
 ) {
+    _log_native_call("amp_run_node", (size_t)batches, (size_t)frames);
     (void)channels;
     if (out_buffer == NULL || out_channels == NULL) {
         return -1;
@@ -3400,12 +3883,16 @@ AMP_CAPI int amp_run_node(
 }
 
 AMP_CAPI void amp_free(double *buffer) {
+    _log_native_call("amp_free", (size_t)(buffer != NULL), 0);
+    _gen_wrapper_log("amp_free", (size_t)buffer, 0);
     if (buffer != NULL) {
         free(buffer);
     }
 }
 
 AMP_CAPI void amp_release_state(void *state_ptr) {
+    _log_native_call("amp_release_state", (size_t)(state_ptr != NULL), 0);
+    _gen_wrapper_log("amp_release_state", (size_t)state_ptr, 0);
     if (state_ptr == NULL) {
         return;
     }
@@ -3417,6 +3904,12 @@ AMP_CAPI void amp_release_state(void *state_ptr) {
         ffi.set_source("_amp_ckernels_cffi", C_SRC)
         # compile lazy; this will create a module in-place and return its path
         module_path = ffi.compile(verbose=False)
+        # DEBUG: expose where cffi wrote the compiled module so post-processing
+        # can reliably find and mutate the generated C file.
+        try:
+            print("[c_kernels] cffi compiled module_path:", module_path)
+        except Exception:
+            pass
         import importlib.util
         import sys
         from pathlib import Path
@@ -3431,6 +3924,69 @@ AMP_CAPI void amp_release_state(void *state_ptr) {
                 target_path = compiled_path
         else:
             target_path = compiled_path
+
+        # Post-process the generated C file to insert extra logging at the
+        # start of native wrapper entry points. Try several candidate paths
+        # where cffi may have emitted the generated C so this works reliably.
+        try:
+            candidates = [
+                compiled_path,  # whatever ffi.compile returned
+                target_path,    # the copied location next to this Python file
+                Path.cwd() / "_amp_ckernels_cffi.c",  # common filename in cwd
+                Path(__file__).resolve().parent / "_amp_ckernels_cffi.c",
+            ]
+            for gen_c in candidates:
+                try:
+                    if not gen_c.exists():
+                        continue
+                    src = gen_c.read_text(encoding="utf-8", errors="ignore")
+                    insert_marker = "#include <Python.h>"
+                    if insert_marker not in src:
+                        continue
+                    helper = '''
+// Injected generated-wrapper logger
+static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
+    FILE *f = fopen("logs/native_c_generated.log", "a");
+    if (!f) return;
+#ifdef PyThreadState_Get
+    void *py_ts = (void *)PyThreadState_Get();
+    fprintf(f, "%s %p %zu %zu\n", fn, py_ts, a, b);
+#else
+    fprintf(f, "%s %p %zu %zu\n", fn, (void*)0, a, b);
+#endif
+    fclose(f);
+}
+'''
+                    src = src.replace(insert_marker, insert_marker + "\n" + helper)
+
+                    wrappers = [
+                        'amp_load_compiled_plan',
+                        'amp_release_compiled_plan',
+                        'amp_load_control_history',
+                        'amp_release_control_history',
+                        'amp_run_node',
+                        'amp_free',
+                        'amp_release_state'
+                    ]
+                    for name in wrappers:
+                        pattern = name + '('
+                        idx = src.find(pattern)
+                        if idx == -1:
+                            continue
+                        brace = src.find('{', idx)
+                        if brace == -1:
+                            continue
+                        injection = f'\n    _gen_wrapper_log("{name}", (size_t)0, (size_t)0);\n'
+                        src = src[:brace+1] + injection + src[brace+1:]
+
+                    gen_c.write_text(src, encoding="utf-8")
+                    # stop after first successful injection
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            # best-effort only
+            pass
 
         spec = importlib.util.spec_from_file_location("_amp_ckernels_cffi", str(target_path))
         if spec is None or spec.loader is None:

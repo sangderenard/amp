@@ -154,7 +154,20 @@ def render_audio_block(
         joystick_curves,
         start_time=start_time,
     )
-    output_node_buffer = graph.render_block(frames, sample_rate, base_params)
+    try:
+        try:
+            with open("logs/py_c_calls.log", "a") as _pf:
+                _pf.write(f"{time.time()} {threading.get_ident()} render_audio_block.enter frames={frames} sample_rate={sample_rate} base_params_keys={list((base_params or {}).keys())}\n")
+        except Exception:
+            pass
+        output_node_buffer = graph.render_block(frames, sample_rate, base_params)
+        try:
+            with open("logs/py_c_calls.log", "a") as _pf:
+                _pf.write(f"{time.time()} {threading.get_ident()} render_audio_block.exit frames={frames} output_shape={getattr(output_node_buffer, 'shape', None)}\n")
+        except Exception:
+            pass
+    except Exception:
+        raise
     runner = getattr(graph, "_edge_runner", None)
     if runner is not None:
         fallback_summary = getattr(runner, "python_fallback_summary", lambda: {})()

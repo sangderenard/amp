@@ -4,7 +4,7 @@ from amp.graph import ControlDelay
 
 
 def test_control_delay_interpolates_and_emits_tensor():
-    delay = ControlDelay(48000, history_seconds=0.2, lookahead_seconds=0.05)
+    delay = ControlDelay(48000, history_seconds=0.2, control_delay_seconds=0.05)
 
     delay.record_event(0.0, pitch=60.0, envelope=0.0)
     delay.record_event(0.01, pitch=62.0, envelope=0.5)

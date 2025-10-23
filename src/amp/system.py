@@ -102,9 +102,9 @@ def benchmark_default_graph(
         sampled_envelope = sampled.get("envelope")
         sampled_extras = sampled.get("extras", {})
 
-        # Build joystick_curves strictly from sampled history. This ensures
-        # the headless path uses the exact same interpolation/lookahead
-        # semantics as the interactive application.
+    # Build joystick_curves strictly from sampled history. This ensures
+    # the headless path uses the exact same interpolation/control-delay
+    # semantics as the interactive application.
         joystick_curves_from_history: dict = {}
         # Keys the interactive app expects as joystick_curves
         expected_keys = (

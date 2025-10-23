@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import os
+import threading
 
 from .graph import (
     AudioGraph,
@@ -26,6 +27,39 @@ try:  # pragma: no cover - optional dependency
     import cffi
 except Exception:  # pragma: no cover - optional dependency
     cffi = None
+
+
+# Runtime guard: enforce that only a single thread ever calls into the C
+# backend. The first thread to call becomes the authorized caller; any
+# subsequent attempt from a different thread will abort the process
+# immediately (os._exit) to avoid undefined/native concurrent behaviour.
+_c_kernel_authorized_thread: int | None = None
+
+
+def _assert_single_c_thread() -> None:
+    """Ensure the current thread is the single authorized C-caller.
+
+    On first call, record the current thread id as the authorized caller.
+    If a different thread later attempts to call into the C kernel, abort
+    the process immediately.
+    """
+    global _c_kernel_authorized_thread
+    tid = threading.get_ident()
+    if _c_kernel_authorized_thread is None:
+        _c_kernel_authorized_thread = tid
+        return
+    if _c_kernel_authorized_thread != tid:
+        # Best-effort diagnostic message then hard abort.
+        try:
+            import sys
+
+            sys.stderr.write(
+                f"FATAL: C kernel called from forbidden thread {tid} (allowed {_c_kernel_authorized_thread})\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(1)
 
 
 _MODE_NAMES = {code: name for name, code in _MODE_CODES.items()}
@@ -353,7 +387,17 @@ class CffiEdgeRunner:
             lib = self._c_kernel
             if lib is not None:
                 try:
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_release_compiled_plan plan_handle={int(self._plan_handle!=self.ffi.NULL)}\n")
+                    except Exception:
+                        pass
                     lib.amp_release_compiled_plan(self._plan_handle)
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_release_compiled_plan.done\n")
+                    except Exception:
+                        pass
                 except Exception:  # pragma: no cover - defensive cleanup
                     pass
             self._plan_handle = self.ffi.NULL
@@ -365,6 +409,7 @@ class CffiEdgeRunner:
             self._release_plan()
             return
         try:
+            _assert_single_c_thread()
             lib = self._ensure_c_kernel()
         except Exception:
             # If the C kernel isn't available during compiled-plan loading, just
@@ -374,12 +419,25 @@ class CffiEdgeRunner:
             return
         desc_buf = self.ffi.new("uint8_t[]", self._descriptor_blob)
         plan_buf = self.ffi.new("uint8_t[]", self._compiled_plan)
-        handle = lib.amp_load_compiled_plan(
-            desc_buf,
-            len(self._descriptor_blob),
-            plan_buf,
-            len(self._compiled_plan),
-        )
+        try:
+            try:
+                with open("logs/py_c_calls.log", "a") as _pf:
+                    _pf.write(f"{time.time()} {threading.get_ident()} amp_load_compiled_plan desc_len={len(self._descriptor_blob)} plan_len={len(self._compiled_plan)}\n")
+            except Exception:
+                pass
+            handle = lib.amp_load_compiled_plan(
+                desc_buf,
+                len(self._descriptor_blob),
+                plan_buf,
+                len(self._compiled_plan),
+            )
+            try:
+                with open("logs/py_c_calls.log", "a") as _pf:
+                    _pf.write(f"{time.time()} {threading.get_ident()} amp_load_compiled_plan.done handle={int(handle!=self.ffi.NULL)}\n")
+            except Exception:
+                pass
+        except Exception:
+            raise
         if handle == self.ffi.NULL:
             raise RuntimeError("C kernel rejected compiled plan blob")
         plan_struct = handle[0]
@@ -452,6 +510,9 @@ class CffiEdgeRunner:
         return dict(self._python_fallback_counts)
 
     def _ensure_c_kernel(self) -> Any:
+        # Enforce single-threaded access policy for C kernel loading/usage
+        _assert_single_c_thread()
+
         if self._c_kernel is not None:
             return self._c_kernel
         try:
@@ -822,6 +883,9 @@ class CffiEdgeRunner:
         except Exception:
             lib = None
 
+        # Ensure only the authorized thread may invoke the C runtime.
+        _assert_single_c_thread()
+
         if not self._descriptor_blob:
             raise RuntimeError("Descriptor blob not initialised for C execution")
 
@@ -861,9 +925,22 @@ class CffiEdgeRunner:
 
         if control_history_blob:
             history_buf = self.ffi.new("uint8_t[]", control_history_blob)
-            handle = lib.amp_load_control_history(history_buf, len(control_history_blob), int(self._frames))
-            if handle == self.ffi.NULL:
-                raise RuntimeError("C kernel rejected control history blob")
+            try:
+                try:
+                    with open("logs/py_c_calls.log", "a") as _pf:
+                        _pf.write(f"{time.time()} {threading.get_ident()} amp_load_control_history len={len(control_history_blob)} frames_hint={int(self._frames)}\n")
+                except Exception:
+                    pass
+                handle = lib.amp_load_control_history(history_buf, len(control_history_blob), int(self._frames))
+                if handle == self.ffi.NULL:
+                    raise RuntimeError("C kernel rejected control history blob")
+                try:
+                    with open("logs/py_c_calls.log", "a") as _pf:
+                        _pf.write(f"{time.time()} {threading.get_ident()} amp_load_control_history.done handle={int(handle!=self.ffi.NULL)}\n")
+                except Exception:
+                    pass
+            except Exception:
+                raise
             history_handle = handle
             history_keepalive = (history_buf,)
         # Feature gate: verbose per-node logging to help diagnose C/kernel failures.
@@ -882,7 +959,13 @@ class CffiEdgeRunner:
                     "void **", self._node_states.get(name, self.ffi.NULL)
                 )
                 start_time = time.perf_counter()
-                status = lib.amp_run_node(
+                try:
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_run_node name={name} batches={int(handle.batches)} channels={int(handle.channels)} frames={int(handle.frames)}\n")
+                    except Exception:
+                        pass
+                    status = lib.amp_run_node(
                     desc_struct,
                     handle.cdata,
                     int(handle.batches),
@@ -894,6 +977,13 @@ class CffiEdgeRunner:
                     state_ptr,
                     history_handle,
                 )
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_run_node.done name={name} status={int(status)}\n")
+                    except Exception:
+                        pass
+                except Exception:
+                    raise
                 if verbose_nodes:
                     try:
                         print(f"[CffiEdgeRunner] node='{name}' -> status={status}", flush=True)
@@ -948,7 +1038,21 @@ class CffiEdgeRunner:
                     array = np.frombuffer(buffer, dtype=RAW_DTYPE).copy().reshape(
                         batches, channels, frames
                     )
-                    lib.amp_free(out_ptr[0])
+                    try:
+                        try:
+                            with open("logs/py_c_calls.log", "a") as _pf:
+                                _pf.write(f"{time.time()} {threading.get_ident()} amp_free ptr={int(self.ffi.cast('uintptr_t', out_ptr[0]))}\n")
+                        except Exception:
+                            pass
+                        lib.amp_free(out_ptr[0])
+                        try:
+                            with open("logs/py_c_calls.log", "a") as _pf:
+                                _pf.write(f"{time.time()} {threading.get_ident()} amp_free.done\n")
+                        except Exception:
+                            pass
+                    except Exception:
+                        # best-effort: do not block correct exception propagation
+                        raise
                 else:
                     raise RuntimeError(
                         f"C kernel failed while executing node '{name}' (status {status})"
@@ -962,7 +1066,17 @@ class CffiEdgeRunner:
         finally:
             if history_handle not in (None, self.ffi.NULL):
                 try:
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_release_control_history handle={int(history_handle!=self.ffi.NULL)}\n")
+                    except Exception:
+                        pass
                     lib.amp_release_control_history(history_handle)
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_release_control_history.done\n")
+                    except Exception:
+                        pass
                 except Exception:  # pragma: no cover - defensive cleanup
                     pass
         _ = history_keepalive
@@ -1190,12 +1304,31 @@ class CffiEdgeRunner:
         if not self._node_states:
             return
         lib = self._c_kernel
+        try:
+            _assert_single_c_thread()
+        except Exception:
+            # If the guard aborts, let it; otherwise, fall through defensively
+            pass
         if lib is None:
             self._node_states.clear()
             return
         for state in self._node_states.values():
             if state:
-                lib.amp_release_state(state)
+                try:
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_release_state ptr={int(state!=self.ffi.NULL)}\n")
+                    except Exception:
+                        pass
+                    lib.amp_release_state(state)
+                    try:
+                        with open("logs/py_c_calls.log", "a") as _pf:
+                            _pf.write(f"{time.time()} {threading.get_ident()} amp_release_state.done\n")
+                    except Exception:
+                        pass
+                except Exception:
+                    # defensive: ignore logging errors
+                    pass
         self._node_states.clear()
 
 __all__ = ["CffiEdgeRunner", "NodeInputHandle"]

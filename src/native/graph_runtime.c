@@ -4,6 +4,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#if defined(_WIN32) || defined(_WIN64)
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#endif
 
 #if defined(_WIN32) || defined(_WIN64)
 #define AMP_API __declspec(dllexport)
@@ -111,6 +117,25 @@ static char *dup_string(const char *src, size_t length) {
     memcpy(dest, src, length);
     dest[length] = '\0';
     return dest;
+}
+
+/* Minimal native-entry logger that records wall-clock time and OS thread id.
+   Writes one-line records to logs/native_c_calls.log: <timestamp> <os_tid> <fn> <a> <b>\n
+   Best-effort only; failures are ignored to avoid impacting runtime behaviour. */
+static void _log_native_call(const char *fn, size_t a, size_t b) {
+    FILE *f = fopen("logs/native_c_calls.log", "a");
+    if (f == NULL) {
+        return;
+    }
+    double t = (double)time(NULL);
+#if defined(_WIN32) || defined(_WIN64)
+    unsigned long tid = (unsigned long) GetCurrentThreadId();
+    fprintf(f, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
+#else
+    unsigned long tid = (unsigned long) pthread_self();
+    fprintf(f, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
+#endif
+    fclose(f);
 }
 
 static void buffer_pool_destroy(buffer_pool_t *pool) {

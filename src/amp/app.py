@@ -535,6 +535,10 @@ def run(
     if headless:
         return render_summary("Headless run requested.")
 
+    # Attach a run identifier to correlate logs and diagnostics across files
+    run_start_time = time.time()
+    run_id = f"run-{int(run_start_time)}"
+
     try:
         import pygame
     except ImportError as exc:  # pragma: no cover - exercised only when pygame missing
@@ -1090,10 +1094,56 @@ def run(
         def _exit_dump():
             try:
                 names = [t.name for t in threading.enumerate()]
-                STATUS_PRINTER.emit(f"[ExitDump] threads={names} audio_failures_count={len(audio_failures)}", force=True)
-                # Attempt to print stack for each thread
+                STATUS_PRINTER.emit(f"[ExitDump] run_id={run_id} threads={names} audio_failures_count={len(audio_failures)}", force=True)
+                # Attempt to print stack for each thread and write richer diagnostics
                 try:
                     import faulthandler
+                    import os as _os
+                    _os.makedirs("logs", exist_ok=True)
+                    diag_path = _os.path.join("logs", "exit_diagnostics.log")
+                    with open(diag_path, "a", encoding="utf-8") as _f:
+                        _f.write(f"==== Exit dump: {time.ctime()} run_id={run_id} ===\n")
+                        _f.write(f"Threads: {names}\n")
+                        _f.write(f"audio_failures_count={len(audio_failures)}\n")
+                        try:
+                            # Write audio_failures tracebacks if present
+                            for idx, exc in enumerate(list(audio_failures)):
+                                _f.write(f"--- audio_failure #{idx} ---\n")
+                                try:
+                                    import traceback as _tb
+
+                                    _f.write("".join(_tb.format_exception(type(exc), exc, exc.__traceback__)))
+                                except Exception:
+                                    try:
+                                        _f.write(repr(exc) + "\n")
+                                    except Exception:
+                                        _f.write("<could not format exception>\n")
+                        except Exception:
+                            _f.write("<error while dumping audio_failures>\n")
+                        try:
+                            # Dump a small sample of the timing snapshots if available
+                            with callback_timing_lock:
+                                samples = list(callback_timing_samples)
+                            _f.write(f"callback_timing_samples_count={len(samples)}\n")
+                            if samples:
+                                _f.write("--- last timing sample ---\n")
+                                try:
+                                    import pprint as _pp
+
+                                    _pp.pprint(samples[-1], stream=_f)
+                                except Exception:
+                                    try:
+                                        _f.write(repr(samples[-1]) + "\n")
+                                    except Exception:
+                                        _f.write("<could not format timing sample>\n")
+                        except Exception:
+                            _f.write("<error while dumping timing samples>\n")
+                        # Ask faulthandler to dump native stacks for all threads if possible
+                        try:
+                            faulthandler.dump_traceback(file=_f)
+                        except Exception:
+                            pass
+                        _f.write("==== End exit dump ===\n\n")
 
                     for t in threading.enumerate():
                         try:
@@ -1101,7 +1151,12 @@ def run(
                         except Exception:
                             pass
                 except Exception:
-                    pass
+                    # Best-effort: if diagnostics fail, still try to emit a simple thread list
+                    try:
+                        for t in threading.enumerate():
+                            STATUS_PRINTER.emit(f"[ExitDump] thread: {t.name} id={getattr(t, 'ident', None)}", force=True)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
