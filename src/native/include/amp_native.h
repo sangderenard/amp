@@ -163,6 +163,7 @@ void osc_square_blep_c(const double *ph, const double *dphi, double pw, double *
 void osc_triangle_blep_c(const double *ph, const double *dphi, double *out, int B, int F, double *tri_state);
 
 AMP_CAPI size_t amp_last_alloc_count_get(void);
+AMP_CAPI int amp_native_logging_enabled(void);
 AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b);
 AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b);
 AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(

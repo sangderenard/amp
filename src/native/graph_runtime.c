@@ -122,6 +122,9 @@ static char *dup_string(const char *src, size_t length) {
    Best-effort only; failures are ignored to avoid impacting runtime behaviour. */
 extern void amp_log_native_call_external(const char *fn, size_t a, size_t b);
 static void _log_native_call(const char *fn, size_t a, size_t b) {
+    if (!amp_native_logging_enabled()) {
+        return;
+    }
     /* Prefer the external cached logger (if linked), otherwise fall back. */
     if (&amp_log_native_call_external) {
         amp_log_native_call_external(fn, a, b);
