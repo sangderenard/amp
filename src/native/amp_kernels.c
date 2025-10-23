@@ -73,7 +73,41 @@ static int log_lock_initialized = 0;
 
 static void close_all_logs(void);
 
+#if defined(__GNUC__)
+#define AMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#define AMP_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define AMP_LIKELY(x) (x)
+#define AMP_UNLIKELY(x) (x)
+#endif
+
+/* Logging is opt-in: set AMP_NATIVE_LOG to a truthy value to enable. */
+static int logging_mode_initialized = 0;
+static int logging_mode_enabled = 0;
+
+static int amp_native_logging_enabled_internal(void) {
+    if (AMP_LIKELY(logging_mode_initialized)) {
+        return logging_mode_enabled;
+    }
+    if (!log_lock_initialized) LOG_LOCK_INIT();
+    LOG_LOCK();
+    if (!logging_mode_initialized) {
+        const char *env = getenv("AMP_NATIVE_LOG");
+        logging_mode_enabled = (env != NULL && env[0] != '\0' && env[0] != '0');
+        logging_mode_initialized = 1;
+    }
+    LOG_UNLOCK();
+    return logging_mode_enabled;
+}
+
+AMP_CAPI int amp_native_logging_enabled(void) {
+    return amp_native_logging_enabled_internal();
+}
+
 static void ensure_log_files_open(void) {
+    if (!amp_native_logging_enabled_internal()) {
+        return;
+    }
     if (!log_lock_initialized) LOG_LOCK_INIT();
     LOG_LOCK();
     /* Create logs directory if it doesn't exist. On Windows CreateDirectoryA
@@ -105,6 +139,9 @@ static void ensure_log_files_open(void) {
    Keep this function minimal and tolerant of failures (best-effort logging only).
 */
 static void _log_native_call(const char *fn, size_t a, size_t b) {
+    if (!amp_native_logging_enabled_internal()) {
+        return;
+    }
     ensure_log_files_open();
     if (log_f_ccalls == NULL) {
         return;
@@ -127,6 +164,9 @@ static void _log_native_call(const char *fn, size_t a, size_t b) {
 
 /* Generated-wrapper logger: record wrapper entry and a couple numeric args. */
 static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
+    if (!amp_native_logging_enabled_internal()) {
+        return;
+    }
     ensure_log_files_open();
     if (log_f_cgenerated == NULL) return;
 #ifdef PyThreadState_Get
@@ -153,6 +193,13 @@ static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
 #undef memcpy
 #undef memset
 
+static void *(*real_malloc_fn)(size_t) = malloc;
+static void *(*real_calloc_fn)(size_t, size_t) = calloc;
+static void *(*real_realloc_fn)(void *, size_t) = realloc;
+static void (*real_free_fn)(void *) = free;
+static void *(*real_memcpy_fn)(void *, const void *, size_t) = memcpy;
+static void *(*real_memset_fn)(void *, int, size_t) = memset;
+
 /* Simple in-memory allocation registry to detect writes into freed or
    undersized buffers. This is intentionally lightweight and only used
    in debug runs. We maintain a singly-linked list of allocation records
@@ -175,6 +222,9 @@ static void capture_stack_frames(void **out_frames, unsigned short *out_count);
 static void dump_alloc_backtrace(FILE *g, struct alloc_rec *r);
 
 static void close_all_logs(void) {
+    if (!amp_native_logging_enabled_internal()) {
+        return;
+    }
     if (!log_lock_initialized) LOG_LOCK_INIT();
     LOG_LOCK();
     if (log_f_alloc) { fflush(log_f_alloc); fclose(log_f_alloc); log_f_alloc = NULL; }
@@ -188,6 +238,9 @@ static void close_all_logs(void) {
    using the same cached-file backing store. This avoids repeated fopen()/fclose()
    in additional C files. */
 AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b) {
+    if (!amp_native_logging_enabled_internal()) {
+        return;
+    }
     ensure_log_files_open();
     if (!log_f_cgenerated) return;
     fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, py_ts, a, b);
@@ -197,6 +250,9 @@ AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b)
 /* Exported helper for other C files to log native-entry calls into the
    cached native_c_calls log. Mirrors the previous one-line format. */
 AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
+    if (!amp_native_logging_enabled_internal()) {
+        return;
+    }
     ensure_log_files_open();
     if (!log_f_ccalls) return;
     double t = (double)time(NULL);
@@ -217,6 +273,7 @@ AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
  * the recorded registration backtrace id.
  */
 static void dump_alloc_snapshot(FILE *g) {
+    if (!amp_native_logging_enabled_internal()) return;
     alloc_rec *it = alloc_list;
     fprintf(g, "ALLOC_SNAPSHOT_BEGIN\n");
     while (it) {
@@ -231,6 +288,7 @@ static void dump_alloc_snapshot(FILE *g) {
 }
 
 static void register_alloc(void *ptr, size_t size) {
+    if (!amp_native_logging_enabled_internal()) return;
     if (ptr == NULL) return;
     /* If already registered, update size and record an update log instead
        of creating duplicate entries. This avoids confusing duplicate
@@ -274,6 +332,7 @@ static void register_alloc(void *ptr, size_t size) {
 }
 
 static void unregister_alloc(void *ptr) {
+    if (!amp_native_logging_enabled_internal()) return;
     if (ptr == NULL) return;
     /* Remove all matching entries for ptr (shouldn't be duplicates if
        register_alloc prevents them, but be robust). Record if no entry
@@ -331,6 +390,7 @@ static int range_within_alloc(void *addr, size_t len) {
    BAD_* logs will significantly speed offline correlation even without
    symbol resolution. */
 static void dump_backtrace(FILE *g) {
+    if (!amp_native_logging_enabled_internal()) return;
     if (g == NULL) return;
 #if defined(_WIN32) || defined(_WIN64)
     /* Use CaptureStackBackTrace which is available on Windows. We print
@@ -367,6 +427,7 @@ static void dump_backtrace(FILE *g) {
 /* Capture stack frames into the provided buffer and set count. This is
    used to record a backtrace at allocation time for later correlation. */
 static void capture_stack_frames(void **out_frames, unsigned short *out_count) {
+    if (!amp_native_logging_enabled_internal()) return;
     if (out_frames == NULL || out_count == NULL) return;
 #if defined(_WIN32) || defined(_WIN64)
     void *frames[64];
@@ -389,6 +450,7 @@ static void capture_stack_frames(void **out_frames, unsigned short *out_count) {
 
 /* Print the recorded allocation backtrace stored in alloc_rec (if any). */
 static void dump_alloc_backtrace(FILE *g, alloc_rec *r) {
+    if (!amp_native_logging_enabled_internal()) return;
     if (g == NULL || r == NULL) return;
     fprintf(g, "REGISTER_BACKTRACE %u\n", (unsigned)r->bt_count);
     for (unsigned i = 0; i < r->bt_count; ++i) {
@@ -397,6 +459,9 @@ static void dump_alloc_backtrace(FILE *g, alloc_rec *r) {
 }
 
 static void *_dbg_malloc(size_t s, const char *file, int line, const char *func) {
+    if (!amp_native_logging_enabled_internal()) {
+        return real_malloc_fn(s);
+    }
     void *p = malloc(s); /* calls real malloc because we undef'd macro above */
     /* log: op=malloc, size, ptr, caller */
     _log_native_call("malloc", (size_t)s, (size_t)(uintptr_t)p);
@@ -410,6 +475,9 @@ static void *_dbg_malloc(size_t s, const char *file, int line, const char *func)
 }
 
 static void *_dbg_calloc(size_t n, size_t size, const char *file, int line, const char *func) {
+    if (!amp_native_logging_enabled_internal()) {
+        return real_calloc_fn(n, size);
+    }
     void *p = calloc(n, size);
     _log_native_call("calloc", (size_t)(n * size), (size_t)(uintptr_t)p);
     ensure_log_files_open();
@@ -422,6 +490,9 @@ static void *_dbg_calloc(size_t n, size_t size, const char *file, int line, cons
 }
 
 static void *_dbg_realloc(void *ptr, size_t s, const char *file, int line, const char *func) {
+    if (!amp_native_logging_enabled_internal()) {
+        return real_realloc_fn(ptr, s);
+    }
     void *p = realloc(ptr, s);
     _log_native_call("realloc_old", (size_t)(uintptr_t)ptr, (size_t)(uintptr_t)p);
     _log_native_call("realloc_new", (size_t)s, (size_t)(uintptr_t)p);
@@ -438,6 +509,10 @@ static void *_dbg_realloc(void *ptr, size_t s, const char *file, int line, const
 }
 
 static void _dbg_free(void *ptr, const char *file, int line, const char *func) {
+    if (!amp_native_logging_enabled_internal()) {
+        if (ptr != NULL) real_free_fn(ptr);
+        return;
+    }
     _log_native_call("free", (size_t)(uintptr_t)ptr, 0);
     ensure_log_files_open();
     if (log_f_alloc) {
@@ -455,6 +530,9 @@ static void _dbg_free(void *ptr, const char *file, int line, const char *func) {
    simple byte loops to avoid calling the (possibly macro-redirected)
    libc functions and to keep the logging minimal and self-contained. */
 static void *_dbg_memcpy(void *dest, const void *src, size_t n, const char *file, int line, const char *func) {
+    if (!amp_native_logging_enabled_internal()) {
+        return real_memcpy_fn(dest, src, n);
+    }
     ensure_log_files_open();
     if (log_f_memops) fprintf(log_f_memops, "MEMCPY %s:%d %s dest=%p src=%p n=%zu\n", file, line, func, dest, src, n);
     if (dest == NULL || src == NULL || n == 0) {
@@ -493,6 +571,9 @@ static void *_dbg_memcpy(void *dest, const void *src, size_t n, const char *file
 }
 
 static void *_dbg_memset(void *s_ptr, int c, size_t n, const char *file, int line, const char *func) {
+    if (!amp_native_logging_enabled_internal()) {
+        return real_memset_fn(s_ptr, c, n);
+    }
     ensure_log_files_open();
     if (log_f_memops) fprintf(log_f_memops, "MEMSET %s:%d %s ptr=%p val=%d n=%zu\n", file, line, func, s_ptr, c, n);
     if (s_ptr == NULL || n == 0) return s_ptr;
