@@ -182,7 +182,12 @@ class ControllerMonitor:
             drone_axis=float(drone_axis),
         )
 
-    def _record_snapshot(self, timestamp: float, snapshot: _Snapshot) -> None:
+    def _record_snapshot(
+        self, timestamp: float, axes: Sequence[float], buttons: Sequence[float]
+    ) -> None:
+        """Derive control extras from the latest axes/buttons sample and store them."""
+
+        snapshot = self._derive_snapshot(axes, buttons)
         extras = {
             "trigger": np.asarray([snapshot.trigger], dtype=np.float64),
             "gate": np.asarray([snapshot.gate], dtype=np.float64),
@@ -195,6 +200,8 @@ class ControllerMonitor:
             "pitch_root": np.asarray([snapshot.pitch_root], dtype=np.float64),
             "momentary_axis": np.asarray([snapshot.momentary_axis], dtype=np.float64),
             "drone_axis": np.asarray([snapshot.drone_axis], dtype=np.float64),
+            "axes": np.asarray(list(axes), dtype=np.float64),
+            "buttons": np.asarray(list(buttons), dtype=np.float64),
         }
         pitch = np.zeros(1, dtype=np.float64)
         envelope = np.zeros(1, dtype=np.float64)
@@ -236,21 +243,33 @@ class ControllerMonitor:
                 continue
 
             axes, buttons = self._coerce_axes_buttons(payload)
-            # Store raw axes/buttons as arrays in 'extras' for the control event
-            extras = {
-                "axes": np.asarray(axes, dtype=np.float64),
-                "buttons": np.asarray(buttons, dtype=np.float64),
-            }
-            pitch = np.zeros(1, dtype=np.float64)
-            envelope = np.zeros(1, dtype=np.float64)
             try:
-                self.control_history.record_control_event(
-                    float(timestamp), pitch=pitch, envelope=envelope, extras=extras
-                )
+                self._record_snapshot(timestamp, axes, buttons)
             except Exception:
-                print("ControllerMonitor failed to record raw controller state", file=sys.stderr)
+                print(
+                    "ControllerMonitor failed to record derived controller state",
+                    file=sys.stderr,
+                )
                 import traceback
+
                 traceback.print_exc()
+                # Fallback to recording raw controller payload so history still advances
+                try:
+                    extras = {
+                        "axes": np.asarray(list(axes), dtype=np.float64),
+                        "buttons": np.asarray(list(buttons), dtype=np.float64),
+                    }
+                    pitch = np.zeros(1, dtype=np.float64)
+                    envelope = np.zeros(1, dtype=np.float64)
+                    self.control_history.record_control_event(
+                        float(timestamp), pitch=pitch, envelope=envelope, extras=extras
+                    )
+                except Exception:
+                    print(
+                        "ControllerMonitor failed to record raw controller state",
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc()
             time.sleep(self.poll_interval)
 
 

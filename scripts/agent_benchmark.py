@@ -131,7 +131,7 @@ def benchmark_default_graph(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark the default AMP controller graph headlessly")
     parser.add_argument("--frames", type=int, default=256, help="Frames per render block")
-    parser.add_argument("--iterations", type=int, default=512, help="Number of benchmark iterations (excluding warmup)")
+    parser.add_argument("--iterations", type=int, default=256, help="Number of benchmark iterations (excluding warmup)")
     parser.add_argument("--warmup", type=int, default=32, help="Warmup iterations to discard from EMA")
     parser.add_argument("--rate", type=float, default=44100.0, help="Sample rate in Hz")
     parser.add_argument("--alpha", type=float, default=0.02, help="EMA smoothing factor (0-1)")

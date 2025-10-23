@@ -4,7 +4,6 @@ import importlib.util
 import sys
 import threading
 from pathlib import Path
-from queue import Queue
 from typing import Mapping
 
 import numpy as np
@@ -145,7 +144,8 @@ class NativeGraphExecutor:
             plan_len,
         )
         if runtime == self.ffi.NULL:
-            raise RuntimeError("native runtime rejected graph descriptors")
+            self._runtime = self.ffi.NULL
+            raise RuntimeError("failed to create native graph runtime instance")
         self._runtime = runtime
         self._lock = threading.Lock()
 
@@ -178,79 +178,62 @@ class NativeGraphExecutor:
             raise RuntimeError("native runtime has been closed")
         if frames <= 0:
             raise ValueError("frames must be positive")
-        result_queue: "Queue[tuple[str, object]]" = Queue(maxsize=1)
-
-        def _worker() -> None:
-            try:
-                with self._lock:
-                    batches = 1
-                    if base_params and "_B" in base_params:
-                        batches = int(base_params["_B"])
-                    self.lib.amp_graph_runtime_clear_params(self._runtime)
-                    self.lib.amp_graph_runtime_configure(self._runtime, batches, frames)
-                    if base_params:
-                        for node_name, params in base_params.items():
-                            if node_name.startswith("_"):
-                                continue
-                            for param_name, array in params.items():
-                                arr = np.asarray(array, dtype=np.float64)
-                                if arr.ndim != 3:
-                                    raise ValueError(
-                                        f"param '{param_name}' for node '{node_name}' must be BxCxF"
-                                    )
-                                arr_c = np.require(arr, requirements=("C",))
-                                ptr = self.ffi.from_buffer("double[]", arr_c)
-                                status = self.lib.amp_graph_runtime_set_param(
-                                    self._runtime,
-                                    node_name.encode("utf-8"),
-                                    param_name.encode("utf-8"),
-                                    ptr,
-                                    arr_c.shape[0],
-                                    arr_c.shape[1],
-                                    arr_c.shape[2],
-                                )
-                                if int(status) != 0:
-                                    raise RuntimeError(
-                                        f"failed to bind param '{param_name}' for node '{node_name}'"
-                                    )
-                    ctrl_blob = control_history_blob or b""
-                    ctrl_buf = self.ffi.new("uint8_t[]", ctrl_blob) if ctrl_blob else self.ffi.NULL
-                    out_ptr = self.ffi.new("double **")
-                    out_batches = self.ffi.new("uint32_t *")
-                    out_channels = self.ffi.new("uint32_t *")
-                    out_frames = self.ffi.new("uint32_t *")
-                    status = self.lib.amp_graph_runtime_execute(
-                        self._runtime,
-                        ctrl_buf if ctrl_blob else self.ffi.NULL,
-                        len(ctrl_blob),
-                        frames,
-                        float(sample_rate),
-                        out_ptr,
-                        out_batches,
-                        out_channels,
-                        out_frames,
-                    )
-                    if int(status) != 0:
-                        raise RuntimeError(f"native runtime execution failed (status {int(status)})")
-                    total = int(out_batches[0]) * int(out_channels[0]) * int(out_frames[0])
-                    buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(np.float64).itemsize)
-                    array = np.frombuffer(buffer, dtype=np.float64).copy().reshape(
-                        int(out_batches[0]), int(out_channels[0]), int(out_frames[0])
-                    )
-                    self.lib.amp_graph_runtime_buffer_free(out_ptr[0])
-                result_queue.put(("ok", array))
-            except Exception as exc:  # pragma: no cover - background error propagation
-                result_queue.put(("err", exc))
-
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
-        thread.join(timeout)
-        if thread.is_alive():
-            raise TimeoutError("native runtime execution timed out")
-        status, payload = result_queue.get()
-        if status == "err":
-            raise payload
-        return payload  # type: ignore[return-value]
+        with self._lock:
+            batches = 1
+            if base_params and "_B" in base_params:
+                batches = int(base_params["_B"])
+            self.lib.amp_graph_runtime_clear_params(self._runtime)
+            self.lib.amp_graph_runtime_configure(self._runtime, batches, frames)
+            if base_params:
+                for node_name, params in base_params.items():
+                    if node_name.startswith("_"):
+                        continue
+                    for param_name, array in params.items():
+                        arr = np.asarray(array, dtype=np.float64)
+                        if arr.ndim != 3:
+                            raise ValueError(
+                                f"param '{param_name}' for node '{node_name}' must be BxCxF"
+                            )
+                        arr_c = np.require(arr, requirements=("C",))
+                        ptr = self.ffi.from_buffer("double[]", arr_c)
+                        status = self.lib.amp_graph_runtime_set_param(
+                            self._runtime,
+                            node_name.encode("utf-8"),
+                            param_name.encode("utf-8"),
+                            ptr,
+                            arr_c.shape[0],
+                            arr_c.shape[1],
+                            arr_c.shape[2],
+                        )
+                        if int(status) != 0:
+                            raise RuntimeError(
+                                f"failed to bind param '{param_name}' for node '{node_name}'"
+                            )
+            ctrl_blob = control_history_blob or b""
+            ctrl_buf = self.ffi.new("uint8_t[]", ctrl_blob) if ctrl_blob else self.ffi.NULL
+            out_ptr = self.ffi.new("double **")
+            out_batches = self.ffi.new("uint32_t *")
+            out_channels = self.ffi.new("uint32_t *")
+            out_frames = self.ffi.new("uint32_t *")
+            status = self.lib.amp_graph_runtime_execute(
+                self._runtime,
+                ctrl_buf if ctrl_blob else self.ffi.NULL,
+                len(ctrl_blob),
+                frames,
+                float(sample_rate),
+                out_ptr,
+                out_batches,
+                out_channels,
+                out_frames,
+            )
+            if int(status) != 0:
+                raise RuntimeError(f"native runtime execution failed (status {int(status)})")
+            total = int(out_batches[0]) * int(out_channels[0]) * int(out_frames[0])
+            buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(np.float64).itemsize)
+            array = np.frombuffer(buffer, dtype=np.float64).copy().reshape(
+                int(out_batches[0]), int(out_channels[0]), int(out_frames[0])
+            )
+        return array
 
 
 __all__ = [
