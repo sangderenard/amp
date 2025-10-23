@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -49,6 +49,7 @@ def benchmark_default_graph(
     warmup: int,
     joystick_mode: str,
     joystick_script_path,
+    batch_blocks: int = 1,
 ) -> pd.DataFrame:
     """Run the default graph headlessly using a virtual controller.
 
@@ -75,6 +76,16 @@ def benchmark_default_graph(
     state = app_state.build_default_state(joy=None, pygame=_StubPygame())
     graph, envelope_names, amp_mod_names = amp_app.build_runtime_graph(sample_rate, state)
 
+    if frames <= 0:
+        raise ValueError("frames must be a positive integer")
+
+    batch_blocks = int(batch_blocks)
+    if batch_blocks <= 0:
+        raise ValueError("batch_blocks must be a positive integer")
+
+    block_frames = int(frames)
+    total_frames = block_frames * batch_blocks
+
     control_cache: Dict[str, np.ndarray] = {}
     ema: Dict[str, float] = {}
     peaks: Dict[str, float] = defaultdict(float)
@@ -92,22 +103,24 @@ def benchmark_default_graph(
     virtual_joystick = VirtualJoystickPerformer(sample_rate, mode=joystick_mode, script=script)
 
     timeline_records: list[Dict[str, Any]] = []
-    timeline_start = time.perf_counter()
+    timeline_start_wall = time.perf_counter()
     playhead_time = 0.0
+    frame_step = 1.0 / sample_rate if sample_rate else 0.0
     buffer_ahead = 0.0
     cumulative_gap = 0.0
 
     for iteration in range(iterations + warmup):
-        joystick_curves = virtual_joystick.generate(frames)
-        timestamp = time.perf_counter()
+        joystick_curves = virtual_joystick.generate(total_frames)
+        timeline_timestamp = timeline_start_wall + playhead_time
+        timestamp = timeline_timestamp
 
         def _control_array(value: Any) -> np.ndarray:
             array = np.asarray(value, dtype=np.float64)
             if array.ndim == 0:
-                return np.full(frames, float(array), dtype=np.float64)
-            if array.shape[0] != frames:
+                return np.full(total_frames, float(array), dtype=np.float64)
+            if array.shape[0] != total_frames:
                 raise ValueError(
-                    f"Control array expected {frames} samples, received {array.shape[0]}"
+                    f"Control array expected {total_frames} samples, received {array.shape[0]}"
                 )
             return array
 
@@ -173,7 +186,7 @@ def benchmark_default_graph(
         # pitch/envelope and any extras. This enforces the invariant that
         # the renderer only consumes data derived from ControlDelay.
         start_time = timestamp
-        sampled = graph.sample_control_tensor(start_time, frames)
+        sampled = graph.sample_control_tensor(start_time, total_frames)
         sampled_pitch = sampled.get("pitch")
         sampled_envelope = sampled.get("envelope")
         sampled_extras = sampled.get("extras", {})
@@ -211,7 +224,7 @@ def benchmark_default_graph(
             else:
                 if key == "pitch_input":
                     if sampled_pitch is None:
-                        joystick_curves_from_history[key] = np.zeros(frames, dtype=float)
+                        joystick_curves_from_history[key] = np.zeros(total_frames, dtype=float)
                     else:
                         pitch_array = np.asarray(sampled_pitch, dtype=float)
                         if pitch_array.ndim == 1:
@@ -227,11 +240,12 @@ def benchmark_default_graph(
                     joystick_curves_from_history[key] = np.zeros(frames, dtype=float)
 
         from .runner import render_audio_block
-        block_start_time = time.perf_counter()
+        block_start_time = start_time
+        render_start_wall = time.perf_counter()
         audio_block, meta = render_audio_block(
             graph,
             block_start_time,
-            frames,
+            total_frames,
             sample_rate,
             joystick_curves_from_history,
             state,
@@ -239,10 +253,10 @@ def benchmark_default_graph(
             amp_mod_names,
             control_cache,
         )
-        block_end_time = time.perf_counter()
+        block_end_time_wall = time.perf_counter()
 
-        render_duration = block_end_time - block_start_time
-        block_duration = frames / sample_rate
+        render_duration = block_end_time_wall - render_start_wall
+        block_duration = total_frames / sample_rate if sample_rate else 0.0
         buffer_ahead += block_duration
         buffer_ahead -= render_duration
         underrun_gap = 0.0
@@ -267,6 +281,23 @@ def benchmark_default_graph(
                     previous = ema.get(name)
                     ema[name] = duration if previous is None else previous + ema_alpha * (duration - previous)
 
+        try:
+            pcm_buffer = np.asarray(audio_block, dtype=np.float64)
+            if pcm_buffer.ndim == 3 and pcm_buffer.shape[0] == 1 and frame_step > 0.0:
+                chunk_start_time = block_start_time
+                pcm_channels = pcm_buffer[0]
+                total_available = pcm_channels.shape[1]
+                offset = 0
+                while offset < total_available:
+                    chunk_end = min(offset + block_frames, total_available)
+                    chunk = pcm_channels[:, offset:chunk_end]
+                    if chunk.size:
+                        graph.add_pcm_history(chunk_start_time, chunk, sample_rate=sample_rate)
+                        chunk_start_time += (chunk.shape[1] * frame_step)
+                    offset = chunk_end
+        except Exception:
+            pass
+
         audio_abs = np.abs(audio_block)
         audio_peak = float(np.max(audio_abs)) if audio_abs.size else 0.0
         audio_rms = float(np.sqrt(np.mean(np.square(audio_block)))) if audio_abs.size else 0.0
@@ -278,8 +309,8 @@ def benchmark_default_graph(
             channel_peaks = per_channel_peaks.flatten().tolist()
             channel_rms = per_channel_rms.flatten().tolist()
 
-        wall_start = block_start_time - timeline_start
-        wall_end = block_end_time - timeline_start
+        wall_start = render_start_wall - timeline_start_wall
+        wall_end = block_end_time_wall - timeline_start_wall
 
         def _curve_mean(value: Any) -> float:
             array = np.asarray(value, dtype=np.float64)
@@ -320,8 +351,11 @@ def benchmark_default_graph(
             "drone_active": bool(_curve_max(drone_curve) >= 0.5),
             "velocity_mean": _curve_mean(velocity_curve),
             "pitch_mean": _curve_mean(pitch_curve),
-            "start_sample": iteration * frames,
-            "end_sample": (iteration + 1) * frames,
+            "start_sample": iteration * total_frames,
+            "end_sample": (iteration + 1) * total_frames,
+            "batch_blocks": batch_blocks,
+            "requested_frames": total_frames,
+            "callback_frames": block_frames,
         }
 
         for name, duration in timings.items():
@@ -333,4 +367,101 @@ def benchmark_default_graph(
     return timeline_df
 
 
-__all__ = ["benchmark_default_graph", "require_native_graph_runtime"]
+def summarise_benchmark_timeline(df: pd.DataFrame, *, ema_alpha: float) -> Sequence[str]:
+    """Render a human-readable summary for the benchmark timeline."""
+
+    lines: list[str] = []
+    if df.empty:
+        lines.append("No benchmark samples were recorded.")
+        return lines
+
+    block_ms = float(df["block_ms"].iloc[0]) if "block_ms" in df else float("nan")
+    iterations = int((~df.get("is_warmup", pd.Series(dtype=bool))).sum()) if "is_warmup" in df else len(df)
+
+    start_sample = df.get("start_sample")
+    end_sample = df.get("end_sample")
+    frames_rendered = (
+        int(end_sample.iloc[0] - start_sample.iloc[0])
+        if start_sample is not None and end_sample is not None and not start_sample.empty and not end_sample.empty
+        else None
+    )
+
+    if frames_rendered is not None:
+        lines.append(
+            f"Rendered {iterations} iterations of {frames_rendered} frames ({block_ms:.2f} ms per block)"
+        )
+    else:
+        lines.append(f"Rendered {iterations} iterations (block {block_ms:.2f} ms)")
+
+    measured = df.loc[~df["is_warmup"]] if "is_warmup" in df else df
+
+    node_columns = [col for col in df.columns if col.startswith("node_") and col.endswith("_ms")]
+    totals: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    peaks: Dict[str, float] = {}
+    ema: Dict[str, float] = {}
+
+    for col in node_columns:
+        node = col[len("node_") : -len("_ms")]
+        if measured.empty:
+            totals[node] = 0.0
+            counts[node] = 0
+            peaks[node] = 0.0
+            ema[node] = 0.0
+            continue
+        values_ms = measured[col].to_numpy(dtype=float)
+        totals[node] = float(np.sum(values_ms)) / 1000.0
+        counts[node] = int(values_ms.size)
+        peaks[node] = float(np.max(values_ms))
+
+    if measured.empty:
+        ema.clear()
+    else:
+        for _, row in measured.iterrows():
+            for col in node_columns:
+                node = col[len("node_") : -len("_ms")]
+                value_sec = float(row[col]) / 1000.0
+                previous = ema.get(node)
+                ema[node] = value_sec if previous is None else previous + ema_alpha * (value_sec - previous)
+
+    lines.append("")
+    lines.append(f"Moving averages (alpha={ema_alpha:.3f}) sorted by descending EMA:")
+    ordered_nodes = sorted(ema, key=lambda key: ema[key], reverse=True)
+    for node in ordered_nodes:
+        mean_sec = totals.get(node, 0.0) / max(1, counts.get(node, 1))
+        ema_ms = ema[node] * 1000.0
+        peak_ms = peaks.get(node, 0.0)
+        lines.append(
+            f"  {node:<24} avg {mean_sec * 1000.0:7.3f} ms  ema {ema_ms:7.3f} ms  peak {peak_ms:7.3f} ms"
+        )
+
+    if measured.empty:
+        underrun_count = 0
+        total_gap = 0.0
+    else:
+        underrun_count = int((measured.get("underrun_gap_ms", 0.0) > 0.0).sum())
+        total_gap = float(measured.get("underrun_gap_ms", pd.Series(dtype=float)).sum()) if "underrun_gap_ms" in measured else 0.0
+
+    lines.append("")
+    lines.append(
+        "Real-time timeline summary: "
+        f" {len(measured)} measured blocks, {underrun_count} underruns"
+        f" totalling {total_gap:.3f} ms"
+    )
+
+    preview = df.head(min(6, len(df)))
+    if not preview.empty:
+        lines.append("")
+        with pd.option_context("display.max_columns", None, "display.width", 180):
+            preview_str = preview.to_string(index=False, float_format=lambda x: f"{x:0.3f}")
+        lines.append("Timeline preview (first rows):")
+        lines.append(preview_str)
+
+    return lines
+
+
+__all__ = [
+    "benchmark_default_graph",
+    "require_native_graph_runtime",
+    "summarise_benchmark_timeline",
+]

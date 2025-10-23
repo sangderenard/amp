@@ -27,6 +27,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Render the configured graph without launching the interactive UI",
     )
+    parser.add_argument(
+        "--headless-frames",
+        type=int,
+        help="Override the callback-sized frame count used for headless diagnostics",
+    )
+    parser.add_argument(
+        "--headless-iterations",
+        type=int,
+        help="Number of headless diagnostic iterations to run",
+    )
+    parser.add_argument(
+        "--headless-warmup",
+        type=int,
+        help="Warmup iterations to discard from headless EMA calculations",
+    )
+    parser.add_argument(
+        "--headless-batch",
+        type=int,
+        help="Number of callback-sized blocks rendered per headless iteration",
+    )
+    parser.add_argument(
+        "--headless-alpha",
+        type=float,
+        help="EMA smoothing factor for headless diagnostics (0-1)",
+    )
     return parser
 
 
@@ -41,6 +66,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         no_audio=args.no_audio,
         headless=args.headless,
         config_path=str(args.config),
+        headless_frames=args.headless_frames,
+        headless_iterations=args.headless_iterations,
+        headless_warmup=args.headless_warmup,
+        headless_batch=args.headless_batch,
+        headless_alpha=args.headless_alpha,
     )
 
 
