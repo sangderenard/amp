@@ -229,6 +229,7 @@ class ControlDelay:
             raise ValueError("envelope dimensionality mismatch in control history")
         with self._lock:
             self._latest_time = max(self._latest_time, event.timestamp)
+            self._invalidate_future_pcm(event.timestamp)
             self._trim_history()
         return event
 
@@ -247,6 +248,46 @@ class ControlDelay:
             self._latest_time = max(self._latest_time, chunk.end_time)
             self._trim_history()
         return chunk
+
+    def consume_pcm(
+        self,
+        start_time: float,
+        frames: int,
+        *,
+        sample_rate: float | None = None,
+    ) -> np.ndarray | None:
+        """Consume cached PCM spanning ``start_time`` for ``frames``.
+
+        Returns a copy of the cached buffer when an exact match is found,
+        otherwise ``None``. Consumed frames are removed from the retained
+        PCM history so repeated calls advance through the cache.
+        """
+
+        if frames <= 0:
+            raise ValueError("frames must be a positive integer")
+        requested_sr = float(sample_rate or self.sample_rate)
+        frame_step = 1.0 / requested_sr
+        tolerance = frame_step * 0.5
+        with self._lock:
+            if not self._pcm:
+                return None
+            first = self._pcm[0]
+            if not np.isclose(first.sample_rate, requested_sr):
+                return None
+            if abs(first.timestamp - start_time) > tolerance:
+                return None
+            if first.frames < frames:
+                return None
+            # Copy the requested view to avoid sharing storage with history
+            data = first.output_buffer[:, :frames].copy()
+            if first.frames == frames:
+                self._pcm.popleft()
+            else:
+                remaining = first.output_buffer[:, frames:].copy()
+                new_timestamp = first.timestamp + frames * frame_step
+                trimmed = PcmChunk(new_timestamp, remaining, first.sample_rate)
+                self._pcm[0] = trimmed
+            return data
 
     def sample(
         self,
@@ -437,6 +478,35 @@ class ControlDelay:
                 self._events.popleft()
             while self._pcm and self._pcm[0].end_time < cutoff:
                 self._pcm.popleft()
+
+    def _invalidate_future_pcm(self, timestamp: float) -> None:
+        """Discard cached PCM that overlaps or follows ``timestamp``."""
+
+        cutoff = float(timestamp)
+        with self._lock:
+            if not self._pcm:
+                return
+            retained: Deque[PcmChunk] = deque()
+            epsilon = (1.0 / self.sample_rate) * 0.5
+            for chunk in self._pcm:
+                if chunk.end_time <= cutoff + epsilon:
+                    retained.append(chunk)
+                    continue
+                if chunk.timestamp >= cutoff - epsilon:
+                    break
+                # Partial overlap: retain prefix preceding the cutoff
+                keep_seconds = max(0.0, cutoff - chunk.timestamp)
+                keep_frames = int(round(keep_seconds * chunk.sample_rate))
+                if keep_frames <= 0:
+                    break
+                prefix = chunk.output_buffer[:, :keep_frames].copy()
+                if prefix.shape[1] == 0:
+                    break
+                retained.append(
+                    PcmChunk(chunk.timestamp, prefix, chunk.sample_rate)
+                )
+                break
+            self._pcm = retained
 
     def _interpolate_series(
         self,
