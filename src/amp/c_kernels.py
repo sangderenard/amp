@@ -307,31 +307,52 @@ typedef struct {
 
 /* Persistent log file handles. Lazily opened on first use so builds that run
    in read-only or log-less environments can continue without crashing. */
+static FILE *log_f_alloc = NULL;
+static FILE *log_f_memops = NULL;
 static FILE *log_f_ccalls = NULL;
 static FILE *log_f_cgenerated = NULL;
 
+#if defined(_WIN32) || defined(_WIN64)
+static CRITICAL_SECTION log_lock;
+static int log_lock_initialized = 0;
+#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { InitializeCriticalSection(&log_lock); log_lock_initialized = 1; } } while(0)
+#define LOG_LOCK() EnterCriticalSection(&log_lock)
+#define LOG_UNLOCK() LeaveCriticalSection(&log_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t log_lock;
+static int log_lock_initialized = 0;
+#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { pthread_mutex_init(&log_lock, NULL); log_lock_initialized = 1; } } while(0)
+#define LOG_LOCK() pthread_mutex_lock(&log_lock)
+#define LOG_UNLOCK() pthread_mutex_unlock(&log_lock)
+#endif
+
+static void close_all_logs(void);
+
 static void ensure_log_files_open(void) {
-    if (log_f_ccalls == NULL) {
-        FILE *candidate = fopen("logs/native_c_calls.log", "a");
-        if (candidate != NULL) {
+    if (!log_lock_initialized) LOG_LOCK_INIT();
+    LOG_LOCK();
+    /* Create logs directory if it doesn't exist. On Windows CreateDirectoryA
+       is a no-op if the directory already exists; on POSIX use mkdir(). */
 #if defined(_WIN32) || defined(_WIN64)
-            setvbuf(candidate, NULL, _IONBF, 0);
+    CreateDirectoryA("logs", NULL);
 #else
-            setvbuf(candidate, NULL, _IOLBF, 0);
+    /* ignore errors: directory may already exist */
+    mkdir("logs", 0775);
 #endif
-            log_f_ccalls = candidate;
-        }
-    }
-    if (log_f_cgenerated == NULL) {
-        FILE *candidate = fopen("logs/native_c_generated.log", "a");
-        if (candidate != NULL) {
-#if defined(_WIN32) || defined(_WIN64)
-            setvbuf(candidate, NULL, _IONBF, 0);
-#else
-            setvbuf(candidate, NULL, _IOLBF, 0);
-#endif
-            log_f_cgenerated = candidate;
-        }
+
+    if (log_f_alloc == NULL) log_f_alloc = fopen("logs/native_alloc_trace.log", "a");
+    if (log_f_memops == NULL) log_f_memops = fopen("logs/native_mem_ops.log", "a");
+    if (log_f_ccalls == NULL) log_f_ccalls = fopen("logs/native_c_calls.log", "a");
+    if (log_f_cgenerated == NULL) log_f_cgenerated = fopen("logs/native_c_generated.log", "a");
+    LOG_UNLOCK();
+
+    /* Register close handler once (safe to call repeatedly). We do this
+       outside the lock to avoid re-entrancy issues on some platforms. */
+    static int atexit_registered = 0;
+    if (!atexit_registered) {
+        atexit(close_all_logs);
+        atexit_registered = 1;
     }
 }
 
@@ -408,60 +429,6 @@ static void dump_backtrace(FILE *g);
 /* forward declarations for allocation backtrace helpers */
 static void capture_stack_frames(void **out_frames, unsigned short *out_count);
 static void dump_alloc_backtrace(FILE *g, struct alloc_rec *r);
-
-/* Cached FILE* handles for high-frequency logs to avoid open/close overhead.
- * We open these lazily and close them at process exit. For safety we still
- * fflush() on high-importance events (UNREGISTER_NOTFOUND, BAD_*) so the
- * data is durable even if the process crashes shortly thereafter.
- */
-static FILE *log_f_alloc = NULL;
-static FILE *log_f_memops = NULL;
-static FILE *log_f_ccalls = NULL;
-static FILE *log_f_cgenerated = NULL;
-
-#if defined(_WIN32) || defined(_WIN64)
-static CRITICAL_SECTION log_lock;
-static int log_lock_initialized = 0;
-#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { InitializeCriticalSection(&log_lock); log_lock_initialized = 1; } } while(0)
-#define LOG_LOCK() EnterCriticalSection(&log_lock)
-#define LOG_UNLOCK() LeaveCriticalSection(&log_lock)
-#else
-#include <pthread.h>
-static pthread_mutex_t log_lock;
-static int log_lock_initialized = 0;
-#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { pthread_mutex_init(&log_lock, NULL); log_lock_initialized = 1; } } while(0)
-#define LOG_LOCK() pthread_mutex_lock(&log_lock)
-#define LOG_UNLOCK() pthread_mutex_unlock(&log_lock)
-#endif
-
-static void close_all_logs(void);
-
-static void ensure_log_files_open(void) {
-    if (!log_lock_initialized) LOG_LOCK_INIT();
-    LOG_LOCK();
-    /* Create logs directory if it doesn't exist. On Windows CreateDirectoryA
-       is a no-op if the directory already exists; on POSIX use mkdir(). */
-#if defined(_WIN32) || defined(_WIN64)
-    CreateDirectoryA("logs", NULL);
-#else
-    /* ignore errors: directory may already exist */
-    mkdir("logs", 0775);
-#endif
-
-    if (log_f_alloc == NULL) log_f_alloc = fopen("logs/native_alloc_trace.log", "a");
-    if (log_f_memops == NULL) log_f_memops = fopen("logs/native_mem_ops.log", "a");
-    if (log_f_ccalls == NULL) log_f_ccalls = fopen("logs/native_c_calls.log", "a");
-    if (log_f_cgenerated == NULL) log_f_cgenerated = fopen("logs/native_c_generated.log", "a");
-    LOG_UNLOCK();
-
-    /* Register close handler once (safe to call repeatedly). We do this
-       outside the lock to avoid re-entrancy issues on some platforms. */
-    static int atexit_registered = 0;
-    if (!atexit_registered) {
-        atexit(close_all_logs);
-        atexit_registered = 1;
-    }
-}
 
 static void close_all_logs(void) {
     if (!log_lock_initialized) LOG_LOCK_INIT();
