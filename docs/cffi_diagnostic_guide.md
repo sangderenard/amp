@@ -4,7 +4,9 @@ This document captures the current structure of AMP's dynamically generated C
 runtime and the places where segmentation faults usually appear.  The goal is to
 make native crashes reproducible without introducing alternate execution paths
 or "smoke" harnesses – the tooling described here exercises the same code that
-the interactive UI calls.
+the interactive UI calls.  All helpers route through
+`amp.system.require_native_graph_runtime`, so any missing native components are
+treated as hard failures rather than silently falling back to Python.
 
 ## Runtime build pipeline
 

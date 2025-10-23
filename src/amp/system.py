@@ -10,8 +10,34 @@ import numpy as np
 import pandas as pd
 
 from . import app as amp_app
+from . import c_kernels, native_runtime
 from .virtual_joystick import VirtualJoystickPerformer, _load_prewritten_script
 from .graph import AudioGraph
+
+
+def require_native_graph_runtime() -> None:
+    """Ensure the native C graph runtime is available before rendering.
+
+    All benchmark and diagnostic entry points *must* route through the C edge
+    runner.  Python fallbacks exist solely for development convenience and are
+    unsuitable for performance measurements or crash triage because they bypass
+    the compiled execution plan.  This guard keeps every public entry point
+    aligned with that policy by refusing to proceed when the native bindings are
+    missing.
+    """
+
+    if not c_kernels.AVAILABLE:
+        reason = c_kernels.UNAVAILABLE_REASON or "unknown reason"
+        raise RuntimeError(
+            "C kernels are required for graph benchmarking and diagnostics; "
+            f"unavailable ({reason})."
+        )
+    if not native_runtime.AVAILABLE:
+        reason = native_runtime.UNAVAILABLE_REASON or "unknown reason"
+        raise RuntimeError(
+            "Native graph runtime is unavailable; all graph operations must run in C. "
+            f"Loader reported: {reason}."
+        )
 
 
 def benchmark_default_graph(
@@ -29,6 +55,8 @@ def benchmark_default_graph(
     Returns a pandas DataFrame matching the shape produced by the original
     script-based benchmark helper.
     """
+
+    require_native_graph_runtime()
 
     from . import state as app_state
 
@@ -245,4 +273,4 @@ def benchmark_default_graph(
     return timeline_df
 
 
-__all__ = ["benchmark_default_graph"]
+__all__ = ["benchmark_default_graph", "require_native_graph_runtime"]

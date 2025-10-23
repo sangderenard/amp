@@ -22,7 +22,10 @@ SRC_ROOT = pathlib.Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from amp.system import benchmark_default_graph as run_benchmark_default_graph
+from amp.system import (
+    benchmark_default_graph as run_benchmark_default_graph,
+    require_native_graph_runtime,
+)
 
 def _summarise_timeline(df: pd.DataFrame, ema_alpha: float) -> None:
     if df.empty:
@@ -144,6 +147,11 @@ def main() -> int:
         help="Optional JSON file containing prewritten joystick automation",
     )
     args = parser.parse_args()
+
+    try:
+        require_native_graph_runtime()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if args.frames <= 0:
         raise SystemExit("Frames must be positive")
