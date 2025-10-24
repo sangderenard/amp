@@ -55,7 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--headless-output",
         type=Path,
-        help="Optional path to write rendered PCM frames (float32 little-endian)",
+        help=(
+            "Optional path to write rendered audio. Paths ending in .wav are"
+            " written as 16-bit WAV; other suffixes receive raw float32"
+            " frames (little-endian)."
+        ),
     )
     parser.add_argument(
         "--headless-joystick-mode",

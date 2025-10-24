@@ -10,6 +10,7 @@ import queue
 import sys
 import threading
 import time
+import wave
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence, cast
@@ -451,14 +452,35 @@ def _write_headless_pcm(
 
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    interleaved.tofile(path)
+
+    file_format = "raw"
+    dtype_name = "float32"
+
+    if path.suffix.lower() == ".wav":
+        file_format = "wav"
+        dtype_name = "int16"
+        # WAV containers expect integer PCM. Convert to signed 16-bit while
+        # preserving amplitude by clipping to the representable range.
+        wav_rate = int(round(sample_rate)) if sample_rate else 0
+        if wav_rate <= 0:
+            raise ValueError("Sample rate must be positive for WAV output")
+        pcm16 = np.clip(interleaved, -1.0, 1.0)
+        pcm16 = np.rint(pcm16 * 32767.0).astype(np.dtype("<i2"), copy=False)
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(wav_rate)
+            wav_file.writeframes(pcm16.tobytes())
+    else:
+        interleaved.tofile(path)
 
     metadata = {
         "sample_rate": float(sample_rate),
         "channels": channels,
         "frames": frames,
-        "dtype": "float32",
+        "dtype": dtype_name,
         "layout": "interleaved",
+        "format": file_format,
     }
 
     try:
@@ -693,8 +715,9 @@ def run(
         Optional configuration override used when the application needs to
         fall back to a summary render (for example when pygame is unavailable).
     headless_output:
-        Optional file path that receives the rendered PCM stream when running
-        in headless mode. The file contains float32 little-endian frames
+        Optional file path that receives the rendered audio stream when running
+        in headless mode.  Paths ending in ``.wav`` are written as 16-bit WAV
+        files; other suffixes receive raw float32 little-endian frames
         interleaved per channel.
     headless_joystick_mode:
         Overrides the virtual joystick performer style used during headless
