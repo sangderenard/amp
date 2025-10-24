@@ -1,7 +1,7 @@
 # KPN Runtime Guidance for Agents and Humans
 
 ## Purpose
-This document records the shared goals and guardrails for extending the AMP Kahn Process Network (KPN) runtime so that the team can converge on the DAG + IPLS design brief without drifting from project ethos. No Python fallbacks are acceptable—every feature described here must execute through the native runtime pathway. Use this memo as the primary reference when planning or reviewing work around the scheduler, node contracts, and data movement.
+This document records the shared goals and guardrails for extending the AMP Kahn Process Network (KPN) runtime so that the team can converge on the DAG + IPLS design brief without drifting from project ethos. No Python fallbacks are acceptable—every feature described here must execute through the native runtime pathway. Use this memo as the primary reference when planning or reviewing work around the scheduler, node contracts, and data movement, and consult [`docs/kpn_contract.md`](./kpn_contract.md) for the authoritative node-level contract.
 
 ## Scheduling Philosophy
 - **Baseline KPN, optional IPLS:** The native scheduler must continue to support the current KPN semantics as the default. When the host supplies an Iterative Partial-Latency Schedule (IPLS), the runtime should honour it. The IPLS description arrives as a data structure that enumerates nodes by execution stage and type cohort; treat that ordering as authoritative.
