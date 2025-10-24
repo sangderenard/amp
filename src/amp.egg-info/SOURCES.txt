@@ -15,7 +15,6 @@ src/amp/controls.py
 src/amp/envelope.py
 src/amp/graph.py
 src/amp/graph_debug.py
-src/amp/graph_edge_runner.py
 src/amp/input_history.py
 src/amp/joystick.py
 src/amp/menu.py
@@ -48,7 +47,6 @@ tests/test_control_delay.py
 tests/test_envelope_kernel.py
 tests/test_envelope_parity.py
 tests/test_graph.py
-tests/test_graph_edge_runner.py
 tests/test_graph_timings.py
 tests/test_inversion_sum_error.py
 tests/test_joystick.py

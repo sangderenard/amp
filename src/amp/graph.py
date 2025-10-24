@@ -3,23 +3,22 @@
 from __future__ import annotations
 
 import json
+
 from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock, RLock
-from typing import TYPE_CHECKING, Deque, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Deque, Dict, Iterable, List, Mapping, Sequence, Tuple
 import struct
 import time
 import zlib
 
 import numpy as np
-from pathlib import Path
 
 from .config import GraphConfig
+from .diagnostics import log_py_c_call
 from .nodes import NODE_TYPES, Node as AudioNode
-
-if TYPE_CHECKING:
-    from .graph_edge_runner import CffiEdgeRunner
 
 RAW_DTYPE = np.float64
 
@@ -155,6 +154,8 @@ class ControlDelay:
             if e.extras:
                 all_keys.update(e.extras.keys())
         all_keys = sorted(all_keys)
+        if not events or not all_keys:
+            return b""
         # Prepare binary layout: [event_count][key_count][key_lens][keys][events...]
         import struct
         payload = bytearray()
@@ -607,10 +608,9 @@ class AudioGraph:
         self._merge_scratch: Dict[Tuple[int, int, int], np.ndarray] = {}
         self._audio_workspaces: Dict[Tuple[int, int, int], np.ndarray] = {}
         self._last_node_timings: Dict[str, float] = {}
-        self._edge_runner: "CffiEdgeRunner" | None = None
-        # Protect access to the CFFI edge runner (compile/run) to avoid
-        # concurrent native calls from multiple Python threads which can
-        # lead to native heap corruption on some platforms.
+        self._native_executor: "NativeGraphExecutor" | None = None
+        # Protect access to the native executor so only one Python thread
+        # interacts with the C runtime at a time.
         self._runner_lock: Lock = Lock()
         # Sequence counter for diagnostic control-blob dumps; incremented
         # per render so logs can be correlated to a specific render run.
@@ -724,7 +724,12 @@ class AudioGraph:
 
     def _invalidate_plan(self) -> None:
         self._plan_dirty = True
-        self._edge_runner = None
+        executor = getattr(self, "_native_executor", None)
+        if executor is not None:
+            try:
+                executor.close()
+            finally:
+                self._native_executor = None
 
     def _ensure_execution_plan(self) -> Tuple[_NodeExecutionPlan, ...]:
         if not self._plan_dirty:
@@ -881,24 +886,14 @@ class AudioGraph:
             self._audio_workspaces[shape] = buffer
         return buffer
 
-    def _ensure_edge_runner(self) -> "CffiEdgeRunner":
-        if self._edge_runner is None:
-            try:
-                from .graph_edge_runner import CffiEdgeRunner
-            except Exception as exc:  # pragma: no cover - defensive import guard
-                raise RuntimeError("cffi edge runner is required for graph rendering") from exc
-            # Instantiate the runner and compile it while holding the runner
-            # lock so no other thread can invoke native code until compilation
-            # is complete.
+    def _ensure_native_executor(self) -> "NativeGraphExecutor":
+        if self._native_executor is None:
+            from .native_runtime import NativeGraphExecutor
+
             with self._runner_lock:
-                self._edge_runner = CffiEdgeRunner(self)
-                try:
-                    self._edge_runner.compile()
-                except Exception:
-                    # If compilation fails, ensure runner isn't left in a partial state
-                    self._edge_runner = None
-                    raise
-        return self._edge_runner
+                if self._native_executor is None:
+                    self._native_executor = NativeGraphExecutor(self)
+        return self._native_executor
 
     def render_block(
         self,
@@ -910,10 +905,7 @@ class AudioGraph:
         output_sample_rate: float | None = None,
         dsp_sample_rate: float | None = None,
     ) -> np.ndarray:
-        """
-        Render a block using the CFFI edge runner only. All node and edge processing is performed in C.
-        Controller history for the block is serialized (raw, not upsampled) and delivered to the C kernel; output is returned from C.
-        """
+        """Render a block using the native C graph runtime."""
         if not self.sink:
             raise RuntimeError("Sink node has not been configured")
         requested_frames = int(output_frames) if output_frames is not None else int(frames)
@@ -928,7 +920,7 @@ class AudioGraph:
         if output_sr <= 0.0:
             raise ValueError("sample rate must be positive")
         sr = int(round(dsp_sr))
-        runner = self._ensure_edge_runner()
+        executor = self._ensure_native_executor()
         # Serialize raw control history for the relevant window.
         # Control events are recorded with a deliberate controller delay
         # (historical samples) and therefore the control history window
@@ -961,7 +953,59 @@ class AudioGraph:
         if req_end <= req_start and latest >= req_start:
             horizon = requested_frames / output_sr if output_sr else 0.0
             req_end = min(req_start + horizon, latest + horizon)
+        block_params: Mapping[str, Mapping[str, np.ndarray]] | None = base_params
+        if block_params is None:
+            zeros = np.zeros((1, 1, frames), dtype=RAW_DTYPE)
+            neutral: dict[str, Mapping[str, np.ndarray]] = {"_B": 1, "_C": 1}
+            if "keyboard_ctrl" in self._nodes:
+                neutral["keyboard_ctrl"] = {
+                    "trigger": zeros,
+                    "gate": zeros,
+                    "drone": zeros,
+                    "velocity": zeros,
+                }
+            if "joystick_ctrl" in self._nodes:
+                neutral["joystick_ctrl"] = {
+                    "trigger": zeros,
+                    "gate": zeros,
+                    "drone": zeros,
+                    "velocity": zeros,
+                    "pitch_input": zeros,
+                    "pitch_span": zeros,
+                    "pitch_root": zeros,
+                    "cutoff": zeros,
+                    "q": zeros,
+                }
+            block_params = neutral
+
         control_history_blob = self.control_delay.export_control_history_blob(req_start, req_end)
+        if not control_history_blob and block_params:
+            history_curves: dict[str, np.ndarray] = {}
+            for node_name, params in block_params.items():
+                if not isinstance(params, Mapping) or node_name.startswith("_"):
+                    continue
+                if not (node_name.endswith("_ctrl") or "controller" in node_name):
+                    continue
+                for key, value in params.items():
+                    array = np.asarray(value, dtype=RAW_DTYPE)
+                    if array.ndim != 3:
+                        continue
+                    history_curves.setdefault(key, np.ascontiguousarray(array).reshape(-1))
+            if history_curves:
+                payload = bytearray()
+                payload.extend(struct.pack("<II", 1, len(history_curves)))
+                keys = tuple(sorted(history_curves))
+                for key in keys:
+                    encoded = key.encode("utf-8")
+                    payload.extend(struct.pack("<I", len(encoded)))
+                for key in keys:
+                    payload.extend(key.encode("utf-8"))
+                payload.extend(struct.pack("<d", req_start))
+                for key in keys:
+                    values = history_curves[key]
+                    payload.extend(struct.pack("<I", values.size))
+                    payload.extend(values.tobytes(order="C"))
+                control_history_blob = bytes(payload)
 
         # Diagnostic: dump last control-history blob and metadata to logs so we can
         # inspect the exact bytes passed to the C kernel when a native crash occurs.
@@ -984,8 +1028,7 @@ class AudioGraph:
             # Include graph descriptor/plan sizes to help triage mismatches
             try:
                 meta["descriptor_len"] = len(self.serialize_node_descriptors())
-                runner = getattr(self, "_edge_runner", None)
-                meta["compiled_plan_len"] = len(getattr(runner, "_compiled_plan", b"") or b"")
+                meta["compiled_plan_len"] = len(self.serialize_compiled_plan())
             except Exception:
                 pass
             with open(meta_path, "w", encoding="utf-8") as mf:
@@ -993,31 +1036,19 @@ class AudioGraph:
         except Exception:
             # Diagnostics must never interfere with runtime; swallow errors.
             pass
-        # Serialize access to the native runner to avoid simultaneous
-        # invocations from multiple Python threads (producer/consumer/UI).
-        try:
-            try:
-                with open("logs/py_c_calls.log", "a") as _pf:
-                    _pf.write(f"{time.time()} {threading.get_ident()} render_block.enter frames={frames} sample_rate={sr} base_params_keys={list((base_params or {}).keys())}\n")
-            except Exception:
-                pass
-            with self._runner_lock:
-                runner.begin_block(
-                    int(frames),
-                    sample_rate=dsp_sr,
-                    base_params=base_params or {},
-                    output_frames=requested_frames,
-                    output_sample_rate=output_sr,
-                )
-                output = runner.run_c_graph(control_history_blob)
-            try:
-                with open("logs/py_c_calls.log", "a") as _pf:
-                    _pf.write(f"{time.time()} {threading.get_ident()} render_block.exit frames={frames} sample_rate={sr} output_shape={getattr(output, 'shape', None)}\n")
-            except Exception:
-                pass
-        except Exception:
-            # propagate after logging attempt
-            raise
+        self._last_node_timings.clear()
+        log_py_c_call(
+            f"{time.time()} render_block.enter frames={frames} sample_rate={sr} base_params_keys={list((block_params or {}).keys())}"
+        )
+        output = executor.run_block(
+            requested_frames,
+            output_sr,
+            base_params=block_params or {},
+            control_history_blob=control_history_blob,
+        )
+        log_py_c_call(
+            f"{time.time()} render_block.exit frames={frames} sample_rate={sr} output_shape={getattr(output, 'shape', None)}"
+        )
         self._last_block_time = end_time
         return output
 
@@ -1130,6 +1161,48 @@ class AudioGraph:
 
             payload.extend(params_json)
 
+        return bytes(payload)
+
+    def serialize_compiled_plan(self) -> bytes:
+        """Serialize the execution plan in the native runtime's compact format."""
+
+        plan = self._ensure_execution_plan()
+        if not plan:
+            return b""
+        payload = bytearray()
+        payload.extend(b"AMPL")
+        payload.extend(struct.pack("<II", 1, len(plan)))
+        audio_cursor = 0
+        for function_id, entry in enumerate(plan):
+            name_bytes = entry.name.encode("utf-8")
+            audio_offset = audio_cursor
+            audio_span = 1
+            audio_cursor += 1
+            param_count = len(entry.mod_groups)
+            payload.extend(
+                struct.pack(
+                    "<IIIII",
+                    int(function_id),
+                    len(name_bytes),
+                    int(audio_offset),
+                    int(audio_span),
+                    int(param_count),
+                )
+            )
+            payload.extend(name_bytes)
+            param_cursor = 0
+            for group in entry.mod_groups:
+                param_bytes = group.param.encode("utf-8")
+                payload.extend(
+                    struct.pack(
+                        "<III",
+                        len(param_bytes),
+                        int(param_cursor),
+                        0,
+                    )
+                )
+                payload.extend(param_bytes)
+                param_cursor += 1
         return bytes(payload)
 
     @property

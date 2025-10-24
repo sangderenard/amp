@@ -133,11 +133,8 @@ class NativeGraphExecutor:
             raise ValueError("graph must be provided")
         self._graph = graph
         self.ffi, self.lib = get_graph_runtime_impl()
-        runner = graph._ensure_edge_runner()
-        descriptor_blob = getattr(runner, "_descriptor_blob", None)
-        if not descriptor_blob:
-            descriptor_blob = graph.serialize_node_descriptors()
-        plan_blob = getattr(runner, "_compiled_plan", b"") or b""
+        descriptor_blob = graph.serialize_node_descriptors()
+        plan_blob = graph.serialize_compiled_plan()
         desc_buf = self.ffi.new("uint8_t[]", descriptor_blob)
         if plan_blob:
             plan_buf = self.ffi.new("uint8_t[]", plan_blob)
@@ -202,6 +199,7 @@ class NativeGraphExecutor:
             self.lib.amp_graph_runtime_clear_params(self._runtime)
             self.lib.amp_graph_runtime_configure(self._runtime, batches, dsp_frames)
             self.lib.amp_graph_runtime_set_dsp_sample_rate(self._runtime, float(dsp_rate))
+            keepalive: list[np.ndarray] = []
             if base_params:
                 for node_name, params in base_params.items():
                     if node_name.startswith("_"):
@@ -213,6 +211,7 @@ class NativeGraphExecutor:
                                 f"param '{param_name}' for node '{node_name}' must be BxCxF"
                             )
                         arr_c = np.require(arr, requirements=("C",))
+                        keepalive.append(arr_c)
                         ptr = self.ffi.from_buffer("double[]", arr_c)
                         status = self.lib.amp_graph_runtime_set_param(
                             self._runtime,
@@ -253,7 +252,7 @@ class NativeGraphExecutor:
             )
         if int(out_frames[0]) != output_frames or not np.isclose(dsp_rate, audio_rate):
             array = lanczos_resample(array, dsp_rate, audio_rate, output_frames)
-        return array
+        return np.nan_to_num(array, copy=False)
 
 
 __all__ = [

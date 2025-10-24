@@ -12,6 +12,8 @@ from amp import c_kernels
 print("c_kernels.AVAILABLE:", c_kernels.AVAILABLE)
 
 from amp.app import build_runtime_graph
+from amp.native_runtime import AVAILABLE as RUNTIME_AVAILABLE
+from amp.native_runtime import NativeGraphExecutor
 from amp.state import build_default_state
 
 fake_pygame = types.SimpleNamespace(
@@ -22,21 +24,12 @@ state = build_default_state(joy=None, pygame=fake_pygame)
 graph, envs, amps = build_runtime_graph(44100, state)
 
 print("graph nodes:", list(graph._nodes.keys()))
-
-from amp.graph_edge_runner import CffiEdgeRunner
+print("native runtime available:", RUNTIME_AVAILABLE)
 
 try:
-    runner = CffiEdgeRunner(graph)
-    print("CffiEdgeRunner compiled:", runner._compiled)
-    print("C kernel available (runner._c_kernel is not None):", runner._c_kernel is not None)
-    print("plan names:", getattr(runner, "_plan_names", None))
-    runner.begin_block(frames=256, sample_rate=44100, base_params={})
-    try:
-        out = runner.run_c_graph(b"")
-        print("run_c_graph success, output shape:", out.shape)
-    except Exception as e:
-        print("run_c_graph raised:")
-        traceback.print_exc()
+    with NativeGraphExecutor(graph) as executor:
+        out = executor.run_block(256, sample_rate=44100.0, base_params={}, control_history_blob=b"")
+        print("NativeGraphExecutor run succeeded, output shape:", out.shape)
 except Exception:
-    print("Failed to create CffiEdgeRunner:")
+    print("NativeGraphExecutor failed:")
     traceback.print_exc()

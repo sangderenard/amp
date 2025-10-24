@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Deterministic graph renderer for CFFI diagnostics.
+"""Deterministic graph renderer for native runtime diagnostics.
 
 This helper instantiates the same interactive graph used by the AMP UI and drives
-it with neutral controller curves so the CFFI edge-runner can be compiled and
+it with neutral controller curves so the native runtime can be compiled and
 exercised without pygame or joystick hardware.  It records the generated C source,
 compiled plan, and timing metadata to make native crashes reproducible.
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import shutil
 import sys
 import time
@@ -97,8 +98,46 @@ def _build_from_config(path: Path) -> Tuple[AudioGraph, Dict[str, object], int, 
     )
 
 
+def _describe_compiled_plan(plan_blob: bytes) -> Dict[str, object]:
+    if not plan_blob.startswith(b"AMPL") or len(plan_blob) < 12:
+        return {"version": 0, "node_count": 0, "nodes": ()}
+    version, node_count = struct.unpack_from("<II", plan_blob, 4)
+    offset = 12
+    nodes: list[Dict[str, object]] = []
+    for _ in range(int(node_count)):
+        function_id, name_len, audio_offset, audio_span, param_count = struct.unpack_from(
+            "<IIIII", plan_blob, offset
+        )
+        offset += 20
+        name = plan_blob[offset : offset + name_len].decode("utf-8")
+        offset += name_len
+        params: list[Dict[str, object]] = []
+        for _ in range(int(param_count)):
+            param_len, param_offset, param_span = struct.unpack_from("<III", plan_blob, offset)
+            offset += 12
+            param_name = plan_blob[offset : offset + param_len].decode("utf-8")
+            offset += param_len
+            params.append(
+                {
+                    "name": param_name,
+                    "offset": int(param_offset),
+                    "span": int(param_span),
+                }
+            )
+        nodes.append(
+            {
+                "name": name,
+                "function_id": int(function_id),
+                "audio_offset": int(audio_offset),
+                "audio_span": int(audio_span),
+                "params": tuple(params),
+            }
+        )
+    return {"version": int(version), "node_count": int(node_count), "nodes": tuple(nodes)}
+
+
 def _materialise_artifacts(graph: AudioGraph, dump_dir: Path) -> Dict[str, object]:
-    """Write CFFI artifacts (C source, descriptors, plan) into dump_dir."""
+    """Write runtime artifacts (descriptors, plan) into ``dump_dir``."""
 
     dump_dir.mkdir(parents=True, exist_ok=True)
     metadata: Dict[str, object] = {}
@@ -108,13 +147,12 @@ def _materialise_artifacts(graph: AudioGraph, dump_dir: Path) -> Dict[str, objec
     descriptor_path.write_bytes(descriptors)
     metadata["descriptor_len"] = len(descriptors)
 
-    runner = graph._ensure_edge_runner()
-    compiled_plan = getattr(runner, "_compiled_plan", None)
+    compiled_plan = graph.serialize_compiled_plan()
     if compiled_plan:
         plan_path = dump_dir / "compiled_plan.bin"
         plan_path.write_bytes(compiled_plan)
         metadata["compiled_plan_len"] = len(compiled_plan)
-        plan_desc = runner.describe_compiled_plan()
+        plan_desc = _describe_compiled_plan(compiled_plan)
         (dump_dir / "compiled_plan.json").write_text(
             json.dumps(plan_desc, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -199,7 +237,7 @@ def _render_blocks(
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Render the AMP interactive graph via the CFFI edge runner without pygame.",
+        description="Render the AMP interactive graph via the native runtime without pygame.",
     )
     parser.add_argument(
         "--config",
