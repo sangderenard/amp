@@ -53,6 +53,8 @@ int amp_graph_runtime_execute(
 void amp_graph_runtime_buffer_free(double *buffer);
 AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
 void amp_graph_history_destroy(AmpGraphControlHistory *history);
+int amp_native_logging_enabled(void);
+void amp_native_logging_set(int enabled);
 """
 
 
