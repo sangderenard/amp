@@ -13,7 +13,7 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Phase 2 — Contract Documentation & Discoverability
 - **Goal**: Provide a single authoritative contract reference for contributors who may not inspect C++ headers.
 - **Tasks**:
-  - Author `docs/kpn_contract.md` summarising runtime/node expectations (frames-first invocation, `(batch, channel, frame)` layout, buffer ownership, state lifecycle, modulation semantics, thermodynamic reporting convention) while reiterating that Python fallbacks are prohibited in production tests and features.【F:src/native/include/amp_native.h†L29-L81】【F:src/native/include/oscillator_design_notes.h†L88-L118】【F:docs/oscillator_design_brief.md†L1-L44】
+  - Author `docs/kpn_contract.md` summarising runtime/node expectations (frames-first invocation, `(batch, channel, frame)` layout, buffer ownership, state lifecycle, modulation semantics, thermodynamic reporting convention) while reiterating that Python fallbacks are prohibited in production tests and features. ✅ Completed in [`docs/kpn_contract.md`](./kpn_contract.md).【F:src/native/include/amp_native.h†L29-L81】【F:src/native/include/oscillator_design_notes.h†L88-L118】【F:docs/oscillator_design_brief.md†L1-L44】
   - Cross-link the new markdown from existing design docs.
 - **Delegation prompt**:
   ```text
@@ -74,7 +74,7 @@ This document sequences the work required to align the AMP native KPN runtime, o
 
 ## Checklist Summary
 - [x] Audit findings documented (`docs/kpn_audit_findings.md`).
-- [ ] Contract markdown published and cross-referenced.
+- [x] Contract markdown published and cross-referenced.
 - [ ] Runtime shape validation + thermo test implemented.
 - [ ] ABI extension proposal ready for review.
 - [ ] ABI extension implemented (post-approval).

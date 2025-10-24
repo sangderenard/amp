@@ -1,6 +1,6 @@
 # High-Fidelity Oscillator Design Brief
 
-This brief codifies the expectations for oscillators implemented within the upgraded AMP KPN/IPLS runtime. Every oscillator node must honor the runtime's C++-first implementation policy—**Python fallbacks are prohibited** in production graphs and in any tooling meant to exercise the oscillator behaviour.
+This brief codifies the expectations for oscillators implemented within the upgraded AMP KPN/IPLS runtime. Every oscillator node must honor the runtime's C++-first implementation policy—**Python fallbacks are prohibited** in production graphs and in any tooling meant to exercise the oscillator behaviour. For the full runtime and node contract, see [`docs/kpn_contract.md`](./kpn_contract.md).
 
 ## 1. Signal Rate and Oversampling Strategy
 - Oscillators operate at an intentionally overcranked internal rate chosen for optimal resampling and algorithmic stability.
