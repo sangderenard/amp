@@ -1,6 +1,7 @@
 import threading
 import time
 import queue
+import math
 import numpy as np
 import pandas as pd
 
@@ -144,15 +145,24 @@ def render_audio_block(
     """
     # Build base params using shared builder
     from .app import build_base_params
+    output_frames = int(frames)
+    output_sample_rate = float(sample_rate or graph.sample_rate)
+    dsp_rate = float(getattr(graph, "dsp_sample_rate", output_sample_rate) or output_sample_rate)
+    if output_sample_rate <= 0.0:
+        raise ValueError("sample_rate must be positive")
+    ratio = dsp_rate / output_sample_rate
+    dsp_frames = int(math.ceil(output_frames * ratio)) if ratio > 0 else output_frames
+
     base_params = build_base_params(
         graph,
         state,
-        frames,
+        dsp_frames,
         control_cache,
         envelope_names,
         amp_mod_names,
         joystick_curves,
         start_time=start_time,
+        update_hz=dsp_rate,
     )
     try:
         try:
@@ -160,7 +170,14 @@ def render_audio_block(
                 _pf.write(f"{time.time()} {threading.get_ident()} render_audio_block.enter frames={frames} sample_rate={sample_rate} base_params_keys={list((base_params or {}).keys())}\n")
         except Exception:
             pass
-        output_node_buffer = graph.render_block(frames, sample_rate, base_params)
+        output_node_buffer = graph.render_block(
+            dsp_frames,
+            dsp_rate,
+            base_params,
+            output_frames=output_frames,
+            output_sample_rate=output_sample_rate,
+            dsp_sample_rate=dsp_rate,
+        )
         try:
             with open("logs/py_c_calls.log", "a") as _pf:
                 _pf.write(f"{time.time()} {threading.get_ident()} render_audio_block.exit frames={frames} output_shape={getattr(output_node_buffer, 'shape', None)}\n")
@@ -182,8 +199,8 @@ def render_audio_block(
             )
     meta = {
         "render_duration": None,  # caller can fill timing
-        "produced_frames": frames,
-        "sample_rate": sample_rate,
+        "produced_frames": output_frames,
+        "sample_rate": output_sample_rate,
         "node_timings": getattr(graph, "last_node_timings", {}),
     }
     return output_node_buffer, meta

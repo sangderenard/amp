@@ -339,6 +339,7 @@ def build_base_params(
     joystick_curves: dict,
     *,
     start_time: float | None = None,
+    update_hz: float | None = None,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Construct the base parameter dict used for rendering blocks.
 
@@ -354,7 +355,7 @@ def build_base_params(
         if start_time is not None
         else getattr(getattr(graph, "control_delay", None), "latest_time", 0.0)
     )
-    sampled = graph.sample_control_tensor(sample_start, frames)
+    sampled = graph.sample_control_tensor(sample_start, frames, update_hz=update_hz)
     sampled_extras = sampled.get("extras", {})
 
     # Keyboard controller (if present in history/extras)

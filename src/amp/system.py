@@ -303,6 +303,19 @@ def benchmark_default_graph(
         meta.setdefault("allotted_time", block_duration)
         meta["batch_blocks"] = int(current_batch_blocks)
         meta["requested_frames"] = int(total_frames)
+        meta["dsp_sample_rate"] = float(getattr(graph, "dsp_sample_rate", sample_rate))
+        meta["rendered_future_start"] = float(block_start_time)
+        meta["rendered_future_end"] = float(block_start_time + produced_time)
+        latest_time = getattr(graph.control_delay, "latest_time", None)
+        if latest_time is not None:
+            meta["control_latest_time"] = float(latest_time)
+        try:
+            pcm_chunks = graph.control_delay.pcm_chunks  # type: ignore[attr-defined]
+        except Exception:
+            pcm_chunks = ()
+        if pcm_chunks:
+            last_chunk = pcm_chunks[-1]
+            meta["pcm_horizon"] = float(getattr(last_chunk, "end_time", meta["rendered_future_end"]))
 
         if adaptive_batching:
             efficiency = float("inf") if render_duration <= 0.0 else (produced_time / render_duration)

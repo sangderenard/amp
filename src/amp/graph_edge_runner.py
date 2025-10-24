@@ -21,6 +21,7 @@ from .graph import (
     _assert_bcf,
 )
 from . import quantizer
+from .utils import lanczos_resample
 from .node_contracts import NodeContract, get_node_contract
 
 try:  # pragma: no cover - optional dependency
@@ -277,6 +278,9 @@ class CffiEdgeRunner:
         frames: int,
         sample_rate: float | None = None,
         base_params: Dict[str, Dict[str, np.ndarray]] | None = None,
+        *,
+        output_frames: int | None = None,
+        output_sample_rate: float | None = None,
     ) -> None:
         """
         Prepare for a new processing block (frame window), initializing all C-ready node buffers and caches.
@@ -285,6 +289,10 @@ class CffiEdgeRunner:
             raise ValueError("frames must be positive")
         self._frames = int(frames)
         self._sample_rate = float(sample_rate or self._graph.sample_rate)
+        self._requested_frames = int(output_frames) if output_frames is not None else self._frames
+        self._requested_sample_rate = float(
+            output_sample_rate if output_sample_rate is not None else self._sample_rate
+        )
         self._base_params = dict(base_params or {})
         # Descriptor parsing and cache allocation are performed in compile();
         # begin_block should be lightweight and only reset per-block state.
@@ -1076,7 +1084,12 @@ class CffiEdgeRunner:
             if sink_buffer is None:
                 raise RuntimeError("Sink node did not produce output")
             result = sink_buffer
-        return np.require(result, dtype=RAW_DTYPE, requirements=("C",)).copy()
+        result = np.require(result, dtype=RAW_DTYPE, requirements=("C",)).copy()
+        requested_frames = getattr(self, "_requested_frames", int(result.shape[2]))
+        requested_rate = float(getattr(self, "_requested_sample_rate", self._sample_rate))
+        if int(result.shape[2]) != int(requested_frames) or not np.isclose(self._sample_rate, requested_rate):
+            result = lanczos_resample(result, self._sample_rate, requested_rate, int(requested_frames))
+        return result
 
     def _predict_output_channels(
         self, node_name: str, descriptor: _ParsedNodeDescriptor, batches: int
