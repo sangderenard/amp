@@ -51,6 +51,7 @@ def benchmark_default_graph(
     joystick_script_path,
     batch_blocks: int = 1,
     pcm_consumer: Callable[[float, np.ndarray, float], None] | None = None,
+    adaptive_batching: bool = False,
 ) -> pd.DataFrame:
     """Run the default graph headlessly using a virtual controller.
 
@@ -82,12 +83,23 @@ def benchmark_default_graph(
     if frames <= 0:
         raise ValueError("frames must be a positive integer")
 
-    batch_blocks = int(batch_blocks)
-    if batch_blocks <= 0:
+    base_batch_blocks = int(batch_blocks)
+    if base_batch_blocks <= 0:
         raise ValueError("batch_blocks must be a positive integer")
 
     block_frames = int(frames)
-    total_frames = block_frames * batch_blocks
+    min_batch_blocks = max(1, base_batch_blocks)
+    max_batch_blocks = max(min_batch_blocks, 64)
+    preferred_batch_blocks = float(base_batch_blocks)
+    adaptive_batching = bool(adaptive_batching)
+    probe_sequence = (0, 1, -1) if adaptive_batching else (0,)
+    probe_idx = 0
+    efficiency_ema: float | None = None
+    efficiency_alpha = 0.2
+    grad_ema: float | None = None
+    grad_alpha = 0.4
+    grad_threshold = 1e-6
+    last_eff_map: Dict[int, float] = {}
 
     control_cache: Dict[str, np.ndarray] = {}
     ema: Dict[str, float] = {}
@@ -112,7 +124,21 @@ def benchmark_default_graph(
     buffer_ahead = 0.0
     cumulative_gap = 0.0
 
+    cumulative_samples = 0
+
     for iteration in range(iterations + warmup):
+        if adaptive_batching:
+            base_pref = int(preferred_batch_blocks)
+            probe = probe_sequence[probe_idx]
+            probe_idx = (probe_idx + 1) % len(probe_sequence)
+            candidate = base_pref + probe
+            candidate = max(min_batch_blocks, min(max_batch_blocks, candidate))
+            current_batch_blocks = candidate
+        else:
+            current_batch_blocks = base_batch_blocks
+
+        total_frames = block_frames * max(1, current_batch_blocks)
+
         joystick_curves = virtual_joystick.generate(total_frames)
         timeline_timestamp = timeline_start_wall + playhead_time
         timestamp = timeline_timestamp
@@ -270,6 +296,59 @@ def benchmark_default_graph(
             cumulative_gap += underrun_gap
             buffer_ahead = 0.0
 
+        meta["render_duration"] = render_duration
+        produced_frames = int(meta.get("produced_frames", total_frames))
+        produced_time = float(meta.get("produced_time", (produced_frames / sample_rate) if sample_rate else 0.0))
+        meta.setdefault("produced_time", produced_time)
+        meta.setdefault("allotted_time", block_duration)
+        meta["batch_blocks"] = int(current_batch_blocks)
+        meta["requested_frames"] = int(total_frames)
+
+        if adaptive_batching:
+            efficiency = float("inf") if render_duration <= 0.0 else (produced_time / render_duration)
+            if efficiency_ema is None:
+                efficiency_ema = efficiency
+            else:
+                efficiency_ema = efficiency_ema + efficiency_alpha * (efficiency - efficiency_ema)
+
+            try:
+                last_eff_map[int(current_batch_blocks)] = float(efficiency)
+                if len(last_eff_map) > 9:
+                    oldest = sorted(last_eff_map.keys())[0]
+                    del last_eff_map[oldest]
+            except Exception:
+                pass
+
+            grad: float | None = None
+            p = int(preferred_batch_blocks)
+            eff_p = last_eff_map.get(p)
+            eff_p_plus = last_eff_map.get(p + 1)
+            eff_p_minus = last_eff_map.get(p - 1)
+            if eff_p_plus is not None and eff_p_minus is not None:
+                grad = (eff_p_plus - eff_p_minus) / 2.0
+            elif eff_p_plus is not None and eff_p is not None:
+                grad = (eff_p_plus - eff_p) / 1.0
+            elif eff_p_minus is not None and eff_p is not None:
+                grad = (eff_p - eff_p_minus) / 1.0
+
+            if grad is not None:
+                if grad_ema is None:
+                    grad_ema = grad
+                else:
+                    grad_ema = grad_ema + grad_alpha * (grad - grad_ema)
+
+            if grad_ema is not None:
+                if grad_ema > grad_threshold:
+                    preferred_batch_blocks = min(
+                        max_batch_blocks,
+                        preferred_batch_blocks + 1,
+                    )
+                elif grad_ema < -grad_threshold:
+                    preferred_batch_blocks = max(
+                        min_batch_blocks,
+                        preferred_batch_blocks - 1,
+                    )
+
         scheduled_start = playhead_time
         scheduled_end = scheduled_start + block_duration
         realised_start = scheduled_start + cumulative_gap
@@ -334,6 +413,10 @@ def benchmark_default_graph(
         velocity_curve = joystick_curves_from_history.get("velocity", 0.0)
         pitch_curve = joystick_curves_from_history.get("pitch_input", 0.0)
 
+        start_sample = cumulative_samples
+        end_sample = start_sample + total_frames
+        cumulative_samples = end_sample
+
         record: Dict[str, Any] = {
             "iteration": iteration,
             "is_warmup": iteration < warmup,
@@ -356,9 +439,9 @@ def benchmark_default_graph(
             "drone_active": bool(_curve_max(drone_curve) >= 0.5),
             "velocity_mean": _curve_mean(velocity_curve),
             "pitch_mean": _curve_mean(pitch_curve),
-            "start_sample": iteration * total_frames,
-            "end_sample": (iteration + 1) * total_frames,
-            "batch_blocks": batch_blocks,
+            "start_sample": start_sample,
+            "end_sample": end_sample,
+            "batch_blocks": int(current_batch_blocks),
             "requested_frames": total_frames,
             "callback_frames": block_frames,
         }
@@ -380,20 +463,34 @@ def summarise_benchmark_timeline(df: pd.DataFrame, *, ema_alpha: float) -> Seque
         lines.append("No benchmark samples were recorded.")
         return lines
 
-    block_ms = float(df["block_ms"].iloc[0]) if "block_ms" in df else float("nan")
+    block_ms = float(df["block_ms"].mean()) if "block_ms" in df else float("nan")
     iterations = int((~df.get("is_warmup", pd.Series(dtype=bool))).sum()) if "is_warmup" in df else len(df)
 
     start_sample = df.get("start_sample")
     end_sample = df.get("end_sample")
-    frames_rendered = (
-        int(end_sample.iloc[0] - start_sample.iloc[0])
-        if start_sample is not None and end_sample is not None and not start_sample.empty and not end_sample.empty
+    total_frames_rendered = (
+        int(end_sample.iloc[-1] - start_sample.iloc[0])
+        if start_sample is not None
+        and end_sample is not None
+        and not start_sample.empty
+        and not end_sample.empty
         else None
     )
 
-    if frames_rendered is not None:
+    requested_frames = df.get("requested_frames")
+    uniform_request = (
+        int(requested_frames.iloc[0])
+        if requested_frames is not None and not requested_frames.empty and requested_frames.nunique() == 1
+        else None
+    )
+
+    if uniform_request is not None:
         lines.append(
-            f"Rendered {iterations} iterations of {frames_rendered} frames ({block_ms:.2f} ms per block)"
+            f"Rendered {iterations} iterations of {uniform_request} frames ({block_ms:.2f} ms per block)"
+        )
+    elif total_frames_rendered is not None:
+        lines.append(
+            f"Rendered {iterations} iterations totalling {total_frames_rendered} frames ({block_ms:.2f} ms avg block)"
         )
     else:
         lines.append(f"Rendered {iterations} iterations (block {block_ms:.2f} ms)")
