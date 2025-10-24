@@ -1,5 +1,4 @@
 
-#include <ctype.h>
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -82,23 +81,10 @@ static void close_all_logs(void);
 #define AMP_UNLIKELY(x) (x)
 #endif
 
-/* Logging is opt-in: when compiled with AMP_NATIVE_ENABLE_LOGGING set
-   AMP_NATIVE_LOG to a truthy value to enable runtime instrumentation. */
-static int logging_mode_initialized = 0;
+/* Logging is opt-in: diagnostics remain disabled until explicitly enabled. */
 static int logging_mode_enabled = 0;
 
 static int amp_native_logging_enabled_internal(void) {
-    if (AMP_LIKELY(logging_mode_initialized)) {
-        return logging_mode_enabled;
-    }
-    if (!log_lock_initialized) LOG_LOCK_INIT();
-    LOG_LOCK();
-    if (!logging_mode_initialized) {
-        const char *env = getenv("AMP_NATIVE_LOG");
-        logging_mode_enabled = (env != NULL && env[0] != '\0' && env[0] != '0');
-        logging_mode_initialized = 1;
-    }
-    LOG_UNLOCK();
     return logging_mode_enabled;
 }
 
@@ -281,7 +267,6 @@ AMP_CAPI void amp_native_logging_set(int enabled) {
     if (!log_lock_initialized) LOG_LOCK_INIT();
     LOG_LOCK();
     logging_mode_enabled = normalised;
-    logging_mode_initialized = 1;
     LOG_UNLOCK();
     if (normalised) {
         ensure_log_files_open();

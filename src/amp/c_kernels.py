@@ -10,6 +10,8 @@ from __future__ import annotations
 import traceback
 from typing import Optional
 
+import os
+
 import numpy as np
 
 AVAILABLE = False
@@ -17,6 +19,11 @@ _impl = None
 UNAVAILABLE_REASON: str | None = None
 
 from pathlib import Path
+
+_DIAGNOSTIC_BUILD = os.environ.get("AMP_NATIVE_DIAGNOSTICS_BUILD", "")
+_EXTRA_COMPILE_ARGS: list[str] = []
+if _DIAGNOSTIC_BUILD.lower() in ("1", "true", "yes", "on"):
+    _EXTRA_COMPILE_ARGS.append("-DAMP_NATIVE_ENABLE_LOGGING")
 
 try:
     import cffi
@@ -188,6 +195,7 @@ try:
             '#include "amp_native.h"\n',
             sources=[str(kernels_source)],
             include_dirs=[str(include_dir)],
+            extra_compile_args=_EXTRA_COMPILE_ARGS,
         )
         # compile lazy; this will create a module in-place and return its path
         module_path = ffi.compile(verbose=False)
