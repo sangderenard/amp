@@ -123,3 +123,39 @@ struct OscillatorDesignBrief {
 
 }  // namespace amp::oscillator
 
+// Contract notes: concrete expectations between an "ideal" oscillator node
+// implementation and the AMP KPN runtime. These bullets translate design brief
+// goals into actionable requirements for node implementers and the runtime:
+//
+// - Forward/Backward: Each oscillator node must implement a forward-runtime
+//   behaviour (produce frames) and provide an optional reversible/adjoint
+//   interface for backward/differentiable workflows. The runtime currently
+//   exposes an opaque `state` pointer to support persistent integrator state.
+//
+// - Frame slices: The runtime may call nodes for single-frame slices (frames
+//   == 1) or multi-frame windows. Nodes MUST handle both modes. Inputs and
+//   outputs are organised (batch, channel, frame). For slice calls the provided
+//   `data` pointers will point to the first frame of the slice.
+//
+// - Oversampling and resampling: Oscillators that run at an internal
+//   oversampled rate must present a deterministic resampling/delay contract.
+//   When an oscillator down-samples to KPN network rate, it must declare its
+//   nominal delay and honour IPLS timing gates so downstream nodes see
+//   aligned frames.
+//
+// - Param modulation: Parameter tensors and modulation sources follow the
+//   same tensor conventions as audio (batch, channel, frame). Modulators are
+//   applied using add/multiply semantics; nodes should expose trusted hooks to
+//   accept pre-applied modulation tensors from the runtime when available.
+//
+// - Thermodynamic reporting: Oscillators must expose (via params or a
+//   documented side-channel) a scalar 'heat' contribution per frame so higher
+//   level scheduling may integrate thermal budgets. The runtime will consume
+//   this data if available—do not rely on its presence for correctness.
+//
+// - No Python fallback: Per project policy, production oscillator behaviour
+//   and tests must run through the native runtime. Tools or experiments may
+//   use higher-level languages for prototyping, but not for authoritative
+//   regression tests.
+
+

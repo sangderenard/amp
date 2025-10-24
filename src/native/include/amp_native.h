@@ -34,6 +34,56 @@ typedef struct {
     const double *data;
 } EdgeRunnerParamView;
 
+/*
+ * Node/oscillator contract (notes)
+ * --------------------------------
+ * The runtime and native node implementations (oscillators, gains, drivers)
+ * agree on the following expectations. These are documentation-only clarifications
+ * to make the API contract explicit for implementers of `amp_run_node` and
+ * oscillator-like nodes.
+ *
+ * - Per-frame invocation: The runtime currently drives nodes in an inner
+ *   frame loop (see graph_runtime.cpp) and commonly calls `amp_run_node` with
+ *   a single-frame slice (frames==1). Implementations SHOULD accept larger
+ *   `frames` values and behave correctly when batch-processing multiple frames
+ *   in a single call, but may assume callers will also call in single-frame
+ *   increments for deterministic scheduling.
+ *
+ * - Inputs layout: Audio and parameter views follow a (batch,channel,frame)
+ *   logical layout. For slice-based calls the `data` pointer refers to the
+ *   beginning of the frame slice and `frames` indicates how many frames are
+ *   available starting at that pointer. The runtime may provide audio with
+ *   channels aggregated across upstream sources (fan-in) and nodes must
+ *   respect the provided `channels` count.
+ *
+ * - Output contract: Nodes must allocate an output buffer (double*) using the
+ *   runtime allocator conventions (the runtime expects to call `amp_free` on
+ *   returned pointers). The `out_channels` out-parameter must be set to the
+ *   number of channels produced for the provided frame slice. The runtime will
+ *   copy per-frame outputs into its tensors and then free the buffer.
+ *
+ * - State handling: The `state` argument is an opaque pointer that the node
+ *   may read and replace. If the node modifies or replaces the state it should
+ *   return the new state via `*state`. The runtime will call `amp_release_state`
+ *   on any previous state pointer if it is replaced.
+ *
+ * - Control history: When provided, the `history` pointer offers time-indexed
+ *   control curves that nodes may sample for deterministic control-driven
+ *   modulation. Implementations should treat this object as read-only for the
+ *   duration of the `amp_run_node` call.
+ *
+ * - Modulation semantics: Modulation sources (passed through channels) are
+ *   presented as tensors with the same batch/frame layout as parameters. Nodes
+ *   should follow the runtime's modulation application rules: either add or
+ *   multiply (mode), support per-channel addressing and scaling, and honour
+ *   channel-indexing behaviour when the source has fewer channels than the
+ *   destination.
+ *
+ * - Performance: Node implementations should be vectorised where possible and
+ *   avoid per-sample allocation. The runtime expects low-latency execution and
+ *   will call nodes repeatedly in tight loops.
+ */
+
 typedef struct {
     uint32_t count;
     EdgeRunnerParamView *items;
