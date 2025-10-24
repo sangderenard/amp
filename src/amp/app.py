@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 
+import json
 import math
 import os
 import queue
 import sys
 import threading
 import time
+import wave
 from collections import deque
-from typing import Any, Callable, Optional, cast
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence, cast
 import traceback
 
 # Import the modular controller monitor
@@ -414,6 +417,88 @@ def build_base_params(
 from .config import DEFAULT_CONFIG_PATH, load_configuration
 
 
+def _write_headless_pcm(
+    path: Path,
+    chunks: Sequence[np.ndarray],
+    *,
+    sample_rate: float,
+) -> tuple[int, Path | None]:
+    """Persist captured PCM data to *path* and return frame count/metadata path."""
+
+    if not chunks:
+        raise ValueError("Headless render did not produce any PCM data")
+
+    arrays: list[np.ndarray] = []
+    expected_channels: int | None = None
+    for chunk in chunks:
+        array = np.asarray(chunk, dtype=np.float64)
+        if array.ndim != 2:
+            raise ValueError("PCM chunks must be 2D (channels x frames)")
+        if expected_channels is None:
+            expected_channels = int(array.shape[0])
+        elif array.shape[0] != expected_channels:
+            raise ValueError("PCM chunk channel count mismatch")
+        if array.size == 0:
+            continue
+        arrays.append(np.ascontiguousarray(array))
+
+    if not arrays:
+        raise ValueError("PCM chunks were empty")
+
+    data = np.concatenate(arrays, axis=1)
+    channels = int(data.shape[0])
+    frames = int(data.shape[1])
+    interleaved = data.T.reshape(-1).astype(np.dtype("<f4"), copy=False)
+
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    file_format = "raw"
+    dtype_name = "float32"
+
+    if path.suffix.lower() == ".wav":
+        file_format = "wav"
+        dtype_name = "int16"
+        # WAV containers expect integer PCM. Convert to signed 16-bit while
+        # preserving amplitude by clipping to the representable range.
+        wav_rate = int(round(sample_rate)) if sample_rate else 0
+        if wav_rate <= 0:
+            raise ValueError("Sample rate must be positive for WAV output")
+        pcm16 = np.clip(interleaved, -1.0, 1.0)
+        pcm16 = np.rint(pcm16 * 32767.0).astype(np.dtype("<i2"), copy=False)
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(wav_rate)
+            wav_file.writeframes(pcm16.tobytes())
+    else:
+        interleaved.tofile(path)
+
+    metadata = {
+        "sample_rate": float(sample_rate),
+        "channels": channels,
+        "frames": frames,
+        "dtype": dtype_name,
+        "layout": "interleaved",
+        "format": file_format,
+    }
+
+    try:
+        metadata_path = (
+            path.with_suffix(path.suffix + ".json")
+            if path.suffix
+            else path.with_suffix(".json")
+        )
+    except ValueError:
+        metadata_path = path.parent / f"{path.name}.json"
+
+    with metadata_path.open("w", encoding="utf-8") as meta_file:
+        json.dump(metadata, meta_file, indent=2, sort_keys=True)
+        meta_file.write("\n")
+
+    return frames, metadata_path
+
+
 def _run_headless_diagnostic(
     *,
     config_path: str,
@@ -422,6 +507,9 @@ def _run_headless_diagnostic(
     warmup: int | None,
     batch_blocks: int | None,
     ema_alpha: float | None,
+    joystick_mode: str | None,
+    joystick_script_path: str | None,
+    pcm_output_path: str | None,
 ) -> int:
     cfg = load_configuration(config_path)
     frames = int(frames_override) if frames_override is not None else int(cfg.runtime.frames_per_chunk)
@@ -447,6 +535,44 @@ def _run_headless_diagnostic(
         STATUS_PRINTER.flush()
         return 1
 
+    joystick_mode = (joystick_mode or "switch").strip().lower()
+    if joystick_mode not in {"switch", "axis"}:
+        STATUS_PRINTER.emit(
+            "Headless joystick mode must be 'switch' or 'axis'",
+            force=True,
+        )
+        STATUS_PRINTER.flush()
+        return 1
+
+    script_path = Path(joystick_script_path) if joystick_script_path else None
+    if script_path and not script_path.is_file():
+        STATUS_PRINTER.emit(f"Headless joystick script not found: {script_path}", force=True)
+        STATUS_PRINTER.flush()
+        return 1
+
+    pcm_path = Path(pcm_output_path).expanduser() if pcm_output_path else None
+    sample_rate = float(cfg.sample_rate)
+
+    pcm_chunks: list[np.ndarray] = []
+
+    def _capture_pcm(_timestamp: float, buffer: np.ndarray, sr: float) -> None:
+        if not np.isfinite(buffer).all():
+            raise ValueError("PCM buffer contains non-finite values")
+        array = np.asarray(buffer, dtype=np.float64)
+        if array.ndim == 3 and array.shape[0] == 1:
+            array = array[0]
+        elif array.ndim != 2:
+            raise ValueError(
+                f"Unsupported audio block shape {array.shape!r}; expected (channels, frames)"
+            )
+        if not np.isclose(sr, sample_rate):
+            raise ValueError(
+                f"PCM callback reported sample_rate {sr}, expected {sample_rate}"
+            )
+        pcm_chunks.append(np.ascontiguousarray(array, dtype=np.float64))
+
+    pcm_consumer = _capture_pcm if pcm_path is not None else None
+
     from .system import (
         benchmark_default_graph,
         require_native_graph_runtime,
@@ -463,16 +589,38 @@ def _run_headless_diagnostic(
     timeline = benchmark_default_graph(
         frames=frames,
         iterations=iterations,
-        sample_rate=float(cfg.sample_rate),
+        sample_rate=sample_rate,
         ema_alpha=ema_alpha,
         warmup=max(0, min(warmup, iterations)),
-        joystick_mode="switch",
-        joystick_script_path=None,
+        joystick_mode=joystick_mode,
+        joystick_script_path=script_path,
         batch_blocks=batch_blocks,
+        pcm_consumer=pcm_consumer,
     )
 
     for line in summarise_benchmark_timeline(timeline, ema_alpha=ema_alpha):
         STATUS_PRINTER.emit(line, force=True)
+
+    if pcm_path is not None:
+        try:
+            frames_written, metadata_path = _write_headless_pcm(
+                pcm_path,
+                pcm_chunks,
+                sample_rate=sample_rate,
+            )
+        except Exception as exc:
+            STATUS_PRINTER.emit(f"Failed to write headless PCM: {exc}", force=True)
+            STATUS_PRINTER.flush()
+            return 1
+
+        duration_seconds = frames_written / sample_rate if sample_rate else 0.0
+        STATUS_PRINTER.emit(
+            f"Saved {frames_written} frames ({duration_seconds:.3f} s) to {pcm_path}",
+            force=True,
+        )
+        if metadata_path is not None:
+            STATUS_PRINTER.emit(f"PCM metadata written to {metadata_path}", force=True)
+
     STATUS_PRINTER.flush()
     return 0
 
@@ -546,6 +694,9 @@ def run(
     headless_warmup: int | None = None,
     headless_batch: int | None = None,
     headless_alpha: float | None = None,
+    headless_output: str | None = None,
+    headless_joystick_mode: str | None = None,
+    headless_joystick_script: str | None = None,
 ) -> int:
     """Launch the synthesiser.
 
@@ -563,6 +714,17 @@ def run(
     config_path:
         Optional configuration override used when the application needs to
         fall back to a summary render (for example when pygame is unavailable).
+    headless_output:
+        Optional file path that receives the rendered audio stream when running
+        in headless mode.  Paths ending in ``.wav`` are written as 16-bit WAV
+        files; other suffixes receive raw float32 little-endian frames
+        interleaved per channel.
+    headless_joystick_mode:
+        Overrides the virtual joystick performer style used during headless
+        runs (``"switch"`` or ``"axis"``).
+    headless_joystick_script:
+        Path to a JSON automation script applied to the virtual joystick when
+        running headlessly.
     """
 
     cfg_path = config_path or str(DEFAULT_CONFIG_PATH)
@@ -608,6 +770,9 @@ def run(
             warmup=headless_warmup,
             batch_blocks=headless_batch,
             ema_alpha=headless_alpha,
+            joystick_mode=headless_joystick_mode,
+            joystick_script_path=headless_joystick_script,
+            pcm_output_path=headless_output,
         )
 
     # Attach a run identifier to correlate logs and diagnostics across files

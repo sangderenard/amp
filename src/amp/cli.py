@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip initialising audio output (useful in CI or debugging)",
     )
     parser.add_argument(
-        "--headless",
+        "--headless", 
         action="store_true",
         help="Render the configured graph without launching the interactive UI",
     )
@@ -52,6 +52,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="EMA smoothing factor for headless diagnostics (0-1)",
     )
+    parser.add_argument(
+        "--headless-output",
+        type=Path,
+        help=(
+            "Optional path to write rendered audio. Paths ending in .wav are"
+            " written as 16-bit WAV; other suffixes receive raw float32"
+            " frames (little-endian)."
+        ),
+    )
+    parser.add_argument(
+        "--headless-joystick-mode",
+        choices=("switch", "axis"),
+        help="Select the virtual joystick style used during headless runs",
+    )
+    parser.add_argument(
+        "--headless-joystick-script",
+        type=Path,
+        help="Path to a JSON script describing virtual joystick automation",
+    )
     return parser
 
 
@@ -71,6 +90,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         headless_warmup=args.headless_warmup,
         headless_batch=args.headless_batch,
         headless_alpha=args.headless_alpha,
+        headless_output=str(args.headless_output) if args.headless_output else None,
+        headless_joystick_mode=args.headless_joystick_mode,
+        headless_joystick_script=str(args.headless_joystick_script)
+        if args.headless_joystick_script
+        else None,
     )
 
 
