@@ -150,8 +150,10 @@ struct OscillatorDesignBrief {
 //
 // - Thermodynamic reporting: Oscillators must expose (via params or a
 //   documented side-channel) a scalar 'heat' contribution per frame so higher
-//   level scheduling may integrate thermal budgets. The runtime will consume
-//   this data if available—do not rely on its presence for correctness.
+//   level scheduling may integrate thermal budgets. Prefer binding this to the
+//   reserved `thermo.heat` parameter name so the runtime can surface it without
+//   additional negotiation. The runtime will consume this data if available—do
+//   not rely on its presence for correctness.
 //
 // - No Python fallback: Per project policy, production oscillator behaviour
 //   and tests must run through the native runtime. Tools or experiments may
