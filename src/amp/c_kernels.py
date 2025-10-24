@@ -230,6 +230,7 @@ try:
                     if insert_marker not in src:
                         continue
                     helper = '''
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
 // Injected generated-wrapper logger
 extern void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b);
 static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
@@ -240,6 +241,10 @@ static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
 #endif
     amp_log_generated(fn, py_ts, a, b);
 }
+#define AMP_GEN_WRAPPER_LOG(fn, a, b) _gen_wrapper_log((fn), (a), (b))
+#else
+#define AMP_GEN_WRAPPER_LOG(fn, a, b) ((void)0)
+#endif
 '''
                     src = src.replace(insert_marker, insert_marker + "\n" + helper)
 
@@ -260,7 +265,7 @@ static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
                         brace = src.find('{', idx)
                         if brace == -1:
                             continue
-                        injection = f'\n    _gen_wrapper_log("{name}", (size_t)0, (size_t)0);\n'
+                        injection = f'\n    AMP_GEN_WRAPPER_LOG("{name}", (size_t)0, (size_t)0);\n'
                         src = src[:brace+1] + injection + src[brace+1:]
 
                     gen_c.write_text(src, encoding="utf-8")
