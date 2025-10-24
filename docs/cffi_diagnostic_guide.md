@@ -32,13 +32,17 @@ The instrumentation hooks in `src/native/amp_kernels.c` and
 `src/native/graph_runtime.c` are compiled out by default so the production build
 stays fast.  To opt into native logging:
 
-1. Build the C sources with `-DAMP_NATIVE_ENABLE_LOGGING` so the logging code is
-   included in the resulting binary.
-2. Set the environment variable `AMP_NATIVE_LOG=1` (or any non-zero, non-empty
-   value) when running the instrumented binary to activate the log sinks.
+1. Set the environment variable `AMP_NATIVE_DIAGNOSTICS_BUILD=1` (or "true",
+   "yes", "on") before importing the modules so the CFFI builders compile the
+   native extensions with `-DAMP_NATIVE_ENABLE_LOGGING` and include the logging
+   hooks in the resulting binaries.
+2. Call `amp_native_logging_set(1)` on the compiled runtime (or
+   `amp.diagnostics.enable_py_c_logging(True)` from Python) to activate the log
+   sinks.  The runtime ships with logging hard-disabled, so no files are opened
+   until an explicit opt-in occurs.
 
-Without the compile-time flag the logging hooks are hard-disabled, even if the
-environment variable is present.
+Without the compile-time flag the logging hooks are hard-disabled regardless of
+any runtime toggles.
 
 The interplay between these layers means crashes can stem from descriptor drift,
 control-history mismatches, or the CFFI module itself; the diagnostics described

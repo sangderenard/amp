@@ -16,7 +16,16 @@ def enable_py_c_logging(enabled: bool) -> None:
     """Enable or disable logging of Python/C bridge activity."""
 
     global _LOG_PY_C_CALLS
-    _LOG_PY_C_CALLS = bool(enabled)
+    flag = bool(enabled)
+    _LOG_PY_C_CALLS = flag
+    try:
+        from . import native_runtime
+    except Exception:
+        return
+    try:
+        native_runtime.set_native_logging_enabled(flag)
+    except Exception:
+        return
 
 
 def py_c_logging_enabled() -> bool:

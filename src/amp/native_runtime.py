@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import math
+import os
 import sys
 import threading
-import math
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -14,6 +15,11 @@ from .utils import lanczos_resample
 AVAILABLE = False
 _IMPL = None
 UNAVAILABLE_REASON: str | None = None
+
+_DIAGNOSTIC_BUILD = os.environ.get("AMP_NATIVE_DIAGNOSTICS_BUILD", "")
+_EXTRA_COMPILE_ARGS: list[str] = []
+if _DIAGNOSTIC_BUILD.lower() in ("1", "true", "yes", "on"):
+    _EXTRA_COMPILE_ARGS.append("-DAMP_NATIVE_ENABLE_LOGGING")
 
 _CDEF = """
 typedef unsigned char uint8_t;
@@ -53,6 +59,8 @@ int amp_graph_runtime_execute(
 void amp_graph_runtime_buffer_free(double *buffer);
 AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
 void amp_graph_history_destroy(AmpGraphControlHistory *history);
+int amp_native_logging_enabled(void);
+void amp_native_logging_set(int enabled);
 """
 
 
@@ -74,6 +82,7 @@ def _build_impl() -> tuple["cffi.FFI", object]:
         '#include "amp_native.h"\n',
         sources=[str(kernels_source), str(runtime_source)],
         include_dirs=[str(include_dir)],
+        extra_compile_args=_EXTRA_COMPILE_ARGS,
     )
     module_path = ffi.compile(verbose=False)
     compiled_path = Path(module_path)
@@ -123,6 +132,22 @@ def get_graph_runtime_impl() -> tuple["cffi.FFI", object]:
     """Return the (ffi, lib) pair for the native graph runtime."""
 
     return _load_impl()
+
+
+def set_native_logging_enabled(enabled: bool) -> None:
+    """Propagate the bridge logging preference to the native runtime."""
+
+    try:
+        _, lib = _load_impl()
+    except Exception:
+        return
+    setter = getattr(lib, "amp_native_logging_set", None)
+    if setter is None:
+        return
+    try:
+        setter(1 if enabled else 0)
+    except Exception:
+        return
 
 
 class NativeGraphExecutor:
