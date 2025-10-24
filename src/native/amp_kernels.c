@@ -51,6 +51,7 @@ AMP_CAPI size_t amp_last_alloc_count_get(void) {
  */
 /* Persistent log file handles. Lazily opened on first use so builds that run
    in read-only or log-less environments can continue without crashing. */
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
 static FILE *log_f_alloc = NULL;
 static FILE *log_f_memops = NULL;
 static FILE *log_f_ccalls = NULL;
@@ -81,7 +82,8 @@ static void close_all_logs(void);
 #define AMP_UNLIKELY(x) (x)
 #endif
 
-/* Logging is opt-in: set AMP_NATIVE_LOG to a truthy value to enable. */
+/* Logging is opt-in: when compiled with AMP_NATIVE_ENABLE_LOGGING set
+   AMP_NATIVE_LOG to a truthy value to enable runtime instrumentation. */
 static int logging_mode_initialized = 0;
 static int logging_mode_enabled = 0;
 
@@ -606,6 +608,71 @@ static void *_dbg_memset(void *s_ptr, int c, size_t n, const char *file, int lin
 #define memcpy(d,s,n) _dbg_memcpy((d),(s),(n), __FILE__, __LINE__, __func__)
 #define memset(p,c,n) _dbg_memset((p),(c),(n), __FILE__, __LINE__, __func__)
 
+#define AMP_LOG_NATIVE_CALL(fn, a, b) _log_native_call((fn), (a), (b))
+#define AMP_LOG_GENERATED(fn, a, b) _gen_wrapper_log((fn), (a), (b))
+
+#else  /* !AMP_NATIVE_ENABLE_LOGGING */
+
+static inline int amp_native_logging_enabled_internal(void) {
+    return 0;
+}
+
+AMP_CAPI int amp_native_logging_enabled(void) {
+    return 0;
+}
+
+static inline void ensure_log_files_open(void) {
+    (void)0;
+}
+
+static inline void close_all_logs(void) {
+    (void)0;
+}
+
+static inline void _log_native_call(const char *fn, size_t a, size_t b) {
+    (void)fn;
+    (void)a;
+    (void)b;
+}
+
+static inline void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
+    (void)fn;
+    (void)a;
+    (void)b;
+}
+
+AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b) {
+    (void)fn;
+    (void)py_ts;
+    (void)a;
+    (void)b;
+}
+
+#define log_f_alloc ((FILE *)0)
+#define log_f_memops ((FILE *)0)
+#define log_f_ccalls ((FILE *)0)
+#define log_f_cgenerated ((FILE *)0)
+
+static inline void register_alloc(void *ptr, size_t size) {
+    (void)ptr;
+    (void)size;
+}
+
+static inline void unregister_alloc(void *ptr) {
+    (void)ptr;
+}
+
+AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
+    (void)fn;
+    (void)a;
+    (void)b;
+}
+
+#define AMP_LOG_NATIVE_CALL(fn, a, b) ((void)0)
+#define AMP_LOG_GENERATED(fn, a, b) ((void)0)
+
+#endif /* AMP_NATIVE_ENABLE_LOGGING */
+
 static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     if (plan == NULL) {
         return;
@@ -658,8 +725,8 @@ AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
     const uint8_t *plan_blob,
     size_t plan_len
 ) {
-    _log_native_call("amp_load_compiled_plan", descriptor_len, plan_len);
-    _gen_wrapper_log("amp_load_compiled_plan", (size_t)descriptor_blob, (size_t)plan_blob);
+    AMP_LOG_NATIVE_CALL("amp_load_compiled_plan", descriptor_len, plan_len);
+    AMP_LOG_GENERATED("amp_load_compiled_plan", (size_t)descriptor_blob, (size_t)plan_blob);
     if (descriptor_blob == NULL || plan_blob == NULL) {
         return NULL;
     }
@@ -794,8 +861,8 @@ AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
 }
 
 AMP_CAPI void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
-    _log_native_call("amp_release_compiled_plan", (size_t)(plan != NULL), 0);
-    _gen_wrapper_log("amp_release_compiled_plan", (size_t)plan, 0);
+    AMP_LOG_NATIVE_CALL("amp_release_compiled_plan", (size_t)(plan != NULL), 0);
+    AMP_LOG_GENERATED("amp_release_compiled_plan", (size_t)plan, 0);
     destroy_compiled_plan(plan);
 }
 
@@ -883,8 +950,8 @@ AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
     size_t blob_len,
     int frames_hint
 ) {
-    _log_native_call("amp_load_control_history", blob_len, (size_t)frames_hint);
-    _gen_wrapper_log("amp_load_control_history", (size_t)blob, (size_t)frames_hint);
+    AMP_LOG_NATIVE_CALL("amp_load_control_history", blob_len, (size_t)frames_hint);
+    AMP_LOG_GENERATED("amp_load_control_history", (size_t)blob, (size_t)frames_hint);
     if (blob == NULL || blob_len < 8) {
         return NULL;
     }
@@ -997,8 +1064,8 @@ AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
 }
 
 AMP_CAPI void amp_release_control_history(EdgeRunnerControlHistory *history) {
-    _log_native_call("amp_release_control_history", (size_t)(history != NULL), 0);
-    _gen_wrapper_log("amp_release_control_history", (size_t)history, 0);
+    AMP_LOG_NATIVE_CALL("amp_release_control_history", (size_t)(history != NULL), 0);
+    AMP_LOG_GENERATED("amp_release_control_history", (size_t)history, 0);
     destroy_control_history(history);
 }
 
@@ -3813,7 +3880,7 @@ AMP_CAPI int amp_run_node(
     void **state,
     const EdgeRunnerControlHistory *history
 ) {
-    _log_native_call("amp_run_node", (size_t)batches, (size_t)frames);
+    AMP_LOG_NATIVE_CALL("amp_run_node", (size_t)batches, (size_t)frames);
     (void)channels;
     if (out_buffer == NULL || out_channels == NULL) {
         return -1;
@@ -3887,16 +3954,16 @@ AMP_CAPI int amp_run_node(
 }
 
 AMP_CAPI void amp_free(double *buffer) {
-    _log_native_call("amp_free", (size_t)(buffer != NULL), 0);
-    _gen_wrapper_log("amp_free", (size_t)buffer, 0);
+    AMP_LOG_NATIVE_CALL("amp_free", (size_t)(buffer != NULL), 0);
+    AMP_LOG_GENERATED("amp_free", (size_t)buffer, 0);
     if (buffer != NULL) {
         free(buffer);
     }
 }
 
 AMP_CAPI void amp_release_state(void *state_ptr) {
-    _log_native_call("amp_release_state", (size_t)(state_ptr != NULL), 0);
-    _gen_wrapper_log("amp_release_state", (size_t)state_ptr, 0);
+    AMP_LOG_NATIVE_CALL("amp_release_state", (size_t)(state_ptr != NULL), 0);
+    AMP_LOG_GENERATED("amp_release_state", (size_t)state_ptr, 0);
     if (state_ptr == NULL) {
         return;
     }
