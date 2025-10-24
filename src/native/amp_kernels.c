@@ -224,16 +224,21 @@ static void capture_stack_frames(void **out_frames, unsigned short *out_count);
 static void dump_alloc_backtrace(FILE *g, struct alloc_rec *r);
 
 static void close_all_logs(void) {
-    if (!amp_native_logging_enabled_internal()) {
-        return;
-    }
     if (!log_lock_initialized) LOG_LOCK_INIT();
     LOG_LOCK();
-    if (log_f_alloc) { fflush(log_f_alloc); fclose(log_f_alloc); log_f_alloc = NULL; }
-    if (log_f_memops) { fflush(log_f_memops); fclose(log_f_memops); log_f_memops = NULL; }
-    if (log_f_ccalls) { fflush(log_f_ccalls); fclose(log_f_ccalls); log_f_ccalls = NULL; }
-    if (log_f_cgenerated) { fflush(log_f_cgenerated); fclose(log_f_cgenerated); log_f_cgenerated = NULL; }
+    FILE *alloc_handle = log_f_alloc;
+    FILE *memops_handle = log_f_memops;
+    FILE *ccalls_handle = log_f_ccalls;
+    FILE *cgen_handle = log_f_cgenerated;
+    log_f_alloc = NULL;
+    log_f_memops = NULL;
+    log_f_ccalls = NULL;
+    log_f_cgenerated = NULL;
     LOG_UNLOCK();
+    if (alloc_handle) { fflush(alloc_handle); fclose(alloc_handle); }
+    if (memops_handle) { fflush(memops_handle); fclose(memops_handle); }
+    if (ccalls_handle) { fflush(ccalls_handle); fclose(ccalls_handle); }
+    if (cgen_handle) { fflush(cgen_handle); fclose(cgen_handle); }
 }
 
 /* Exported helper for other compilation units to emit generated-wrapper logs
@@ -266,6 +271,21 @@ AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
     fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
 #endif
     fflush(log_f_ccalls);
+}
+
+AMP_CAPI void amp_native_logging_set(int enabled) {
+    int normalised = enabled ? 1 : 0;
+    if (!normalised) {
+        close_all_logs();
+    }
+    if (!log_lock_initialized) LOG_LOCK_INIT();
+    LOG_LOCK();
+    logging_mode_enabled = normalised;
+    logging_mode_initialized = 1;
+    LOG_UNLOCK();
+    if (normalised) {
+        ensure_log_files_open();
+    }
 }
 
 /* Dump a compact snapshot of the live allocation registry to the given file.
@@ -666,6 +686,10 @@ AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
     (void)fn;
     (void)a;
     (void)b;
+}
+
+AMP_CAPI void amp_native_logging_set(int enabled) {
+    (void)enabled;
 }
 
 #define AMP_LOG_NATIVE_CALL(fn, a, b) ((void)0)
