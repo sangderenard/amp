@@ -34,8 +34,8 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Phase 4 — ABI Extension Design (Planning Only)
 - **Goal**: Prepare a design proposal for declared delay metadata, oversampling hints, and backward execution.
 - **Tasks**:
-  - Draft `docs/abi_extension_proposal.md` outlining `amp_run_node_v2`, execution-mode enums, optional side-channel structures, and plan-blob schema updates.【F:docs/kpn_development_guidance.md†L5-L44】
-  - Include migration/compatibility strategy and test plan.
+  - ✅ Drafted `docs/abi_extension_proposal.md` outlining `amp_run_node_v2`, execution-mode enums, optional side-channel structures, and plan-blob schema updates.【F:docs/kpn_development_guidance.md†L5-L44】【F:docs/abi_extension_proposal.md†L1-L167】
+  - ✅ Included migration/compatibility strategy and test plan.【F:docs/abi_extension_proposal.md†L89-L152】
 - **Delegation prompt**:
   ```text
   Create docs/abi_extension_proposal.md describing amp_run_node_v2 with forward/adjoint modes, plan blob extensions for declared delays and oversample ratios, and a rollout plan that keeps amp_run_node available for legacy nodes.
@@ -76,7 +76,7 @@ This document sequences the work required to align the AMP native KPN runtime, o
 - [x] Audit findings documented (`docs/kpn_audit_findings.md`).
 - [x] Contract markdown published and cross-referenced.
 - [x] Runtime shape validation + thermo test implemented.【F:src/native/graph_runtime.cpp†L906-L955】【F:src/native/tests/test_thermo_param.cpp†L1-L200】【F:docs/kpn_contract.md†L1-L120】【F:src/native/include/oscillator_design_notes.h†L1-L160】
-- [ ] ABI extension proposal ready for review.
+- [x] ABI extension proposal ready for review.【F:docs/abi_extension_proposal.md†L1-L167】
 - [ ] ABI extension implemented (post-approval).
 - [ ] CI workflows enforcing native test coverage.
 - [ ] Performance benchmarks and monitoring notes delivered.
