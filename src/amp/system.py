@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Callable, Dict, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -50,11 +50,14 @@ def benchmark_default_graph(
     joystick_mode: str,
     joystick_script_path,
     batch_blocks: int = 1,
+    pcm_consumer: Callable[[float, np.ndarray, float], None] | None = None,
 ) -> pd.DataFrame:
     """Run the default graph headlessly using a virtual controller.
 
     Returns a pandas DataFrame matching the shape produced by the original
-    script-based benchmark helper.
+    script-based benchmark helper. When *pcm_consumer* is supplied it receives
+    ``(timestamp, audio_block, sample_rate)`` for every rendered block prior to
+    timeline analysis.
     """
 
     require_native_graph_runtime()
@@ -253,6 +256,8 @@ def benchmark_default_graph(
             amp_mod_names,
             control_cache,
         )
+        if pcm_consumer is not None:
+            pcm_consumer(block_start_time, audio_block, sample_rate)
         block_end_time_wall = time.perf_counter()
 
         render_duration = block_end_time_wall - render_start_wall

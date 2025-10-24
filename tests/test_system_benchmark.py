@@ -1,6 +1,7 @@
 import copy
 
 import pandas as pd
+import numpy as np
 import pytest
 
 pytest.importorskip("cffi")
@@ -92,3 +93,37 @@ def test_benchmark_uses_interactive_graph_without_python_fallback(monkeypatch):
 
     runner = graph._ensure_edge_runner()
     assert runner.python_fallback_summary() == {}
+
+
+@pytest.mark.skipif(not c_kernels.AVAILABLE, reason="C kernels unavailable")
+@pytest.mark.skipif(not native_runtime.AVAILABLE, reason="Native runtime unavailable")
+def test_benchmark_invokes_pcm_consumer():
+    captured: list[tuple[float, np.ndarray, float]] = []
+
+    def _pcm_consumer(timestamp: float, block: np.ndarray, sample_rate: float) -> None:
+        captured.append((timestamp, np.asarray(block).copy(), float(sample_rate)))
+
+    df = benchmark_default_graph(
+        frames=32,
+        iterations=1,
+        sample_rate=44100.0,
+        ema_alpha=0.05,
+        warmup=0,
+        joystick_mode="switch",
+        joystick_script_path=None,
+        batch_blocks=1,
+        pcm_consumer=_pcm_consumer,
+    )
+
+    assert isinstance(df, pd.DataFrame)
+    assert captured, "PCM consumer did not receive any buffers"
+    timestamp, block, sr = captured[0]
+    assert isinstance(timestamp, float)
+    assert sr == pytest.approx(44100.0)
+    assert isinstance(block, np.ndarray)
+    assert block.ndim in (2, 3)
+    if block.ndim == 3:
+        assert block.shape[0] == 1
+        block = block[0]
+    assert block.shape[0] > 0
+    assert block.shape[1] == 32
