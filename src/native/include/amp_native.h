@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #if defined(_WIN32) || defined(_WIN64)
 #  define AMP_CAPI __declspec(dllexport)
 #else
@@ -227,5 +231,9 @@ AMP_CAPI int amp_graph_runtime_execute(
 AMP_CAPI void amp_graph_runtime_buffer_free(double *buffer);
 AMP_CAPI AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
 AMP_CAPI void amp_graph_history_destroy(AmpGraphControlHistory *history);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AMP_NATIVE_H */

@@ -4,3 +4,5 @@ __pycache__/
 _amp_ckernels_cffi.*
 logs/
 Release/
+src/native/build/
+workspace/

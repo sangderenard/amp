@@ -11,31 +11,35 @@ treated as hard failures rather than silently falling back to Python.
 ## Runtime build pipeline
 
 1. **Kernel scaffolding** – `src/native/amp_kernels.c` and
-   `src/native/graph_runtime.c` hold the DSP kernels and runtime glue.  The
-   Python module `src/amp/c_kernels.py` builds an `_amp_ckernels_cffi` extension
-   on import via `ffi.set_source(...)` with those sources and `ffi.compile(...)`,
-   then copies the generated `.c` file and shared library back into the
-   repository so they can be inspected when compilation succeeds.
+   `src/native/graph_runtime.cpp` contain the DSP kernels and the Kahn process
+   network runtime.  The shared library (`libamp_native.*`) is produced by the
+   CMake project in `src/native/` and can be built entirely outside Python.
+   Initialise the `third_party/eigen` submodule before configuring the build;
+   the project refuses to compile if the headers are missing.  Python only
+   drives the build when no binary is available (or when an override requests a
+   rebuild) and never falls back to a Python executor.
 2. **Graph specialisation** – `AudioGraph.render_block` serialises the Python
    graph into descriptors (`serialize_node_descriptors`) and a compiled plan
    (`serialize_compiled_plan`).  These blobs describe the node ordering,
    parameter shapes, and modulation wiring that the native runtime executes.
 3. **Native execution** – During each render the graph exports a
    control-history blob (`ControlDelay.export_control_history_blob`) and hands
-   that, together with the compiled plan, to the `NativeGraphExecutor`.  Failures
-   at this stage usually manifest as heap corruption or segmentation faults
-   inside the generated C.
+   that, together with the compiled plan, to the `NativeGraphExecutor`.  The
+   executor loads the standalone CMake-built library via CFFI and refuses to
+   proceed if the binary is missing, keeping Python fallbacks strictly
+   forbidden.  Failures at this stage usually manifest as heap corruption or
+   segmentation faults inside the native code.
 
 ## Native logging instrumentation
 
 The instrumentation hooks in `src/native/amp_kernels.c` and
-`src/native/graph_runtime.c` are compiled out by default so the production build
+`src/native/graph_runtime.cpp` are compiled out by default so the production build
 stays fast.  To opt into native logging:
 
 1. Set the environment variable `AMP_NATIVE_DIAGNOSTICS_BUILD=1` (or "true",
-   "yes", "on") before importing the modules so the CFFI builders compile the
-   native extensions with `-DAMP_NATIVE_ENABLE_LOGGING` and include the logging
-   hooks in the resulting binaries.
+   "yes", "on") before importing the modules so the CMake build enables the
+   `AMP_NATIVE_ENABLE_LOGGING` option and includes the logging hooks in the
+   resulting binaries.
 2. Call `amp_native_logging_set(1)` on the compiled runtime (or
    `amp.diagnostics.enable_py_c_logging(True)` from Python) to activate the log
    sinks.  The runtime ships with logging hard-disabled, so no files are opened
