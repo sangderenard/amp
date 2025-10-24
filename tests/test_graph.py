@@ -5,8 +5,8 @@ import pytest
 
 from amp import nodes
 from amp.application import SynthApplication
-from amp.config import AppConfig, GraphConfig, NodeConfig, ConnectionConfig, RuntimeConfig
-from amp.graph import RAW_DTYPE, AudioGraph
+from amp.config import AppConfig, ConnectionConfig, GraphConfig, NodeConfig, RuntimeConfig
+from amp.graph import AudioGraph
 
 
 def simple_config() -> AppConfig:

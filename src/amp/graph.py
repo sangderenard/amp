@@ -1176,9 +1176,9 @@ class AudioGraph:
         audio_cursor = 0
         for function_id, entry in enumerate(plan):
             name_bytes = entry.name.encode("utf-8")
+            audio_span = len(entry.audio_inputs)
             audio_offset = audio_cursor
-            audio_span = 1
-            audio_cursor += 1
+            audio_cursor += audio_span
             param_count = len(entry.mod_groups)
             payload.extend(
                 struct.pack(
@@ -1194,16 +1194,17 @@ class AudioGraph:
             param_cursor = 0
             for group in entry.mod_groups:
                 param_bytes = group.param.encode("utf-8")
+                span = len(group.connections)
                 payload.extend(
                     struct.pack(
                         "<III",
                         len(param_bytes),
                         int(param_cursor),
-                        0,
+                        int(span),
                     )
                 )
                 payload.extend(param_bytes)
-                param_cursor += 1
+                param_cursor += span
         return bytes(payload)
 
     @property
