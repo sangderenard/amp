@@ -1,4 +1,4 @@
-# CFFI Runtime Diagnostic Reference
+# Native Runtime Diagnostic Reference
 
 This document captures the current structure of AMP's dynamically generated C
 runtime and the places where segmentation faults usually appear.  The goal is to
@@ -16,15 +16,15 @@ treated as hard failures rather than silently falling back to Python.
    on import via `ffi.set_source(...)` with those sources and `ffi.compile(...)`,
    then copies the generated `.c` file and shared library back into the
    repository so they can be inspected when compilation succeeds.
-2. **Graph specialisation** – `AudioGraph.render_block` asks
-   `graph_edge_runner.CffiEdgeRunner` to serialise the Python graph into static
-   descriptors (`serialize_node_descriptors`) and a compiled plan.  The runner
-   is responsible for loading `_amp_ckernels_cffi`, allocating C-ready buffers,
-   and marshalling parameters before calling `amp_run_node` for each node.
-3. **Native execution** – During each render the graph exports a control-history
-   blob (`ControlDelay.export_control_history_blob`) and hands that, together
-   with the compiled plan, to the C entry point.  Failures at this stage usually
-   manifest as heap corruption or segmentation faults inside the generated C.
+2. **Graph specialisation** – `AudioGraph.render_block` serialises the Python
+   graph into descriptors (`serialize_node_descriptors`) and a compiled plan
+   (`serialize_compiled_plan`).  These blobs describe the node ordering,
+   parameter shapes, and modulation wiring that the native runtime executes.
+3. **Native execution** – During each render the graph exports a
+   control-history blob (`ControlDelay.export_control_history_blob`) and hands
+   that, together with the compiled plan, to the `NativeGraphExecutor`.  Failures
+   at this stage usually manifest as heap corruption or segmentation faults
+   inside the generated C.
 
 The interplay between these layers means crashes can stem from descriptor drift,
 control-history mismatches, or the CFFI module itself; the diagnostics described
@@ -37,7 +37,7 @@ It samples controller history (`AudioGraph.sample_control_tensor`), builds the
 parameter block with `app.build_base_params`, then calls
 `AudioGraph.render_block`.  That method records the window of control history it
 is about to hand to C, writes `logs/last_control_blob.bin` and
-`logs/last_control_blob.json`, and finally invokes the `CffiEdgeRunner`.  Any
+`logs/last_control_blob.json`, and finally invokes the native runtime.  Any
 mismatch between the control blob and the compiled plan is a likely source of
 native crashes; the JSON metadata captures the time window and descriptor sizes
 involved so regressions can be reproduced.
@@ -56,16 +56,16 @@ python scripts/graph_runtime_diagnostic.py --blocks 4 --dump-dir logs/native_deb
 
 The script will:
 
-- drive the real control-delay path with zeroed joystick curves so the CFFI
-  runner still sees canonical history data;
+- drive the real control-delay path with zeroed joystick curves so the native
+  runtime still sees canonical history data;
 - persist each rendered PCM block as `block_XXX.npy` for numerical comparison;
 - copy the generated `_amp_ckernels_cffi.c` (when present), write the serialized
   node descriptors and compiled plan, and emit a JSON summary.
 
 Because this harness uses the shared modules (`build_runtime_graph`,
-`render_audio_block`, and `CffiEdgeRunner`) it surfaces the same segmentation
-faults as the interactive UI while making the compilation artifacts easy to
-inspect.
+`render_audio_block`, and `NativeGraphExecutor`) it surfaces the same
+segmentation faults as the interactive UI while making the compilation artifacts
+easy to inspect.
 
 ## Triage checklist when C crashes persist
 

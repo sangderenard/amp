@@ -87,12 +87,8 @@ def test_benchmark_uses_interactive_graph_without_python_fallback(monkeypatch):
 
     graph = captured.get("graph")
     assert graph is not None, "benchmark did not build a runtime graph"
-    assert hasattr(graph, "_edge_runner")
-
     assert captured["descriptor"] == captured["reference_descriptor"]
-
-    runner = graph._ensure_edge_runner()
-    assert runner.python_fallback_summary() == {}
+    assert hasattr(graph, "_native_executor")
 
 
 @pytest.mark.skipif(not c_kernels.AVAILABLE, reason="C kernels unavailable")

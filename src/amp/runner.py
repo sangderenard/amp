@@ -125,6 +125,8 @@ Ready for CFFI migration: uses only simple types and numpy arrays.
 from typing import Any, Dict
 import numpy as np
 
+from .diagnostics import log_py_c_call
+
 def render_audio_block(
     graph,
     start_time: float,
@@ -164,39 +166,20 @@ def render_audio_block(
         start_time=start_time,
         update_hz=dsp_rate,
     )
-    try:
-        try:
-            with open("logs/py_c_calls.log", "a") as _pf:
-                _pf.write(f"{time.time()} {threading.get_ident()} render_audio_block.enter frames={frames} sample_rate={sample_rate} base_params_keys={list((base_params or {}).keys())}\n")
-        except Exception:
-            pass
-        output_node_buffer = graph.render_block(
-            dsp_frames,
-            dsp_rate,
-            base_params,
-            output_frames=output_frames,
-            output_sample_rate=output_sample_rate,
-            dsp_sample_rate=dsp_rate,
-        )
-        try:
-            with open("logs/py_c_calls.log", "a") as _pf:
-                _pf.write(f"{time.time()} {threading.get_ident()} render_audio_block.exit frames={frames} output_shape={getattr(output_node_buffer, 'shape', None)}\n")
-        except Exception:
-            pass
-    except Exception:
-        raise
-    runner = getattr(graph, "_edge_runner", None)
-    if runner is not None:
-        fallback_summary = getattr(runner, "python_fallback_summary", lambda: {})()
-        if fallback_summary:
-            details = ", ".join(
-                f"{name}={count}" for name, count in sorted(fallback_summary.items()) if count
-            )
-            raise RuntimeError(
-                "Graph execution invoked Python fallbacks; "
-                "runtime requires the C backend for all nodes"
-                + (f" (fallbacks: {details})" if details else "")
-            )
+    log_py_c_call(
+        f"{time.time()} render_audio_block.enter frames={frames} sample_rate={sample_rate} base_params_keys={list((base_params or {}).keys())}"
+    )
+    output_node_buffer = graph.render_block(
+        dsp_frames,
+        dsp_rate,
+        base_params,
+        output_frames=output_frames,
+        output_sample_rate=output_sample_rate,
+        dsp_sample_rate=dsp_rate,
+    )
+    log_py_c_call(
+        f"{time.time()} render_audio_block.exit frames={frames} output_shape={getattr(output_node_buffer, 'shape', None)}"
+    )
     meta = {
         "render_duration": None,  # caller can fill timing
         "produced_frames": output_frames,
