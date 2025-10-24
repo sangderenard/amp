@@ -64,4 +64,15 @@ if (AMP_NATIVE_BUILD_TESTS)
     )
     target_link_libraries(kpn_unit_test PRIVATE amp_native)
     add_test(NAME kpn_unit_test COMMAND kpn_unit_test)
+
+    add_executable(test_thermo_param
+        tests/test_thermo_param.cpp
+    )
+    target_include_directories(test_thermo_param PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(test_thermo_param PRIVATE amp_native)
+    add_test(NAME test_thermo_param COMMAND test_thermo_param)
 endif()

@@ -23,9 +23,9 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Phase 3 — Runtime Hardening (No ABI Change)
 - **Goal**: Address immediate runtime risks without altering public signatures.
 - **Tasks**:
-  - Add shape validation and diagnostic logging to `amp_graph_runtime_set_param` so mismatched overrides return a distinct error code and emit clear log entries.【F:src/native/graph_runtime.cpp†L905-L932】
-  - Introduce a lightweight native test (e.g., `test_thermo_param.cpp`) that exercises a reserved `thermo.heat` parameter through `amp_graph_runtime_set_param` and ensures execution remains stable.【F:src/native/tests/kpn_unit_test.cpp†L24-L208】
-  - Document the `thermo.heat` convention in the new contract markdown and mention it in `oscillator_design_notes.h` if additional clarity is needed.
+  - Add shape validation and diagnostic logging to `amp_graph_runtime_set_param` so mismatched overrides return a distinct error code and emit clear log entries.【F:src/native/graph_runtime.cpp†L906-L955】
+  - Introduce a lightweight native test (e.g., `test_thermo_param.cpp`) that exercises a reserved `thermo.heat` parameter through `amp_graph_runtime_set_param` and ensures execution remains stable.【F:src/native/tests/test_thermo_param.cpp†L1-L170】
+  - Document the `thermo.heat` convention in the new contract markdown and mention it in `oscillator_design_notes.h` if additional clarity is needed.【F:docs/kpn_contract.md†L1-L120】【F:src/native/include/oscillator_design_notes.h†L1-L160】
 - **Delegation prompt**:
   ```text
   Update amp_graph_runtime_set_param to validate incoming tensor shapes against defaults, returning -2 on mismatch with AMP logging enabled. Add src/native/tests/test_thermo_param.cpp that sets a thermo.heat override on a GainNode, runs amp_graph_runtime_execute, and asserts success.
@@ -75,7 +75,7 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Checklist Summary
 - [x] Audit findings documented (`docs/kpn_audit_findings.md`).
 - [x] Contract markdown published and cross-referenced.
-- [ ] Runtime shape validation + thermo test implemented.
+- [x] Runtime shape validation + thermo test implemented.【F:src/native/graph_runtime.cpp†L906-L955】【F:src/native/tests/test_thermo_param.cpp†L1-L200】【F:docs/kpn_contract.md†L1-L120】【F:src/native/include/oscillator_design_notes.h†L1-L160】
 - [ ] ABI extension proposal ready for review.
 - [ ] ABI extension implemented (post-approval).
 - [ ] CI workflows enforcing native test coverage.
