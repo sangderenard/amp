@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -234,6 +235,10 @@ static TensorShape make_shape(uint32_t batches, uint32_t channels, uint32_t fram
     shape.channels = std::max<uint32_t>(1U, channels);
     shape.frames = std::max<uint32_t>(1U, frames);
     return shape;
+}
+
+static bool shapes_equal(const TensorShape &lhs, const TensorShape &rhs) {
+    return lhs.batches == rhs.batches && lhs.channels == rhs.channels && lhs.frames == rhs.frames;
 }
 
 static std::shared_ptr<EigenTensorHolder> make_tensor(const TensorShape &shape) {
@@ -917,6 +922,37 @@ AMP_API int amp_graph_runtime_set_param(
     size_t total = static_cast<size_t>(binding.shape.batches) * static_cast<size_t>(binding.shape.channels) * static_cast<size_t>(binding.shape.frames);
     if (total == 0U) {
         return -1;
+    }
+    const TensorShape *expected_shape = nullptr;
+    for (const DefaultParam &param : node.defaults) {
+        if (param.name == param_name) {
+            expected_shape = &param.shape;
+            break;
+        }
+    }
+    if (expected_shape == nullptr) {
+        auto existing = node.bindings.find(param_name);
+        if (existing != node.bindings.end()) {
+            expected_shape = &existing->second.shape;
+        }
+    }
+    if (expected_shape != nullptr && !shapes_equal(*expected_shape, binding.shape)) {
+        AMP_LOG_NATIVE_CALL("amp_graph_runtime_set_param_shape_mismatch", expected_shape->element_count(), binding.shape.element_count());
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
+        std::fprintf(
+            stderr,
+            "amp_graph_runtime_set_param: shape mismatch for %s.%s (expected %u x %u x %u, got %u x %u x %u)\n",
+            node_name,
+            param_name,
+            expected_shape->batches,
+            expected_shape->channels,
+            expected_shape->frames,
+            binding.shape.batches,
+            binding.shape.channels,
+            binding.shape.frames
+        );
+#endif
+        return -2;
     }
     binding.data.resize(total);
     std::memcpy(binding.data.data(), data, total * sizeof(double));

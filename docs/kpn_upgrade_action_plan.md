@@ -23,9 +23,9 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Phase 3 — Runtime Hardening (No ABI Change)
 - **Goal**: Address immediate runtime risks without altering public signatures.
 - **Tasks**:
-  - Add shape validation and diagnostic logging to `amp_graph_runtime_set_param` so mismatched overrides return a distinct error code and emit clear log entries.【F:src/native/graph_runtime.cpp†L905-L932】
-  - Introduce a lightweight native test (e.g., `test_thermo_param.cpp`) that exercises a reserved `thermo.heat` parameter through `amp_graph_runtime_set_param` and ensures execution remains stable.【F:src/native/tests/kpn_unit_test.cpp†L24-L208】
-  - Document the `thermo.heat` convention in the new contract markdown and mention it in `oscillator_design_notes.h` if additional clarity is needed.
+  - Add shape validation and diagnostic logging to `amp_graph_runtime_set_param` so mismatched overrides return a distinct error code and emit clear log entries.【F:src/native/graph_runtime.cpp†L906-L955】
+  - Introduce a lightweight native test (e.g., `test_thermo_param.cpp`) that exercises a reserved `thermo.heat` parameter through `amp_graph_runtime_set_param` and ensures execution remains stable.【F:src/native/tests/test_thermo_param.cpp†L1-L170】
+  - Document the `thermo.heat` convention in the new contract markdown and mention it in `oscillator_design_notes.h` if additional clarity is needed.【F:docs/kpn_contract.md†L1-L120】【F:src/native/include/oscillator_design_notes.h†L1-L160】
 - **Delegation prompt**:
   ```text
   Update amp_graph_runtime_set_param to validate incoming tensor shapes against defaults, returning -2 on mismatch with AMP logging enabled. Add src/native/tests/test_thermo_param.cpp that sets a thermo.heat override on a GainNode, runs amp_graph_runtime_execute, and asserts success.
@@ -34,8 +34,8 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Phase 4 — ABI Extension Design (Planning Only)
 - **Goal**: Prepare a design proposal for declared delay metadata, oversampling hints, and backward execution.
 - **Tasks**:
-  - Draft `docs/abi_extension_proposal.md` outlining `amp_run_node_v2`, execution-mode enums, optional side-channel structures, and plan-blob schema updates.【F:docs/kpn_development_guidance.md†L5-L44】
-  - Include migration/compatibility strategy and test plan.
+  - ✅ Drafted `docs/abi_extension_proposal.md` outlining `amp_run_node_v2`, execution-mode enums, optional side-channel structures, and plan-blob schema updates.【F:docs/kpn_development_guidance.md†L5-L44】【F:docs/abi_extension_proposal.md†L1-L167】
+  - ✅ Included migration/compatibility strategy and test plan.【F:docs/abi_extension_proposal.md†L89-L152】
 - **Delegation prompt**:
   ```text
   Create docs/abi_extension_proposal.md describing amp_run_node_v2 with forward/adjoint modes, plan blob extensions for declared delays and oversample ratios, and a rollout plan that keeps amp_run_node available for legacy nodes.
@@ -75,8 +75,8 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Checklist Summary
 - [x] Audit findings documented (`docs/kpn_audit_findings.md`).
 - [x] Contract markdown published and cross-referenced.
-- [ ] Runtime shape validation + thermo test implemented.
-- [ ] ABI extension proposal ready for review.
+- [x] Runtime shape validation + thermo test implemented.【F:src/native/graph_runtime.cpp†L906-L955】【F:src/native/tests/test_thermo_param.cpp†L1-L200】【F:docs/kpn_contract.md†L1-L120】【F:src/native/include/oscillator_design_notes.h†L1-L160】
+- [x] ABI extension proposal ready for review.【F:docs/abi_extension_proposal.md†L1-L167】
 - [ ] ABI extension implemented (post-approval).
 - [ ] CI workflows enforcing native test coverage.
 - [ ] Performance benchmarks and monitoring notes delivered.
