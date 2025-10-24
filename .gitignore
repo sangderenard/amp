@@ -1,14 +1,34 @@
+# Python caches and virtual environments
 __pycache__/
 *.pyc
+*.pyd
+*.egg-info
 .venv/
-_amp_ckernels_cffi.*
-logs/
+
+# Generated audio artifacts
+output.wav*
+
+# Native build outputs
+build/
 Release/
 src/native/build/
 workspace/
-output.wav*
-.gitignore
+logs/
+_amp_ckernels_cffi.*
 
-!.gitignore
-*.pyd
-*.egg-info/
+# C/C++ toolchain outputs
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/_deps/
+**/*.dir/
+**/*.pdb
+**/*.obj
+**/*.idb
+**/*.ilk
+**/*.lib
+**/*.exp
+**/*.dll
+**/*.vcxproj
+**/*.vcxproj.filters
+**/*.sln
