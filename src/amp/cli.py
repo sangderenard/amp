@@ -35,6 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable adaptive batching during interactive playback",
     )
     parser.add_argument(
+        "--interactive-initial-frame-multiplier",
+        type=int,
+        help=(
+            "Initial multiplier for interactive callback-sized frames rendered per batch"
+            " when priming the audio queue"
+        ),
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Render the configured graph without launching the interactive UI",
@@ -115,6 +123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         headless=args.headless,
         config_path=str(args.config),
         interactive_adaptive_batching=args.interactive_adaptive_batching,
+        interactive_initial_frame_multiplier=args.interactive_initial_frame_multiplier,
         headless_frames=args.headless_frames,
         headless_iterations=args.headless_iterations,
         headless_warmup=args.headless_warmup,
