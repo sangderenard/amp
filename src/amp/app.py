@@ -510,6 +510,7 @@ def _run_headless_diagnostic(
     joystick_mode: str | None,
     joystick_script_path: str | None,
     pcm_output_path: str | None,
+    adaptive_batching: bool,
 ) -> int:
     cfg = load_configuration(config_path)
     frames = int(frames_override) if frames_override is not None else int(cfg.runtime.frames_per_chunk)
@@ -596,6 +597,7 @@ def _run_headless_diagnostic(
         joystick_script_path=script_path,
         batch_blocks=batch_blocks,
         pcm_consumer=pcm_consumer,
+        adaptive_batching=adaptive_batching,
     )
 
     for line in summarise_benchmark_timeline(timeline, ema_alpha=ema_alpha):
@@ -689,6 +691,7 @@ def run(
     no_audio: bool = False,
     headless: bool = False,
     config_path: str | None = None,
+    interactive_adaptive_batching: bool | None = None,
     headless_frames: int | None = None,
     headless_iterations: int | None = None,
     headless_warmup: int | None = None,
@@ -697,6 +700,7 @@ def run(
     headless_output: str | None = None,
     headless_joystick_mode: str | None = None,
     headless_joystick_script: str | None = None,
+    headless_adaptive_batching: bool | None = None,
 ) -> int:
     """Launch the synthesiser.
 
@@ -711,6 +715,9 @@ def run(
     headless:
         Render the configured graph without initialising pygame.  This is useful
         for automated verification of graph behaviour.
+    interactive_adaptive_batching:
+        When provided, overrides whether interactive playback uses adaptive
+        batching.  Defaults to ``True`` when unspecified.
     config_path:
         Optional configuration override used when the application needs to
         fall back to a summary render (for example when pygame is unavailable).
@@ -725,6 +732,9 @@ def run(
     headless_joystick_script:
         Path to a JSON automation script applied to the virtual joystick when
         running headlessly.
+    headless_adaptive_batching:
+        When provided, overrides whether headless diagnostics use adaptive
+        batching.  Defaults to ``False`` when unspecified.
     """
 
     cfg_path = config_path or str(DEFAULT_CONFIG_PATH)
@@ -763,6 +773,7 @@ def run(
         return 0
 
     if headless:
+        adaptive_batching = False if headless_adaptive_batching is None else bool(headless_adaptive_batching)
         return _run_headless_diagnostic(
             config_path=cfg_path,
             frames_override=headless_frames,
@@ -773,6 +784,7 @@ def run(
             joystick_mode=headless_joystick_mode,
             joystick_script_path=headless_joystick_script,
             pcm_output_path=headless_output,
+            adaptive_batching=adaptive_batching,
         )
 
     # Attach a run identifier to correlate logs and diagnostics across files
@@ -974,6 +986,7 @@ def run(
     producer_fill_target = 1.0
     producer_stop_event = threading.Event()
     producer_thread_obj: threading.Thread | None = None
+    use_adaptive_batching = True if interactive_adaptive_batching is None else bool(interactive_adaptive_batching)
 
     queue_stats_lock = threading.Lock()
     queue_stats = {
@@ -1440,7 +1453,7 @@ def run(
                 put_backoff = 0.0001
                 put_backoff_max = 0.05
                 # Preferred batch size driven by real renders (never probe).
-                preferred_batch_blocks = producer_batch_blocks
+                preferred_batch_blocks = float(producer_batch_blocks)
                 # EMA for measured efficiency = produced_time / render_duration
                 efficiency_ema: float | None = None
                 efficiency_alpha = 0.2
@@ -1457,7 +1470,7 @@ def run(
                 # Probe cycle: 0 (preferred), +1, -1, repeat. This ensures
                 # we sample both neighbours frequently to form a centre
                 # difference estimate.
-                probe_sequence = (0, 1, -1)
+                probe_sequence = (0, 1, -1) if use_adaptive_batching else (0,)
                 probe_idx = 0
                 # Greedy ascent: render at the current preferred size and
                 # rely on the finite-difference gradient EMA to step the
@@ -1490,13 +1503,19 @@ def run(
                     # perturbation around the preferred size. We cycle
                     # through preferred, +1, -1 so we get neighbour
                     # measurements for a centered gradient estimate.
-                    base_pref = int(preferred_batch_blocks)
-                    probe = probe_sequence[probe_idx]
-                    probe_idx = (probe_idx + 1) % len(probe_sequence)
-                    candidate = base_pref + probe
-                    # Clamp to allowed range.
-                    candidate = min(producer_max_batch_blocks, max(producer_batch_blocks, candidate))
-                    batch_blocks = candidate
+                    if use_adaptive_batching:
+                        base_pref = int(preferred_batch_blocks)
+                        probe = probe_sequence[probe_idx]
+                        probe_idx = (probe_idx + 1) % len(probe_sequence)
+                        candidate = base_pref + probe
+                        # Clamp to allowed range.
+                        candidate = min(
+                            producer_max_batch_blocks,
+                            max(producer_batch_blocks, candidate),
+                        )
+                        batch_blocks = candidate
+                    else:
+                        batch_blocks = producer_batch_blocks
                     total_frames = block_frames * max(1, batch_blocks)
                     # Render exactly once for the chosen batch size. Do NOT
                     # perform additional probe renders — every render must be
@@ -1541,50 +1560,57 @@ def run(
                     else:
                         efficiency_ema = efficiency_ema + efficiency_alpha * (efficiency - efficiency_ema)
 
-                    # Record this measurement in the small recent map so we
-                    # can compute centred finite differences over the ±1
-                    # neighbourhood. Keep the map tiny to avoid memory use.
-                    try:
-                        last_eff_map[int(batch_blocks)] = float(efficiency)
-                        # Keep only the most recent few sizes (e.g. 9)
-                        if len(last_eff_map) > 9:
-                            # drop the oldest entry (arbitrary eviction)
-                            oldest = sorted(last_eff_map.keys())[0]
-                            del last_eff_map[oldest]
-                    except Exception:
-                        pass
+                    if use_adaptive_batching:
+                        # Record this measurement in the small recent map so we
+                        # can compute centred finite differences over the ±1
+                        # neighbourhood. Keep the map tiny to avoid memory use.
+                        try:
+                            last_eff_map[int(batch_blocks)] = float(efficiency)
+                            # Keep only the most recent few sizes (e.g. 9)
+                            if len(last_eff_map) > 9:
+                                # drop the oldest entry (arbitrary eviction)
+                                oldest = sorted(last_eff_map.keys())[0]
+                                del last_eff_map[oldest]
+                        except Exception:
+                            pass
 
-                    # Compute a hyperlocal gradient estimate around the
-                    # current integer preferred size using a centred
-                    # difference when both neighbours are present.
-                    grad: float | None = None
-                    p = int(preferred_batch_blocks)
-                    eff_p = last_eff_map.get(p)
-                    eff_p_plus = last_eff_map.get(p + 1)
-                    eff_p_minus = last_eff_map.get(p - 1)
-                    if eff_p_plus is not None and eff_p_minus is not None:
-                        # centred difference (per-block)
-                        grad = (eff_p_plus - eff_p_minus) / 2.0
-                    elif eff_p_plus is not None and eff_p is not None:
-                        grad = (eff_p_plus - eff_p) / 1.0
-                    elif eff_p_minus is not None and eff_p is not None:
-                        grad = (eff_p - eff_p_minus) / 1.0
+                        # Compute a hyperlocal gradient estimate around the
+                        # current integer preferred size using a centred
+                        # difference when both neighbours are present.
+                        grad: float | None = None
+                        p = int(preferred_batch_blocks)
+                        eff_p = last_eff_map.get(p)
+                        eff_p_plus = last_eff_map.get(p + 1)
+                        eff_p_minus = last_eff_map.get(p - 1)
+                        if eff_p_plus is not None and eff_p_minus is not None:
+                            # centred difference (per-block)
+                            grad = (eff_p_plus - eff_p_minus) / 2.0
+                        elif eff_p_plus is not None and eff_p is not None:
+                            grad = (eff_p_plus - eff_p) / 1.0
+                        elif eff_p_minus is not None and eff_p is not None:
+                            grad = (eff_p - eff_p_minus) / 1.0
 
-                    if grad is not None:
-                        if grad_ema is None:
-                            grad_ema = grad
-                        else:
-                            grad_ema = grad_ema + grad_alpha * (grad - grad_ema)
+                        if grad is not None:
+                            if grad_ema is None:
+                                grad_ema = grad
+                            else:
+                                grad_ema = grad_ema + grad_alpha * (grad - grad_ema)
 
-                    # Move preferred size by one block in the direction
-                    # of increasing efficiency if the EMA'd gradient is
-                    # significantly non-zero. This yields gradual,
-                    # stable steps instead of jumping to bounds.
-                    if grad_ema is not None:
-                        if grad_ema > grad_threshold:
-                            preferred_batch_blocks = min(producer_max_batch_blocks, preferred_batch_blocks + 1)
-                        elif grad_ema < -grad_threshold:
-                            preferred_batch_blocks = max(producer_batch_blocks, preferred_batch_blocks - 1)
+                        # Move preferred size by one block in the direction
+                        # of increasing efficiency if the EMA'd gradient is
+                        # significantly non-zero. This yields gradual,
+                        # stable steps instead of jumping to bounds.
+                        if grad_ema is not None:
+                            if grad_ema > grad_threshold:
+                                preferred_batch_blocks = min(
+                                    producer_max_batch_blocks,
+                                    preferred_batch_blocks + 1,
+                                )
+                            elif grad_ema < -grad_threshold:
+                                preferred_batch_blocks = max(
+                                    producer_batch_blocks,
+                                    preferred_batch_blocks - 1,
+                                )
 
                     # Split the returned buffer into full blocks and a final
                     # partial remainder (if any). Do NOT drop or mutate
@@ -1630,7 +1656,11 @@ def run(
                                 with efficiency_lock:
                                     # Record the producer's chosen batch size (candidate)
                                     efficiency_points.append((int(batch_blocks), float(efficiency)))
-                                    preferred_batch_snapshot = int(preferred_batch_blocks)
+                                    preferred_batch_snapshot = (
+                                        int(preferred_batch_blocks)
+                                        if use_adaptive_batching
+                                        else int(producer_batch_blocks)
+                                    )
                             except Exception:
                                 pass
                         except queue.Full:
@@ -1663,7 +1693,11 @@ def run(
                                 with efficiency_lock:
                                     # Record the producer's chosen batch size (candidate)
                                     efficiency_points.append((int(batch_blocks), float(efficiency)))
-                                    preferred_batch_snapshot = int(preferred_batch_blocks)
+                                    preferred_batch_snapshot = (
+                                        int(preferred_batch_blocks)
+                                        if use_adaptive_batching
+                                        else int(producer_batch_blocks)
+                                    )
                             except Exception:
                                 pass
                         except queue.Full:

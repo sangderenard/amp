@@ -23,7 +23,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip initialising audio output (useful in CI or debugging)",
     )
     parser.add_argument(
-        "--headless", 
+        "--interactive-adaptive-batching",
+        dest="interactive_adaptive_batching",
+        action="store_true",
+        help="Enable adaptive batching during interactive playback",
+    )
+    parser.add_argument(
+        "--no-interactive-adaptive-batching",
+        dest="interactive_adaptive_batching",
+        action="store_false",
+        help="Disable adaptive batching during interactive playback",
+    )
+    parser.add_argument(
+        "--headless",
         action="store_true",
         help="Render the configured graph without launching the interactive UI",
     )
@@ -53,6 +65,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="EMA smoothing factor for headless diagnostics (0-1)",
     )
     parser.add_argument(
+        "--headless-adaptive-batching",
+        dest="headless_adaptive_batching",
+        action="store_true",
+        help="Enable adaptive batching during headless diagnostics",
+    )
+    parser.add_argument(
+        "--no-headless-adaptive-batching",
+        dest="headless_adaptive_batching",
+        action="store_false",
+        help="Disable adaptive batching during headless diagnostics",
+    )
+    parser.add_argument(
         "--headless-output",
         type=Path,
         help=(
@@ -76,6 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
+    parser.set_defaults(
+        interactive_adaptive_batching=None,
+        headless_adaptive_batching=None,
+    )
+
     args = parser.parse_args(argv)
 
     from .app import run as run_app
@@ -85,6 +114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         no_audio=args.no_audio,
         headless=args.headless,
         config_path=str(args.config),
+        interactive_adaptive_batching=args.interactive_adaptive_batching,
         headless_frames=args.headless_frames,
         headless_iterations=args.headless_iterations,
         headless_warmup=args.headless_warmup,
@@ -92,9 +122,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         headless_alpha=args.headless_alpha,
         headless_output=str(args.headless_output) if args.headless_output else None,
         headless_joystick_mode=args.headless_joystick_mode,
-        headless_joystick_script=str(args.headless_joystick_script)
-        if args.headless_joystick_script
-        else None,
+        headless_joystick_script=(
+            str(args.headless_joystick_script)
+            if args.headless_joystick_script
+            else None
+        ),
+        headless_adaptive_batching=args.headless_adaptive_batching,
     )
 
 
