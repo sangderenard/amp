@@ -1,3 +1,0 @@
-[console_scripts]
-amp = amp.cli:main
-amp-benchmark-nodes = amp.node_benchmarks:main

@@ -1,5 +1,0 @@
-C:/dev/Powershell/amp/build/CMakeFiles/amp_native.dir
-C:/dev/Powershell/amp/build/CMakeFiles/kpn_unit_test.dir
-C:/dev/Powershell/amp/build/CMakeFiles/RUN_TESTS.dir
-C:/dev/Powershell/amp/build/CMakeFiles/ALL_BUILD.dir
-C:/dev/Powershell/amp/build/CMakeFiles/ZERO_CHECK.dir

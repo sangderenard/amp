@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"C:/dev/Powershell/amp/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
