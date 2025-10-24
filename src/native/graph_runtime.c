@@ -118,6 +118,7 @@ static char *dup_string(const char *src, size_t length) {
     return dest;
 }
 
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
 /* Minimal native-entry logger that records wall-clock time and OS thread id.
    Writes one-line records to logs/native_c_calls.log: <timestamp> <os_tid> <fn> <a> <b>\n
    Best-effort only; failures are ignored to avoid impacting runtime behaviour. */
@@ -145,6 +146,10 @@ static void _log_native_call(const char *fn, size_t a, size_t b) {
 #endif
     fclose(f);
 }
+#define AMP_LOG_NATIVE_CALL(fn, a, b) _log_native_call((fn), (a), (b))
+#else
+#define AMP_LOG_NATIVE_CALL(fn, a, b) ((void)0)
+#endif
 
 static void buffer_pool_destroy(buffer_pool_t *pool) {
     if (pool == NULL) {
