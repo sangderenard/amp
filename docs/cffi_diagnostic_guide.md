@@ -26,6 +26,20 @@ treated as hard failures rather than silently falling back to Python.
    at this stage usually manifest as heap corruption or segmentation faults
    inside the generated C.
 
+## Native logging instrumentation
+
+The instrumentation hooks in `src/native/amp_kernels.c` and
+`src/native/graph_runtime.c` are compiled out by default so the production build
+stays fast.  To opt into native logging:
+
+1. Build the C sources with `-DAMP_NATIVE_ENABLE_LOGGING` so the logging code is
+   included in the resulting binary.
+2. Set the environment variable `AMP_NATIVE_LOG=1` (or any non-zero, non-empty
+   value) when running the instrumented binary to activate the log sinks.
+
+Without the compile-time flag the logging hooks are hard-disabled, even if the
+environment variable is present.
+
 The interplay between these layers means crashes can stem from descriptor drift,
 control-history mismatches, or the CFFI module itself; the diagnostics described
 below help separate those cases.
