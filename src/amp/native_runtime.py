@@ -53,6 +53,8 @@ int amp_graph_runtime_execute(
 void amp_graph_runtime_buffer_free(double *buffer);
 AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
 void amp_graph_history_destroy(AmpGraphControlHistory *history);
+int amp_native_logging_enabled(void);
+void amp_native_logging_set(int enabled);
 """
 
 
@@ -123,6 +125,22 @@ def get_graph_runtime_impl() -> tuple["cffi.FFI", object]:
     """Return the (ffi, lib) pair for the native graph runtime."""
 
     return _load_impl()
+
+
+def set_native_logging_enabled(enabled: bool) -> None:
+    """Propagate the bridge logging preference to the native runtime."""
+
+    try:
+        _, lib = _load_impl()
+    except Exception:
+        return
+    setter = getattr(lib, "amp_native_logging_set", None)
+    if setter is None:
+        return
+    try:
+        setter(1 if enabled else 0)
+    except Exception:
+        return
 
 
 class NativeGraphExecutor:
