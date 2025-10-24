@@ -125,7 +125,7 @@ Ready for CFFI migration: uses only simple types and numpy arrays.
 from typing import Any, Dict
 import numpy as np
 
-from .diagnostics import log_py_c_call
+from .diagnostics import log_py_c_call, py_c_logging_enabled
 
 def render_audio_block(
     graph,
@@ -166,9 +166,10 @@ def render_audio_block(
         start_time=start_time,
         update_hz=dsp_rate,
     )
-    log_py_c_call(
-        f"{time.time()} render_audio_block.enter frames={frames} sample_rate={sample_rate} base_params_keys={list((base_params or {}).keys())}"
-    )
+    if py_c_logging_enabled():
+        log_py_c_call(
+            f"{time.time()} render_audio_block.enter frames={frames} sample_rate={sample_rate} base_params_keys={list((base_params or {}).keys())}"
+        )
     output_node_buffer = graph.render_block(
         dsp_frames,
         dsp_rate,
@@ -177,9 +178,10 @@ def render_audio_block(
         output_sample_rate=output_sample_rate,
         dsp_sample_rate=dsp_rate,
     )
-    log_py_c_call(
-        f"{time.time()} render_audio_block.exit frames={frames} output_shape={getattr(output_node_buffer, 'shape', None)}"
-    )
+    if py_c_logging_enabled():
+        log_py_c_call(
+            f"{time.time()} render_audio_block.exit frames={frames} output_shape={getattr(output_node_buffer, 'shape', None)}"
+        )
     meta = {
         "render_duration": None,  # caller can fill timing
         "produced_frames": output_frames,
