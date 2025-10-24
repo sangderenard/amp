@@ -587,6 +587,13 @@ class AudioGraph:
         self._levels_lock = Lock()
         self._last_node_levels: Dict[str, np.ndarray] = {}
         self.control_delay = ControlDelay(self.sample_rate)
+        # Align the initial render window with the controller delay so the first
+        # block sees the same historical data as subsequent blocks.  Without
+        # this offset the first render would request a window entirely before
+        # any recorded controller events, yielding an empty control blob and
+        # diverging behaviour between the Python edge runner and the native
+        # runtime (which consumes the raw history directly).
+        self._last_block_time = float(getattr(self.control_delay, "control_delay_seconds", 0.0))
         self._plan_dirty = True
         self._execution_plan: Tuple[_NodeExecutionPlan, ...] = ()
         self._ordered_node_names: Tuple[str, ...] = ()
@@ -930,6 +937,14 @@ class AudioGraph:
         # Ensure non-inverted window
         if req_end < req_start:
             req_end = req_start
+        # If history is sparse (e.g. the first event lies exactly at the clamp
+        # boundary) the [start, end) window may collapse to a single point even
+        # though a valid event exists at ``req_start``.  Extend the window by a
+        # small, frame-sized horizon so the serialized blob includes that event
+        # and matches the control data seen by the native runtime.
+        if req_end <= req_start and latest >= req_start:
+            horizon = frames / sr if sr else 0.0
+            req_end = min(req_start + horizon, latest + horizon)
         control_history_blob = self.control_delay.export_control_history_blob(req_start, req_end)
 
         # Diagnostic: dump last control-history blob and metadata to logs so we can
