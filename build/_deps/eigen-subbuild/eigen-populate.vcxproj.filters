@@ -1,0 +1,44 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-mkdir.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-download.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-update.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-patch.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-configure.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-build.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-install.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\d724f4650056d817cff8753a344beba3\eigen-populate-test.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\b65972d2d1fcd9c09fc25996818e90b3\eigen-populate-complete.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\e66985f1756d0955da060713025d20cc\eigen-populate.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="C:\dev\Powershell\amp\build\_deps\eigen-subbuild\CMakeFiles\eigen-populate" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{83515DC6-77E9-364B-AAB0-0233D77AFF05}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

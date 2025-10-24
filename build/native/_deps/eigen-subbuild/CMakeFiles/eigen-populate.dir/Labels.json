@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/eigen-populate"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/74186c59878e4a5d64a176b6025a24dd/eigen-populate.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/c428bb46a8bb39b0037111a93b021719/eigen-populate-complete.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-build.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-configure.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-download.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-install.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-mkdir.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-patch.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-test.rule"
+		},
+		{
+			"file" : "C:/dev/Powershell/amp/build/native/_deps/eigen-subbuild/CMakeFiles/88819207f2b825f94a07244c73dc9990/eigen-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"eigen-populate"
+		],
+		"name" : "eigen-populate"
+	}
+}

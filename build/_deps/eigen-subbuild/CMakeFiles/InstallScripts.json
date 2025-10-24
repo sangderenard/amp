@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/dev/Powershell/amp/build/_deps/eigen-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

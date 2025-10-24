@@ -1,0 +1,152 @@
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-MKDIR.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -Dcfgdir=/Debug -P C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/tmp/eigen-populate-mkdirs.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-mkdir
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-DOWNLOAD.RULE
+setlocal
+cd C:\dev\Powershell\amp\build\_deps
+if %errorlevel% neq 0 goto :cmEnd
+C:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/download-eigen-populate.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/verify-eigen-populate.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE -P C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/extract-eigen-populate.cmake
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-download
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-UPDATE.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-update
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-PATCH.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-patch
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-CONFIGURE.RULE
+setlocal
+cd C:\dev\Powershell\amp\build\_deps\eigen-build
+if %errorlevel% neq 0 goto :cmEnd
+C:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-configure
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-BUILD.RULE
+setlocal
+cd C:\dev\Powershell\amp\build\_deps\eigen-build
+if %errorlevel% neq 0 goto :cmEnd
+C:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-build
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-INSTALL.RULE
+setlocal
+cd C:\dev\Powershell\amp\build\_deps\eigen-build
+if %errorlevel% neq 0 goto :cmEnd
+C:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-install
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\D724F4650056D817CFF8753A344BEBA3\EIGEN-POPULATE-TEST.RULE
+setlocal
+cd C:\dev\Powershell\amp\build\_deps\eigen-build
+if %errorlevel% neq 0 goto :cmEnd
+C:
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E echo_append
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-test
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\B65972D2D1FCD9C09FC25996818E90B3\EIGEN-POPULATE-COMPLETE.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -E make_directory C:/dev/Powershell/amp/build/_deps/eigen-subbuild/CMakeFiles/Debug
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/CMakeFiles/Debug/eigen-populate-complete
+if %errorlevel% neq 0 goto :cmEnd
+"C:\Program Files\CMake\bin\cmake.exe" -E touch C:/dev/Powershell/amp/build/_deps/eigen-subbuild/eigen-populate-prefix/src/eigen-populate-stamp/Debug/eigen-populate-done
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKEFILES\E66985F1756D0955DA060713025D20CC\EIGEN-POPULATE.RULE
+setlocal
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
+^C:\DEV\POWERSHELL\AMP\BUILD\_DEPS\EIGEN-SUBBUILD\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/Powershell/amp/build/_deps/eigen-subbuild -BC:/dev/Powershell/amp/build/_deps/eigen-subbuild --check-stamp-file C:/dev/Powershell/amp/build/_deps/eigen-subbuild/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

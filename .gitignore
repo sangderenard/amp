@@ -6,3 +6,9 @@ logs/
 Release/
 src/native/build/
 workspace/
+output.wav*
+.gitignore
+
+!.gitignore
+*.pyd
+*.egg-info/
