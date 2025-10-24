@@ -117,3 +117,14 @@ def test_topo_order_large_graph_is_deterministic_and_fast() -> None:
         graph.render_block(32)
     elapsed = time.perf_counter() - start
     assert elapsed < 0.5, f"rendering took too long: {elapsed:.3f}s"
+
+
+def test_render_block_resamples_to_audio_rate() -> None:
+    graph = AudioGraph(sample_rate=48000)
+    graph.add_node(nodes.ConstantNode("src", {"value": 0.5}))
+    graph.set_sink("src")
+    graph.dsp_sample_rate = 96000.0
+    frames = 64
+    output = graph.render_block(frames, sample_rate=48000)
+    assert output.shape == (1, 1, frames)
+    assert np.allclose(output, 0.5)

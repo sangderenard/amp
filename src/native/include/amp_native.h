@@ -201,6 +201,7 @@ AMP_CAPI AmpGraphRuntime *amp_graph_runtime_create(
 );
 AMP_CAPI void amp_graph_runtime_destroy(AmpGraphRuntime *runtime);
 AMP_CAPI int amp_graph_runtime_configure(AmpGraphRuntime *runtime, uint32_t batches, uint32_t frames);
+AMP_CAPI void amp_graph_runtime_set_dsp_sample_rate(AmpGraphRuntime *runtime, double sample_rate);
 AMP_CAPI void amp_graph_runtime_clear_params(AmpGraphRuntime *runtime);
 AMP_CAPI int amp_graph_runtime_set_param(
     AmpGraphRuntime *runtime,

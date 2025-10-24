@@ -55,6 +55,55 @@ class _ScratchBuffers:
 _scratch = _ScratchBuffers()
 
 # =========================
+# Resampling
+# =========================
+
+
+def lanczos_resample(buffer, src_rate, dst_rate, dst_frames, *, a=8):
+    if src_rate <= 0.0 or dst_rate <= 0.0:
+        raise ValueError("sample rates must be positive")
+    if dst_frames <= 0:
+        raise ValueError("dst_frames must be positive")
+    array = np.asarray(buffer, dtype=RAW_DTYPE)
+    if array.ndim == 0:
+        return np.full(dst_frames, float(array), dtype=RAW_DTYPE)
+    src_frames = int(array.shape[-1])
+    if src_frames == 0:
+        shape = array.shape[:-1] + (dst_frames,)
+        return np.zeros(shape, dtype=RAW_DTYPE)
+    if np.isclose(src_rate, dst_rate) and src_frames == dst_frames:
+        return np.array(array, copy=True)
+
+    ratio = float(src_rate) / float(dst_rate)
+    positions = np.arange(dst_frames, dtype=RAW_DTYPE) * ratio
+    base = np.floor(positions).astype(np.int64)
+    frac = positions - base
+
+    taps = int(max(1, a))
+    offsets = np.arange(-taps + 1, taps + 1, dtype=np.int64)
+    window = offsets.shape[0]
+
+    indices = base[:, None] + offsets[None, :]
+    phase = frac[:, None] - offsets[None, :]
+    kernel = np.sinc(phase) * np.sinc(phase / taps)
+    kernel[np.abs(phase) >= taps] = 0.0
+
+    valid = (indices >= 0) & (indices < src_frames)
+    kernel *= valid.astype(RAW_DTYPE)
+    sums = kernel.sum(axis=1, keepdims=True)
+    sums[sums == 0.0] = 1.0
+    kernel /= sums
+
+    clipped = np.clip(indices, 0, src_frames - 1)
+    samples = np.take(array, clipped, axis=-1)
+    leading = samples.shape[:-2]
+    samples = samples.reshape((-1, dst_frames, window))
+    weights = kernel[np.newaxis, :, :]
+    resampled = np.sum(samples * weights, axis=2)
+    resampled = resampled.reshape(leading + (dst_frames,))
+    return np.require(resampled, dtype=RAW_DTYPE, requirements=("C",))
+
+# =========================
 # Persistence
 # =========================
 MAPPINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mappings.json")

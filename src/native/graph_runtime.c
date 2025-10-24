@@ -102,6 +102,7 @@ typedef struct AmpGraphRuntime {
     buffer_pool_t pool;
     uint32_t default_batches;
     uint32_t default_frames;
+    double dsp_sample_rate;
 } AmpGraphRuntime;
 
 static char *dup_string(const char *src, size_t length) {
@@ -998,6 +999,7 @@ AMP_API AmpGraphRuntime *amp_graph_runtime_create(
     }
     runtime->default_batches = 1U;
     runtime->default_frames = 0U;
+    runtime->dsp_sample_rate = 0.0;
     if (!parse_node_blob(runtime, descriptor_blob, descriptor_len)) {
         release_runtime(runtime);
         return NULL;
@@ -1020,6 +1022,13 @@ AMP_API int amp_graph_runtime_configure(AmpGraphRuntime *runtime, uint32_t batch
     runtime->default_batches = batches > 0U ? batches : 1U;
     runtime->default_frames = frames;
     return 0;
+}
+
+AMP_API void amp_graph_runtime_set_dsp_sample_rate(AmpGraphRuntime *runtime, double sample_rate) {
+    if (runtime == NULL) {
+        return;
+    }
+    runtime->dsp_sample_rate = sample_rate > 0.0 ? sample_rate : 0.0;
 }
 
 AMP_API void amp_graph_runtime_clear_params(AmpGraphRuntime *runtime) {
@@ -1129,6 +1138,7 @@ AMP_API int amp_graph_runtime_execute(
         node->frames = 0;
     }
     buffer_pool_reset(&runtime->pool);
+    double dsp_rate = runtime->dsp_sample_rate > 0.0 ? runtime->dsp_sample_rate : sample_rate;
     int status = 0;
     for (uint32_t order = 0; order < runtime->node_count; ++order) {
         uint32_t node_idx = runtime->execution_order[order];
@@ -1153,50 +1163,147 @@ AMP_API int amp_graph_runtime_execute(
             }
             break;
         }
-        EdgeRunnerNodeInputs inputs;
-        memset(&inputs, 0, sizeof(inputs));
-        if (audio_data != NULL) {
-            inputs.audio.has_audio = 1;
-            inputs.audio.batches = batches;
-            inputs.audio.channels = input_channels;
-            inputs.audio.frames = frames;
-            inputs.audio.data = audio_data;
-        } else {
-            inputs.audio.has_audio = 0;
-            inputs.audio.batches = batches;
-            inputs.audio.channels = 0;
-            inputs.audio.frames = frames;
-            inputs.audio.data = NULL;
-        }
-        if (param_count > 0) {
-            inputs.params.count = param_count;
-            inputs.params.items = param_views;
-        } else {
-            inputs.params.count = 0;
-            inputs.params.items = NULL;
-        }
-        double *out_ptr = NULL;
-        int out_ch = 0;
-        void *state = node->state;
-        status = amp_run_node(
-            &node->descriptor,
-            &inputs,
-            (int)batches,
-            (int)input_channels,
-            (int)frames,
-            sample_rate,
-            &out_ptr,
-            &out_ch,
-            &state,
-            history
-        );
-        if (status != 0) {
-            release_param_views(&runtime->pool, param_views, param_count, owned_buffers, owned_count);
-            if (audio_owned != NULL) {
-                for (uint32_t i = 0; i < audio_owned_count; ++i) {
-                    buffer_pool_release(&runtime->pool, audio_owned[i]);
+        double **param_bases = NULL;
+        size_t *param_strides = NULL;
+        if (param_count > 0U) {
+            param_bases = (double **)calloc(param_count, sizeof(double *));
+            param_strides = (size_t *)calloc(param_count, sizeof(size_t));
+            if (param_bases == NULL || param_strides == NULL) {
+                free(param_bases);
+                free(param_strides);
+                release_param_views(&runtime->pool, param_views, param_count, owned_buffers, owned_count);
+                if (audio_owned != NULL) {
+                    for (uint32_t i = 0; i < audio_owned_count; ++i) {
+                        buffer_pool_release(&runtime->pool, audio_owned[i]);
+                    }
+                    free(audio_owned);
                 }
-                free(audio_owned);
+                status = -1;
+                break;
+            }
+            for (uint32_t i = 0; i < param_count; ++i) {
+                EdgeRunnerParamView *view = &param_views[i];
+                param_bases[i] = view->data;
+                size_t stride = (size_t)view->batches * (size_t)view->channels;
+                if (stride == 0) {
+                    stride = (size_t)batches * (size_t)input_channels;
+                    if (stride == 0) {
+                        stride = 1;
+                    }
+                }
+                param_strides[i] = stride;
+            }
+        }
+        size_t audio_stride = 0;
+        if (audio_data != NULL) {
+            audio_stride = (size_t)batches * (size_t)input_channels;
+            if (audio_stride == 0) {
+                audio_stride = 1;
+            }
+        }
+        double *node_output = NULL;
+        size_t node_stride = 0;
+        uint32_t node_channels = 0;
+        void *state = node->state;
+        for (uint32_t frame_index = 0; frame_index < frames; ++frame_index) {
+            EdgeRunnerNodeInputs inputs;
+            memset(&inputs, 0, sizeof(inputs));
+            if (audio_data != NULL) {
+                inputs.audio.has_audio = 1;
+                inputs.audio.batches = batches;
+                inputs.audio.channels = input_channels;
+                inputs.audio.frames = 1;
+                inputs.audio.data = audio_data + (size_t)frame_index * audio_stride;
+            } else {
+                inputs.audio.has_audio = 0;
+                inputs.audio.batches = batches;
+                inputs.audio.channels = 0;
+                inputs.audio.frames = 1;
+                inputs.audio.data = NULL;
+            }
+            if (param_count > 0U) {
+                inputs.params.count = param_count;
+                inputs.params.items = param_views;
+                for (uint32_t p = 0; p < param_count; ++p) {
+                    EdgeRunnerParamView *view = &param_views[p];
+                    if (param_bases[p] != NULL) {
+                        view->data = param_bases[p] + (size_t)frame_index * param_strides[p];
+                    } else {
+                        view->data = NULL;
+                    }
+                    view->frames = 1;
+                }
+            } else {
+                inputs.params.count = 0;
+                inputs.params.items = NULL;
+            }
+            double *frame_buffer = NULL;
+            int out_ch = 0;
+            void *state_arg = state;
+            status = amp_run_node(
+                &node->descriptor,
+                &inputs,
+                (int)batches,
+                (int)input_channels,
+                1,
+                dsp_rate,
+                &frame_buffer,
+                &out_ch,
+                &state_arg,
+                history
+            );
+            if (status != 0) {
+                if (frame_buffer != NULL) {
+                    amp_free(frame_buffer);
+                }
+                break;
+            }
+            if (frame_buffer == NULL) {
+                status = -1;
+                break;
+            }
+            state = state_arg;
+            if (node_output == NULL) {
+                node_channels = (uint32_t)out_ch;
+                if (node_channels == 0U) {
+                    amp_free(frame_buffer);
+                    status = -1;
+                    break;
+                }
+                size_t total = (size_t)batches * (size_t)node_channels * (size_t)frames;
+                node_output = (double *)malloc(total * sizeof(double));
+                if (node_output == NULL) {
+                    amp_free(frame_buffer);
+                    status = -1;
+                    break;
+                }
+                node_stride = (size_t)batches * (size_t)node_channels;
+            } else if ((uint32_t)out_ch != node_channels) {
+                amp_free(frame_buffer);
+                status = -1;
+                break;
+            }
+            memcpy(node_output + (size_t)frame_index * node_stride, frame_buffer, node_stride * sizeof(double));
+            amp_free(frame_buffer);
+        }
+        if (param_count > 0U) {
+            for (uint32_t p = 0; p < param_count; ++p) {
+                param_views[p].data = param_bases[p];
+                param_views[p].frames = frames;
+            }
+        }
+        free(param_bases);
+        free(param_strides);
+        release_param_views(&runtime->pool, param_views, param_count, owned_buffers, owned_count);
+        if (audio_owned != NULL) {
+            for (uint32_t i = 0; i < audio_owned_count; ++i) {
+                buffer_pool_release(&runtime->pool, audio_owned[i]);
+            }
+            free(audio_owned);
+        }
+        if (status != 0) {
+            if (node_output != NULL) {
+                amp_free(node_output);
             }
             break;
         }
@@ -1206,17 +1313,10 @@ AMP_API int amp_graph_runtime_execute(
             }
             node->state = state;
         }
-        node->output = out_ptr;
+        node->output = node_output;
         node->batches = batches;
-        node->channels = (uint32_t)out_ch;
+        node->channels = node_channels;
         node->frames = frames;
-        release_param_views(&runtime->pool, param_views, param_count, owned_buffers, owned_count);
-        if (audio_owned != NULL) {
-            for (uint32_t i = 0; i < audio_owned_count; ++i) {
-                buffer_pool_release(&runtime->pool, audio_owned[i]);
-            }
-            free(audio_owned);
-        }
     }
     if (history != NULL) {
         amp_release_control_history(history);

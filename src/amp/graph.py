@@ -578,6 +578,7 @@ class AudioGraph:
 
     def __init__(self, sample_rate: int, output_channels: int | None = None) -> None:
         self.sample_rate = int(sample_rate)
+        self.dsp_sample_rate = float(sample_rate)
         self.output_channels = int(output_channels) if output_channels is not None else None
         self._nodes: Dict[str, AudioNode] = {}
         self._audio_inputs: Dict[str, List[str]] = {}
@@ -904,6 +905,10 @@ class AudioGraph:
         frames: int,
         sample_rate: int | None = None,
         base_params: Mapping[str, Mapping[str, np.ndarray]] | None = None,
+        *,
+        output_frames: int | None = None,
+        output_sample_rate: float | None = None,
+        dsp_sample_rate: float | None = None,
     ) -> np.ndarray:
         """
         Render a block using the CFFI edge runner only. All node and edge processing is performed in C.
@@ -911,7 +916,18 @@ class AudioGraph:
         """
         if not self.sink:
             raise RuntimeError("Sink node has not been configured")
-        sr = int(sample_rate or self.sample_rate)
+        requested_frames = int(output_frames) if output_frames is not None else int(frames)
+        output_sr = float(output_sample_rate if output_sample_rate is not None else sample_rate or self.sample_rate)
+        dsp_sr = float(
+            dsp_sample_rate
+            if dsp_sample_rate is not None
+            else getattr(self, "dsp_sample_rate", output_sr)
+        )
+        if dsp_sample_rate is None and output_sample_rate is None and sample_rate is not None:
+            dsp_sr = float(sample_rate)
+        if output_sr <= 0.0:
+            raise ValueError("sample rate must be positive")
+        sr = int(round(dsp_sr))
         runner = self._ensure_edge_runner()
         # Serialize raw control history for the relevant window.
         # Control events are recorded with a deliberate controller delay
@@ -921,7 +937,7 @@ class AudioGraph:
         # invalid — clamp the requested window to the latest available
         # control timestamp to avoid exposing present/future events to C.
         start_time = getattr(self, "_last_block_time", 0.0)
-        end_time = start_time + (frames / sr)
+        end_time = start_time + (requested_frames / output_sr)
         # Support older code that may have used the previous attribute
         # name by falling back to it if present for compatibility.
         ctrl_delay = float(getattr(self.control_delay, "control_delay_seconds", 0.0))
@@ -943,7 +959,7 @@ class AudioGraph:
         # small, frame-sized horizon so the serialized blob includes that event
         # and matches the control data seen by the native runtime.
         if req_end <= req_start and latest >= req_start:
-            horizon = frames / sr if sr else 0.0
+            horizon = requested_frames / output_sr if output_sr else 0.0
             req_end = min(req_start + horizon, latest + horizon)
         control_history_blob = self.control_delay.export_control_history_blob(req_start, req_end)
 
@@ -986,7 +1002,13 @@ class AudioGraph:
             except Exception:
                 pass
             with self._runner_lock:
-                runner.begin_block(frames, sample_rate=sr, base_params=base_params or {})
+                runner.begin_block(
+                    int(frames),
+                    sample_rate=dsp_sr,
+                    base_params=base_params or {},
+                    output_frames=requested_frames,
+                    output_sample_rate=output_sr,
+                )
                 output = runner.run_c_graph(control_history_blob)
             try:
                 with open("logs/py_c_calls.log", "a") as _pf:
