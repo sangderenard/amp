@@ -125,6 +125,22 @@ def get_graph_runtime_impl() -> tuple["cffi.FFI", object]:
     return _load_impl()
 
 
+def set_native_logging_enabled(enabled: bool) -> None:
+    """Propagate the bridge logging preference to the native runtime."""
+
+    try:
+        _, lib = _load_impl()
+    except Exception:
+        return
+    setter = getattr(lib, "amp_native_logging_set", None)
+    if setter is None:
+        return
+    try:
+        setter(1 if enabled else 0)
+    except Exception:
+        return
+
+
 class NativeGraphExecutor:
     """Small shim that evaluates an AudioGraph via the native runtime."""
 
