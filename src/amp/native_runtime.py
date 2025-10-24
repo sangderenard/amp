@@ -5,7 +5,7 @@ import sys
 import threading
 import math
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 import numpy as np
 
@@ -155,6 +155,11 @@ class NativeGraphExecutor:
             raise RuntimeError("failed to create native graph runtime instance")
         self._runtime = runtime
         self._lock = threading.Lock()
+        self._set_dsp_sample_rate: Callable[[object, float], object] | None
+        try:
+            self._set_dsp_sample_rate = self.lib.amp_graph_runtime_set_dsp_sample_rate
+        except AttributeError:
+            self._set_dsp_sample_rate = None
 
     def __enter__(self) -> "NativeGraphExecutor":
         return self
@@ -198,7 +203,8 @@ class NativeGraphExecutor:
                 batches = int(base_params["_B"])
             self.lib.amp_graph_runtime_clear_params(self._runtime)
             self.lib.amp_graph_runtime_configure(self._runtime, batches, dsp_frames)
-            self.lib.amp_graph_runtime_set_dsp_sample_rate(self._runtime, float(dsp_rate))
+            if self._set_dsp_sample_rate is not None:
+                self._set_dsp_sample_rate(self._runtime, float(dsp_rate))
             keepalive: list[np.ndarray] = []
             if base_params:
                 for node_name, params in base_params.items():
