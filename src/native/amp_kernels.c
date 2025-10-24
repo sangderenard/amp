@@ -648,6 +648,20 @@ AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b)
     (void)b;
 }
 
+#define log_f_alloc ((FILE *)0)
+#define log_f_memops ((FILE *)0)
+#define log_f_ccalls ((FILE *)0)
+#define log_f_cgenerated ((FILE *)0)
+
+static inline void register_alloc(void *ptr, size_t size) {
+    (void)ptr;
+    (void)size;
+}
+
+static inline void unregister_alloc(void *ptr) {
+    (void)ptr;
+}
+
 AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
     (void)fn;
     (void)a;
