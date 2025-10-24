@@ -693,6 +693,7 @@ def run(
     headless: bool = False,
     config_path: str | None = None,
     interactive_adaptive_batching: bool | None = None,
+    interactive_initial_frame_multiplier: int | None = None,
     headless_frames: int | None = None,
     headless_iterations: int | None = None,
     headless_warmup: int | None = None,
@@ -719,6 +720,11 @@ def run(
     interactive_adaptive_batching:
         When provided, overrides whether interactive playback uses adaptive
         batching.  Defaults to ``True`` when unspecified.
+    interactive_initial_frame_multiplier:
+        Optional override for the initial interactive render batch size
+        expressed as a multiple of the callback-sized frame count. When
+        adaptive batching is disabled and no override is supplied, a value of
+        ``1`` is used.
     config_path:
         Optional configuration override used when the application needs to
         fall back to a summary render (for example when pygame is unavailable).
@@ -987,7 +993,32 @@ def run(
     producer_fill_target = 1.0
     producer_stop_event = threading.Event()
     producer_thread_obj: threading.Thread | None = None
-    use_adaptive_batching = True if interactive_adaptive_batching is None else bool(interactive_adaptive_batching)
+    use_adaptive_batching = (
+        True if interactive_adaptive_batching is None else bool(interactive_adaptive_batching)
+    )
+
+    if interactive_initial_frame_multiplier is not None:
+        try:
+            producer_batch_blocks = int(interactive_initial_frame_multiplier)
+        except Exception:
+            STATUS_PRINTER.emit(
+                "[Audio] Invalid interactive initial frame multiplier; using fallback",
+                force=True,
+            )
+            producer_batch_blocks = 1 if not use_adaptive_batching else 8
+        else:
+            if producer_batch_blocks <= 0:
+                STATUS_PRINTER.emit(
+                    "[Audio] interactive initial frame multiplier must be >= 1 (clamped)",
+                    force=True,
+                )
+                producer_batch_blocks = 1
+    elif not use_adaptive_batching:
+        producer_batch_blocks = 1
+
+    producer_batch_blocks = max(1, int(producer_batch_blocks))
+    if producer_max_batch_blocks < producer_batch_blocks:
+        producer_max_batch_blocks = int(producer_batch_blocks)
 
     queue_stats_lock = threading.Lock()
     queue_stats = {
@@ -1016,6 +1047,7 @@ def run(
     # Debug throttling for STATUS_PRINTER emits
     efficiency_debug_last_emit: float = 0.0
     efficiency_debug_emit_interval: float = 5.0
+    last_render_event_time: float = float("-inf")
 
     # Use module-level control helpers to centralise cache behaviour and
     # ensure both interactive and headless runners create identical buffers.
@@ -1446,7 +1478,7 @@ def run(
         producer_stop_event.clear()
 
         def producer_thread() -> None:
-            nonlocal running, audio_blocksize
+            nonlocal running, audio_blocksize, last_render_event_time
             try:
                 # Adaptive backoff used when the queue is full. This starts
                 # very small (low-latency retry) and exponentially backs off
@@ -1482,6 +1514,39 @@ def run(
 
                 while running and not producer_stop_event.is_set():
                     block_frames = max(1, audio_blocksize)
+                    latest_event_time = last_render_event_time
+                    history = getattr(graph, "control_delay", None)
+                    if history is not None:
+                        try:
+                            events_snapshot = history.events
+                            if events_snapshot:
+                                latest_event_time = float(events_snapshot[-1].timestamp)
+                        except Exception:
+                            latest_event_time = last_render_event_time
+                    skip_render = False
+                    if pcm_queue is not None and queue_capacity:
+                        try:
+                            pending_chunks = pcm_queue.qsize()
+                        except Exception:
+                            pending_chunks = 0
+                        pending_chunks += len(stashed_chunks)
+                        target_depth = max(
+                            1, int(math.ceil(queue_capacity * producer_fill_target))
+                        )
+                        if (
+                            pending_chunks >= target_depth
+                            and latest_event_time <= last_render_event_time
+                        ):
+                            skip_render = True
+                    if skip_render:
+                        sleep_interval = 0.001
+                        try:
+                            if sample_rate:
+                                sleep_interval = min(0.005, block_frames / sample_rate)
+                        except Exception:
+                            pass
+                        time.sleep(max(0.0005, sleep_interval))
+                        continue
                     # Batch selection MUST be independent of cache occupancy.
                     # Always render according to the learned
                     # `preferred_batch_blocks` with a small alternating
@@ -1524,6 +1589,7 @@ def run(
                     # batch required to fill the queue target (as calculated
                     # above) and render it in one go.
                     buffer, meta = _render_audio_frames(total_frames)
+                    last_render_event_time = latest_event_time
 
                     # Update batching policy from the actual measured efficiency
                     # Require producer metadata to be present and trust the
