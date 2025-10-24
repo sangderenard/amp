@@ -17,7 +17,7 @@ import zlib
 import numpy as np
 
 from .config import GraphConfig
-from .diagnostics import log_py_c_call
+from .diagnostics import log_py_c_call, py_c_logging_enabled
 from .nodes import NODE_TYPES, Node as AudioNode
 
 RAW_DTYPE = np.float64
@@ -1007,35 +1007,36 @@ class AudioGraph:
                     payload.extend(values.tobytes(order="C"))
                 control_history_blob = bytes(payload)
 
-        # Diagnostic: dump last control-history blob and metadata to logs so we can
-        # inspect the exact bytes passed to the C kernel when a native crash occurs.
-        try:
-            logs_dir = Path("logs")
-            logs_dir.mkdir(exist_ok=True)
-            blob_path = logs_dir / "last_control_blob.bin"
-            meta_path = logs_dir / "last_control_blob.json"
-            with open(blob_path, "wb") as bf:
-                bf.write(control_history_blob)
-            meta = {
-                "req_start": float(req_start),
-                "req_end": float(req_end),
-                "start_time": float(start_time),
-                "end_time": float(end_time),
-                "ctrl_delay": float(ctrl_delay),
-                "latest_time": float(latest),
-                "blob_len": len(control_history_blob),
-            }
-            # Include graph descriptor/plan sizes to help triage mismatches
+        if py_c_logging_enabled():
+            # Diagnostic: dump last control-history blob and metadata to logs so we can
+            # inspect the exact bytes passed to the C kernel when a native crash occurs.
             try:
-                meta["descriptor_len"] = len(self.serialize_node_descriptors())
-                meta["compiled_plan_len"] = len(self.serialize_compiled_plan())
+                logs_dir = Path("logs")
+                logs_dir.mkdir(exist_ok=True)
+                blob_path = logs_dir / "last_control_blob.bin"
+                meta_path = logs_dir / "last_control_blob.json"
+                with open(blob_path, "wb") as bf:
+                    bf.write(control_history_blob)
+                meta = {
+                    "req_start": float(req_start),
+                    "req_end": float(req_end),
+                    "start_time": float(start_time),
+                    "end_time": float(end_time),
+                    "ctrl_delay": float(ctrl_delay),
+                    "latest_time": float(latest),
+                    "blob_len": len(control_history_blob),
+                }
+                # Include graph descriptor/plan sizes to help triage mismatches
+                try:
+                    meta["descriptor_len"] = len(self.serialize_node_descriptors())
+                    meta["compiled_plan_len"] = len(self.serialize_compiled_plan())
+                except Exception:
+                    pass
+                with open(meta_path, "w", encoding="utf-8") as mf:
+                    json.dump(meta, mf)
             except Exception:
+                # Diagnostics must never interfere with runtime; swallow errors.
                 pass
-            with open(meta_path, "w", encoding="utf-8") as mf:
-                json.dump(meta, mf)
-        except Exception:
-            # Diagnostics must never interfere with runtime; swallow errors.
-            pass
         self._last_node_timings.clear()
         log_py_c_call(
             f"{time.time()} render_block.enter frames={frames} sample_rate={sr} base_params_keys={list((block_params or {}).keys())}"
