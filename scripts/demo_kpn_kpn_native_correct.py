@@ -1,14 +1,17 @@
-"""Native-only KPN demo: driver -> oscillator -> PCM sink with FFT tap."""
+"""Native-only KPN demo: stream oscillator -> driver -> op-amp oscillator -> PCM sink with FFT tap."""
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import wave
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, List, Tuple
 
 import numpy as np
+import sympy as sp
 
 if __package__ in (None, ""):
     REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +19,13 @@ if __package__ in (None, ""):
 
 from amp.graph import AudioGraph
 from amp.native_runtime import NativeGraphExecutor, UNAVAILABLE_REASON
-from amp.nodes import FFTDivisionNode, MixNode, OscNode, ParametricDriverNode
+from amp.nodes import (
+    FFTDivisionNode,
+    MixNode,
+    OscNode,
+    OscillatorPitchNode,
+    ParametricDriverNode,
+)
 
 
 def _write_grayscale_png(path: Path, image: np.ndarray) -> None:
@@ -47,19 +56,57 @@ def _write_grayscale_png(path: Path, image: np.ndarray) -> None:
         stream.write(chunk(b"IEND", b""))
 
 
-def build_graph(sample_rate: int) -> AudioGraph:
+@dataclass(frozen=True)
+class PitchProgram:
+    oscillator_freq: np.ndarray
+    driver_freq: np.ndarray
+    driver_amp: np.ndarray
+    normalized: np.ndarray
+    render_blend: np.ndarray
+    raw_expression: np.ndarray
+
+
+@dataclass(frozen=True)
+class PitchDriverOscModule:
+    pitch: OscillatorPitchNode
+    driver: ParametricDriverNode
+    oscillator: OscNode
+
+    @classmethod
+    def install(
+        cls,
+        graph: AudioGraph,
+        *,
+        pitch_name: str = "pitch_programmer",
+        driver_name: str = "driver",
+        oscillator_name: str = "osc_master",
+    ) -> "PitchDriverOscModule":
+        pitch = OscillatorPitchNode(pitch_name, min_freq=0.0, default_slew=0.0)
+        driver = ParametricDriverNode(driver_name, mode="piezo")
+        osc = OscNode(
+            oscillator_name,
+            wave="saw",
+            mode="op_amp",
+            accept_reset=False,
+            integration_leak=0.997,
+            integration_gain=0.5,
+            integration_clamp=1.2,
+        )
+
+        graph.add_node(pitch)
+        graph.add_node(driver)
+        graph.add_node(osc)
+
+        graph.connect_mod(pitch.name, driver.name, "frequency", scale=1.0, mode="add")
+        graph.connect_audio(driver.name, osc.name)
+
+        return cls(pitch=pitch, driver=driver, oscillator=osc)
+
+
+def build_graph(sample_rate: int) -> Tuple[AudioGraph, PitchDriverOscModule]:
     graph = AudioGraph(sample_rate=sample_rate, output_channels=1)
 
-    driver = ParametricDriverNode("driver", mode="piezo")
-    osc = OscNode(
-        "osc",
-        wave="saw",
-        mode="integrator",
-        accept_reset=False,
-        integration_leak=0.997,
-        integration_gain=0.5,
-        integration_clamp=1.2,
-    )
+    module = PitchDriverOscModule.install(graph)
     mix = MixNode("mix", params={"channels": 1})
     fft = FFTDivisionNode(
         "fft",
@@ -73,16 +120,88 @@ def build_graph(sample_rate: int) -> AudioGraph:
         },
     )
 
-    graph.add_node(driver)
-    graph.add_node(osc)
     graph.add_node(mix)
     graph.add_node(fft)
 
-    graph.connect_mod("driver", "osc", "freq", scale=40.0, mode="add")
-    graph.connect_audio("osc", "mix")
+    graph.connect_audio(module.oscillator.name, "mix")
     graph.connect_audio("mix", "fft")
     graph.set_sink("mix")
-    return graph
+    return graph, module
+
+
+def _json_safe(value):
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    return repr(value)
+
+
+def export_network_map(graph: AudioGraph, path: Path) -> None:
+    nodes = []
+    for node in graph.ordered_nodes:
+        params = dict(getattr(node, "params", {}))
+        safe_params = {str(key): _json_safe(val) for key, val in params.items()}
+        nodes.append(
+            {
+                "name": node.name,
+                "type": type(node).__name__,
+                "params": safe_params,
+                "oversample_ratio": int(getattr(node, "oversample_ratio", 1) or 1),
+                "declared_delay": int(getattr(node, "declared_delay_frames", 0) or 0),
+                "supports_v2": bool(getattr(node, "supports_v2", True)),
+            }
+        )
+    audio_edges = []
+    for target, sources in graph._audio_inputs.items():  # type: ignore[attr-defined]
+        for source in sources:
+            audio_edges.append({"source": source, "target": target})
+    mod_edges = []
+    for target, entries in graph._mod_inputs.items():  # type: ignore[attr-defined]
+        for connection in entries:
+            mod_edges.append(
+                {
+                    "source": connection.source,
+                    "target": target,
+                    "param": connection.param,
+                    "scale": connection.scale,
+                    "mode": connection.mode,
+                    "channel": connection.channel,
+                }
+            )
+    payload = {
+        "nodes": nodes,
+        "audio_edges": audio_edges,
+        "mod_edges": mod_edges,
+        "sink": graph.sink,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _evaluate_pitch_expression(expr: str, t: np.ndarray) -> np.ndarray:
+    symbol_t = sp.Symbol("t", real=True)
+    try:
+        parsed = sp.sympify(expr, locals={"pi": sp.pi})
+    except sp.SympifyError as exc:
+        raise ValueError(f"invalid SymPy expression '{expr}': {exc}") from exc
+    extra_symbols = parsed.free_symbols.difference({symbol_t})
+    if extra_symbols:
+        names = ", ".join(sorted(str(sym) for sym in extra_symbols))
+        raise ValueError(f"unsupported symbols in pitch expression: {names}")
+    func = sp.lambdify((symbol_t,), parsed, modules=["numpy"])
+    values = func(t)
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = np.full(t.shape, float(arr), dtype=np.float64)
+    else:
+        arr = np.broadcast_to(arr, t.shape).astype(np.float64, copy=False)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("pitch expression produced non-finite values")
+    return arr
 
 
 def ensure_native_kernels(executor: NativeGraphExecutor, node_names: Iterable[str]) -> None:
@@ -108,11 +227,196 @@ def create_param_block(values: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     return block
 
 
-def generate_driver_curves(total_frames: int, sample_rate: float) -> Tuple[np.ndarray, np.ndarray]:
+def _apply_hold_mask(curve: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if curve.ndim != 1:
+        raise ValueError("curve must be one-dimensional for hold application")
+    if mask.shape != curve.shape:
+        raise ValueError("mask shape must match curve shape")
+    if not np.any(mask):
+        return curve
+    held = curve.copy()
+    current = float(curve[0]) if curve.size else 0.0
+    for idx in range(curve.size):
+        if mask[idx]:
+            held[idx] = current
+        else:
+            current = float(curve[idx])
+    return held
+
+
+def _parse_semitone_list(text: str, *, fallback: Iterable[int]) -> List[int]:
+    entries = [part.strip() for part in str(text).split(",")]
+    values: List[int] = []
+    for entry in entries:
+        if not entry:
+            continue
+        try:
+            values.append(int(entry))
+        except ValueError as exc:
+            raise ValueError(f"invalid semitone offset '{entry}' in '{text}'") from exc
+    if not values:
+        values = [int(v) for v in fallback]
+    return values
+
+
+def _generate_expression_schedule(
+    total_frames: int,
+    sample_rate: float,
+    expression: str,
+    *,
+    base_freq: float,
+    pitch_depth: float,
+    driver_min_freq: float,
+    log: Callable[[str], None],
+) -> PitchProgram:
     t = np.arange(total_frames, dtype=np.float64) / sample_rate
-    frequency = np.full(total_frames, 2.0, dtype=np.float64)  # 2 Hz modulation
-    amplitude = 0.65 + 0.35 * np.sin(2.0 * math.pi * 0.25 * t)
-    return frequency, amplitude
+    try:
+        raw_curve = _evaluate_pitch_expression(expression, t)
+    except Exception as exc:  # noqa: BLE001 - fall back to a stable modulation
+        log(
+            "[demo] Pitch expression evaluation failed: "
+            f"{exc}. Falling back to neutral modulation."
+        )
+        raw_curve = np.zeros(total_frames, dtype=np.float64)
+    centered = raw_curve - np.mean(raw_curve)
+    span = float(np.max(np.abs(centered))) if centered.size else 0.0
+    if not math.isfinite(span) or span < 1.0e-9:
+        normalized = np.zeros_like(centered)
+    else:
+        normalized = centered / span
+    pitch_offsets = normalized * float(pitch_depth)
+    osc_frequency = np.asarray(base_freq + pitch_offsets, dtype=np.float64)
+    osc_frequency = np.maximum(osc_frequency, driver_min_freq)
+    driver_frequency = np.maximum(osc_frequency, driver_min_freq)
+    driver_amplitude = 0.65 + 0.35 * np.tanh(normalized)
+    render_mode = np.clip(0.5 + 0.5 * normalized, 0.0, 1.0)
+    return PitchProgram(
+        oscillator_freq=osc_frequency,
+        driver_freq=driver_frequency,
+        driver_amp=driver_amplitude,
+        normalized=normalized,
+        render_blend=render_mode,
+        raw_expression=raw_curve,
+    )
+
+
+def _generate_arpeggio_schedule(
+    total_frames: int,
+    sample_rate: float,
+    *,
+    base_freq: float,
+    driver_min_freq: float,
+    arpeggio_intervals: Iterable[int],
+    chord_intervals: Iterable[int],
+    whole_note_seconds: float,
+    chord_hold_notes: int,
+    log: Callable[[str], None],
+) -> PitchProgram:
+    intervals = list(arpeggio_intervals)
+    chord = list(chord_intervals)
+    if not intervals:
+        intervals = [0]
+    if not chord:
+        chord = [intervals[0]]
+    frames_per_note = max(1, int(round(max(whole_note_seconds, 1.0e-3) * sample_rate)))
+    chord_hold_notes = max(1, int(chord_hold_notes))
+    arpeggio_frames = frames_per_note * len(intervals)
+    chord_frames = frames_per_note * chord_hold_notes
+    cycle_frames = arpeggio_frames + chord_frames
+    raw_offsets = np.zeros(total_frames, dtype=np.float64)
+    driver_offsets = np.zeros(total_frames, dtype=np.float64)
+    render_blend = np.zeros(total_frames, dtype=np.float64)
+    driver_amp = np.zeros(total_frames, dtype=np.float64)
+
+    for frame in range(total_frames):
+        pos = frame % cycle_frames
+        if pos < arpeggio_frames:
+            note_idx = pos // frames_per_note
+            offset = intervals[note_idx]
+            raw_offsets[frame] = float(offset)
+            driver_offsets[frame] = float(intervals[0])
+            render_blend[frame] = 0.2
+            driver_amp[frame] = 0.55 + 0.35 * (note_idx / max(1, len(intervals) - 1))
+        else:
+            local = pos - arpeggio_frames
+            chord_note_idx = (local // frames_per_note) % len(chord)
+            offset = chord[chord_note_idx]
+            raw_offsets[frame] = float(offset)
+            driver_offsets[frame] = float(chord[0])
+            render_blend[frame] = 0.85
+            driver_amp[frame] = 0.75
+
+    root_multiplier = np.power(2.0, raw_offsets / 12.0)
+    osc_frequency = np.asarray(base_freq * root_multiplier, dtype=np.float64)
+    driver_multiplier = np.power(2.0, driver_offsets / 12.0)
+    driver_frequency = np.asarray(base_freq * driver_multiplier, dtype=np.float64)
+    np.maximum(osc_frequency, driver_min_freq, out=osc_frequency)
+    np.maximum(driver_frequency, driver_min_freq, out=driver_frequency)
+
+    centered = raw_offsets - np.mean(raw_offsets)
+    span = float(np.max(np.abs(centered))) if centered.size else 0.0
+    if not math.isfinite(span) or span < 1.0e-9:
+        normalized = np.zeros_like(centered)
+    else:
+        normalized = centered / span
+
+    driver_amp = np.clip(driver_amp, 0.1, 1.1)
+    render_blend = np.clip(render_blend, 0.0, 1.0)
+
+    log(
+        "[demo] Arpeggio program: intervals=%s chord=%s whole_note=%.3fs chord_hold=%d notes"
+        % (intervals, chord, whole_note_seconds, chord_hold_notes)
+    )
+
+    return PitchProgram(
+        oscillator_freq=osc_frequency,
+        driver_freq=driver_frequency,
+        driver_amp=driver_amp,
+        normalized=normalized,
+        render_blend=render_blend,
+        raw_expression=raw_offsets,
+    )
+
+
+def generate_pitch_schedule(
+    total_frames: int,
+    sample_rate: float,
+    expression: str,
+    *,
+    base_freq: float,
+    pitch_depth: float,
+    driver_min_freq: float,
+    program: str,
+    arpeggio_intervals: Iterable[int],
+    chord_intervals: Iterable[int],
+    whole_note_seconds: float,
+    chord_hold_notes: int,
+    log: Callable[[str], None],
+) -> PitchProgram:
+    mode = program.lower()
+    if mode == "expression":
+        return _generate_expression_schedule(
+            total_frames,
+            sample_rate,
+            expression,
+            base_freq=base_freq,
+            pitch_depth=pitch_depth,
+            driver_min_freq=driver_min_freq,
+            log=log,
+        )
+    if mode == "arpeggio":
+        return _generate_arpeggio_schedule(
+            total_frames,
+            sample_rate,
+            base_freq=base_freq,
+            driver_min_freq=driver_min_freq,
+            arpeggio_intervals=arpeggio_intervals,
+            chord_intervals=chord_intervals,
+            whole_note_seconds=whole_note_seconds,
+            chord_hold_notes=chord_hold_notes,
+            log=log,
+        )
+    raise ValueError(f"unsupported pitch program '{program}'")
 
 
 def compute_spectrogram(
@@ -166,6 +470,117 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--sr", type=float, default=48_000.0, help="Sample rate in Hz (default: 48000)")
     parser.add_argument("--block-size", type=int, default=512, help="Block size in frames (default: 512)")
     parser.add_argument("--out-dir", type=Path, default=Path("output") / "demo_kpn_spectro", help="Output directory")
+    parser.add_argument(
+        "--pitch-program",
+        choices=("arpeggio", "expression"),
+        default="arpeggio",
+        help="Select the high-level pitch program to render (default: arpeggio).",
+    )
+    parser.add_argument(
+        "--pitch-modulation",
+        type=str,
+        default="2.0",
+        help=(
+            "SymPy expression of time 't' describing the oscillator pitch program prior to driver handoff. "
+            "Only used when --pitch-program=expression (default: '2.0')."
+        ),
+    )
+    parser.add_argument(
+        "--pitch-depth",
+        type=float,
+        default=40.0,
+        help="Depth in Hz applied to the evaluated expression before delivering pitch to the driver (expression mode only).",
+    )
+    parser.add_argument(
+        "--pitch-direct-depth",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional depth in Hz applied directly inside the oscillator after the driver-rendered waveform is received "
+            "(default: 0.0)."
+        ),
+    )
+    parser.add_argument(
+        "--base-freq",
+        type=float,
+        default=330.0,
+        help="Base oscillator frequency in Hz before modulation is applied (default: 330.0).",
+    )
+    parser.add_argument(
+        "--driver-min-freq",
+        type=float,
+        default=0.1,
+        help="Lower clamp in Hz applied to the evaluated driver frequency curve (default: 0.1).",
+    )
+    parser.add_argument(
+        "--pitch-slew",
+        type=float,
+        default=75.0,
+        help="Slew limit in Hz/s applied by the pitch programmer before values reach the driver (default: 75.0).",
+    )
+    parser.add_argument(
+        "--op-amp-slew",
+        type=float,
+        default=12000.0,
+        help="Slew rate in Hz/s applied by the op-amp oscillator when chasing the driver signal (default: 12000.0).",
+    )
+    parser.add_argument(
+        "--oscillator-pitch-mode",
+        choices=("follow", "hold"),
+        default="follow",
+        help=(
+            "Whether the oscillator should follow the programmed pitch curve or hold a static frequency "
+            "derived from --base-freq (default: follow)."
+        ),
+    )
+    parser.add_argument(
+        "--driver-pitch-mode",
+        choices=("follow", "hold"),
+        default="follow",
+        help=(
+            "Whether the driver should follow the pitch program or hold its initial frequency "
+            "(default: follow)."
+        ),
+    )
+    parser.add_argument(
+        "--pitch-authority",
+        choices=("both", "oscillator", "driver", "manual"),
+        default="both",
+        help=(
+            "Chooses which element leads the pitch program across the render. 'both' splits the render "
+            "between oscillator-led then driver-led halves; 'manual' honours the follow/hold switches."
+        ),
+    )
+    parser.add_argument(
+        "--arpeggio-intervals",
+        type=str,
+        default="0,4,7",
+        help=(
+            "Comma separated semitone offsets (relative to --base-freq) used for the ascending arpeggio "
+            "when --pitch-program=arpeggio (default: '0,4,7')."
+        ),
+    )
+    parser.add_argument(
+        "--arpeggio-chord",
+        type=str,
+        default="0,4,7",
+        help=(
+            "Comma separated semitone offsets that describe the sustained chord segment when "
+            "--pitch-program=arpeggio (default: '0,4,7')."
+        ),
+    )
+    parser.add_argument(
+        "--arpeggio-whole-note",
+        type=float,
+        default=1.0,
+        help="Duration in seconds of each whole note during the arpeggio program (default: 1.0).",
+    )
+    parser.add_argument(
+        "--arpeggio-chord-hold",
+        type=int,
+        default=2,
+        help="Number of whole notes to sustain the chord segment in the arpeggio program (default: 2).",
+    )
     parser.add_argument("--play", action="store_true", help="Attempt realtime playback (not implemented)")
     parser.add_argument("--display", action="store_true", help="Display spectrogram window (not implemented)")
     return parser.parse_args(list(argv))
@@ -190,7 +605,13 @@ def main(argv: Iterable[str]) -> int:
             fh.write(message + "\n")
 
     log("[demo] Constructing audio graph...")
-    graph = build_graph(int(args.sr))
+    graph, module = build_graph(int(args.sr))
+    pitch_node = module.pitch
+    pitch_node.params["default_slew"] = max(0.0, float(args.pitch_slew))
+    pitch_node.params["min_freq"] = max(0.0, float(args.driver_min_freq))
+    map_path = out_dir / "network_map.json"
+    export_network_map(graph, map_path)
+    log(f"[demo] Exported network map: {map_path}")
 
     try:
         log("[demo] Initialising native graph runtime...")
@@ -219,10 +640,118 @@ def main(argv: Iterable[str]) -> int:
             raise ValueError("block-size must be positive")
 
         log(f"[demo] Rendering {total_frames} frames (block size {block_size})...")
-        driver_freq_curve, driver_amp_curve = generate_driver_curves(total_frames, args.sr)
+        arpeggio_intervals = _parse_semitone_list(args.arpeggio_intervals, fallback=(0,))
+        chord_intervals = _parse_semitone_list(args.arpeggio_chord, fallback=arpeggio_intervals)
+        pitch_program = generate_pitch_schedule(
+            total_frames,
+            args.sr,
+            args.pitch_modulation,
+            base_freq=float(args.base_freq),
+            pitch_depth=float(args.pitch_depth),
+            driver_min_freq=max(1.0e-6, float(args.driver_min_freq)),
+            program=args.pitch_program,
+            arpeggio_intervals=arpeggio_intervals,
+            chord_intervals=chord_intervals,
+            whole_note_seconds=float(args.arpeggio_whole_note),
+            chord_hold_notes=int(args.arpeggio_chord_hold),
+            log=log,
+        )
 
-        base_freq = 330.0
+        pitch_schedule = pitch_program.oscillator_freq
+        driver_freq_curve = pitch_program.driver_freq
+        driver_amp_curve = pitch_program.driver_amp
+        normalized_pitch = pitch_program.normalized
+        render_mode_curve = pitch_program.render_blend
+
         base_amp = 0.4
+        if args.pitch_direct_depth != 0.0:
+            master_freq_curve = pitch_schedule + normalized_pitch * float(args.pitch_direct_depth)
+        else:
+            master_freq_curve = pitch_schedule.copy()
+
+        authority_mode = str(args.pitch_authority)
+        driver_hold_mask = np.zeros(total_frames, dtype=bool)
+        osc_hold_mask = np.zeros(total_frames, dtype=bool)
+        if authority_mode == "manual":
+            if args.driver_pitch_mode == "hold":
+                driver_hold_mask[:] = True
+            if args.oscillator_pitch_mode == "hold":
+                osc_hold_mask[:] = True
+            log(
+                "[demo] Manual authority: driver=%s oscillator=%s"
+                % (args.driver_pitch_mode, args.oscillator_pitch_mode)
+            )
+        elif authority_mode == "oscillator":
+            driver_hold_mask[:] = True
+            log("[demo] Authority: oscillator-led (driver holds, oscillator follows)")
+        elif authority_mode == "driver":
+            osc_hold_mask[:] = True
+            log("[demo] Authority: driver-led (oscillator holds, driver follows)")
+        elif authority_mode == "both":
+            split = max(1, total_frames // 2)
+            driver_hold_mask[:split] = True
+            osc_hold_mask[split:] = True
+            render_mode_curve[:split] = np.minimum(render_mode_curve[:split], 0.3)
+            render_mode_curve[split:] = np.maximum(render_mode_curve[split:], 0.7)
+            log(
+                "[demo] Authority split: first half oscillator-led, second half driver-led (split frame %d)"
+                % split
+            )
+        else:
+            raise ValueError(f"unsupported pitch authority '{authority_mode}'")
+
+        if np.any(driver_hold_mask):
+            driver_freq_curve = _apply_hold_mask(driver_freq_curve, driver_hold_mask)
+            driver_amp_curve = _apply_hold_mask(driver_amp_curve, driver_hold_mask)
+        if np.any(osc_hold_mask):
+            master_freq_curve = _apply_hold_mask(master_freq_curve, osc_hold_mask)
+
+        slew_curve = np.full(total_frames, max(0.0, float(args.op_amp_slew)), dtype=np.float64)
+        pitch_slew_curve = np.full(total_frames, max(0.0, float(args.pitch_slew)), dtype=np.float64)
+        log(
+            "[demo] Pitch program stats: pitch[min={:.4f}, max={:.4f}] Hz, raw[min={:.4f}, max={:.4f}], "
+            "norm[min={:.4f}, max={:.4f}]".format(
+                float(pitch_schedule.min()),
+                float(pitch_schedule.max()),
+                float(pitch_program.raw_expression.min()),
+                float(pitch_program.raw_expression.max()),
+                float(normalized_pitch.min()),
+                float(normalized_pitch.max()),
+            )
+        )
+        if driver_freq_curve.size:
+            if np.all(driver_hold_mask):
+                driver_mode_label = "hold"
+            elif not np.any(driver_hold_mask):
+                driver_mode_label = "follow"
+            else:
+                driver_mode_label = "split"
+            log(
+                "[demo] Driver stats: freq[min={:.4f}, max={:.4f}] Hz, amp[min={:.4f}, max={:.4f}], "
+                "blend[min={:.4f}, max={:.4f}] mode={}".format(
+                    float(driver_freq_curve.min()),
+                    float(driver_freq_curve.max()),
+                    float(driver_amp_curve.min()),
+                    float(driver_amp_curve.max()),
+                    float(render_mode_curve.min()),
+                    float(render_mode_curve.max()),
+                    driver_mode_label,
+                )
+            )
+        if master_freq_curve.size:
+            if np.all(osc_hold_mask):
+                osc_mode_label = "hold"
+            elif not np.any(osc_hold_mask):
+                osc_mode_label = "follow"
+            else:
+                osc_mode_label = "split"
+            log(
+                "[demo] Oscillator stats: freq[min={:.4f}, max={:.4f}] Hz mode={}".format(
+                    float(master_freq_curve.min()),
+                    float(master_freq_curve.max()),
+                    osc_mode_label,
+                )
+            )
 
         pcm_blocks: list[np.ndarray] = []
         metrics_log: list[Tuple[int, float]] = []
@@ -237,12 +766,20 @@ def main(argv: Iterable[str]) -> int:
                 {
                     "frequency": driver_freq_curve[sl],
                     "amplitude": driver_amp_curve[sl],
+                    "render_mode": render_mode_curve[sl],
+                }
+            )
+            pitch_params = create_param_block(
+                {
+                    "pitch_hz": pitch_schedule[sl],
+                    "slew_hz_per_s": pitch_slew_curve[sl],
                 }
             )
             osc_params = create_param_block(
                 {
-                    "freq": np.full(frames_this, base_freq, dtype=np.float64),
+                    "freq": master_freq_curve[sl],
                     "amp": np.full(frames_this, base_amp, dtype=np.float64),
+                    "slew": slew_curve[sl],
                 }
             )
             fft_params = create_param_block(
@@ -258,8 +795,9 @@ def main(argv: Iterable[str]) -> int:
             )
 
             base_params = {
-                "driver": driver_params,
-                "osc": osc_params,
+                module.pitch.name: pitch_params,
+                module.driver.name: driver_params,
+                module.oscillator.name: osc_params,
                 "fft": fft_params,
             }
             try:

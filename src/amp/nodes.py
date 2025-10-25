@@ -931,6 +931,100 @@ class AmplifierModulatorNode(Node):
         return out
 
 
+class OscillatorPitchNode(Node):
+    """Program pitch curves for driver handoff with optional slew limiting."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        min_freq: float = 0.0,
+        default_slew: float = 0.0,
+    ) -> None:
+        super().__init__(name)
+        self.min_freq = float(min_freq)
+        self.default_slew = float(default_slew)
+        self.params.update({
+            "min_freq": self.min_freq,
+            "default_slew": self.default_slew,
+        })
+        self._last: np.ndarray | None = None
+
+    def _ensure_curve(self, key: str, value, batches: int, frames: int) -> np.ndarray:
+        return as_BCF(value, batches, 1, frames, name=key)[:, 0, :]
+
+    def process(self, frames, sr, audio_in, mods, params):
+        batches = audio_in.shape[0] if audio_in is not None else 1
+        if batches <= 0:
+            batches = 1
+        freq_curve = None
+        if "pitch_hz" in params:
+            freq_curve = self._ensure_curve(
+                f"{self.name}.pitch_hz", params.get("pitch_hz", 0.0), batches, frames
+            ).astype(RAW_DTYPE, copy=True)
+        else:
+            root = self._ensure_curve(
+                f"{self.name}.root_hz", params.get("root_hz", self.min_freq), batches, frames
+            )
+            offsets = self._ensure_curve(
+                f"{self.name}.offset_cents", params.get("offset_cents", 0.0), batches, frames
+            )
+            freq_curve = (root * np.power(2.0, offsets / 1200.0)).astype(RAW_DTYPE, copy=True)
+        add = params.get("add_hz")
+        if add is not None:
+            freq_curve = freq_curve + self._ensure_curve(
+                f"{self.name}.add_hz", add, batches, frames
+            )
+        min_freq = float(params.get("min_freq", self.min_freq))
+        if min_freq > 0.0:
+            np.maximum(freq_curve, min_freq, out=freq_curve)
+        slew_param = params.get("slew_hz_per_s")
+        if slew_param is not None:
+            slew_curve = np.maximum(
+                self._ensure_curve(f"{self.name}.slew", slew_param, batches, frames),
+                0.0,
+            )
+        elif self.default_slew > 0.0:
+            slew_curve = np.full((batches, frames), self.default_slew, dtype=RAW_DTYPE)
+        else:
+            slew_curve = None
+
+        if slew_curve is None or not np.any(slew_curve > 0.0):
+            if self._last is None or self._last.shape[0] != batches:
+                self._last = freq_curve[:, -1].copy()
+            return freq_curve[:, None, :]
+
+        if self._last is None or self._last.shape[0] != batches:
+            self._last = freq_curve[:, 0].copy()
+
+        output = np.empty_like(freq_curve, dtype=RAW_DTYPE)
+        per_sample = slew_curve / float(sr)
+        np.maximum(per_sample, 0.0, out=per_sample)
+
+        for b in range(batches):
+            current = float(self._last[b])
+            base = freq_curve[b]
+            limit = per_sample[b]
+            for f in range(frames):
+                target = float(base[f])
+                lim = float(limit[f])
+                if lim > 0.0:
+                    delta = target - current
+                    if delta > lim:
+                        delta = lim
+                    elif delta < -lim:
+                        delta = -lim
+                    current += delta
+                else:
+                    current = target
+                if current < min_freq:
+                    current = min_freq
+                output[b, f] = current
+            self._last[b] = current
+
+        return output[:, None, :]
+
+
 class OscNode(Node):
     def __init__(
         self,
@@ -1279,10 +1373,16 @@ class ParametricDriverNode(Node):
         freq = as_BCF(params.get("frequency", 440.0), B, 1, frames, name=f"{self.name}.frequency")[:, 0, :]
         amp = as_BCF(params.get("amplitude", 1.0), B, 1, frames, name=f"{self.name}.amplitude")[:, 0, :]
         phase_offset = as_BCF(params.get("phase_offset", 0.0), B, 1, frames, name=f"{self.name}.phase_offset")[:, 0, :]
+        blend = as_BCF(params.get("render_mode", 0.0), B, 1, frames, name=f"{self.name}.render_mode")[:, 0, :]
         if self._phase is None or self._phase.shape[0] != B:
             self._phase = np.zeros(B, dtype=RAW_DTYPE)
         out = np.zeros((B, 1, frames), dtype=RAW_DTYPE)
         harmonics = np.asarray(self.harmonics if self.harmonics else (1.0,), dtype=RAW_DTYPE)
+        if audio_in is not None:
+            driver_in = assert_BCF(audio_in, name=f"{self.name}.in")  # (B,C,F)
+            streaming = np.mean(driver_in, axis=1)
+        else:
+            streaming = np.zeros((B, frames), dtype=RAW_DTYPE)
         for b in range(B):
             phase = float(self._phase[b])
             for f in range(frames):
@@ -1293,7 +1393,17 @@ class ParametricDriverNode(Node):
                     if coeff == 0.0:
                         continue
                     sample += float(coeff) * np.sin(2.0 * np.pi * ph * (idx + 1))
-                out[b, 0, f] = sample * float(amp[b, f])
+                mix = float(blend[b, f])
+                if mix < 0.0:
+                    mix = 0.0
+                elif mix > 1.0:
+                    mix = 1.0
+                if streaming.size:
+                    stream_val = float(streaming[b, f % streaming.shape[1]])
+                else:
+                    stream_val = 0.0
+                combined = (1.0 - mix) * sample + mix * stream_val
+                out[b, 0, f] = combined * float(amp[b, f])
             self._phase[b] = phase
         return out
 
@@ -1617,6 +1727,8 @@ NODE_TYPES = {
     "sine_oscillator": SineOscillatorNode,
     "osc": OscNode,
     "oscillator": OscNode,
+    "oscillator_pitch": OscillatorPitchNode,
+    "OscillatorPitchNode": OscillatorPitchNode,
     "parametric_driver": ParametricDriverNode,
     "ParametricDriverNode": ParametricDriverNode,
     "fft_division": FFTDivisionNode,
@@ -1639,6 +1751,7 @@ __all__ = [
     "ControllerNode",
     "SineOscillatorNode",
     "PitchQuantizerNode",
+    "OscillatorPitchNode",
     "EnvelopeModulatorNode",
     "AmplifierModulatorNode",
     "OscNode",
