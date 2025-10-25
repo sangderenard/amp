@@ -6,7 +6,7 @@ __pycache__/
 .venv/
 
 # Generated audio artifacts
-output.wav*
+output*.wav*
 
 # Native build outputs
 build/
