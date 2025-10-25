@@ -116,6 +116,12 @@ typedef struct {
     AmpNodeMetrics metrics;
     double total_heat_accumulated;
 } AmpGraphNodeSummary;
+typedef struct {
+    int code;
+    const char *stage;
+    const char *node;
+    const char *detail;
+} AmpGraphRuntimeErrorInfo;
 AmpGraphRuntime *amp_graph_runtime_create(
     const uint8_t *descriptor_blob,
     size_t descriptor_len,
@@ -150,6 +156,10 @@ int amp_graph_runtime_execute(
     uint32_t *out_batches,
     uint32_t *out_channels,
     uint32_t *out_frames
+);
+int amp_graph_runtime_last_error(
+    AmpGraphRuntime *runtime,
+    AmpGraphRuntimeErrorInfo *out_error
 );
 void amp_graph_runtime_buffer_free(double *buffer);
 AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
@@ -270,6 +280,49 @@ class NativeGraphExecutor:
         except Exception:
             pass
 
+    def _decode_optional_string(self, pointer) -> str | None:
+        if pointer in (None, self.ffi.NULL):
+            return None
+        return self.ffi.string(pointer).decode("utf-8", "replace")
+
+    def last_error(self) -> dict[str, object] | None:
+        """Return the last error reported by the native runtime, if any."""
+
+        if getattr(self, "_runtime", self.ffi.NULL) in (None, self.ffi.NULL):
+            return None
+        info = self.ffi.new("AmpGraphRuntimeErrorInfo *")
+        rc = self.lib.amp_graph_runtime_last_error(self._runtime, info)
+        if int(rc) != 0:
+            return None
+        error = {
+            "code": int(info.code),
+            "stage": self._decode_optional_string(info.stage),
+            "node": self._decode_optional_string(info.node),
+            "detail": self._decode_optional_string(info.detail),
+        }
+        if error["code"] == 0 and not error["stage"] and not error["node"] and not error["detail"]:
+            return None
+        return error
+
+    def _format_error(self, prefix: str, error: dict[str, object] | None) -> str:
+        if not error:
+            return prefix
+        parts: list[str] = []
+        code = error.get("code")
+        if code is not None:
+            parts.append(f"code={code}")
+        stage = error.get("stage")
+        if stage:
+            parts.append(f"stage={stage}")
+        node = error.get("node")
+        if node:
+            parts.append(f"node={node}")
+        detail = error.get("detail")
+        if detail:
+            parts.append(str(detail))
+        detail_str = ", ".join(parts)
+        return f"{prefix} ({detail_str})" if detail_str else prefix
+
     def run_block(
         self,
         frames: int,
@@ -321,9 +374,11 @@ class NativeGraphExecutor:
                             arr_c.shape[2],
                         )
                         if int(status) != 0:
-                            raise RuntimeError(
-                                f"failed to bind param '{param_name}' for node '{node_name}'"
+                            message = self._format_error(
+                                f"failed to bind param '{param_name}' for node '{node_name}'",
+                                self.last_error(),
                             )
+                            raise RuntimeError(message)
             ctrl_blob = control_history_blob or b""
             ctrl_buf = self.ffi.new("uint8_t[]", ctrl_blob) if ctrl_blob else self.ffi.NULL
             out_ptr = self.ffi.new("double **")
@@ -342,7 +397,11 @@ class NativeGraphExecutor:
                 out_frames,
             )
             if int(status) != 0:
-                raise RuntimeError(f"native runtime execution failed (status {int(status)})")
+                message = self._format_error(
+                    f"native runtime execution failed (status {int(status)})",
+                    self.last_error(),
+                )
+                raise RuntimeError(message)
             total = int(out_batches[0]) * int(out_channels[0]) * int(out_frames[0])
             buffer = self.ffi.buffer(out_ptr[0], total * np.dtype(np.float64).itemsize)
             array = np.frombuffer(buffer, dtype=np.float64).copy().reshape(

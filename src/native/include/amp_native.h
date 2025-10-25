@@ -266,6 +266,13 @@ typedef struct {
     double total_heat_accumulated;
 } AmpGraphNodeSummary;
 
+typedef struct {
+    int code;
+    const char *stage;
+    const char *node;
+    const char *detail;
+} AmpGraphRuntimeErrorInfo;
+
 #define AMP_E_UNSUPPORTED (-4)
 
 AMP_CAPI int amp_run_node_v2(
@@ -318,6 +325,10 @@ AMP_CAPI int amp_graph_runtime_execute(
     uint32_t *out_batches,
     uint32_t *out_channels,
     uint32_t *out_frames
+);
+AMP_CAPI int amp_graph_runtime_last_error(
+    AmpGraphRuntime *runtime,
+    AmpGraphRuntimeErrorInfo *out_error
 );
 AMP_CAPI void amp_graph_runtime_buffer_free(double *buffer);
 AMP_CAPI AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);

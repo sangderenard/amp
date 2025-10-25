@@ -10,6 +10,10 @@ from typing import Dict, Iterable, Tuple
 
 import numpy as np
 
+if __package__ in (None, ""):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
 from amp.graph import AudioGraph
 from amp.native_runtime import NativeGraphExecutor, UNAVAILABLE_REASON
 from amp.nodes import FFTDivisionNode, MixNode, OscNode, ParametricDriverNode
@@ -262,6 +266,15 @@ def main(argv: Iterable[str]) -> int:
                 block_pcm = executor.run_block(frames_this, float(args.sr), base_params=base_params)
             except Exception as exc:
                 log(f"[demo] Native execution failed at block {block_index}: {exc}")
+                err = executor.last_error()
+                if err:
+                    stage = err.get("stage") or "<unknown>"
+                    node_name = err.get("node") or "<none>"
+                    detail = err.get("detail") or ""
+                    log(
+                        "[demo] Last native error: "
+                        f"code={err.get('code')} stage={stage} node={node_name} detail={detail}"
+                    )
                 raise
             log(f"[demo] Block {block_index}: completed")
             pcm_blocks.append(block_pcm.reshape(-1))

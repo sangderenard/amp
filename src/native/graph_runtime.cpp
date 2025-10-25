@@ -141,6 +141,13 @@ struct KahnChannel {
     explicit KahnChannel(std::string name_) : name(std::move(name_)) {}
 };
 
+struct RuntimeErrorState {
+    int code{0};
+    std::string stage;
+    std::string node;
+    std::string detail;
+};
+
 struct RuntimeNode {
     std::string name;
     std::string type_name;
@@ -318,7 +325,34 @@ struct AmpGraphRuntime {
     uint32_t default_batches{1};
     uint32_t default_frames{0};
     double dsp_sample_rate{0.0};
+    RuntimeErrorState last_error;
 };
+
+static void runtime_clear_error(AmpGraphRuntime *runtime) {
+    if (runtime == nullptr) {
+        return;
+    }
+    runtime->last_error.code = 0;
+    runtime->last_error.stage.clear();
+    runtime->last_error.node.clear();
+    runtime->last_error.detail.clear();
+}
+
+static void runtime_set_error(
+    AmpGraphRuntime *runtime,
+    int code,
+    const char *stage,
+    const RuntimeNode *node,
+    std::string detail
+) {
+    if (runtime == nullptr) {
+        return;
+    }
+    runtime->last_error.code = code;
+    runtime->last_error.stage = stage != nullptr ? stage : "";
+    runtime->last_error.node = node != nullptr ? node->name : "";
+    runtime->last_error.detail = std::move(detail);
+}
 
 static TensorShape make_shape(uint32_t batches, uint32_t channels, uint32_t frames) {
     TensorShape shape{};
@@ -736,13 +770,19 @@ static int execute_runtime(
     uint32_t *out_channels,
     uint32_t *out_frames
 ) {
-    if (runtime == nullptr || out_buffer == nullptr || out_batches == nullptr || out_channels == nullptr || out_frames == nullptr) {
+    if (runtime == nullptr) {
+        return -1;
+    }
+    runtime_clear_error(runtime);
+    if (out_buffer == nullptr || out_batches == nullptr || out_channels == nullptr || out_frames == nullptr) {
+        runtime_set_error(runtime, -1, "execute_runtime", nullptr, "output buffers must not be null");
         return -1;
     }
     EdgeRunnerControlHistory *history = nullptr;
     if (control_blob != nullptr && control_len > 0U) {
         history = amp_load_control_history(control_blob, control_len, frames_hint);
         if (history == nullptr) {
+            runtime_set_error(runtime, -1, "load_control_history", nullptr, "amp_load_control_history returned null");
             return -1;
         }
     }
@@ -765,6 +805,8 @@ static int execute_runtime(
             if (history != nullptr) {
                 amp_release_control_history(history);
             }
+            std::string detail = std::string("execution order index out of range: ") + std::to_string(order);
+            runtime_set_error(runtime, -1, "schedule_bounds", nullptr, std::move(detail));
             return -1;
         }
         RuntimeNode &node = *runtime->nodes[order];
@@ -774,6 +816,7 @@ static int execute_runtime(
             if (history != nullptr) {
                 amp_release_control_history(history);
             }
+            runtime_set_error(runtime, -1, "merge_audio_inputs", &node, "required audio input missing");
             return -1;
         }
         node.has_latest_metrics = false;
@@ -880,6 +923,9 @@ static int execute_runtime(
                     if (history != nullptr) {
                         amp_release_control_history(history);
                     }
+                    std::string detail = std::string("amp_run_node_v2 returned status ") + std::to_string(v2_status)
+                        + std::string(" at frame ") + std::to_string(frame_index);
+                    runtime_set_error(runtime, v2_status, "run_node_v2", &node, std::move(detail));
                     return -1;
                 } else {
                     used_v2 = true;
@@ -908,6 +954,16 @@ static int execute_runtime(
                     if (history != nullptr) {
                         amp_release_control_history(history);
                     }
+                    std::string detail;
+                    int code = status;
+                    if (frame_buffer == nullptr && status == 0) {
+                        detail = "amp_run_node returned null buffer";
+                        code = -1;
+                    } else {
+                        detail = std::string("amp_run_node returned status ") + std::to_string(status)
+                            + std::string(" at frame ") + std::to_string(frame_index);
+                    }
+                    runtime_set_error(runtime, code, "run_node", &node, std::move(detail));
                     return -1;
                 }
                 node.has_latest_metrics = false;
@@ -915,6 +971,7 @@ static int execute_runtime(
                 if (history != nullptr) {
                     amp_release_control_history(history);
                 }
+                runtime_set_error(runtime, -1, "run_node_v2", &node, "amp_run_node_v2 returned null buffer");
                 return -1;
             }
             if (!node_output) {
@@ -944,6 +1001,7 @@ static int execute_runtime(
             if (history != nullptr) {
                 amp_release_control_history(history);
             }
+            runtime_set_error(runtime, -1, "node_output", &node, "node produced no output");
             return -1;
         }
         node.output = node_output;
@@ -959,10 +1017,12 @@ static int execute_runtime(
         amp_release_control_history(history);
     }
     if (runtime->sink_index >= runtime->nodes.size()) {
+        runtime_set_error(runtime, -1, "sink_lookup", nullptr, "sink index out of range");
         return -1;
     }
     RuntimeNode &sink = *runtime->nodes[runtime->sink_index];
     if (!sink.output) {
+        runtime_set_error(runtime, -1, "sink_output", &sink, "sink produced no output");
         return -1;
     }
     *out_buffer = sink.output->data();
@@ -1067,11 +1127,17 @@ AMP_API int amp_graph_runtime_set_param(
     uint32_t frames
 ) {
     AMP_LOG_NATIVE_CALL("amp_graph_runtime_set_param", (size_t)batches, (size_t)frames);
-    if (runtime == nullptr || node_name == nullptr || param_name == nullptr || data == nullptr) {
+    if (runtime == nullptr) {
+        return -1;
+    }
+    runtime_clear_error(runtime);
+    if (node_name == nullptr || param_name == nullptr || data == nullptr) {
+        runtime_set_error(runtime, -1, "set_param", nullptr, "invalid argument");
         return -1;
     }
     auto it = runtime->node_index.find(node_name);
     if (it == runtime->node_index.end()) {
+        runtime_set_error(runtime, -1, "set_param", nullptr, std::string("unknown node: ") + node_name);
         return -1;
     }
     RuntimeNode &node = *runtime->nodes[it->second];
@@ -1079,6 +1145,7 @@ AMP_API int amp_graph_runtime_set_param(
     binding.shape = make_shape(batches, channels, frames);
     size_t total = static_cast<size_t>(binding.shape.batches) * static_cast<size_t>(binding.shape.channels) * static_cast<size_t>(binding.shape.frames);
     if (total == 0U) {
+        runtime_set_error(runtime, -1, "set_param", &node, "parameter tensor has zero elements");
         return -1;
     }
     const TensorShape *expected_shape = nullptr;
@@ -1110,6 +1177,12 @@ AMP_API int amp_graph_runtime_set_param(
             binding.shape.frames
         );
 #endif
+        std::string detail = std::string("shape mismatch for ") + node.name + "." + param_name
+            + std::string(" (expected ") + std::to_string(expected_shape->batches) + " x "
+            + std::to_string(expected_shape->channels) + " x " + std::to_string(expected_shape->frames)
+            + ", got " + std::to_string(binding.shape.batches) + " x " + std::to_string(binding.shape.channels)
+            + " x " + std::to_string(binding.shape.frames) + ")";
+        runtime_set_error(runtime, -2, "set_param", &node, std::move(detail));
         return -2;
     }
     binding.data.resize(total);
@@ -1162,6 +1235,25 @@ AMP_API int amp_graph_runtime_execute(
 ) {
     AMP_LOG_NATIVE_CALL("amp_graph_runtime_execute", (size_t)(control_blob != nullptr ? control_len : 0U), static_cast<size_t>(frames_hint));
     return execute_runtime(runtime, control_blob, control_len, frames_hint, sample_rate, out_buffer, out_batches, out_channels, out_frames);
+}
+
+AMP_API int amp_graph_runtime_last_error(
+    AmpGraphRuntime *runtime,
+    AmpGraphRuntimeErrorInfo *out_error
+) {
+    AMP_LOG_NATIVE_CALL(
+        "amp_graph_runtime_last_error",
+        static_cast<size_t>(runtime != nullptr),
+        static_cast<size_t>(out_error != nullptr)
+    );
+    if (runtime == nullptr || out_error == nullptr) {
+        return -1;
+    }
+    out_error->code = runtime->last_error.code;
+    out_error->stage = runtime->last_error.stage.empty() ? nullptr : runtime->last_error.stage.c_str();
+    out_error->node = runtime->last_error.node.empty() ? nullptr : runtime->last_error.node.c_str();
+    out_error->detail = runtime->last_error.detail.empty() ? nullptr : runtime->last_error.detail.c_str();
+    return 0;
 }
 
 AMP_API void amp_graph_runtime_buffer_free(double *buffer) {
