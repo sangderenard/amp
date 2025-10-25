@@ -1279,10 +1279,16 @@ class ParametricDriverNode(Node):
         freq = as_BCF(params.get("frequency", 440.0), B, 1, frames, name=f"{self.name}.frequency")[:, 0, :]
         amp = as_BCF(params.get("amplitude", 1.0), B, 1, frames, name=f"{self.name}.amplitude")[:, 0, :]
         phase_offset = as_BCF(params.get("phase_offset", 0.0), B, 1, frames, name=f"{self.name}.phase_offset")[:, 0, :]
+        blend = as_BCF(params.get("render_mode", 0.0), B, 1, frames, name=f"{self.name}.render_mode")[:, 0, :]
         if self._phase is None or self._phase.shape[0] != B:
             self._phase = np.zeros(B, dtype=RAW_DTYPE)
         out = np.zeros((B, 1, frames), dtype=RAW_DTYPE)
         harmonics = np.asarray(self.harmonics if self.harmonics else (1.0,), dtype=RAW_DTYPE)
+        if audio_in is not None:
+            driver_in = assert_BCF(audio_in, name=f"{self.name}.in")  # (B,C,F)
+            streaming = np.mean(driver_in, axis=1)
+        else:
+            streaming = np.zeros((B, frames), dtype=RAW_DTYPE)
         for b in range(B):
             phase = float(self._phase[b])
             for f in range(frames):
@@ -1293,7 +1299,17 @@ class ParametricDriverNode(Node):
                     if coeff == 0.0:
                         continue
                     sample += float(coeff) * np.sin(2.0 * np.pi * ph * (idx + 1))
-                out[b, 0, f] = sample * float(amp[b, f])
+                mix = float(blend[b, f])
+                if mix < 0.0:
+                    mix = 0.0
+                elif mix > 1.0:
+                    mix = 1.0
+                if streaming.size:
+                    stream_val = float(streaming[b, f % streaming.shape[1]])
+                else:
+                    stream_val = 0.0
+                combined = (1.0 - mix) * sample + mix * stream_val
+                out[b, 0, f] = combined * float(amp[b, f])
             self._phase[b] = phase
         return out
 

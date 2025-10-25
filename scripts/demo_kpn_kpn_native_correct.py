@@ -1,4 +1,4 @@
-"""Native-only KPN demo: driver -> oscillator -> PCM sink with FFT tap."""
+"""Native-only KPN demo: stream oscillator -> driver -> op-amp oscillator -> PCM sink with FFT tap."""
 from __future__ import annotations
 
 import argparse
@@ -6,9 +6,10 @@ import math
 import sys
 import wave
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, Tuple
 
 import numpy as np
+import sympy as sp
 
 if __package__ in (None, ""):
     REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -47,14 +48,23 @@ def _write_grayscale_png(path: Path, image: np.ndarray) -> None:
         stream.write(chunk(b"IEND", b""))
 
 
-def build_graph(sample_rate: int) -> AudioGraph:
+def build_graph(sample_rate: int, modulation_scale: float) -> AudioGraph:
     graph = AudioGraph(sample_rate=sample_rate, output_channels=1)
 
-    driver = ParametricDriverNode("driver", mode="piezo")
-    osc = OscNode(
-        "osc",
+    stream_osc = OscNode(
+        "stream_osc",
         wave="saw",
         mode="integrator",
+        accept_reset=False,
+        integration_leak=0.997,
+        integration_gain=0.5,
+        integration_clamp=1.2,
+    )
+    driver = ParametricDriverNode("driver", mode="piezo")
+    osc = OscNode(
+        "osc_master",
+        wave="saw",
+        mode="op_amp",
         accept_reset=False,
         integration_leak=0.997,
         integration_gain=0.5,
@@ -73,16 +83,42 @@ def build_graph(sample_rate: int) -> AudioGraph:
         },
     )
 
+    graph.add_node(stream_osc)
     graph.add_node(driver)
     graph.add_node(osc)
     graph.add_node(mix)
     graph.add_node(fft)
 
-    graph.connect_mod("driver", "osc", "freq", scale=40.0, mode="add")
-    graph.connect_audio("osc", "mix")
+    graph.connect_audio("stream_osc", "driver")
+    graph.connect_mod("driver", "osc_master", "freq", scale=float(modulation_scale), mode="add")
+    graph.connect_audio("driver", "osc_master")
+    graph.connect_audio("driver", "mix")
+    graph.connect_audio("osc_master", "mix")
     graph.connect_audio("mix", "fft")
     graph.set_sink("mix")
     return graph
+
+
+def _evaluate_pitch_expression(expr: str, t: np.ndarray) -> np.ndarray:
+    symbol_t = sp.Symbol("t", real=True)
+    try:
+        parsed = sp.sympify(expr, locals={"pi": sp.pi})
+    except sp.SympifyError as exc:
+        raise ValueError(f"invalid SymPy expression '{expr}': {exc}") from exc
+    extra_symbols = parsed.free_symbols.difference({symbol_t})
+    if extra_symbols:
+        names = ", ".join(sorted(str(sym) for sym in extra_symbols))
+        raise ValueError(f"unsupported symbols in pitch expression: {names}")
+    func = sp.lambdify((symbol_t,), parsed, modules=["numpy"])
+    values = func(t)
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = np.full(t.shape, float(arr), dtype=np.float64)
+    else:
+        arr = np.broadcast_to(arr, t.shape).astype(np.float64, copy=False)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("pitch expression produced non-finite values")
+    return arr
 
 
 def ensure_native_kernels(executor: NativeGraphExecutor, node_names: Iterable[str]) -> None:
@@ -108,11 +144,33 @@ def create_param_block(values: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     return block
 
 
-def generate_driver_curves(total_frames: int, sample_rate: float) -> Tuple[np.ndarray, np.ndarray]:
+def generate_driver_curves(
+    total_frames: int,
+    sample_rate: float,
+    expression: str,
+    *,
+    driver_min_freq: float,
+    log: Callable[[str], None],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     t = np.arange(total_frames, dtype=np.float64) / sample_rate
-    frequency = np.full(total_frames, 2.0, dtype=np.float64)  # 2 Hz modulation
-    amplitude = 0.65 + 0.35 * np.sin(2.0 * math.pi * 0.25 * t)
-    return frequency, amplitude
+    try:
+        raw_curve = _evaluate_pitch_expression(expression, t)
+    except Exception as exc:  # noqa: BLE001 - fall back to a stable modulation
+        log(
+            "[demo] Pitch expression evaluation failed: "
+            f"{exc}. Falling back to constant 2.0 Hz modulation."
+        )
+        raw_curve = np.full(total_frames, 2.0, dtype=np.float64)
+    centered = raw_curve - np.mean(raw_curve)
+    span = float(np.max(np.abs(centered))) if centered.size else 0.0
+    if not math.isfinite(span) or span < 1.0e-9:
+        normalized = np.zeros_like(centered)
+    else:
+        normalized = centered / span
+    driver_frequency = np.clip(np.abs(raw_curve), driver_min_freq, None)
+    driver_amplitude = 0.65 + 0.35 * np.tanh(normalized)
+    render_mode = np.clip(0.5 + 0.5 * normalized, 0.0, 1.0)
+    return driver_frequency, driver_amplitude, normalized, render_mode
 
 
 def compute_spectrogram(
@@ -166,6 +224,45 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--sr", type=float, default=48_000.0, help="Sample rate in Hz (default: 48000)")
     parser.add_argument("--block-size", type=int, default=512, help="Block size in frames (default: 512)")
     parser.add_argument("--out-dir", type=Path, default=Path("output") / "demo_kpn_spectro", help="Output directory")
+    parser.add_argument(
+        "--pitch-modulation",
+        type=str,
+        default="2.0",
+        help="SymPy expression of time 't' describing driver pitch modulation (default: '2.0').",
+    )
+    parser.add_argument(
+        "--pitch-depth",
+        type=float,
+        default=40.0,
+        help="Scale applied to driver modulation when routed to the oscillator frequency (Hz, default: 40.0).",
+    )
+    parser.add_argument(
+        "--pitch-direct-depth",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional depth in Hz applied directly to the oscillator frequency after normalising the pitch expression. "
+            "Set to zero to rely solely on the driver modulation (default: 0.0)."
+        ),
+    )
+    parser.add_argument(
+        "--base-freq",
+        type=float,
+        default=330.0,
+        help="Base oscillator frequency in Hz before modulation is applied (default: 330.0).",
+    )
+    parser.add_argument(
+        "--driver-min-freq",
+        type=float,
+        default=0.1,
+        help="Lower clamp in Hz applied to the evaluated driver frequency curve (default: 0.1).",
+    )
+    parser.add_argument(
+        "--op-amp-slew",
+        type=float,
+        default=12000.0,
+        help="Slew rate in Hz/s applied by the op-amp oscillator when chasing the driver signal (default: 12000.0).",
+    )
     parser.add_argument("--play", action="store_true", help="Attempt realtime playback (not implemented)")
     parser.add_argument("--display", action="store_true", help="Display spectrogram window (not implemented)")
     return parser.parse_args(list(argv))
@@ -190,7 +287,7 @@ def main(argv: Iterable[str]) -> int:
             fh.write(message + "\n")
 
     log("[demo] Constructing audio graph...")
-    graph = build_graph(int(args.sr))
+    graph = build_graph(int(args.sr), args.pitch_depth)
 
     try:
         log("[demo] Initialising native graph runtime...")
@@ -219,10 +316,49 @@ def main(argv: Iterable[str]) -> int:
             raise ValueError("block-size must be positive")
 
         log(f"[demo] Rendering {total_frames} frames (block size {block_size})...")
-        driver_freq_curve, driver_amp_curve = generate_driver_curves(total_frames, args.sr)
+        driver_freq_curve, driver_amp_curve, normalized_pitch, render_mode_curve = generate_driver_curves(
+            total_frames,
+            args.sr,
+            args.pitch_modulation,
+            driver_min_freq=max(1.0e-6, float(args.driver_min_freq)),
+            log=log,
+        )
 
-        base_freq = 330.0
+        base_freq = float(args.base_freq)
         base_amp = 0.4
+        if args.pitch_direct_depth != 0.0:
+            master_freq_curve = base_freq + normalized_pitch * float(args.pitch_direct_depth)
+        else:
+            master_freq_curve = np.full(total_frames, base_freq, dtype=np.float64)
+        stream_freq_curve = np.clip(
+            0.5 * driver_freq_curve + 0.5 * base_freq,
+            max(1.0e-6, float(args.driver_min_freq)),
+            None,
+        )
+        stream_amp_curve = 0.25 + 0.25 * render_mode_curve
+        slew_curve = np.full(total_frames, max(0.0, float(args.op_amp_slew)), dtype=np.float64)
+        log(
+            "[demo] Pitch expression stats: freq[min={:.4f}, max={:.4f}] Hz, "
+            "amp[min={:.4f}, max={:.4f}], norm[min={:.4f}, max={:.4f}], blend[min={:.4f}, max={:.4f}]".format(
+                float(driver_freq_curve.min()),
+                float(driver_freq_curve.max()),
+                float(driver_amp_curve.min()),
+                float(driver_amp_curve.max()),
+                float(normalized_pitch.min()),
+                float(normalized_pitch.max()),
+                float(render_mode_curve.min()),
+                float(render_mode_curve.max()),
+            )
+        )
+        log(
+            "[demo] Stream osc stats: freq[min={:.4f}, max={:.4f}] Hz, "
+            "amp[min={:.4f}, max={:.4f}]".format(
+                float(stream_freq_curve.min()),
+                float(stream_freq_curve.max()),
+                float(stream_amp_curve.min()),
+                float(stream_amp_curve.max()),
+            )
+        )
 
         pcm_blocks: list[np.ndarray] = []
         metrics_log: list[Tuple[int, float]] = []
@@ -237,12 +373,20 @@ def main(argv: Iterable[str]) -> int:
                 {
                     "frequency": driver_freq_curve[sl],
                     "amplitude": driver_amp_curve[sl],
+                    "render_mode": render_mode_curve[sl],
+                }
+            )
+            stream_params = create_param_block(
+                {
+                    "freq": stream_freq_curve[sl],
+                    "amp": stream_amp_curve[sl],
                 }
             )
             osc_params = create_param_block(
                 {
-                    "freq": np.full(frames_this, base_freq, dtype=np.float64),
+                    "freq": master_freq_curve[sl],
                     "amp": np.full(frames_this, base_amp, dtype=np.float64),
+                    "slew": slew_curve[sl],
                 }
             )
             fft_params = create_param_block(
@@ -258,8 +402,9 @@ def main(argv: Iterable[str]) -> int:
             )
 
             base_params = {
+                "stream_osc": stream_params,
                 "driver": driver_params,
-                "osc": osc_params,
+                "osc_master": osc_params,
                 "fft": fft_params,
             }
             try:

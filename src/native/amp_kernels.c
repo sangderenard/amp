@@ -4751,6 +4751,7 @@ static int run_parametric_driver_node(
     if (phase_view == NULL) {
         phase_view = find_param(inputs, "phase");
     }
+    const EdgeRunnerParamView *render_view = find_param(inputs, "render_mode");
 
     int B = batches > 0 ? batches : 1;
     int F = frames > 0 ? frames : 1;
@@ -4769,14 +4770,17 @@ static int run_parametric_driver_node(
     double *owned_freq = NULL;
     double *owned_amp = NULL;
     double *owned_phase = NULL;
+    double *owned_render = NULL;
 
     const double *freq = ensure_param_plane(freq_view, B, F, 440.0, &owned_freq);
     const double *amp = ensure_param_plane(amp_view, B, F, 1.0, &owned_amp);
     const double *phase_offset = ensure_param_plane(phase_view, B, F, 0.0, &owned_phase);
+    const double *render_mode = ensure_param_plane(render_view, B, F, 0.0, &owned_render);
     if (freq == NULL || amp == NULL) {
         free(owned_freq);
         free(owned_amp);
         free(owned_phase);
+        free(owned_render);
         return -1;
     }
 
@@ -4798,7 +4802,32 @@ static int run_parametric_driver_node(
         free(owned_freq);
         free(owned_amp);
         free(owned_phase);
+        free(owned_render);
         return -1;
+    }
+
+    const double *driver_input = NULL;
+    int driver_in_channels = 1;
+    int driver_in_batches = B;
+    int driver_in_frames = F;
+    if (inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
+        driver_input = inputs->audio.data;
+        driver_in_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 1;
+        if (inputs->audio.batches > 0) {
+            driver_in_batches = (int)inputs->audio.batches;
+        }
+        if (inputs->audio.frames > 0) {
+            driver_in_frames = (int)inputs->audio.frames;
+        }
+    }
+    if (driver_in_batches <= 0) {
+        driver_in_batches = B > 0 ? B : 1;
+    }
+    if (driver_in_frames <= 0) {
+        driver_in_frames = F > 0 ? F : 1;
+    }
+    if (driver_in_channels <= 0) {
+        driver_in_channels = 1;
     }
 
     for (int b = 0; b < B; ++b) {
@@ -4829,7 +4858,36 @@ static int run_parametric_driver_node(
                     sample += coeff * sin(harmonic_phase);
                 }
             }
-            buffer[idx] = sample * amp[idx];
+            double blend = render_mode != NULL ? render_mode[idx] : 0.0;
+            if (blend < 0.0) {
+                blend = 0.0;
+            } else if (blend > 1.0) {
+                blend = 1.0;
+            }
+            double stream_val = 0.0;
+            if (driver_input != NULL) {
+                int bb = b;
+                if (bb >= driver_in_batches) {
+                    bb = driver_in_batches - 1;
+                }
+                if (bb < 0) {
+                    bb = 0;
+                }
+                int ff = f;
+                if (ff >= driver_in_frames) {
+                    ff = driver_in_frames - 1;
+                }
+                if (ff < 0) {
+                    ff = 0;
+                }
+                size_t base_audio = ((size_t)bb * (size_t)driver_in_channels) * (size_t)driver_in_frames;
+                for (int c = 0; c < driver_in_channels; ++c) {
+                    stream_val += driver_input[base_audio + (size_t)c * (size_t)driver_in_frames + (size_t)ff];
+                }
+                stream_val /= (double)driver_in_channels;
+            }
+            double combined = (1.0 - blend) * sample + blend * stream_val;
+            buffer[idx] = combined * amp[idx];
         }
         state->u.driver.phase[b] = phase - floor(phase);
     }
@@ -4837,6 +4895,7 @@ static int run_parametric_driver_node(
     free(owned_freq);
     free(owned_amp);
     free(owned_phase);
+    free(owned_render);
 
     *out_buffer = buffer;
     *out_channels = 1;
