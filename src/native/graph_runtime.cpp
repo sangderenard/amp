@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -62,6 +64,20 @@ extern int amp_run_node(
     int *out_channels,
     void **state,
     const EdgeRunnerControlHistory *history
+);
+extern int amp_run_node_v2(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    void **state,
+    const EdgeRunnerControlHistory *history,
+    AmpExecutionMode mode,
+    AmpNodeMetrics *metrics
 );
 extern void amp_free(double *buffer);
 extern void amp_release_state(void *state);
@@ -143,6 +159,12 @@ struct RuntimeNode {
     uint32_t channel_hint{1};
     void *state{nullptr};
     EdgeRunnerNodeDescriptor descriptor{};
+    uint32_t oversample_ratio{1};
+    uint32_t declared_delay_frames{0};
+    bool supports_v2{true};
+    bool has_latest_metrics{false};
+    AmpNodeMetrics latest_metrics{};
+    double total_heat_accumulated{0.0};
 
     RuntimeNode() = default;
 
@@ -217,6 +239,75 @@ struct DescriptorReader {
         return true;
     }
 };
+
+static uint32_t parse_uint_metadata(const std::string &json, const char *key, uint32_t fallback) {
+    if (key == nullptr) {
+        return fallback;
+    }
+    std::string needle;
+    needle.reserve(std::strlen(key) + 4U);
+    needle.push_back('"');
+    needle.append(key);
+    needle.append("\":");
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) {
+        return fallback;
+    }
+    pos += needle.size();
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) {
+        ++pos;
+    }
+    if (pos >= json.size()) {
+        return fallback;
+    }
+    if (json[pos] == '-') {
+        return fallback;
+    }
+    uint64_t value = 0;
+    bool found_digit = false;
+    while (pos < json.size()) {
+        unsigned char ch = static_cast<unsigned char>(json[pos]);
+        if (!std::isdigit(ch)) {
+            break;
+        }
+        found_digit = true;
+        value = value * 10ULL + static_cast<uint64_t>(ch - static_cast<unsigned char>('0'));
+        if (value > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            return fallback;
+        }
+        ++pos;
+    }
+    if (!found_digit) {
+        return fallback;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+static bool parse_bool_metadata(const std::string &json, const char *key, bool fallback) {
+    if (key == nullptr) {
+        return fallback;
+    }
+    std::string needle;
+    needle.reserve(std::strlen(key) + 4U);
+    needle.push_back('"');
+    needle.append(key);
+    needle.append("\":");
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) {
+        return fallback;
+    }
+    pos += needle.size();
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) {
+        ++pos;
+    }
+    if (pos + 4U <= json.size() && json.compare(pos, 4U, "true") == 0) {
+        return true;
+    }
+    if (pos + 5U <= json.size() && json.compare(pos, 5U, "false") == 0) {
+        return false;
+    }
+    return fallback;
+}
 
 struct AmpGraphRuntime {
     std::vector<std::unique_ptr<RuntimeNode>> nodes;
@@ -349,6 +440,9 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             return false;
         }
         node->finalize_descriptor();
+        node->oversample_ratio = std::max<uint32_t>(1U, parse_uint_metadata(node->params_json, "oversample_ratio", 1U));
+        node->declared_delay_frames = parse_uint_metadata(node->params_json, "declared_delay", 0U);
+        node->supports_v2 = parse_bool_metadata(node->params_json, "supports_v2", node->supports_v2);
         runtime->node_index[node->name] = runtime->nodes.size();
         runtime->nodes.push_back(std::move(node));
     }
@@ -395,6 +489,9 @@ static bool parse_plan_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
     if (!reader.read_u32(version) || !reader.read_u32(node_count)) {
         return false;
     }
+    if (version == 0U || version > 2U) {
+        return false;
+    }
     if (node_count == 0U) {
         return true;
     }
@@ -405,9 +502,16 @@ static bool parse_plan_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         uint32_t audio_offset = 0;
         uint32_t audio_span = 0;
         uint32_t param_count = 0;
+        uint32_t declared_delay = 0;
+        uint32_t oversample_ratio = 1;
         if (!reader.read_u32(function_id) || !reader.read_u32(name_len) || !reader.read_u32(audio_offset) ||
             !reader.read_u32(audio_span) || !reader.read_u32(param_count)) {
             return false;
+        }
+        if (version >= 2U) {
+            if (!reader.read_u32(declared_delay) || !reader.read_u32(oversample_ratio)) {
+                return false;
+            }
         }
         (void)audio_offset;
         std::string node_name;
@@ -423,6 +527,14 @@ static bool parse_plan_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         }
         runtime->execution_order[function_id] = static_cast<uint32_t>(it->second);
         auto &node = runtime->nodes[it->second];
+        if (version >= 2U) {
+            if (declared_delay > 0U) {
+                node->declared_delay_frames = declared_delay;
+            }
+            if (oversample_ratio > 0U) {
+                node->oversample_ratio = oversample_ratio;
+            }
+        }
         if (audio_span > 0 && node->channel_hint < audio_span) {
             node->channel_hint = audio_span;
         }
@@ -664,6 +776,9 @@ static int execute_runtime(
             }
             return -1;
         }
+        node.has_latest_metrics = false;
+        node.total_heat_accumulated = 0.0;
+        node.latest_metrics = {};
         uint32_t batches = runtime->default_batches > 0U ? runtime->default_batches : 1U;
         uint32_t frames = runtime->default_frames > 0U ? runtime->default_frames : 1U;
         uint32_t input_channels = node.channel_hint > 0U ? node.channel_hint : 1U;
@@ -738,22 +853,65 @@ static int execute_runtime(
             frame_buffer = nullptr;
             out_channels = 0;
             void *state_arg = state;
-            int status = amp_run_node(
-                &node.descriptor,
-                &inputs,
-                static_cast<int>(batches),
-                static_cast<int>(input_channels),
-                1,
-                dsp_rate,
-                &frame_buffer,
-                &out_channels,
-                &state_arg,
-                history
-            );
-            if (status != 0 || frame_buffer == nullptr) {
-                if (frame_buffer != nullptr) {
-                    amp_free(frame_buffer);
+            bool used_v2 = false;
+            if (node.supports_v2) {
+                AmpNodeMetrics frame_metrics{};
+                int v2_status = amp_run_node_v2(
+                    &node.descriptor,
+                    &inputs,
+                    static_cast<int>(batches),
+                    static_cast<int>(input_channels),
+                    1,
+                    dsp_rate,
+                    &frame_buffer,
+                    &out_channels,
+                    &state_arg,
+                    history,
+                    AMP_EXECUTION_MODE_FORWARD,
+                    &frame_metrics
+                );
+                if (v2_status == AMP_E_UNSUPPORTED) {
+                    node.supports_v2 = false;
+                    node.has_latest_metrics = false;
+                } else if (v2_status != 0) {
+                    if (frame_buffer != nullptr) {
+                        amp_free(frame_buffer);
+                    }
+                    if (history != nullptr) {
+                        amp_release_control_history(history);
+                    }
+                    return -1;
+                } else {
+                    used_v2 = true;
+                    node.has_latest_metrics = true;
+                    node.latest_metrics = frame_metrics;
+                    node.total_heat_accumulated += static_cast<double>(frame_metrics.accumulated_heat);
                 }
+            }
+            if (!used_v2) {
+                int status = amp_run_node(
+                    &node.descriptor,
+                    &inputs,
+                    static_cast<int>(batches),
+                    static_cast<int>(input_channels),
+                    1,
+                    dsp_rate,
+                    &frame_buffer,
+                    &out_channels,
+                    &state_arg,
+                    history
+                );
+                if (status != 0 || frame_buffer == nullptr) {
+                    if (frame_buffer != nullptr) {
+                        amp_free(frame_buffer);
+                    }
+                    if (history != nullptr) {
+                        amp_release_control_history(history);
+                    }
+                    return -1;
+                }
+                node.has_latest_metrics = false;
+            } else if (frame_buffer == nullptr) {
                 if (history != nullptr) {
                     amp_release_control_history(history);
                 }
@@ -957,6 +1115,37 @@ AMP_API int amp_graph_runtime_set_param(
     binding.data.resize(total);
     std::memcpy(binding.data.data(), data, total * sizeof(double));
     node.bindings[param_name] = std::move(binding);
+    return 0;
+}
+
+AMP_API int amp_graph_runtime_describe_node(
+    AmpGraphRuntime *runtime,
+    const char *node_name,
+    AmpGraphNodeSummary *summary
+) {
+    AMP_LOG_NATIVE_CALL(
+        "amp_graph_runtime_describe_node",
+        static_cast<size_t>(runtime != nullptr),
+        static_cast<size_t>(summary != nullptr)
+    );
+    if (runtime == nullptr || node_name == nullptr || summary == nullptr) {
+        return -1;
+    }
+    auto it = runtime->node_index.find(std::string(node_name));
+    if (it == runtime->node_index.end()) {
+        return -1;
+    }
+    RuntimeNode &node = *runtime->nodes[it->second];
+    summary->declared_delay_frames = node.declared_delay_frames;
+    summary->oversample_ratio = node.oversample_ratio;
+    summary->supports_v2 = node.supports_v2 ? 1 : 0;
+    summary->has_metrics = node.has_latest_metrics ? 1 : 0;
+    AmpNodeMetrics metrics{};
+    if (node.has_latest_metrics) {
+        metrics = node.latest_metrics;
+    }
+    summary->metrics = metrics;
+    summary->total_heat_accumulated = node.total_heat_accumulated;
     return 0;
 }
 

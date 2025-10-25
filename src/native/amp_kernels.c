@@ -3877,7 +3877,18 @@ static int run_safety_node(
     return 0;
 }
 
-AMP_CAPI int amp_run_node(
+static void amp_reset_metrics(AmpNodeMetrics *metrics) {
+    if (metrics == NULL) {
+        return;
+    }
+    metrics->measured_delay_frames = 0U;
+    metrics->accumulated_heat = 0.0f;
+    for (size_t i = 0; i < sizeof(metrics->reserved) / sizeof(metrics->reserved[0]); ++i) {
+        metrics->reserved[i] = 0.0f;
+    }
+}
+
+static int amp_run_node_forward_impl(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
     int batches,
@@ -3887,9 +3898,10 @@ AMP_CAPI int amp_run_node(
     double **out_buffer,
     int *out_channels,
     void **state,
-    const EdgeRunnerControlHistory *history
+    const EdgeRunnerControlHistory *history,
+    AmpNodeMetrics *metrics
 ) {
-    AMP_LOG_NATIVE_CALL("amp_run_node", (size_t)batches, (size_t)frames);
+    amp_reset_metrics(metrics);
     (void)channels;
     if (out_buffer == NULL || out_channels == NULL) {
         return -1;
@@ -3959,7 +3971,74 @@ AMP_CAPI int amp_run_node(
             rc = -3;
             break;
     }
+    if (rc == 0 && metrics != NULL) {
+        /* Placeholder metrics until specialised node implementations fill them. */
+        metrics->measured_delay_frames = 0U;
+        metrics->accumulated_heat = 0.0f;
+    }
     return rc;
+}
+
+AMP_CAPI int amp_run_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    void **state,
+    const EdgeRunnerControlHistory *history
+) {
+    AMP_LOG_NATIVE_CALL("amp_run_node", (size_t)batches, (size_t)frames);
+    return amp_run_node_forward_impl(
+        descriptor,
+        inputs,
+        batches,
+        channels,
+        frames,
+        sample_rate,
+        out_buffer,
+        out_channels,
+        state,
+        history,
+        NULL
+    );
+}
+
+AMP_CAPI int amp_run_node_v2(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    void **state,
+    const EdgeRunnerControlHistory *history,
+    AmpExecutionMode mode,
+    AmpNodeMetrics *metrics
+) {
+    AMP_LOG_NATIVE_CALL("amp_run_node_v2", (size_t)batches, (size_t)frames);
+    if (mode != AMP_EXECUTION_MODE_FORWARD) {
+        amp_reset_metrics(metrics);
+        return AMP_E_UNSUPPORTED;
+    }
+    return amp_run_node_forward_impl(
+        descriptor,
+        inputs,
+        batches,
+        channels,
+        frames,
+        sample_rate,
+        out_buffer,
+        out_channels,
+        state,
+        history,
+        metrics
+    );
 }
 
 AMP_CAPI void amp_free(double *buffer) {

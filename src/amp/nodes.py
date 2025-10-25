@@ -173,12 +173,24 @@ def _match_channels(data: np.ndarray, channels: int) -> np.ndarray:
 class Node:
     """Base class providing pooled CFFI-backed node buffers for graph nodes (C-ready)."""
 
-    __slots__ = ("name", "_block_pool", "_leases")
+    __slots__ = (
+        "name",
+        "_block_pool",
+        "_leases",
+        "params",
+        "oversample_ratio",
+        "declared_delay_frames",
+        "supports_v2",
+    )
 
     def __init__(self, name: str, *, block_pool: BlockPool | None = None) -> None:
         self.name = name
         self._block_pool = block_pool or BlockPool()
         self._leases: list[BlockLease] = []
+        self.params: dict[str, object] = {}
+        self.oversample_ratio = 1
+        self.declared_delay_frames = 0
+        self.supports_v2 = True
 
     def allocate_node_buffer(
         self,

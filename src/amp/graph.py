@@ -572,6 +572,8 @@ class _NodeExecutionPlan:
     name: str
     audio_inputs: Tuple[str, ...]
     mod_groups: Tuple[_ModGroupPlan, ...]
+    declared_delay: int
+    oversample_ratio: int
 
 
 class AudioGraph:
@@ -668,7 +670,45 @@ class AudioGraph:
         self._audio_inputs.setdefault(node.name, [])
         self._audio_successors.setdefault(node.name, [])
         self._mod_inputs.setdefault(node.name, [])
+        self._apply_descriptor_metadata(node)
         self._invalidate_plan()
+
+    def _apply_descriptor_metadata(self, node: AudioNode) -> None:
+        try:
+            params = getattr(node, "params", {})
+        except AttributeError:
+            params = {}
+        oversample = getattr(node, "oversample_ratio", 1)
+        declared_delay = getattr(node, "declared_delay_frames", 0)
+        supports_v2 = getattr(node, "supports_v2", True)
+        if isinstance(params, Mapping):
+            if "oversample_ratio" in params:
+                try:
+                    oversample = int(params["oversample_ratio"])
+                except (TypeError, ValueError):
+                    pass
+            if "declared_delay" in params:
+                try:
+                    declared_delay = int(params["declared_delay"])
+                except (TypeError, ValueError):
+                    pass
+            if "supports_v2" in params:
+                supports_v2 = bool(params["supports_v2"])
+        try:
+            oversample = int(oversample)
+        except (TypeError, ValueError):
+            oversample = 1
+        if oversample < 1:
+            oversample = 1
+        try:
+            declared_delay = int(declared_delay)
+        except (TypeError, ValueError):
+            declared_delay = 0
+        if declared_delay < 0:
+            declared_delay = 0
+        node.oversample_ratio = oversample
+        node.declared_delay_frames = declared_delay
+        node.supports_v2 = bool(supports_v2)
 
     def connect_audio(self, source: str, target: str) -> None:
         if source not in self._nodes or target not in self._nodes:
@@ -779,7 +819,28 @@ class AudioGraph:
                     grouped[param].append(connection)
                     valid_mod_keys.add((connection.source, name, param, connection.channel))
                 groups = [_ModGroupPlan(param, tuple(grouped[param])) for param in param_order]
-            plan.append(_NodeExecutionPlan(name, audio_inputs, tuple(groups)))
+            node_obj = self._nodes[name]
+            try:
+                declared_delay = int(getattr(node_obj, "declared_delay_frames", 0))
+            except (TypeError, ValueError):
+                declared_delay = 0
+            if declared_delay < 0:
+                declared_delay = 0
+            try:
+                oversample_ratio = int(getattr(node_obj, "oversample_ratio", 1))
+            except (TypeError, ValueError):
+                oversample_ratio = 1
+            if oversample_ratio < 1:
+                oversample_ratio = 1
+            plan.append(
+                _NodeExecutionPlan(
+                    name,
+                    audio_inputs,
+                    tuple(groups),
+                    declared_delay,
+                    oversample_ratio,
+                )
+            )
         if self._mod_buffers:
             self._mod_buffers = {
                 key: buffers
@@ -1087,7 +1148,19 @@ class AudioGraph:
             audio_inputs = tuple(self._audio_inputs.get(entry.name, ()))
             mod_connections = list(self._mod_inputs.get(entry.name, ()))
 
-            params_json = json.dumps(getattr(node, "params", {}), sort_keys=True).encode("utf-8")
+            node_params = dict(getattr(node, "params", {}))
+            oversample_ratio = int(getattr(node, "oversample_ratio", 1) or 1)
+            if oversample_ratio < 1:
+                oversample_ratio = 1
+            declared_delay = int(getattr(node, "declared_delay_frames", 0) or 0)
+            if declared_delay < 0:
+                declared_delay = 0
+            supports_v2 = bool(getattr(node, "supports_v2", True))
+            descriptor_params = dict(node_params)
+            descriptor_params["oversample_ratio"] = oversample_ratio
+            descriptor_params["declared_delay"] = declared_delay
+            descriptor_params["supports_v2"] = supports_v2
+            params_json = json.dumps(descriptor_params, sort_keys=True).encode("utf-8")
 
             param_buffers: list[tuple[str, tuple[int, int, int], bytes]] = []
             for (node_name, param), buffers in self._param_buffers.items():
@@ -1172,7 +1245,7 @@ class AudioGraph:
             return b""
         payload = bytearray()
         payload.extend(b"AMPL")
-        payload.extend(struct.pack("<II", 1, len(plan)))
+        payload.extend(struct.pack("<II", 2, len(plan)))
         audio_cursor = 0
         for function_id, entry in enumerate(plan):
             name_bytes = entry.name.encode("utf-8")
@@ -1180,14 +1253,28 @@ class AudioGraph:
             audio_offset = audio_cursor
             audio_cursor += audio_span
             param_count = len(entry.mod_groups)
+            try:
+                declared_delay = int(entry.declared_delay)
+            except (TypeError, ValueError):
+                declared_delay = 0
+            if declared_delay < 0:
+                declared_delay = 0
+            try:
+                oversample_ratio = int(entry.oversample_ratio)
+            except (TypeError, ValueError):
+                oversample_ratio = 1
+            if oversample_ratio < 1:
+                oversample_ratio = 1
             payload.extend(
                 struct.pack(
-                    "<IIIII",
+                    "<IIIIIII",
                     int(function_id),
                     len(name_bytes),
                     int(audio_offset),
                     int(audio_span),
                     int(param_count),
+                    int(declared_delay),
+                    int(oversample_ratio),
                 )
             )
             payload.extend(name_bytes)
