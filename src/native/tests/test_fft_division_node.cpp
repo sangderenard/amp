@@ -595,6 +595,209 @@ std::vector<double> simulate_fft_division(
     return output;
 }
 
+std::vector<double> simulate_dynamic_backward(
+    const std::vector<double> &signal,
+    const std::vector<double> &divisor_real,
+    const std::vector<double> &divisor_imag,
+    const std::vector<double> &stabilizer,
+    const std::vector<double> &phase,
+    const std::vector<double> &lower,
+    const std::vector<double> &upper,
+    const std::vector<double> &filter,
+    const std::vector<std::vector<double>> &dynamic_carriers,
+    int window_size,
+    double epsilon_default,
+    double sample_rate_hz
+) {
+    const int frames = static_cast<int>(signal.size());
+    std::vector<double> recomb(window_size, 0.0);
+    std::vector<double> divisor_buf(window_size, 1.0);
+    std::vector<double> divisor_imag_buf(window_size, 0.0);
+    std::vector<double> phase_buf(window_size, 0.0);
+    std::vector<double> lower_buf(window_size, 0.0);
+    std::vector<double> upper_buf(window_size, 1.0);
+    std::vector<double> filter_buf(window_size, 1.0);
+    std::vector<double> window(window_size, 1.0);
+    std::vector<double> dynamic_phase(FFT_DYNAMIC_CARRIER_LIMIT, 0.0);
+    std::vector<double> phasor_re(window_size, 0.0);
+    std::vector<double> phasor_im(window_size, 0.0);
+    std::vector<double> output(frames, 0.0);
+    int filled = 0;
+    int current_window_kind = -1;
+
+    for (int frame = 0; frame < frames; ++frame) {
+        double epsilon = epsilon_default;
+        if (!stabilizer.empty() && frame < static_cast<int>(stabilizer.size())) {
+            double candidate = stabilizer[frame];
+            if (candidate < 0.0) {
+                candidate = -candidate;
+            }
+            if (candidate > 0.0) {
+                epsilon = candidate;
+            }
+        }
+        if (epsilon < 1e-12) {
+            epsilon = 1e-12;
+        }
+        if (current_window_kind != FFT_WINDOW_HANN) {
+            fill_window(FFT_WINDOW_HANN, window);
+            current_window_kind = FFT_WINDOW_HANN;
+        }
+
+        double current_sample = signal[frame];
+        double current_divisor = frame < static_cast<int>(divisor_real.size()) ? divisor_real[frame] : 1.0;
+        double current_divisor_imag = frame < static_cast<int>(divisor_imag.size()) ? divisor_imag[frame] : 0.0;
+        double current_phase = (!phase.empty() && frame < static_cast<int>(phase.size()))
+            ? phase[frame]
+            : (filled > 0 ? phase_buf[filled - 1] : 0.0);
+        double current_lower = (!lower.empty() && frame < static_cast<int>(lower.size()))
+            ? lower[frame]
+            : (filled > 0 ? lower_buf[filled - 1] : 0.0);
+        double current_upper = (!upper.empty() && frame < static_cast<int>(upper.size()))
+            ? upper[frame]
+            : (filled > 0 ? upper_buf[filled - 1] : 1.0);
+        double current_filter = (!filter.empty() && frame < static_cast<int>(filter.size()))
+            ? filter[frame]
+            : (filled > 0 ? filter_buf[filled - 1] : 1.0);
+
+        if (filled < window_size) {
+            recomb[filled] = current_sample;
+            divisor_buf[filled] = current_divisor;
+            divisor_imag_buf[filled] = current_divisor_imag;
+            phase_buf[filled] = current_phase;
+            lower_buf[filled] = current_lower;
+            upper_buf[filled] = current_upper;
+            filter_buf[filled] = current_filter;
+            double safe_div = std::fabs(current_divisor) < epsilon
+                ? (current_divisor >= 0.0 ? epsilon : -epsilon)
+                : current_divisor;
+            output[frame] = current_sample * safe_div;
+            filled += 1;
+            continue;
+        }
+
+        if (window_size > 1) {
+            std::memmove(recomb.data(), recomb.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+            std::memmove(divisor_buf.data(), divisor_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+            std::memmove(divisor_imag_buf.data(), divisor_imag_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+            std::memmove(phase_buf.data(), phase_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+            std::memmove(lower_buf.data(), lower_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+            std::memmove(upper_buf.data(), upper_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+            std::memmove(filter_buf.data(), filter_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+        }
+        recomb[window_size - 1] = current_sample;
+        divisor_buf[window_size - 1] = current_divisor;
+        divisor_imag_buf[window_size - 1] = current_divisor_imag;
+        phase_buf[window_size - 1] = current_phase;
+        lower_buf[window_size - 1] = current_lower;
+        upper_buf[window_size - 1] = current_upper;
+        filter_buf[window_size - 1] = current_filter;
+
+        double phase_mod = phase_buf[window_size - 1];
+        double lower_mod = lower_buf[window_size - 1];
+        double upper_mod = upper_buf[window_size - 1];
+        double filter_mod = filter_buf[window_size - 1];
+        double lower_clamped = clamp_unit_double(lower_mod);
+        double upper_clamped = clamp_unit_double(upper_mod);
+        if (upper_clamped < lower_clamped) {
+            std::swap(lower_clamped, upper_clamped);
+        }
+        double intensity_clamped = clamp_unit_double(filter_mod);
+        double cos_phase = std::cos(phase_mod);
+        double sin_phase = std::sin(phase_mod);
+        bool has_divisor = !divisor_real.empty() || !divisor_imag.empty();
+
+        std::vector<double> carrier_fnorms;
+        std::vector<int> carrier_indices;
+        carrier_fnorms.reserve(dynamic_carriers.size());
+        carrier_indices.reserve(dynamic_carriers.size());
+        for (size_t idx = 0; idx < dynamic_carriers.size() && idx < FFT_DYNAMIC_CARRIER_LIMIT; ++idx) {
+            const auto &series = dynamic_carriers[idx];
+            if (series.empty()) {
+                continue;
+            }
+            double raw_value = frame < static_cast<int>(series.size()) ? series[frame] : series.back();
+            double normalized = raw_value;
+            if (sample_rate_hz > 0.0 && std::fabs(normalized) > 1.0) {
+                normalized = raw_value / sample_rate_hz;
+            }
+            normalized = clamp_unit_double(normalized);
+            carrier_fnorms.push_back(normalized);
+            carrier_indices.push_back(static_cast<int>(idx));
+        }
+
+        double sample_dynamic = 0.0;
+        if (!carrier_indices.empty()) {
+            double inv_window = window_size > 0 ? 1.0 / static_cast<double>(window_size) : 1.0;
+            for (size_t k = 0; k < carrier_indices.size(); ++k) {
+                size_t carrier_index = static_cast<size_t>(carrier_indices[k]);
+                double theta = dynamic_phase[carrier_index];
+                double fnorm = carrier_fnorms[k];
+                double angle = 2.0 * M_PI * fnorm;
+                double step_re = std::cos(angle);
+                double step_im = std::sin(angle);
+                double ph_re = std::cos(theta);
+                double ph_im = std::sin(theta);
+                double div_re_acc = 0.0;
+                double div_im_acc = 0.0;
+                double last_re = ph_re;
+                double last_im = ph_im;
+                for (int n = 0; n < window_size; ++n) {
+                    double w = window[n];
+                    phasor_re[n] = ph_re;
+                    phasor_im[n] = ph_im;
+                    if (has_divisor) {
+                        double dw_re = divisor_buf[n] * w;
+                        double dw_im = divisor_imag_buf[n] * w;
+                        div_re_acc += dw_re * ph_re + dw_im * ph_im;
+                        div_im_acc += -dw_re * ph_im + dw_im * ph_re;
+                    }
+                    if (n == window_size - 1) {
+                        last_re = ph_re;
+                        last_im = ph_im;
+                    }
+                    double next_re = ph_re * step_re - ph_im * step_im;
+                    double next_im = ph_re * step_im + ph_im * step_re;
+                    ph_re = next_re;
+                    ph_im = next_im;
+                }
+                dynamic_phase[carrier_index] = wrap_phase_two_pi(std::atan2(ph_im, ph_re));
+                if (!has_divisor) {
+                    div_re_acc = 1.0;
+                    div_im_acc = 0.0;
+                }
+                double ratio = clamp_unit_double(fnorm);
+                double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+                if (gain < 1e-6) {
+                    gain = 1e-6;
+                }
+                double rotated_re = last_re * cos_phase - last_im * sin_phase;
+                double rotated_im = last_re * sin_phase + last_im * cos_phase;
+                double scale_re = rotated_re * gain;
+                double scale_im = rotated_im * gain;
+                if (has_divisor) {
+                    double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
+                    if (denom < epsilon) {
+                        denom = epsilon;
+                    }
+                    double tmp_re = (scale_re * div_re_acc + scale_im * div_im_acc) / denom;
+                    double tmp_im = (scale_im * div_re_acc - scale_re * div_im_acc) / denom;
+                    scale_re = tmp_re;
+                    scale_im = tmp_im;
+                }
+                for (int n = 0; n < window_size; ++n) {
+                    double w = window[n];
+                    double coeff = inv_window * w * (scale_re * phasor_re[n] + scale_im * phasor_im[n]);
+                    sample_dynamic += coeff * recomb[n];
+                }
+            }
+        }
+        output[frame] = sample_dynamic;
+    }
+
+    return output;
+}
+
 } // namespace
 
 int main() {
@@ -1232,8 +1435,169 @@ int main() {
     amp_free(fresh_reconstructed_out);
     amp_release_state(fresh_state);
 
+    std::vector<int> dynamic_algorithm_selector(kFrames, FFT_ALGORITHM_DYNAMIC_OSCILLATORS);
+    std::vector<double> dynamic_algorithm_selector_d(
+        kFrames,
+        static_cast<double>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)
+    );
+    std::vector<int> dynamic_window_selector(kFrames, FFT_WINDOW_HANN);
+    std::vector<double> dynamic_window_selector_d(
+        kFrames,
+        static_cast<double>(FFT_WINDOW_HANN)
+    );
+
+    std::vector<double> expected_dynamic_forward_direct = simulate_fft_division(
+        signal,
+        divisor_real,
+        divisor_imag,
+        dynamic_algorithm_selector,
+        dynamic_window_selector,
+        stabilizer,
+        phase_metadata,
+        lower_metadata,
+        upper_metadata,
+        filter_metadata,
+        dynamic_carriers,
+        kWindowSize,
+        1e-9,
+        FFT_ALGORITHM_RADIX2,
+        FFT_WINDOW_HANN
+    );
+
+    std::vector<double> expected_dynamic_backward_direct = simulate_dynamic_backward(
+        expected_dynamic_forward_direct,
+        divisor_real,
+        divisor_imag,
+        stabilizer,
+        phase_metadata,
+        lower_metadata,
+        upper_metadata,
+        filter_metadata,
+        dynamic_carriers,
+        kWindowSize,
+        1e-9,
+        48000.0
+    );
+
+    EdgeRunnerParamView dynamic_param_views[] = {
+        {"divisor", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_real.data()},
+        {"divisor_imag", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_imag.data()},
+        {"algorithm_selector", 1U, 1U, static_cast<uint32_t>(kFrames), dynamic_algorithm_selector_d.data()},
+        {"window_selector", 1U, 1U, static_cast<uint32_t>(kFrames), dynamic_window_selector_d.data()},
+        {"stabilizer", 1U, 1U, static_cast<uint32_t>(kFrames), stabilizer.data()},
+        {"phase_offset", 1U, 1U, static_cast<uint32_t>(kFrames), phase_metadata.data()},
+        {"lower_band", 1U, 1U, static_cast<uint32_t>(kFrames), lower_metadata.data()},
+        {"upper_band", 1U, 1U, static_cast<uint32_t>(kFrames), upper_metadata.data()},
+        {"filter_intensity", 1U, 1U, static_cast<uint32_t>(kFrames), filter_metadata.data()},
+        {"carrier_band_0", 1U, 1U, static_cast<uint32_t>(kFrames), carrier_band0.data()}
+    };
+
+    EdgeRunnerParamSet dynamic_param_set{};
+    dynamic_param_set.count = static_cast<uint32_t>(sizeof(dynamic_param_views) / sizeof(dynamic_param_views[0]));
+    dynamic_param_set.items = dynamic_param_views;
+
+    EdgeRunnerNodeInputs dynamic_forward_inputs{};
+    dynamic_forward_inputs.audio = forward_audio;
+    dynamic_forward_inputs.params = dynamic_param_set;
+
+    AmpNodeMetrics dynamic_forward_metrics{};
+    double *dynamic_forward_out = nullptr;
+    int dynamic_forward_channels = 0;
+    void *dynamic_state = nullptr;
+
+    int dynamic_rc = amp_run_node_v2(
+        &direct_descriptor,
+        &dynamic_forward_inputs,
+        1,
+        1,
+        kFrames,
+        48000.0,
+        &dynamic_forward_out,
+        &dynamic_forward_channels,
+        &dynamic_state,
+        nullptr,
+        AMP_EXECUTION_MODE_FORWARD,
+        &dynamic_forward_metrics
+    );
+    assert(dynamic_rc == 0);
+    assert(dynamic_forward_out != nullptr);
+    assert(dynamic_forward_channels == 1);
+    verify_frames(dynamic_forward_out, expected_dynamic_forward_direct, "direct_dynamic_forward");
+    assert(dynamic_forward_metrics.accumulated_heat > 0.0f);
+    assert(std::fabs(dynamic_forward_metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
+
+    std::vector<double> dynamic_forward_copy(dynamic_forward_out, dynamic_forward_out + kFrames);
+
+    EdgeRunnerAudioView dynamic_backward_audio = forward_audio;
+    dynamic_backward_audio.data = dynamic_forward_out;
+    EdgeRunnerNodeInputs dynamic_backward_inputs{};
+    dynamic_backward_inputs.audio = dynamic_backward_audio;
+    dynamic_backward_inputs.params = dynamic_param_set;
+
+    AmpNodeMetrics dynamic_backward_metrics{};
+    double *dynamic_backward_out = nullptr;
+    int dynamic_backward_channels = 0;
+    dynamic_rc = amp_run_node_v2(
+        &direct_descriptor,
+        &dynamic_backward_inputs,
+        1,
+        1,
+        kFrames,
+        48000.0,
+        &dynamic_backward_out,
+        &dynamic_backward_channels,
+        &dynamic_state,
+        nullptr,
+        AMP_EXECUTION_MODE_BACKWARD,
+        &dynamic_backward_metrics
+    );
+    assert(dynamic_rc == 0);
+    assert(dynamic_backward_out != nullptr);
+    assert(dynamic_backward_channels == 1);
+    verify_frames(dynamic_backward_out, expected_dynamic_backward_direct, "direct_dynamic_backward");
+    assert(dynamic_backward_metrics.accumulated_heat > 0.0f);
+    assert(std::fabs(dynamic_backward_metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
+
+    amp_free(dynamic_forward_out);
+    amp_free(dynamic_backward_out);
+    amp_release_state(dynamic_state);
+
+    EdgeRunnerAudioView dynamic_fresh_audio = forward_audio;
+    dynamic_fresh_audio.data = dynamic_forward_copy.data();
+    EdgeRunnerNodeInputs dynamic_fresh_inputs{};
+    dynamic_fresh_inputs.audio = dynamic_fresh_audio;
+    dynamic_fresh_inputs.params = dynamic_param_set;
+
+    AmpNodeMetrics dynamic_fresh_metrics{};
+    double *dynamic_fresh_out = nullptr;
+    int dynamic_fresh_channels = 0;
+    void *dynamic_fresh_state = nullptr;
+    dynamic_rc = amp_run_node_v2(
+        &direct_descriptor,
+        &dynamic_fresh_inputs,
+        1,
+        1,
+        kFrames,
+        48000.0,
+        &dynamic_fresh_out,
+        &dynamic_fresh_channels,
+        &dynamic_fresh_state,
+        nullptr,
+        AMP_EXECUTION_MODE_BACKWARD,
+        &dynamic_fresh_metrics
+    );
+    assert(dynamic_rc == 0);
+    assert(dynamic_fresh_out != nullptr);
+    assert(dynamic_fresh_channels == 1);
+    verify_frames(dynamic_fresh_out, expected_dynamic_backward_direct, "direct_dynamic_backward_fresh");
+    assert(dynamic_fresh_metrics.accumulated_heat > 0.0f);
+    assert(std::fabs(dynamic_fresh_metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
+
+    amp_free(dynamic_fresh_out);
+    amp_release_state(dynamic_fresh_state);
+
     std::printf(
-        "test_fft_division_node: PASS (FFT division node streaming, algorithm, and window overrides validated)\n"
+        "test_fft_division_node: PASS (FFT division node streaming, dynamic oscillators, and window overrides validated)\n"
     );
     return 0;
 }
