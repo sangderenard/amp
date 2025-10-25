@@ -1,4 +1,5 @@
 
+#include <ctype.h>
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -2056,6 +2057,7 @@ typedef enum {
     NODE_KIND_PITCH,
     NODE_KIND_OSC,
     NODE_KIND_SUBHARM,
+    NODE_KIND_FFT_DIV,
 } node_kind_t;
 
 typedef struct {
@@ -2126,8 +2128,45 @@ typedef struct {
             int channels;
             int use_div4;
         } subharm;
+        struct {
+            double *input_buffer;
+            double *divisor_buffer;
+            double *divisor_imag_buffer;
+            double *phase_buffer;
+            double *lower_buffer;
+            double *upper_buffer;
+            double *filter_buffer;
+            double *window;
+            double *work_real;
+            double *work_imag;
+            double *div_real;
+            double *div_imag;
+            double *ifft_real;
+            double *ifft_imag;
+            double *result_buffer;
+            double *div_fft_real;
+            double *div_fft_imag;
+            double *recomb_buffer;
+            int window_size;
+            int algorithm;
+            int window_kind;
+            int filled;
+            int position;
+            double epsilon;
+            int batches;
+            int channels;
+            int slots;
+            int recomb_filled;
+            double last_phase;
+            double last_lower;
+            double last_upper;
+            double last_filter;
+            double total_heat;
+        } fftdiv;
     } u;
 } node_state_t;
+
+static void fft_state_free_buffers(node_state_t *state);
 
 static void release_node_state(node_state_t *state) {
     if (state == NULL) {
@@ -2217,6 +2256,10 @@ static void release_node_state(node_state_t *state) {
         state->u.subharm.channels = 0;
         state->u.subharm.use_div4 = 0;
     }
+    if (state->kind == NODE_KIND_FFT_DIV) {
+        fft_state_free_buffers(state);
+        state->u.fftdiv.total_heat = 0.0;
+    }
     free(state);
 }
 
@@ -2256,6 +2299,9 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "SubharmonicLowLifterNode") == 0) {
         return NODE_KIND_SUBHARM;
+    }
+    if (strcmp(descriptor->type_name, "FFTDivisionNode") == 0) {
+        return NODE_KIND_FFT_DIV;
     }
     return NODE_KIND_UNKNOWN;
 }
@@ -2717,6 +2763,398 @@ static double grid_warp_inverse_value(double u, const double *grid, const double
     double upper = grid_ext[idx + 1];
     double cents = lower + frac * (upper - lower);
     return octs * 1200.0 + cents;
+}
+
+#define FFT_ALGORITHM_RADIX2 0
+#define FFT_ALGORITHM_DFT 1
+
+#define FFT_WINDOW_RECTANGULAR 0
+#define FFT_WINDOW_HANN 1
+#define FFT_WINDOW_HAMMING 2
+
+static int round_to_int(double value) {
+    if (value >= 0.0) {
+        return (int)(value + 0.5);
+    }
+    return (int)(value - 0.5);
+}
+
+static int clamp_algorithm_kind(int kind) {
+    if (kind == FFT_ALGORITHM_DFT) {
+        return FFT_ALGORITHM_DFT;
+    }
+    return FFT_ALGORITHM_RADIX2;
+}
+
+static int clamp_window_kind(int kind) {
+    switch (kind) {
+        case FFT_WINDOW_RECTANGULAR:
+        case FFT_WINDOW_HANN:
+        case FFT_WINDOW_HAMMING:
+            return kind;
+        default:
+            break;
+    }
+    return FFT_WINDOW_HANN;
+}
+
+static double clamp_unit_double(double value) {
+    if (value < 0.0) {
+        return 0.0;
+    }
+    if (value > 1.0) {
+        return 1.0;
+    }
+    return value;
+}
+
+static double compute_band_gain(double ratio, double lower, double upper, double intensity) {
+    double lower_clamped = clamp_unit_double(lower);
+    double upper_clamped = clamp_unit_double(upper);
+    if (upper_clamped < lower_clamped) {
+        double tmp = lower_clamped;
+        lower_clamped = upper_clamped;
+        upper_clamped = tmp;
+    }
+    double intensity_clamped = clamp_unit_double(intensity);
+    double inside_gain = intensity_clamped;
+    if (inside_gain < 1e-6) {
+        inside_gain = 1e-6;
+    }
+    double outside_gain = 1.0 - intensity_clamped;
+    if (outside_gain < 1e-6) {
+        outside_gain = 1e-6;
+    }
+    if (ratio >= lower_clamped && ratio <= upper_clamped) {
+        return inside_gain;
+    }
+    return outside_gain;
+}
+
+static size_t param_total_count(const EdgeRunnerParamView *view) {
+    if (view == NULL) {
+        return 0;
+    }
+    size_t batches = view->batches > 0U ? view->batches : 1U;
+    size_t channels = view->channels > 0U ? view->channels : 1U;
+    size_t frames = view->frames > 0U ? view->frames : 1U;
+    return batches * channels * frames;
+}
+
+static double read_param_value(const EdgeRunnerParamView *view, size_t index, double default_value) {
+    if (view == NULL || view->data == NULL) {
+        return default_value;
+    }
+    size_t total = param_total_count(view);
+    if (total == 0) {
+        return default_value;
+    }
+    if (index >= total) {
+        index = total - 1;
+    }
+    return view->data[index];
+}
+
+static int parse_algorithm_string(const char *json, size_t json_len, int default_value) {
+    char buffer[32];
+    if (!json_copy_string(json, json_len, "algorithm", buffer, sizeof(buffer))) {
+        return default_value;
+    }
+    for (size_t i = 0; buffer[i] != '\0'; ++i) {
+        buffer[i] = (char)tolower((unsigned char)buffer[i]);
+    }
+    if (strcmp(buffer, "fft") == 0 || strcmp(buffer, "radix2") == 0 || strcmp(buffer, "cooleytukey") == 0) {
+        return FFT_ALGORITHM_RADIX2;
+    }
+    if (strcmp(buffer, "dft") == 0 || strcmp(buffer, "direct") == 0 || strcmp(buffer, "slow") == 0) {
+        return FFT_ALGORITHM_DFT;
+    }
+    return default_value;
+}
+
+static int parse_window_string(const char *json, size_t json_len, int default_value) {
+    char buffer[32];
+    if (!json_copy_string(json, json_len, "window", buffer, sizeof(buffer))) {
+        return default_value;
+    }
+    for (size_t i = 0; buffer[i] != '\0'; ++i) {
+        buffer[i] = (char)tolower((unsigned char)buffer[i]);
+    }
+    if (strcmp(buffer, "rect") == 0 || strcmp(buffer, "rectangular") == 0) {
+        return FFT_WINDOW_RECTANGULAR;
+    }
+    if (strcmp(buffer, "hann") == 0 || strcmp(buffer, "hanning") == 0) {
+        return FFT_WINDOW_HANN;
+    }
+    if (strcmp(buffer, "hamming") == 0) {
+        return FFT_WINDOW_HAMMING;
+    }
+    return default_value;
+}
+
+static int is_power_of_two_int(int value) {
+    if (value <= 0) {
+        return 0;
+    }
+    return (value & (value - 1)) == 0;
+}
+
+static int bit_reverse_int(int value, int bits) {
+    int reversed = 0;
+    for (int i = 0; i < bits; ++i) {
+        reversed = (reversed << 1) | (value & 1);
+        value >>= 1;
+    }
+    return reversed;
+}
+
+static void compute_fft_radix2(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n,
+    int inverse
+) {
+    if (n <= 0 || out_real == NULL || out_imag == NULL) {
+        return;
+    }
+    int bits = 0;
+    while ((1 << bits) < n) {
+        bits++;
+    }
+    for (int i = 0; i < n; ++i) {
+        out_real[i] = in_real != NULL ? in_real[i] : 0.0;
+        out_imag[i] = in_imag != NULL ? in_imag[i] : 0.0;
+    }
+    for (int i = 0; i < n; ++i) {
+        int j = bit_reverse_int(i, bits);
+        if (j > i) {
+            double tmp_r = out_real[i];
+            double tmp_i = out_imag[i];
+            out_real[i] = out_real[j];
+            out_imag[i] = out_imag[j];
+            out_real[j] = tmp_r;
+            out_imag[j] = tmp_i;
+        }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        double angle = (inverse != 0 ? 2.0 : -2.0) * M_PI / (double)len;
+        double wlen_real = cos(angle);
+        double wlen_imag = sin(angle);
+        for (int i = 0; i < n; i += len) {
+            double w_real = 1.0;
+            double w_imag = 0.0;
+            int half = len / 2;
+            for (int j = 0; j < half; ++j) {
+                int idx0 = i + j;
+                int idx1 = i + j + half;
+                double u_real = out_real[idx0];
+                double u_imag = out_imag[idx0];
+                double v_real = out_real[idx1] * w_real - out_imag[idx1] * w_imag;
+                double v_imag = out_real[idx1] * w_imag + out_imag[idx1] * w_real;
+                out_real[idx0] = u_real + v_real;
+                out_imag[idx0] = u_imag + v_imag;
+                out_real[idx1] = u_real - v_real;
+                out_imag[idx1] = u_imag - v_imag;
+                double next_real = w_real * wlen_real - w_imag * wlen_imag;
+                double next_imag = w_real * wlen_imag + w_imag * wlen_real;
+                w_real = next_real;
+                w_imag = next_imag;
+            }
+        }
+    }
+    if (inverse != 0) {
+        double inv_n = 1.0 / (double)n;
+        for (int i = 0; i < n; ++i) {
+            out_real[i] *= inv_n;
+            out_imag[i] *= inv_n;
+        }
+    }
+}
+
+static void compute_dft(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n,
+    int inverse
+) {
+    if (n <= 0 || out_real == NULL || out_imag == NULL) {
+        return;
+    }
+    double sign = inverse != 0 ? 1.0 : -1.0;
+    for (int k = 0; k < n; ++k) {
+        double sum_real = 0.0;
+        double sum_imag = 0.0;
+        for (int t = 0; t < n; ++t) {
+            double real = in_real != NULL ? in_real[t] : 0.0;
+            double imag = in_imag != NULL ? in_imag[t] : 0.0;
+            double angle = sign * 2.0 * M_PI * (double)k * (double)t / (double)n;
+            double c = cos(angle);
+            double s = sin(angle);
+            sum_real += real * c - imag * s;
+            sum_imag += real * s + imag * c;
+        }
+        if (inverse != 0) {
+            sum_real /= (double)n;
+            sum_imag /= (double)n;
+        }
+        out_real[k] = sum_real;
+        out_imag[k] = sum_imag;
+    }
+}
+
+static void fill_window_weights(double *window, int window_size, int window_kind) {
+    if (window == NULL || window_size <= 0) {
+        return;
+    }
+    if (window_size == 1) {
+        window[0] = 1.0;
+        return;
+    }
+    for (int i = 0; i < window_size; ++i) {
+        double value = 1.0;
+        double phase = (double)i / (double)(window_size - 1);
+        switch (window_kind) {
+            case FFT_WINDOW_RECTANGULAR:
+                value = 1.0;
+                break;
+            case FFT_WINDOW_HANN:
+                value = 0.5 * (1.0 - cos(2.0 * M_PI * phase));
+                break;
+            case FFT_WINDOW_HAMMING:
+                value = 0.54 - 0.46 * cos(2.0 * M_PI * phase);
+                break;
+            default:
+                value = 1.0;
+                break;
+        }
+        window[i] = value;
+    }
+}
+
+static void fft_state_free_buffers(node_state_t *state) {
+    if (state == NULL) {
+        return;
+    }
+    free(state->u.fftdiv.input_buffer);
+    free(state->u.fftdiv.divisor_buffer);
+    free(state->u.fftdiv.divisor_imag_buffer);
+    free(state->u.fftdiv.phase_buffer);
+    free(state->u.fftdiv.lower_buffer);
+    free(state->u.fftdiv.upper_buffer);
+    free(state->u.fftdiv.filter_buffer);
+    free(state->u.fftdiv.window);
+    free(state->u.fftdiv.work_real);
+    free(state->u.fftdiv.work_imag);
+    free(state->u.fftdiv.div_real);
+    free(state->u.fftdiv.div_imag);
+    free(state->u.fftdiv.ifft_real);
+    free(state->u.fftdiv.ifft_imag);
+    free(state->u.fftdiv.result_buffer);
+    free(state->u.fftdiv.div_fft_real);
+    free(state->u.fftdiv.div_fft_imag);
+    free(state->u.fftdiv.recomb_buffer);
+    state->u.fftdiv.input_buffer = NULL;
+    state->u.fftdiv.divisor_buffer = NULL;
+    state->u.fftdiv.divisor_imag_buffer = NULL;
+    state->u.fftdiv.phase_buffer = NULL;
+    state->u.fftdiv.lower_buffer = NULL;
+    state->u.fftdiv.upper_buffer = NULL;
+    state->u.fftdiv.filter_buffer = NULL;
+    state->u.fftdiv.window = NULL;
+    state->u.fftdiv.work_real = NULL;
+    state->u.fftdiv.work_imag = NULL;
+    state->u.fftdiv.div_real = NULL;
+    state->u.fftdiv.div_imag = NULL;
+    state->u.fftdiv.ifft_real = NULL;
+    state->u.fftdiv.ifft_imag = NULL;
+    state->u.fftdiv.result_buffer = NULL;
+    state->u.fftdiv.div_fft_real = NULL;
+    state->u.fftdiv.div_fft_imag = NULL;
+    state->u.fftdiv.recomb_buffer = NULL;
+    state->u.fftdiv.window_size = 0;
+    state->u.fftdiv.algorithm = FFT_ALGORITHM_RADIX2;
+    state->u.fftdiv.window_kind = -1;
+    state->u.fftdiv.filled = 0;
+    state->u.fftdiv.position = 0;
+    state->u.fftdiv.batches = 0;
+    state->u.fftdiv.channels = 0;
+    state->u.fftdiv.slots = 0;
+    state->u.fftdiv.epsilon = 0.0;
+    state->u.fftdiv.recomb_filled = 0;
+    state->u.fftdiv.last_phase = 0.0;
+    state->u.fftdiv.last_lower = 0.0;
+    state->u.fftdiv.last_upper = 1.0;
+    state->u.fftdiv.last_filter = 1.0;
+}
+
+static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_size) {
+    if (state == NULL) {
+        return -1;
+    }
+    if (slots <= 0) {
+        slots = 1;
+    }
+    if (window_size <= 0) {
+        window_size = 1;
+    }
+    if (state->u.fftdiv.input_buffer != NULL && state->u.fftdiv.window_size == window_size && state->u.fftdiv.slots == slots) {
+        return 0;
+    }
+    double preserved_heat = state->u.fftdiv.total_heat;
+    fft_state_free_buffers(state);
+    size_t total = (size_t)window_size * (size_t)slots;
+    if (total == 0) {
+        state->u.fftdiv.total_heat = preserved_heat;
+        return -1;
+    }
+    state->u.fftdiv.input_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.divisor_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.divisor_imag_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.phase_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.lower_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.upper_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.filter_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.window = (double *)calloc((size_t)window_size, sizeof(double));
+    state->u.fftdiv.work_real = (double *)calloc((size_t)window_size, sizeof(double));
+    state->u.fftdiv.work_imag = (double *)calloc((size_t)window_size, sizeof(double));
+    state->u.fftdiv.div_real = (double *)calloc((size_t)window_size, sizeof(double));
+    state->u.fftdiv.div_imag = (double *)calloc((size_t)window_size, sizeof(double));
+    state->u.fftdiv.ifft_real = (double *)calloc((size_t)window_size, sizeof(double));
+    state->u.fftdiv.ifft_imag = (double *)calloc((size_t)window_size, sizeof(double));
+    state->u.fftdiv.result_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.div_fft_real = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.div_fft_imag = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.recomb_buffer = (double *)calloc(total, sizeof(double));
+    if (state->u.fftdiv.input_buffer == NULL || state->u.fftdiv.divisor_buffer == NULL || state->u.fftdiv.divisor_imag_buffer == NULL
+        || state->u.fftdiv.phase_buffer == NULL || state->u.fftdiv.lower_buffer == NULL || state->u.fftdiv.upper_buffer == NULL
+        || state->u.fftdiv.filter_buffer == NULL || state->u.fftdiv.window == NULL || state->u.fftdiv.work_real == NULL
+        || state->u.fftdiv.work_imag == NULL || state->u.fftdiv.div_real == NULL || state->u.fftdiv.div_imag == NULL
+        || state->u.fftdiv.ifft_real == NULL || state->u.fftdiv.ifft_imag == NULL || state->u.fftdiv.result_buffer == NULL
+        || state->u.fftdiv.div_fft_real == NULL || state->u.fftdiv.div_fft_imag == NULL || state->u.fftdiv.recomb_buffer == NULL) {
+        fft_state_free_buffers(state);
+        state->u.fftdiv.total_heat = preserved_heat;
+        return -1;
+    }
+    state->u.fftdiv.window_size = window_size;
+    state->u.fftdiv.slots = slots;
+    state->u.fftdiv.filled = 0;
+    state->u.fftdiv.position = window_size > 0 ? window_size - 1 : 0;
+    state->u.fftdiv.algorithm = FFT_ALGORITHM_RADIX2;
+    state->u.fftdiv.window_kind = -1;
+    state->u.fftdiv.batches = 0;
+    state->u.fftdiv.channels = 0;
+    state->u.fftdiv.epsilon = 1e-9;
+    state->u.fftdiv.recomb_filled = 0;
+    state->u.fftdiv.last_phase = 0.0;
+    state->u.fftdiv.last_lower = 0.0;
+    state->u.fftdiv.last_upper = 1.0;
+    state->u.fftdiv.last_filter = 1.0;
+    state->u.fftdiv.total_heat = preserved_heat;
+    return 0;
 }
 
 static int run_constant_node(
@@ -3671,6 +4109,646 @@ static int run_gain_node(
     return 0;
 }
 
+static int run_fft_division_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state,
+    AmpNodeMetrics *metrics
+) {
+    (void)sample_rate;
+    if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    if (batches <= 0) {
+        batches = 1;
+    }
+    int input_channels = channels;
+    if (input_channels <= 0) {
+        if (inputs->audio.channels > 0U) {
+            input_channels = (int)inputs->audio.channels;
+        } else {
+            input_channels = 1;
+        }
+    }
+    int slot_count = batches * input_channels;
+    if (slot_count <= 0) {
+        slot_count = 1;
+    }
+
+    int window_size = json_get_int(descriptor->params_json, descriptor->params_len, "window_size", 8);
+    if (window_size <= 0) {
+        window_size = 1;
+    }
+    double epsilon_default = json_get_double(descriptor->params_json, descriptor->params_len, "stabilizer", 1e-9);
+    double epsilon_json = json_get_double(descriptor->params_json, descriptor->params_len, "epsilon", epsilon_default);
+    if (epsilon_json <= 0.0) {
+        epsilon_json = 1e-9;
+    }
+
+    int default_algorithm = parse_algorithm_string(descriptor->params_json, descriptor->params_len, FFT_ALGORITHM_RADIX2);
+    default_algorithm = clamp_algorithm_kind(default_algorithm);
+    int default_window_kind = parse_window_string(descriptor->params_json, descriptor->params_len, FFT_WINDOW_HANN);
+    default_window_kind = clamp_window_kind(default_window_kind);
+
+    if (ensure_fft_state_buffers(state, slot_count, window_size) != 0) {
+        return -1;
+    }
+    state->u.fftdiv.batches = batches;
+    state->u.fftdiv.channels = input_channels;
+    state->u.fftdiv.algorithm = default_algorithm;
+    state->u.fftdiv.epsilon = epsilon_json;
+    if (state->u.fftdiv.window_kind != default_window_kind) {
+        fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
+        state->u.fftdiv.window_kind = default_window_kind;
+    }
+
+    const EdgeRunnerParamView *divisor_view = find_param(inputs, "divisor");
+    const EdgeRunnerParamView *divisor_imag_view = find_param(inputs, "divisor_imag");
+    const EdgeRunnerParamView *algorithm_view = find_param(inputs, "algorithm_selector");
+    const EdgeRunnerParamView *window_view = find_param(inputs, "window_selector");
+    const EdgeRunnerParamView *stabilizer_view = find_param(inputs, "stabilizer");
+    const EdgeRunnerParamView *phase_view = find_param(inputs, "phase_offset");
+    const EdgeRunnerParamView *lower_view = find_param(inputs, "lower_band");
+    const EdgeRunnerParamView *upper_view = find_param(inputs, "upper_band");
+    const EdgeRunnerParamView *filter_view = find_param(inputs, "filter_intensity");
+
+    size_t total_samples = (size_t)slot_count * (size_t)frames;
+    double *buffer = (double *)malloc(total_samples * sizeof(double));
+    amp_last_alloc_count = total_samples;
+    if (buffer == NULL) {
+        return -1;
+    }
+
+    const double *audio_base = (inputs->audio.has_audio && inputs->audio.data != NULL) ? inputs->audio.data : NULL;
+    size_t divisor_total = param_total_count(divisor_view);
+    size_t divisor_imag_total = param_total_count(divisor_imag_view);
+    size_t algorithm_total = param_total_count(algorithm_view);
+    size_t window_total = param_total_count(window_view);
+    size_t stabilizer_total = param_total_count(stabilizer_view);
+    size_t phase_total = param_total_count(phase_view);
+    size_t lower_total = param_total_count(lower_view);
+    size_t upper_total = param_total_count(upper_view);
+    size_t filter_total = param_total_count(filter_view);
+
+    for (int frame_index = 0; frame_index < frames; ++frame_index) {
+        size_t base_index = (size_t)frame_index * (size_t)slot_count;
+        double epsilon_frame = epsilon_json;
+        if (stabilizer_total > 0U) {
+            double candidate = read_param_value(stabilizer_view, base_index, epsilon_frame);
+            if (candidate < 0.0) {
+                candidate = -candidate;
+            }
+            if (candidate > 0.0) {
+                epsilon_frame = candidate;
+            }
+        }
+        if (epsilon_frame < 1e-12) {
+            epsilon_frame = 1e-12;
+        }
+        int algorithm_kind = default_algorithm;
+        if (algorithm_total > 0U) {
+            double raw = read_param_value(algorithm_view, base_index, (double)algorithm_kind);
+            algorithm_kind = clamp_algorithm_kind(round_to_int(raw));
+        }
+        if (algorithm_kind == FFT_ALGORITHM_RADIX2 && !is_power_of_two_int(window_size)) {
+            algorithm_kind = FFT_ALGORITHM_DFT;
+        }
+        int window_kind = default_window_kind;
+        if (window_total > 0U) {
+            double raw_w = read_param_value(window_view, base_index, (double)window_kind);
+            window_kind = clamp_window_kind(round_to_int(raw_w));
+        }
+        if (state->u.fftdiv.window_kind != window_kind) {
+            fill_window_weights(state->u.fftdiv.window, window_size, window_kind);
+            state->u.fftdiv.window_kind = window_kind;
+        }
+        state->u.fftdiv.algorithm = algorithm_kind;
+        state->u.fftdiv.epsilon = epsilon_frame;
+
+        int filled = state->u.fftdiv.filled;
+        double phase_last = state->u.fftdiv.last_phase;
+        double lower_last = state->u.fftdiv.last_lower;
+        double upper_last = state->u.fftdiv.last_upper;
+        double filter_last = state->u.fftdiv.last_filter;
+        for (int slot = 0; slot < slot_count; ++slot) {
+            size_t data_idx = base_index + (size_t)slot;
+            double sample = 0.0;
+            if (audio_base != NULL) {
+                sample = audio_base[data_idx];
+            }
+            double divisor_sample = divisor_total > 0U ? read_param_value(divisor_view, base_index + (size_t)slot, 1.0) : 1.0;
+            double divisor_imag_sample = divisor_imag_total > 0U ? read_param_value(divisor_imag_view, base_index + (size_t)slot, 0.0) : 0.0;
+            double phase_sample = phase_total > 0U ? read_param_value(phase_view, base_index + (size_t)slot, phase_last) : phase_last;
+            double lower_sample = lower_total > 0U ? read_param_value(lower_view, base_index + (size_t)slot, lower_last) : lower_last;
+            double upper_sample = upper_total > 0U ? read_param_value(upper_view, base_index + (size_t)slot, upper_last) : upper_last;
+            double filter_sample = filter_total > 0U ? read_param_value(filter_view, base_index + (size_t)slot, filter_last) : filter_last;
+            size_t offset = (size_t)slot * (size_t)window_size;
+            double *input_ring = state->u.fftdiv.input_buffer + offset;
+            double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
+            double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
+            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
+            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
+            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
+            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
+            if (filled < window_size) {
+                input_ring[filled] = sample;
+                divisor_ring[filled] = divisor_sample;
+                divisor_imag_ring[filled] = divisor_imag_sample;
+                phase_ring[filled] = phase_sample;
+                lower_ring[filled] = lower_sample;
+                upper_ring[filled] = upper_sample;
+                filter_ring[filled] = filter_sample;
+            } else {
+                if (window_size > 1) {
+                    memmove(input_ring, input_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(divisor_ring, divisor_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(divisor_imag_ring, divisor_imag_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(phase_ring, phase_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(lower_ring, lower_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(upper_ring, upper_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(filter_ring, filter_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                }
+                input_ring[window_size - 1] = sample;
+                divisor_ring[window_size - 1] = divisor_sample;
+                divisor_imag_ring[window_size - 1] = divisor_imag_sample;
+                phase_ring[window_size - 1] = phase_sample;
+                lower_ring[window_size - 1] = lower_sample;
+                upper_ring[window_size - 1] = upper_sample;
+                filter_ring[window_size - 1] = filter_sample;
+            }
+            phase_last = phase_sample;
+            lower_last = lower_sample;
+            upper_last = upper_sample;
+            filter_last = filter_sample;
+        }
+        state->u.fftdiv.last_phase = phase_last;
+        state->u.fftdiv.last_lower = lower_last;
+        state->u.fftdiv.last_upper = upper_last;
+        state->u.fftdiv.last_filter = filter_last;
+        if (filled < window_size) {
+            filled += 1;
+            state->u.fftdiv.filled = filled;
+        }
+        if (state->u.fftdiv.filled < window_size) {
+            for (int slot = 0; slot < slot_count; ++slot) {
+                double divisor_sample = divisor_total > 0U ? read_param_value(divisor_view, base_index + (size_t)slot, 1.0) : 1.0;
+                double safe_div = fabs(divisor_sample) < epsilon_frame ? (divisor_sample >= 0.0 ? epsilon_frame : -epsilon_frame) : divisor_sample;
+                double sample = audio_base != NULL ? audio_base[base_index + (size_t)slot] : 0.0;
+                buffer[base_index + (size_t)slot] = sample / safe_div;
+            }
+            continue;
+        }
+        double *work_real = state->u.fftdiv.work_real;
+        double *work_imag = state->u.fftdiv.work_imag;
+        double *div_real = state->u.fftdiv.div_real;
+        double *div_imag = state->u.fftdiv.div_imag;
+        double *ifft_real = state->u.fftdiv.ifft_real;
+        double *ifft_imag = state->u.fftdiv.ifft_imag;
+        double *window_weights = state->u.fftdiv.window;
+        for (int slot = 0; slot < slot_count; ++slot) {
+            size_t offset = (size_t)slot * (size_t)window_size;
+            double *input_ring = state->u.fftdiv.input_buffer + offset;
+            double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
+            double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
+            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
+            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
+            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
+            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
+            for (int i = 0; i < window_size; ++i) {
+                double w = window_weights != NULL ? window_weights[i] : 1.0;
+                work_real[i] = input_ring[i] * w;
+                work_imag[i] = 0.0;
+                div_real[i] = divisor_ring[i] * w;
+                div_imag[i] = divisor_imag_ring[i] * w;
+            }
+            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
+                compute_fft_radix2(work_real, work_imag, work_real, work_imag, window_size, 0);
+                compute_fft_radix2(div_real, div_imag, div_real, div_imag, window_size, 0);
+            } else {
+                compute_dft(work_real, work_imag, work_real, work_imag, window_size, 0);
+                compute_dft(div_real, div_imag, div_real, div_imag, window_size, 0);
+            }
+            double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
+            double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
+            double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
+            double filter_mod = filter_ring[window_size > 0 ? window_size - 1 : 0];
+            double lower_clamped = clamp_unit_double(lower_mod);
+            double upper_clamped = clamp_unit_double(upper_mod);
+            if (upper_clamped < lower_clamped) {
+                double tmp_bounds = lower_clamped;
+                lower_clamped = upper_clamped;
+                upper_clamped = tmp_bounds;
+            }
+            double intensity_clamped = clamp_unit_double(filter_mod);
+            double cos_phase = cos(phase_mod);
+            double sin_phase = sin(phase_mod);
+            for (int i = 0; i < window_size; ++i) {
+                double a = work_real[i];
+                double b = work_imag[i];
+                double c = div_real[i];
+                double d = div_imag[i];
+                state->u.fftdiv.div_fft_real[offset + (size_t)i] = c;
+                state->u.fftdiv.div_fft_imag[offset + (size_t)i] = d;
+                double denom = c * c + d * d;
+                if (denom < epsilon_frame) {
+                    denom = epsilon_frame;
+                }
+                double real = (a * c + b * d) / denom;
+                double imag = (b * c - a * d) / denom;
+                double ratio = window_size > 1 ? (double)i / (double)(window_size - 1) : 0.0;
+                double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+                double gated_real = real * gain;
+                double gated_imag = imag * gain;
+                double rotated_real = gated_real * cos_phase - gated_imag * sin_phase;
+                double rotated_imag = gated_real * sin_phase + gated_imag * cos_phase;
+                work_real[i] = rotated_real;
+                work_imag[i] = rotated_imag;
+            }
+            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
+                compute_fft_radix2(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
+            } else {
+                compute_dft(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
+            }
+            for (int i = 0; i < window_size; ++i) {
+                state->u.fftdiv.result_buffer[offset + (size_t)i] = ifft_real[i];
+            }
+            buffer[base_index + (size_t)slot] = ifft_real[window_size - 1];
+        }
+        state->u.fftdiv.position = window_size - 1;
+    }
+
+    *out_buffer = buffer;
+    *out_channels = input_channels;
+    if (metrics != NULL) {
+        metrics->measured_delay_frames = (uint32_t)(window_size > 0 ? window_size - 1 : 0);
+        double complexity = 0.0;
+        if (state->u.fftdiv.algorithm == FFT_ALGORITHM_RADIX2) {
+            double stages = log((double)window_size) / log(2.0);
+            if (stages < 1.0) {
+                stages = 1.0;
+            }
+            complexity = (double)slot_count * (double)window_size * (stages * 6.0 + 4.0);
+        } else {
+            complexity = (double)slot_count * (double)window_size * (double)window_size * 2.0;
+        }
+        float heat = (float)(complexity / 1000.0);
+        if (heat < 0.001f) {
+            heat = 0.001f;
+        }
+        metrics->accumulated_heat = heat;
+        state->u.fftdiv.total_heat += (double)heat;
+        metrics->reserved[0] = (float)state->u.fftdiv.last_phase;
+        metrics->reserved[1] = (float)state->u.fftdiv.last_lower;
+        metrics->reserved[2] = (float)state->u.fftdiv.last_upper;
+        metrics->reserved[3] = (float)state->u.fftdiv.last_filter;
+        metrics->reserved[4] = (float)window_size;
+        metrics->reserved[5] = (float)state->u.fftdiv.algorithm;
+    }
+    return 0;
+}
+
+static int run_fft_division_node_backward(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state,
+    AmpNodeMetrics *metrics
+) {
+    (void)sample_rate;
+    if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    if (frames <= 0) {
+        frames = 1;
+    }
+    if (batches <= 0) {
+        batches = 1;
+    }
+    int input_channels = channels;
+    if (input_channels <= 0) {
+        if (inputs->audio.channels > 0U) {
+            input_channels = (int)inputs->audio.channels;
+        } else {
+            input_channels = 1;
+        }
+    }
+    int slot_count = batches * input_channels;
+    if (slot_count <= 0) {
+        slot_count = 1;
+    }
+
+    int window_size = json_get_int(descriptor->params_json, descriptor->params_len, "window_size", 8);
+    if (window_size <= 0) {
+        window_size = 1;
+    }
+    double epsilon_default = json_get_double(descriptor->params_json, descriptor->params_len, "stabilizer", 1e-9);
+    double epsilon_json = json_get_double(descriptor->params_json, descriptor->params_len, "epsilon", epsilon_default);
+    if (epsilon_json <= 0.0) {
+        epsilon_json = 1e-9;
+    }
+
+    int default_algorithm = parse_algorithm_string(descriptor->params_json, descriptor->params_len, FFT_ALGORITHM_RADIX2);
+    default_algorithm = clamp_algorithm_kind(default_algorithm);
+    int default_window_kind = parse_window_string(descriptor->params_json, descriptor->params_len, FFT_WINDOW_HANN);
+    default_window_kind = clamp_window_kind(default_window_kind);
+
+    if (ensure_fft_state_buffers(state, slot_count, window_size) != 0) {
+        return -1;
+    }
+    if (state->u.fftdiv.window_kind != default_window_kind) {
+        fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
+        state->u.fftdiv.window_kind = default_window_kind;
+    }
+
+    const EdgeRunnerParamView *divisor_view = find_param(inputs, "divisor");
+    const EdgeRunnerParamView *divisor_imag_view = find_param(inputs, "divisor_imag");
+    const EdgeRunnerParamView *stabilizer_view = find_param(inputs, "stabilizer");
+    const EdgeRunnerParamView *algorithm_view = find_param(inputs, "algorithm_selector");
+    const EdgeRunnerParamView *window_view = find_param(inputs, "window_selector");
+    const EdgeRunnerParamView *phase_view = find_param(inputs, "phase_offset");
+    const EdgeRunnerParamView *lower_view = find_param(inputs, "lower_band");
+    const EdgeRunnerParamView *upper_view = find_param(inputs, "upper_band");
+    const EdgeRunnerParamView *filter_view = find_param(inputs, "filter_intensity");
+
+    size_t divisor_total = param_total_count(divisor_view);
+    size_t divisor_imag_total = param_total_count(divisor_imag_view);
+    size_t stabilizer_total = param_total_count(stabilizer_view);
+    size_t algorithm_total = param_total_count(algorithm_view);
+    size_t window_total = param_total_count(window_view);
+    size_t phase_total = param_total_count(phase_view);
+    size_t lower_total = param_total_count(lower_view);
+    size_t upper_total = param_total_count(upper_view);
+    size_t filter_total = param_total_count(filter_view);
+
+    size_t total_samples = (size_t)slot_count * (size_t)frames;
+    double *buffer = (double *)malloc(total_samples * sizeof(double));
+    amp_last_alloc_count = total_samples;
+    if (buffer == NULL) {
+        return -1;
+    }
+
+    const double *audio_base = (inputs->audio.has_audio && inputs->audio.data != NULL) ? inputs->audio.data : NULL;
+    int recomb_filled = state->u.fftdiv.recomb_filled;
+    double phase_last_state = state->u.fftdiv.last_phase;
+    double lower_last_state = state->u.fftdiv.last_lower;
+    double upper_last_state = state->u.fftdiv.last_upper;
+    double filter_last_state = state->u.fftdiv.last_filter;
+
+    for (int frame_index = 0; frame_index < frames; ++frame_index) {
+        size_t base_index = (size_t)frame_index * (size_t)slot_count;
+        double epsilon_frame = epsilon_json;
+        if (stabilizer_total > 0U) {
+            double candidate = read_param_value(stabilizer_view, base_index, epsilon_frame);
+            if (candidate < 0.0) {
+                candidate = -candidate;
+            }
+            if (candidate > 0.0) {
+                epsilon_frame = candidate;
+            }
+        }
+        if (epsilon_frame < 1e-12) {
+            epsilon_frame = 1e-12;
+        }
+        int algorithm_kind = default_algorithm;
+        if (algorithm_total > 0U) {
+            double raw = read_param_value(algorithm_view, base_index, (double)algorithm_kind);
+            algorithm_kind = clamp_algorithm_kind(round_to_int(raw));
+        }
+        if (algorithm_kind == FFT_ALGORITHM_RADIX2 && !is_power_of_two_int(window_size)) {
+            algorithm_kind = FFT_ALGORITHM_DFT;
+        }
+        int window_kind = default_window_kind;
+        if (window_total > 0U) {
+            double raw_w = read_param_value(window_view, base_index, (double)window_kind);
+            window_kind = clamp_window_kind(round_to_int(raw_w));
+        }
+        if (state->u.fftdiv.window_kind != window_kind) {
+            fill_window_weights(state->u.fftdiv.window, window_size, window_kind);
+            state->u.fftdiv.window_kind = window_kind;
+        }
+        state->u.fftdiv.algorithm = algorithm_kind;
+        state->u.fftdiv.epsilon = epsilon_frame;
+
+        double phase_last = phase_last_state;
+        double lower_last = lower_last_state;
+        double upper_last = upper_last_state;
+        double filter_last = filter_last_state;
+
+        for (int slot = 0; slot < slot_count; ++slot) {
+            size_t data_idx = base_index + (size_t)slot;
+            double sample = audio_base != NULL ? audio_base[data_idx] : 0.0;
+            size_t offset = (size_t)slot * (size_t)window_size;
+            double *recomb_ring = state->u.fftdiv.recomb_buffer + offset;
+            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
+            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
+            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
+            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
+            double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
+            double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
+
+            size_t tail_index = (size_t)(window_size > 0 ? window_size - 1 : 0);
+            double phase_default = (recomb_filled < window_size) ? phase_ring[recomb_filled] : phase_ring[tail_index];
+            double lower_default = (recomb_filled < window_size) ? lower_ring[recomb_filled] : lower_ring[tail_index];
+            double upper_default = (recomb_filled < window_size) ? upper_ring[recomb_filled] : upper_ring[tail_index];
+            double filter_default = (recomb_filled < window_size) ? filter_ring[recomb_filled] : filter_ring[tail_index];
+            double divisor_default = (recomb_filled < window_size) ? divisor_ring[recomb_filled] : divisor_ring[tail_index];
+            double divisor_imag_default = (recomb_filled < window_size) ? divisor_imag_ring[recomb_filled] : divisor_imag_ring[tail_index];
+
+            double phase_sample = phase_total > 0U
+                ? read_param_value(phase_view, base_index + (size_t)slot, phase_default)
+                : phase_default;
+            double lower_sample = lower_total > 0U
+                ? read_param_value(lower_view, base_index + (size_t)slot, lower_default)
+                : lower_default;
+            double upper_sample = upper_total > 0U
+                ? read_param_value(upper_view, base_index + (size_t)slot, upper_default)
+                : upper_default;
+            double filter_sample = filter_total > 0U
+                ? read_param_value(filter_view, base_index + (size_t)slot, filter_default)
+                : filter_default;
+            double divisor_sample = divisor_total > 0U
+                ? read_param_value(divisor_view, base_index + (size_t)slot, divisor_default)
+                : divisor_default;
+            double divisor_imag_sample = divisor_imag_total > 0U
+                ? read_param_value(divisor_imag_view, base_index + (size_t)slot, divisor_imag_default)
+                : divisor_imag_default;
+
+            if (recomb_filled < window_size) {
+                recomb_ring[recomb_filled] = sample;
+                phase_ring[recomb_filled] = phase_sample;
+                lower_ring[recomb_filled] = lower_sample;
+                upper_ring[recomb_filled] = upper_sample;
+                filter_ring[recomb_filled] = filter_sample;
+                divisor_ring[recomb_filled] = divisor_sample;
+                divisor_imag_ring[recomb_filled] = divisor_imag_sample;
+            } else {
+                if (window_size > 1) {
+                    memmove(recomb_ring, recomb_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(phase_ring, phase_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(lower_ring, lower_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(upper_ring, upper_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(filter_ring, filter_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(divisor_ring, divisor_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                    memmove(divisor_imag_ring, divisor_imag_ring + 1, (size_t)(window_size - 1) * sizeof(double));
+                }
+                recomb_ring[window_size - 1] = sample;
+                phase_ring[window_size - 1] = phase_sample;
+                lower_ring[window_size - 1] = lower_sample;
+                upper_ring[window_size - 1] = upper_sample;
+                filter_ring[window_size - 1] = filter_sample;
+                divisor_ring[window_size - 1] = divisor_sample;
+                divisor_imag_ring[window_size - 1] = divisor_imag_sample;
+            }
+
+            phase_last = phase_sample;
+            lower_last = lower_sample;
+            upper_last = upper_sample;
+            filter_last = filter_sample;
+        }
+
+        phase_last_state = phase_last;
+        lower_last_state = lower_last;
+        upper_last_state = upper_last;
+        filter_last_state = filter_last;
+        state->u.fftdiv.last_phase = phase_last;
+        state->u.fftdiv.last_lower = lower_last;
+        state->u.fftdiv.last_upper = upper_last;
+        state->u.fftdiv.last_filter = filter_last;
+        if (recomb_filled < window_size) {
+            recomb_filled += 1;
+            if (recomb_filled > window_size) {
+                recomb_filled = window_size;
+            }
+            for (int slot = 0; slot < slot_count; ++slot) {
+                size_t data_idx = base_index + (size_t)slot;
+                size_t offset = (size_t)slot * (size_t)window_size;
+                double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
+                double divisor_sample = divisor_ring[recomb_filled > 0 ? recomb_filled - 1 : 0];
+                if (divisor_total > 0U) {
+                    divisor_sample = read_param_value(divisor_view, base_index + (size_t)slot, divisor_sample);
+                }
+                double safe_div = fabs(divisor_sample) < epsilon_frame
+                    ? (divisor_sample >= 0.0 ? epsilon_frame : -epsilon_frame)
+                    : divisor_sample;
+                double quotient_sample = audio_base != NULL ? audio_base[data_idx] : 0.0;
+                buffer[data_idx] = quotient_sample * safe_div;
+            }
+            continue;
+        }
+
+        double *work_real = state->u.fftdiv.work_real;
+        double *work_imag = state->u.fftdiv.work_imag;
+        double *div_real = state->u.fftdiv.div_real;
+        double *div_imag = state->u.fftdiv.div_imag;
+        double *ifft_real = state->u.fftdiv.ifft_real;
+        double *ifft_imag = state->u.fftdiv.ifft_imag;
+        double *window_weights = state->u.fftdiv.window;
+
+        for (int slot = 0; slot < slot_count; ++slot) {
+            size_t offset = (size_t)slot * (size_t)window_size;
+            double *recomb_ring = state->u.fftdiv.recomb_buffer + offset;
+            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
+            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
+            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
+            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
+            double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
+            double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
+            double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
+            double filter_mod = filter_ring[window_size > 0 ? window_size - 1 : 0];
+            double lower_clamped = clamp_unit_double(lower_mod);
+            double upper_clamped = clamp_unit_double(upper_mod);
+            if (upper_clamped < lower_clamped) {
+                double tmp_bounds = lower_clamped;
+                lower_clamped = upper_clamped;
+                upper_clamped = tmp_bounds;
+            }
+            double intensity_clamped = clamp_unit_double(filter_mod);
+            double cos_phase = cos(phase_mod);
+            double sin_phase = sin(phase_mod);
+
+            for (int i = 0; i < window_size; ++i) {
+                double w = window_weights != NULL ? window_weights[i] : 1.0;
+                div_real[i] = state->u.fftdiv.divisor_buffer[offset + (size_t)i] * w;
+                div_imag[i] = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i] * w;
+            }
+            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
+                compute_fft_radix2(div_real, div_imag, div_real, div_imag, window_size, 0);
+            } else {
+                compute_dft(div_real, div_imag, div_real, div_imag, window_size, 0);
+            }
+            for (int i = 0; i < window_size; ++i) {
+                state->u.fftdiv.div_fft_real[offset + (size_t)i] = div_real[i];
+                state->u.fftdiv.div_fft_imag[offset + (size_t)i] = div_imag[i];
+            }
+
+            for (int i = 0; i < window_size; ++i) {
+                double w = window_weights != NULL ? window_weights[i] : 1.0;
+                work_real[i] = recomb_ring[i] * w;
+                work_imag[i] = 0.0;
+            }
+            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
+                compute_fft_radix2(work_real, work_imag, work_real, work_imag, window_size, 0);
+            } else {
+                compute_dft(work_real, work_imag, work_real, work_imag, window_size, 0);
+            }
+            for (int i = 0; i < window_size; ++i) {
+                double ratio = window_size > 1 ? (double)i / (double)(window_size - 1) : 0.0;
+                double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+                if (gain < 1e-6) {
+                    gain = 1e-6;
+                }
+                double rotated_real = work_real[i];
+                double rotated_imag = work_imag[i];
+                double inv_real = rotated_real * cos_phase + rotated_imag * sin_phase;
+                double inv_imag = -rotated_real * sin_phase + rotated_imag * cos_phase;
+                inv_real /= gain;
+                inv_imag /= gain;
+                double c = state->u.fftdiv.div_fft_real[offset + (size_t)i];
+                double d = state->u.fftdiv.div_fft_imag[offset + (size_t)i];
+                double out_real_freq = inv_real * c - inv_imag * d;
+                double out_imag_freq = inv_real * d + inv_imag * c;
+                work_real[i] = out_real_freq;
+                work_imag[i] = out_imag_freq;
+            }
+            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
+                compute_fft_radix2(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
+            } else {
+                compute_dft(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
+            }
+            buffer[base_index + (size_t)slot] = ifft_real[window_size - 1];
+        }
+    }
+
+    state->u.fftdiv.recomb_filled = recomb_filled;
+    *out_buffer = buffer;
+    *out_channels = input_channels;
+    if (metrics != NULL) {
+        metrics->measured_delay_frames = (uint32_t)(window_size > 0 ? window_size - 1 : 0);
+        metrics->accumulated_heat = 0.0f;
+        metrics->reserved[0] = (float)state->u.fftdiv.last_phase;
+        metrics->reserved[1] = (float)state->u.fftdiv.last_lower;
+        metrics->reserved[2] = (float)state->u.fftdiv.last_upper;
+        metrics->reserved[3] = (float)state->u.fftdiv.last_filter;
+        metrics->reserved[4] = (float)window_size;
+        metrics->reserved[5] = (float)state->u.fftdiv.algorithm;
+    }
+    return 0;
+}
+
 static int run_mix_node(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
@@ -3888,7 +4966,7 @@ static void amp_reset_metrics(AmpNodeMetrics *metrics) {
     }
 }
 
-static int amp_run_node_forward_impl(
+static int amp_run_node_impl(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
     int batches,
@@ -3899,6 +4977,7 @@ static int amp_run_node_forward_impl(
     int *out_channels,
     void **state,
     const EdgeRunnerControlHistory *history,
+    AmpExecutionMode mode,
     AmpNodeMetrics *metrics
 ) {
     amp_reset_metrics(metrics);
@@ -3935,46 +5014,102 @@ static int amp_run_node_forward_impl(
     int rc = 0;
     switch (kind) {
         case NODE_KIND_CONSTANT:
-            rc = run_constant_node(descriptor, batches, frames, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_constant_node(descriptor, batches, frames, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_GAIN:
-            rc = run_gain_node(inputs, batches, frames, out_buffer, out_channels);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_gain_node(inputs, batches, frames, out_buffer, out_channels)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_MIX:
-            rc = run_mix_node(descriptor, inputs, batches, frames, out_buffer, out_channels);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_mix_node(descriptor, inputs, batches, frames, out_buffer, out_channels)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_SAFETY:
-            rc = run_safety_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_safety_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_SINE_OSC:
-            rc = run_sine_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_sine_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_CONTROLLER:
-            rc = run_controller_node(descriptor, inputs, batches, frames, out_buffer, out_channels, history);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_controller_node(descriptor, inputs, batches, frames, out_buffer, out_channels, history)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_LFO:
-            rc = run_lfo_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_lfo_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_ENVELOPE:
-            rc = run_envelope_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_envelope_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_PITCH:
-            rc = run_pitch_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_pitch_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_OSC:
-            rc = run_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_SUBHARM:
-            rc = run_subharm_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state);
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_subharm_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
+            break;
+        case NODE_KIND_FFT_DIV:
+            if (mode == AMP_EXECUTION_MODE_BACKWARD) {
+                rc = run_fft_division_node_backward(
+                    descriptor,
+                    inputs,
+                    batches,
+                    channels,
+                    frames,
+                    sample_rate,
+                    out_buffer,
+                    out_channels,
+                    node_state,
+                    metrics
+                );
+            } else {
+                rc = run_fft_division_node(
+                    descriptor,
+                    inputs,
+                    batches,
+                    channels,
+                    frames,
+                    sample_rate,
+                    out_buffer,
+                    out_channels,
+                    node_state,
+                    metrics
+                );
+            }
             break;
         default:
             rc = -3;
             break;
     }
-    if (rc == 0 && metrics != NULL) {
-        /* Placeholder metrics until specialised node implementations fill them. */
-        metrics->measured_delay_frames = 0U;
-        metrics->accumulated_heat = 0.0f;
+    if (rc == 0 && metrics != NULL && kind != NODE_KIND_FFT_DIV) {
+        if (mode == AMP_EXECUTION_MODE_FORWARD) {
+            /* Placeholder metrics until specialised node implementations fill them. */
+            metrics->measured_delay_frames = 0U;
+            metrics->accumulated_heat = 0.0f;
+        } else {
+            metrics->measured_delay_frames = 0U;
+            metrics->accumulated_heat = 0.0f;
+        }
     }
     return rc;
 }
@@ -3992,7 +5127,7 @@ AMP_CAPI int amp_run_node(
     const EdgeRunnerControlHistory *history
 ) {
     AMP_LOG_NATIVE_CALL("amp_run_node", (size_t)batches, (size_t)frames);
-    return amp_run_node_forward_impl(
+    return amp_run_node_impl(
         descriptor,
         inputs,
         batches,
@@ -4003,6 +5138,7 @@ AMP_CAPI int amp_run_node(
         out_channels,
         state,
         history,
+        AMP_EXECUTION_MODE_FORWARD,
         NULL
     );
 }
@@ -4022,11 +5158,7 @@ AMP_CAPI int amp_run_node_v2(
     AmpNodeMetrics *metrics
 ) {
     AMP_LOG_NATIVE_CALL("amp_run_node_v2", (size_t)batches, (size_t)frames);
-    if (mode != AMP_EXECUTION_MODE_FORWARD) {
-        amp_reset_metrics(metrics);
-        return AMP_E_UNSUPPORTED;
-    }
-    return amp_run_node_forward_impl(
+    return amp_run_node_impl(
         descriptor,
         inputs,
         batches,
@@ -4037,6 +5169,7 @@ AMP_CAPI int amp_run_node_v2(
         out_channels,
         state,
         history,
+        mode,
         metrics
     );
 }

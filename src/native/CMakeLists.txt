@@ -86,4 +86,15 @@ if (AMP_NATIVE_BUILD_TESTS)
     )
     target_link_libraries(test_amp_run_node_v2 PRIVATE amp_native)
     add_test(NAME test_amp_run_node_v2 COMMAND test_amp_run_node_v2)
+
+    add_executable(test_fft_division_node
+        tests/test_fft_division_node.cpp
+    )
+    target_include_directories(test_fft_division_node PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(test_fft_division_node PRIVATE amp_native)
+    add_test(NAME test_fft_division_node COMMAND test_fft_division_node)
 endif()
