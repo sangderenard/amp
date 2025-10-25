@@ -1298,6 +1298,19 @@ class ParametricDriverNode(Node):
         return out
 
 
+class FFTDivisionNode(Node):
+    """Frequency-division FFT node (native-only)."""
+
+    def __init__(self, name: str, params: Mapping[str, object] | None = None) -> None:
+        super().__init__(name)
+        self.params = dict(params or {})
+
+    def process(self, frames, sr, audio_in, mods, params):
+        raise RuntimeError(
+            "FFTDivisionNode must execute via the native runtime; Python fallback is not available."
+        )
+
+
 class SamplerNode(Node):
     def __init__(self, name, sampler):
         super().__init__(name)
@@ -1606,6 +1619,8 @@ NODE_TYPES = {
     "oscillator": OscNode,
     "parametric_driver": ParametricDriverNode,
     "ParametricDriverNode": ParametricDriverNode,
+    "fft_division": FFTDivisionNode,
+    "FFTDivisionNode": FFTDivisionNode,
     "envelope": EnvelopeModulatorNode,
     "envelope_modulator": EnvelopeModulatorNode,
     "pitch_quantizer": PitchQuantizerNode,
@@ -1628,6 +1643,7 @@ __all__ = [
     "AmplifierModulatorNode",
     "OscNode",
     "ParametricDriverNode",
+    "FFTDivisionNode",
     "MixNode",
     "SafetyNode",
     "SubharmonicLowLifterNode",
