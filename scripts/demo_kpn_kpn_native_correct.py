@@ -204,6 +204,28 @@ def _evaluate_pitch_expression(expr: str, t: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _evaluate_pitch_expression(expr: str, t: np.ndarray) -> np.ndarray:
+    symbol_t = sp.Symbol("t", real=True)
+    try:
+        parsed = sp.sympify(expr, locals={"pi": sp.pi})
+    except sp.SympifyError as exc:
+        raise ValueError(f"invalid SymPy expression '{expr}': {exc}") from exc
+    extra_symbols = parsed.free_symbols.difference({symbol_t})
+    if extra_symbols:
+        names = ", ".join(sorted(str(sym) for sym in extra_symbols))
+        raise ValueError(f"unsupported symbols in pitch expression: {names}")
+    func = sp.lambdify((symbol_t,), parsed, modules=["numpy"])
+    values = func(t)
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = np.full(t.shape, float(arr), dtype=np.float64)
+    else:
+        arr = np.broadcast_to(arr, t.shape).astype(np.float64, copy=False)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("pitch expression produced non-finite values")
+    return arr
+
+
 def ensure_native_kernels(executor: NativeGraphExecutor, node_names: Iterable[str]) -> None:
     ffi, lib = executor.ffi, executor.lib
     for name in node_names:
