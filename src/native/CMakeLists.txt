@@ -87,6 +87,18 @@ if (AMP_NATIVE_BUILD_TESTS)
     target_link_libraries(test_amp_run_node_v2 PRIVATE amp_native)
     add_test(NAME test_amp_run_node_v2 COMMAND test_amp_run_node_v2)
 
+    add_executable(test_fft_noise_gradient
+        tests/test_fft_noise_gradient.cpp
+    )
+    target_include_directories(test_fft_noise_gradient PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(test_fft_noise_gradient PRIVATE amp_native)
+    add_test(NAME test_fft_noise_gradient COMMAND test_fft_noise_gradient --output output.wav)
+    set_tests_properties(test_fft_noise_gradient PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+
     add_executable(test_fft_division_node
         tests/test_fft_division_node.cpp
     )

@@ -98,6 +98,23 @@ typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef struct AmpGraphRuntime AmpGraphRuntime;
 typedef struct AmpGraphControlHistory AmpGraphControlHistory;
+typedef struct {
+    uint32_t measured_delay_frames;
+    float accumulated_heat;
+    float reserved[6];
+} AmpNodeMetrics;
+typedef enum {
+    AMP_EXECUTION_MODE_FORWARD = 0,
+    AMP_EXECUTION_MODE_BACKWARD = 1
+} AmpExecutionMode;
+typedef struct {
+    uint32_t declared_delay_frames;
+    uint32_t oversample_ratio;
+    int supports_v2;
+    int has_metrics;
+    AmpNodeMetrics metrics;
+    double total_heat_accumulated;
+} AmpGraphNodeSummary;
 AmpGraphRuntime *amp_graph_runtime_create(
     const uint8_t *descriptor_blob,
     size_t descriptor_len,
@@ -117,6 +134,11 @@ int amp_graph_runtime_set_param(
     uint32_t channels,
     uint32_t frames
 );
+int amp_graph_runtime_describe_node(
+    AmpGraphRuntime *runtime,
+    const char *node_name,
+    AmpGraphNodeSummary *summary
+);
 int amp_graph_runtime_execute(
     AmpGraphRuntime *runtime,
     const uint8_t *control_blob,
@@ -131,6 +153,20 @@ int amp_graph_runtime_execute(
 void amp_graph_runtime_buffer_free(double *buffer);
 AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
 void amp_graph_history_destroy(AmpGraphControlHistory *history);
+int amp_run_node_v2(
+    const struct EdgeRunnerNodeDescriptor *descriptor,
+    const struct EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    void **state,
+    const EdgeRunnerControlHistory *history,
+    AmpExecutionMode mode,
+    AmpNodeMetrics *metrics
+);
 int amp_native_logging_enabled(void);
 void amp_native_logging_set(int enabled);
 """
