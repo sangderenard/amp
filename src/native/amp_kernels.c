@@ -2164,6 +2164,10 @@ typedef struct {
             double total_heat;
             int dynamic_carrier_band_count;
             double dynamic_carrier_last_sum;
+            double *dynamic_phase;
+            double *dynamic_step_re;
+            double *dynamic_step_im;
+            int dynamic_k_active;
         } fftdiv;
     } u;
 } node_state_t;
@@ -2930,6 +2934,40 @@ static fft_dynamic_carrier_summary_t summarize_dynamic_carriers(const EdgeRunner
     return summary;
 }
 
+static uint32_t collect_dynamic_carrier_views(
+    const EdgeRunnerNodeInputs *inputs,
+    const EdgeRunnerParamView **views,
+    uint32_t limit
+) {
+    if (views == NULL || limit == 0U) {
+        return 0U;
+    }
+    for (uint32_t i = 0; i < limit; ++i) {
+        views[i] = NULL;
+    }
+    if (inputs == NULL) {
+        return 0U;
+    }
+    uint32_t max_index = 0U;
+    uint32_t param_count = inputs->params.count;
+    EdgeRunnerParamView *items = inputs->params.items;
+    for (uint32_t i = 0; i < param_count; ++i) {
+        EdgeRunnerParamView *view = &items[i];
+        uint32_t index = 0U;
+        if (!parse_dynamic_carrier_index(view->name, &index)) {
+            continue;
+        }
+        if (index >= limit) {
+            continue;
+        }
+        views[index] = view;
+        if (index + 1U > max_index) {
+            max_index = index + 1U;
+        }
+    }
+    return max_index;
+}
+
 static int parse_algorithm_string(const char *json, size_t json_len, int default_value) {
     char buffer[32];
     if (!json_copy_string(json, json_len, "algorithm", buffer, sizeof(buffer))) {
@@ -3318,6 +3356,9 @@ static void fft_state_free_buffers(node_state_t *state) {
     free(state->u.fftdiv.div_fft_real);
     free(state->u.fftdiv.div_fft_imag);
     free(state->u.fftdiv.recomb_buffer);
+    free(state->u.fftdiv.dynamic_phase);
+    free(state->u.fftdiv.dynamic_step_re);
+    free(state->u.fftdiv.dynamic_step_im);
     state->u.fftdiv.input_buffer = NULL;
     state->u.fftdiv.divisor_buffer = NULL;
     state->u.fftdiv.divisor_imag_buffer = NULL;
@@ -3336,6 +3377,9 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.div_fft_real = NULL;
     state->u.fftdiv.div_fft_imag = NULL;
     state->u.fftdiv.recomb_buffer = NULL;
+    state->u.fftdiv.dynamic_phase = NULL;
+    state->u.fftdiv.dynamic_step_re = NULL;
+    state->u.fftdiv.dynamic_step_im = NULL;
     state->u.fftdiv.window_size = 0;
     state->u.fftdiv.algorithm = FFT_ALGORITHM_RADIX2;
     state->u.fftdiv.window_kind = -1;
@@ -3352,6 +3396,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.last_filter = 1.0;
     state->u.fftdiv.dynamic_carrier_band_count = 0;
     state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
+    state->u.fftdiv.dynamic_k_active = 0;
 }
 
 static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_size) {
@@ -3392,12 +3437,16 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
     state->u.fftdiv.div_fft_real = (double *)calloc(total, sizeof(double));
     state->u.fftdiv.div_fft_imag = (double *)calloc(total, sizeof(double));
     state->u.fftdiv.recomb_buffer = (double *)calloc(total, sizeof(double));
+    state->u.fftdiv.dynamic_phase = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
+    state->u.fftdiv.dynamic_step_re = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
+    state->u.fftdiv.dynamic_step_im = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
     if (state->u.fftdiv.input_buffer == NULL || state->u.fftdiv.divisor_buffer == NULL || state->u.fftdiv.divisor_imag_buffer == NULL
         || state->u.fftdiv.phase_buffer == NULL || state->u.fftdiv.lower_buffer == NULL || state->u.fftdiv.upper_buffer == NULL
         || state->u.fftdiv.filter_buffer == NULL || state->u.fftdiv.window == NULL || state->u.fftdiv.work_real == NULL
         || state->u.fftdiv.work_imag == NULL || state->u.fftdiv.div_real == NULL || state->u.fftdiv.div_imag == NULL
         || state->u.fftdiv.ifft_real == NULL || state->u.fftdiv.ifft_imag == NULL || state->u.fftdiv.result_buffer == NULL
-        || state->u.fftdiv.div_fft_real == NULL || state->u.fftdiv.div_fft_imag == NULL || state->u.fftdiv.recomb_buffer == NULL) {
+        || state->u.fftdiv.div_fft_real == NULL || state->u.fftdiv.div_fft_imag == NULL || state->u.fftdiv.recomb_buffer == NULL
+        || state->u.fftdiv.dynamic_phase == NULL || state->u.fftdiv.dynamic_step_re == NULL || state->u.fftdiv.dynamic_step_im == NULL) {
         fft_state_free_buffers(state);
         state->u.fftdiv.total_heat = preserved_heat;
         return -1;
@@ -3419,6 +3468,7 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
     state->u.fftdiv.total_heat = preserved_heat;
     state->u.fftdiv.dynamic_carrier_band_count = 0;
     state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
+    state->u.fftdiv.dynamic_k_active = 0;
     return 0;
 }
 
@@ -4386,7 +4436,6 @@ static int run_fft_division_node(
     node_state_t *state,
     AmpNodeMetrics *metrics
 ) {
-    (void)sample_rate;
     if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
         return -1;
     }
@@ -4445,6 +4494,8 @@ static int run_fft_division_node(
     const EdgeRunnerParamView *lower_view = find_param(inputs, "lower_band");
     const EdgeRunnerParamView *upper_view = find_param(inputs, "upper_band");
     const EdgeRunnerParamView *filter_view = find_param(inputs, "filter_intensity");
+    const EdgeRunnerParamView *carrier_views[FFT_DYNAMIC_CARRIER_LIMIT];
+    uint32_t carrier_view_count = collect_dynamic_carrier_views(inputs, carrier_views, FFT_DYNAMIC_CARRIER_LIMIT);
 
     size_t total_samples = (size_t)slot_count * (size_t)frames;
     double *buffer = (double *)malloc(total_samples * sizeof(double));
@@ -4502,12 +4553,18 @@ static int run_fft_division_node(
         }
         state->u.fftdiv.algorithm = algorithm_kind;
         state->u.fftdiv.epsilon = epsilon_frame;
-        if (algorithm_class->supports_dynamic_carriers) {
+        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+            state->u.fftdiv.dynamic_carrier_band_count = 0;
+            state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
+            state->u.fftdiv.dynamic_k_active = 0;
+        } else if (algorithm_class->supports_dynamic_carriers) {
             state->u.fftdiv.dynamic_carrier_band_count = (int)carrier_summary.band_count;
             state->u.fftdiv.dynamic_carrier_last_sum = carrier_summary.last_sum;
+            state->u.fftdiv.dynamic_k_active = (int)carrier_summary.band_count;
         } else {
             state->u.fftdiv.dynamic_carrier_band_count = 0;
             state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
+            state->u.fftdiv.dynamic_k_active = 0;
         }
 
         int filled = state->u.fftdiv.filled;
@@ -4590,6 +4647,9 @@ static int run_fft_division_node(
         double *ifft_real = state->u.fftdiv.ifft_real;
         double *ifft_imag = state->u.fftdiv.ifft_imag;
         double *window_weights = state->u.fftdiv.window;
+        int dynamic_active_frame = 0;
+        double dynamic_sum_frame = 0.0;
+        state->u.fftdiv.dynamic_k_active = 0;
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t offset = (size_t)slot * (size_t)window_size;
             double *input_ring = state->u.fftdiv.input_buffer + offset;
@@ -4599,15 +4659,6 @@ static int run_fft_division_node(
             double *lower_ring = state->u.fftdiv.lower_buffer + offset;
             double *upper_ring = state->u.fftdiv.upper_buffer + offset;
             double *filter_ring = state->u.fftdiv.filter_buffer + offset;
-            for (int i = 0; i < window_size; ++i) {
-                double w = window_weights != NULL ? window_weights[i] : 1.0;
-                work_real[i] = input_ring[i] * w;
-                work_imag[i] = 0.0;
-                div_real[i] = divisor_ring[i] * w;
-                div_imag[i] = divisor_imag_ring[i] * w;
-            }
-            algorithm_class->forward(work_real, work_imag, work_real, work_imag, window_size);
-            algorithm_class->forward(div_real, div_imag, div_real, div_imag, window_size);
             double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
             double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
             double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
@@ -4622,6 +4673,129 @@ static int run_fft_division_node(
             double intensity_clamped = clamp_unit_double(filter_mod);
             double cos_phase = cos(phase_mod);
             double sin_phase = sin(phase_mod);
+
+            if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+                double carrier_fnorm[FFT_DYNAMIC_CARRIER_LIMIT];
+                int carrier_indices_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                int active_count = 0;
+                double carrier_sum_slot = 0.0;
+                for (uint32_t idx = 0; idx < carrier_view_count && idx < FFT_DYNAMIC_CARRIER_LIMIT; ++idx) {
+                    const EdgeRunnerParamView *carrier_view = carrier_views[idx];
+                    if (carrier_view == NULL) {
+                        continue;
+                    }
+                    size_t total = param_total_count(carrier_view);
+                    if (total == 0U) {
+                        continue;
+                    }
+                    double raw_value = read_param_value(
+                        carrier_view,
+                        base_index + (size_t)slot,
+                        0.0
+                    );
+                    carrier_sum_slot += raw_value;
+                    double normalized = raw_value;
+                    if (sample_rate > 0.0 && fabs(normalized) > 1.0) {
+                        normalized = raw_value / sample_rate;
+                    }
+                    normalized = clamp_unit_double(normalized);
+                    carrier_fnorm[active_count] = normalized;
+                    carrier_indices_local[active_count] = (int)idx;
+                    active_count += 1;
+                }
+                for (int i = 0; i < window_size; ++i) {
+                    state->u.fftdiv.div_fft_real[offset + (size_t)i] = 0.0;
+                    state->u.fftdiv.div_fft_imag[offset + (size_t)i] = 0.0;
+                    state->u.fftdiv.result_buffer[offset + (size_t)i] = 0.0;
+                }
+                if (active_count > 0) {
+                    size_t phase_offset = (size_t)slot * (size_t)FFT_DYNAMIC_CARRIER_LIMIT;
+                    double inv_window = window_size > 0 ? 1.0 / (double)window_size : 1.0;
+                    int has_divisor = (divisor_total > 0U) || (divisor_imag_total > 0U);
+                    double sample_dynamic = 0.0;
+                    for (int k = 0; k < active_count; ++k) {
+                        size_t carrier_index = (size_t)carrier_indices_local[k];
+                        size_t phase_index = phase_offset + carrier_index;
+                        double theta = state->u.fftdiv.dynamic_phase[phase_index];
+                        double ph_re = cos(theta);
+                        double ph_im = sin(theta);
+                        double fnorm = carrier_fnorm[k];
+                        double angle = 2.0 * M_PI * fnorm;
+                        double step_re = cos(angle);
+                        double step_im = sin(angle);
+                        state->u.fftdiv.dynamic_step_re[phase_index] = step_re;
+                        state->u.fftdiv.dynamic_step_im[phase_index] = step_im;
+                        double coeff_re = 0.0;
+                        double coeff_im = 0.0;
+                        double div_re_acc = 0.0;
+                        double div_im_acc = 0.0;
+                        double last_re = ph_re;
+                        double last_im = ph_im;
+                        for (int n = 0; n < window_size; ++n) {
+                            double w = window_weights != NULL ? window_weights[n] : 1.0;
+                            double xw = input_ring[n] * w;
+                            coeff_re += xw * ph_re;
+                            coeff_im -= xw * ph_im;
+                            if (has_divisor) {
+                                double dw_re = divisor_ring[n] * w;
+                                double dw_im = divisor_imag_ring[n] * w;
+                                div_re_acc += dw_re * ph_re + dw_im * ph_im;
+                                div_im_acc += -dw_re * ph_im + dw_im * ph_re;
+                            }
+                            if (n == window_size - 1) {
+                                last_re = ph_re;
+                                last_im = ph_im;
+                            }
+                            double next_re = ph_re * step_re - ph_im * step_im;
+                            double next_im = ph_re * step_im + ph_im * step_re;
+                            ph_re = next_re;
+                            ph_im = next_im;
+                        }
+                        state->u.fftdiv.dynamic_phase[phase_index] += 2.0 * M_PI * fnorm * (double)window_size;
+                        if (has_divisor) {
+                            double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
+                            if (denom < epsilon_frame) {
+                                denom = epsilon_frame;
+                            }
+                            double real_tmp = (coeff_re * div_re_acc + coeff_im * div_im_acc) / denom;
+                            double imag_tmp = (coeff_im * div_re_acc - coeff_re * div_im_acc) / denom;
+                            coeff_re = real_tmp;
+                            coeff_im = imag_tmp;
+                        }
+                        double ratio = fnorm;
+                        if (ratio < 0.0) {
+                            ratio = 0.0;
+                        } else if (ratio > 1.0) {
+                            ratio = 1.0;
+                        }
+                        double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+                        double gated_re = coeff_re * gain;
+                        double gated_im = coeff_im * gain;
+                        double rotated_re = gated_re * cos_phase - gated_im * sin_phase;
+                        double rotated_im = gated_re * sin_phase + gated_im * cos_phase;
+                        sample_dynamic += (rotated_re * last_re - rotated_im * last_im) * inv_window;
+                    }
+                    state->u.fftdiv.result_buffer[offset + (size_t)(window_size > 0 ? window_size - 1 : 0)] = sample_dynamic;
+                    buffer[base_index + (size_t)slot] = sample_dynamic;
+                    if (active_count > dynamic_active_frame) {
+                        dynamic_active_frame = active_count;
+                    }
+                    dynamic_sum_frame += carrier_sum_slot;
+                    continue;
+                }
+                buffer[base_index + (size_t)slot] = 0.0;
+                continue;
+            }
+
+            for (int i = 0; i < window_size; ++i) {
+                double w = window_weights != NULL ? window_weights[i] : 1.0;
+                work_real[i] = input_ring[i] * w;
+                work_imag[i] = 0.0;
+                div_real[i] = divisor_ring[i] * w;
+                div_imag[i] = divisor_imag_ring[i] * w;
+            }
+            algorithm_class->forward(work_real, work_imag, work_real, work_imag, window_size);
+            algorithm_class->forward(div_real, div_imag, div_real, div_imag, window_size);
             for (int i = 0; i < window_size; ++i) {
                 double a = work_real[i];
                 double b = work_imag[i];
@@ -4650,6 +4824,11 @@ static int run_fft_division_node(
             }
             buffer[base_index + (size_t)slot] = ifft_real[window_size - 1];
         }
+        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+            state->u.fftdiv.dynamic_carrier_band_count = dynamic_active_frame;
+            state->u.fftdiv.dynamic_carrier_last_sum = dynamic_sum_frame;
+            state->u.fftdiv.dynamic_k_active = dynamic_active_frame;
+        }
         state->u.fftdiv.position = window_size - 1;
     }
 
@@ -4658,7 +4837,9 @@ static int run_fft_division_node(
     if (metrics != NULL) {
         metrics->measured_delay_frames = (uint32_t)(window_size > 0 ? window_size - 1 : 0);
         double complexity = 0.0;
-        if (state->u.fftdiv.algorithm == FFT_ALGORITHM_RADIX2) {
+        if (state->u.fftdiv.algorithm == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+            complexity = (double)slot_count * (double)state->u.fftdiv.dynamic_k_active * (double)window_size * 8.0;
+        } else if (state->u.fftdiv.algorithm == FFT_ALGORITHM_RADIX2) {
             double stages = log((double)window_size) / log(2.0);
             if (stages < 1.0) {
                 stages = 1.0;
@@ -4802,6 +4983,11 @@ static int run_fft_division_node_backward(
             algorithm_class = select_fft_algorithm(FFT_ALGORITHM_DFT);
         }
         algorithm_kind = algorithm_class->kind;
+        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+            free(buffer);
+            // TODO: Implement exact adjoint for the dynamic oscillator path (phasor projection, gating, and phase rotation).
+            return -2;
+        }
         int window_kind = default_window_kind;
         if (window_total > 0U) {
             double raw_w = read_param_value(window_view, base_index, (double)window_kind);

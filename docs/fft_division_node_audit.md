@@ -15,9 +15,10 @@ runtime; no Python fallbacks are provided or allowed under project policy.
   direct DFT path.【F:src/native/amp_kernels.c†L4385-L4574】
 * **Algorithm scaffolding** – The selector now recognises `"nufft"`, `"czt"`, and
   `"dynamic"` (dynamic oscillator synthesis) in addition to the existing radix-2 FFT and
-  direct DFT options. The new choices currently reuse the DFT kernels but keep their enum value
-  alive in state/metrics so the specialised implementations can be dropped in later without
-  altering the call surface.【F:src/native/amp_kernels.c†L2759-L2839】【F:src/native/amp_kernels.c†L3049-L3155】【F:src/native/tests/test_fft_division_node.cpp†L312-L360】
+  direct DFT options. The dynamic variant bypasses the FFT entirely: each frame builds
+  oscillator projections directly in the time domain, advances persistent carrier phases by
+  `exp(i·2πf_norm)` for every windowed sample, and emits the newest sample from the carrier
+  coefficients while leaving the DFT/FFT branches untouched.【F:src/native/amp_kernels.c†L4520-L4581】【F:src/native/amp_kernels.c†L4690-L4808】
 * **Dynamic carrier summary** – When the dynamic oscillator algorithm is selected the node scans
   for `carrier_band_{index}` parameter streams, records how many bands were provided, and stores a
   simple aggregate so future oscillator nodes can contribute per-band carriers without changing
@@ -27,9 +28,10 @@ runtime; no Python fallbacks are provided or allowed under project policy.
   retrieved through `EdgeRunnerParamView` wrappers. Slots correspond to `batches × channels` and
   each slot owns its own rolling window in the state struct.【F:src/native/amp_kernels.c†L4174-L4200】【F:src/native/amp_kernels.c†L4317-L4333】
 * **State buffers** – `ensure_fft_state_buffers` guarantees contiguous per-slot rings for the
-  input signal, complex divisors, phase/band metadata, and scratch FFT workspaces. The node keeps
+  input signal, complex divisors, phase/band metadata, scratch FFT workspaces, and a
+  `dynamic_phase` array that tracks the accumulated oscillator phase per carrier. The node keeps
   the most recent phase/band/filter scalars in `state->u.fftdiv.last_*` so metrics can surface
-  what the synthesis path actually used.【F:src/native/amp_kernels.c†L4162-L4296】【F:src/native/amp_kernels.c†L4389-L4409】
+  what the synthesis path actually used.【F:src/native/amp_kernels.c†L2147-L2194】【F:src/native/amp_kernels.c†L3444-L3519】
 
 ## Forward execution behaviour
 1. **Warm-up and safe division** – Until the window is filled, each slot outputs the input sample
@@ -41,10 +43,13 @@ runtime; no Python fallbacks are provided or allowed under project policy.
 3. **Per-bin complex division** – For every frequency bin, the signal FFT is divided by the
    divisor FFT with an epsilon floor on the magnitude squared. The raw quotient is then routed to
    the arbitrary binning stage described below.【F:src/native/amp_kernels.c†L4354-L4367】
-4. **Recombination and latency** – The inverse FFT of the gated spectrum is written back to the
-   state scratch buffer, and the newest time-domain sample (last index of the IFFT) becomes the
-   node’s output for that slot. The node records `position = window_size - 1`, matching the
-   declared latency reported through metrics.【F:src/native/amp_kernels.c†L4376-L4387】【F:src/native/tests/test_fft_division_node.cpp†L598-L666】
+4. **Dynamic oscillator resynthesis** – When the dynamic oscillator mode is active the node skips
+   the spectral division entirely. Each active carrier is evaluated against the windowed signal by
+   accumulating `Σ x_w[n] · e^{-iθ_k[n]}` and (optionally) dividing by the windowed divisor
+   projection, then reweighted by the band gate and phase offset before emitting
+   `(1/N)·Re{c_k · e^{iθ_k[N-1]}}`. Per-carrier phases are integrated sample-by-sample so the next
+   frame resumes from the exact phasor endpoint, and the fallback inverse transform is invoked only
+   if no carriers are provided.【F:src/native/amp_kernels.c†L4690-L4808】【F:src/native/tests/test_fft_division_node.cpp†L476-L555】
 
 ## Arbitrary binning mechanism
 * **Transform core (FFT or DFT)** – Arbitrary bin control always begins from a uniform spectrum.
@@ -87,12 +92,10 @@ The adjoint closely mirrors the forward pass:
 3. **FFT/DFT replay** – After warm-up, the divisor history is windowed, transformed, and cached in
    the same spectral buffers, followed by a windowed transform of the recombination buffer (the
    accumulated forward outputs).【F:src/native/amp_kernels.c†L4653-L4705】
-4. **Band-aware gradient routing** – The adjoint replays the same ratio comparisons, producing the
-   identical step-function gain mask. Gradients inside the band are scaled by the stored
-   `filter_intensity`, rotated by the conjugate phase, and divided by that gain floor before being
-   multiplied by the cached divisor spectrum. Bins outside the band experience the complementary
-   constant gain. No additional interpolation is introduced—the backward flow mirrors the forward
-   nearest-bin selection exactly.【F:src/native/amp_kernels.c†L4661-L4740】
+4. **Dynamic adjoint guard** – The backward implementation now refuses to run when the dynamic
+   oscillator algorithm is selected, returning `-1` so callers cannot silently reuse the FFT adjoint
+   against the non-linear oscillator bank. FFT/DFT paths continue to undo the gain and phase mask
+   before multiplying by the cached divisor spectrum.【F:src/native/amp_kernels.c†L4557-L4559】【F:src/native/amp_kernels.c†L5154-L5191】
 
 ## Metrics and observability
 * Runtime metrics surface the measured delay, a coarse “heat” estimate derived from algorithmic
@@ -100,8 +103,16 @@ The adjoint closely mirrors the forward pass:
   the node state and grows monotonically across firings.【F:src/native/amp_kernels.c†L4389-L4409】
 * The native test suite (`test_fft_division_node.cpp`) verifies that the node reports the declared
   delay, exposes v2 metrics, and retains the most recent metadata in the metrics struct. The same
-  harness compares node output to an in-test C++ simulation, covering both FFT and DFT code paths
-  plus the new dynamic algorithm stub (with carrier metadata) and the arbitrary bin gating controls.【F:src/native/tests/test_fft_division_node.cpp†L598-L773】
+  harness compares node output to an in-test C++ simulation, covering both FFT and DFT code paths,
+  the oscillator-bank resynthesis, and the arbitrary bin gating controls.【F:src/native/tests/test_fft_division_node.cpp†L598-L879】
+
+## Diagnostic tooling
+
+The headless gradient harness (`test_fft_noise_gradient`) and its companion Python helper
+(`scripts/fft_noise_gradient.py`) now accept an `--algorithm` command line flag, allowing renders to
+toggle between the FFT divider implementations (including the dynamic oscillator stub) without
+editing JSON descriptors. The flag simply injects the chosen label into the node parameters before
+invoking the native renderer.【F:scripts/fft_noise_gradient.py†L63-L86】【F:src/native/tests/test_fft_noise_gradient.cpp†L300-L363】
 
 ## Audit observations
 * The arbitrary bin control is purely algebraic—no lookup tables or Python fallbacks are involved
