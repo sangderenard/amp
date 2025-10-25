@@ -1408,6 +1408,150 @@ class ParametricDriverNode(Node):
         return out
 
 
+class ContinuousTimebaseNode(Node):
+    """Bridge driver PCM to oscillator control using continuous time-base reconciliation.
+
+    Ports
+    -----
+    audio_in
+        Driver-rendered PCM slated for stretch/compression.
+    pitch_in
+        Modulation input that provides the instantaneous oscillator pitch plan.
+    audio_out
+        Time-warped PCM that will feed the oscillator's streaming input.
+    freq_out
+        Derived modulation output that keeps oscillator frequency aligned with the stretched audio.
+
+    Notes
+    -----
+    This node is a structural placeholder; only the native runtime may execute it.
+    Python fallbacks are explicitly disallowed.
+    """
+
+    ALGORITHM_CHOICES = ("sinc_resample", "phase_vocoder")
+    PARAM_SCHEMA = {
+        "algorithm": {
+            "type": "enum",
+            "values": ALGORITHM_CHOICES,
+            "description": "Selects the native continuous time-base kernel",
+        },
+        "analysis_window": {
+            "type": "int",
+            "min": 1,
+            "description": "Analysis window size in frames (controls driver-led latency)",
+        },
+        "synthesis_window": {
+            "type": "int",
+            "min": 1,
+            "description": "Synthesis window size in frames (controls oscillator-led latency)",
+        },
+        "hop_size": {
+            "type": "int",
+            "min": 1,
+            "description": "Frame advance between overlap windows",
+        },
+        "similarity_span": {
+            "type": "int",
+            "min": 1,
+            "description": "Number of candidate windows inspected during SOLA/WSOLA alignment",
+        },
+        "authority_bias": {
+            "type": "float",
+            "min": 0.0,
+            "max": 1.0,
+            "description": "Bias (0=oscillator, 1=driver) applied to similarity search",
+        },
+        "slew_limit": {
+            "type": "float",
+            "min": 0.0,
+            "description": "Maximum delta applied to stretch ratios per block",
+        },
+        "blend_crossfade": {
+            "type": "int",
+            "min": 0,
+            "description": "Crossfade duration in frames when authority toggles",
+        },
+    }
+    DEFAULT_PARAMS = {
+        "algorithm": "sinc_resample",
+        "analysis_window": 512,
+        "synthesis_window": 512,
+        "hop_size": 128,
+        "similarity_span": 4,
+        "authority_bias": 0.5,
+        "slew_limit": 1.5,
+        "blend_crossfade": 128,
+    }
+
+    def __init__(
+        self,
+        name: str,
+        params: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(name)
+        cfg = dict(self.DEFAULT_PARAMS)
+        if params:
+            cfg.update(params)
+        self._validate_config(cfg)
+        self.params.update(cfg)
+        self.declared_delay_frames = int(
+            max(int(cfg["analysis_window"]), int(cfg["synthesis_window"]))
+        )
+
+    def _validate_config(self, cfg: dict[str, object]) -> None:
+        algorithm = str(cfg.get("algorithm", ""))
+        if algorithm not in self.ALGORITHM_CHOICES:
+            raise ValueError(
+                f"{self.name}: unsupported algorithm '{algorithm}', expected one of {self.ALGORITHM_CHOICES}"
+            )
+        for key in ("analysis_window", "synthesis_window", "hop_size", "similarity_span"):
+            value = cfg.get(key)
+            try:
+                ivalue = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{self.name}.{key}: expected integer, got {value!r}") from exc
+            if ivalue < 1:
+                raise ValueError(f"{self.name}.{key}: value must be >= 1")
+            cfg[key] = ivalue
+        blend_value = cfg.get("blend_crossfade", 0)
+        try:
+            blend_frames = int(blend_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}.blend_crossfade: expected integer frames, got {blend_value!r}"
+            ) from exc
+        if blend_frames < 0:
+            raise ValueError(f"{self.name}.blend_crossfade: value must be >= 0")
+        cfg["blend_crossfade"] = blend_frames
+
+        authority_value = cfg.get("authority_bias", 0.5)
+        try:
+            authority_bias = float(authority_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}.authority_bias: expected float between 0 and 1, got {authority_value!r}"
+            ) from exc
+        if not (0.0 <= authority_bias <= 1.0):
+            raise ValueError(f"{self.name}.authority_bias: value must lie in [0.0, 1.0]")
+        cfg["authority_bias"] = authority_bias
+
+        slew_value = cfg.get("slew_limit", 0.0)
+        try:
+            slew_limit = float(slew_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}.slew_limit: expected non-negative float, got {slew_value!r}"
+            ) from exc
+        if slew_limit < 0.0:
+            raise ValueError(f"{self.name}.slew_limit: value must be >= 0")
+        cfg["slew_limit"] = slew_limit
+
+    def process(self, frames, sr, audio_in, mods, params):
+        raise RuntimeError(
+            "ContinuousTimebaseNode must execute via the native runtime; Python fallback is not available."
+        )
+
+
 class FFTDivisionNode(Node):
     """Frequency-division FFT node (native-only)."""
 
@@ -1731,6 +1875,8 @@ NODE_TYPES = {
     "OscillatorPitchNode": OscillatorPitchNode,
     "parametric_driver": ParametricDriverNode,
     "ParametricDriverNode": ParametricDriverNode,
+    "continuous_timebase": ContinuousTimebaseNode,
+    "ContinuousTimebaseNode": ContinuousTimebaseNode,
     "fft_division": FFTDivisionNode,
     "FFTDivisionNode": FFTDivisionNode,
     "envelope": EnvelopeModulatorNode,
@@ -1756,6 +1902,7 @@ __all__ = [
     "AmplifierModulatorNode",
     "OscNode",
     "ParametricDriverNode",
+    "ContinuousTimebaseNode",
     "FFTDivisionNode",
     "MixNode",
     "SafetyNode",

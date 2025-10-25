@@ -8,7 +8,7 @@ import sys
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Tuple
 
 import numpy as np
 import sympy as sp
@@ -25,6 +25,7 @@ from amp.nodes import (
     OscNode,
     OscillatorPitchNode,
     ParametricDriverNode,
+    ContinuousTimebaseNode,
 )
 
 
@@ -71,6 +72,7 @@ class PitchDriverOscModule:
     pitch: OscillatorPitchNode
     driver: ParametricDriverNode
     oscillator: OscNode
+    timebase: ContinuousTimebaseNode | None
 
     @classmethod
     def install(
@@ -80,6 +82,9 @@ class PitchDriverOscModule:
         pitch_name: str = "pitch_programmer",
         driver_name: str = "driver",
         oscillator_name: str = "osc_master",
+        timebase_name: str = "timebase_bridge",
+        enable_timebase: bool = False,
+        timebase_params: Mapping[str, object] | None = None,
     ) -> "PitchDriverOscModule":
         pitch = OscillatorPitchNode(pitch_name, min_freq=0.0, default_slew=0.0)
         driver = ParametricDriverNode(driver_name, mode="piezo")
@@ -97,16 +102,34 @@ class PitchDriverOscModule:
         graph.add_node(driver)
         graph.add_node(osc)
 
+        timebase: ContinuousTimebaseNode | None = None
+        if enable_timebase:
+            timebase = ContinuousTimebaseNode(timebase_name, params=timebase_params)
+            graph.add_node(timebase)
+            graph.connect_audio(driver.name, timebase.name)
+            graph.connect_audio(timebase.name, osc.name)
+            graph.connect_mod(pitch.name, timebase.name, "pitch_in", scale=1.0, mode="add")
+        else:
+            graph.connect_audio(driver.name, osc.name)
+
         graph.connect_mod(pitch.name, driver.name, "frequency", scale=1.0, mode="add")
-        graph.connect_audio(driver.name, osc.name)
 
-        return cls(pitch=pitch, driver=driver, oscillator=osc)
+        return cls(pitch=pitch, driver=driver, oscillator=osc, timebase=timebase)
 
 
-def build_graph(sample_rate: int) -> Tuple[AudioGraph, PitchDriverOscModule]:
+def build_graph(
+    sample_rate: int,
+    *,
+    enable_timebase: bool = False,
+    timebase_params: Mapping[str, object] | None = None,
+) -> Tuple[AudioGraph, PitchDriverOscModule]:
     graph = AudioGraph(sample_rate=sample_rate, output_channels=1)
 
-    module = PitchDriverOscModule.install(graph)
+    module = PitchDriverOscModule.install(
+        graph,
+        enable_timebase=enable_timebase,
+        timebase_params=timebase_params,
+    )
     mix = MixNode("mix", params={"channels": 1})
     fft = FFTDivisionNode(
         "fft",
@@ -204,14 +227,24 @@ def _evaluate_pitch_expression(expr: str, t: np.ndarray) -> np.ndarray:
     return arr
 
 
-def ensure_native_kernels(executor: NativeGraphExecutor, node_names: Iterable[str]) -> None:
+def ensure_native_kernels(
+    executor: NativeGraphExecutor,
+    node_names: Iterable[str],
+    *,
+    allow_missing: Iterable[str] = (),
+) -> None:
     ffi, lib = executor.ffi, executor.lib
+    allowed = {str(name) for name in allow_missing}
     for name in node_names:
         summary = ffi.new("AmpGraphNodeSummary *")
         rc = lib.amp_graph_runtime_describe_node(executor._runtime, name.encode("utf-8"), summary)
         if int(rc) != 0:
+            if name in allowed:
+                continue
             raise RuntimeError(f"native runtime cannot describe node '{name}' (rc={int(rc)})")
         if not summary.supports_v2:
+            if name in allowed:
+                continue
             raise RuntimeError(f"node '{name}' does not have a native ABI implementation (supports_v2=0)")
 
 
@@ -552,6 +585,65 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--timebase-mode",
+        choices=("disabled", "enabled"),
+        default="disabled",
+        help=(
+            "Enable the pending continuous timebase bridge node for graph export and native experiments "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--timebase-algorithm",
+        choices=("sinc_resample", "phase_vocoder"),
+        default="sinc_resample",
+        help=(
+            "Continuous timebase algorithm to configure when --timebase-mode=enabled (default: sinc_resample)."
+        ),
+    )
+    parser.add_argument(
+        "--timebase-analysis-window",
+        type=int,
+        default=512,
+        help="Analysis window size in frames for the continuous timebase node (default: 512).",
+    )
+    parser.add_argument(
+        "--timebase-synthesis-window",
+        type=int,
+        default=512,
+        help="Synthesis window size in frames for the continuous timebase node (default: 512).",
+    )
+    parser.add_argument(
+        "--timebase-hop",
+        type=int,
+        default=128,
+        help="Hop size in frames for overlap scheduling inside the timebase node (default: 128).",
+    )
+    parser.add_argument(
+        "--timebase-similarity-span",
+        type=int,
+        default=4,
+        help="Number of candidate windows scanned for SOLA/WSOLA alignment (default: 4).",
+    )
+    parser.add_argument(
+        "--timebase-authority-bias",
+        type=float,
+        default=0.5,
+        help="Authority bias (0=oscillator, 1=driver) applied to timebase alignment (default: 0.5).",
+    )
+    parser.add_argument(
+        "--timebase-slew-limit",
+        type=float,
+        default=1.5,
+        help="Maximum stretch ratio delta applied per block by the timebase node (default: 1.5).",
+    )
+    parser.add_argument(
+        "--timebase-blend-crossfade",
+        type=int,
+        default=128,
+        help="Crossfade length in frames used when the timebase authority toggles (default: 128).",
+    )
+    parser.add_argument(
         "--arpeggio-intervals",
         type=str,
         default="0,4,7",
@@ -605,10 +697,33 @@ def main(argv: Iterable[str]) -> int:
             fh.write(message + "\n")
 
     log("[demo] Constructing audio graph...")
-    graph, module = build_graph(int(args.sr))
+    enable_timebase = args.timebase_mode == "enabled"
+    timebase_params: Mapping[str, object] | None = None
+    if enable_timebase:
+        timebase_params = {
+            "algorithm": args.timebase_algorithm,
+            "analysis_window": args.timebase_analysis_window,
+            "synthesis_window": args.timebase_synthesis_window,
+            "hop_size": args.timebase_hop,
+            "similarity_span": args.timebase_similarity_span,
+            "authority_bias": args.timebase_authority_bias,
+            "slew_limit": args.timebase_slew_limit,
+            "blend_crossfade": args.timebase_blend_crossfade,
+        }
+
+    graph, module = build_graph(
+        int(args.sr),
+        enable_timebase=enable_timebase,
+        timebase_params=timebase_params,
+    )
     pitch_node = module.pitch
     pitch_node.params["default_slew"] = max(0.0, float(args.pitch_slew))
     pitch_node.params["min_freq"] = max(0.0, float(args.driver_min_freq))
+    if module.timebase is not None:
+        log(
+            "[demo] Continuous timebase node '%s' configured (algorithm=%s)"
+            % (module.timebase.name, module.timebase.params.get("algorithm", "<unset>"))
+        )
     map_path = out_dir / "network_map.json"
     export_network_map(graph, map_path)
     log(f"[demo] Exported network map: {map_path}")
@@ -630,7 +745,14 @@ def main(argv: Iterable[str]) -> int:
 
     with executor:
         log("[demo] Verifying native node coverage...")
-        ensure_native_kernels(executor, [node.name for node in graph.ordered_nodes])
+        pending_native: List[str] = []
+        if module.timebase is not None:
+            pending_native.append(module.timebase.name)
+        ensure_native_kernels(
+            executor,
+            [node.name for node in graph.ordered_nodes],
+            allow_missing=pending_native,
+        )
 
         total_frames = int(round(args.duration * args.sr))
         if total_frames <= 0:
