@@ -5,11 +5,10 @@ __pycache__/
 *.egg-info
 .venv/
 
-# Generated audio artifacts
-output*.wav*
+# Test outputs
+output/*.*
+output*
 
-# Generated audio analysis pngs
-*.png
 
 # Native build outputs
 build/
@@ -35,3 +34,4 @@ _amp_ckernels_cffi.*
 **/*.vcxproj
 **/*.vcxproj.filters
 **/*.sln
+output/test_fft.wav
