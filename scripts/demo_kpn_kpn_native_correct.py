@@ -25,6 +25,7 @@ from amp.nodes import (
     OscNode,
     OscillatorPitchNode,
     ParametricDriverNode,
+    PitchShiftNode,
     ContinuousTimebaseNode,
 )
 
@@ -72,6 +73,7 @@ class PitchDriverOscModule:
     pitch: OscillatorPitchNode
     driver: ParametricDriverNode
     oscillator: OscNode
+    pitch_shift: PitchShiftNode
     timebase: ContinuousTimebaseNode | None
 
     @classmethod
@@ -83,8 +85,10 @@ class PitchDriverOscModule:
         driver_name: str = "driver",
         oscillator_name: str = "osc_master",
         timebase_name: str = "timebase_bridge",
+        pitch_shift_name: str = "pitch_shift_bridge",
         enable_timebase: bool = False,
         timebase_params: Mapping[str, object] | None = None,
+        pitch_shift_params: Mapping[str, object] | None = None,
     ) -> "PitchDriverOscModule":
         pitch = OscillatorPitchNode(pitch_name, min_freq=0.0, default_slew=0.0)
         driver = ParametricDriverNode(driver_name, mode="piezo")
@@ -102,19 +106,39 @@ class PitchDriverOscModule:
         graph.add_node(driver)
         graph.add_node(osc)
 
+        pitch_shift_kwargs: Dict[str, object] = {}
+        if pitch_shift_params is not None:
+            if "window_size" in pitch_shift_params:
+                pitch_shift_kwargs["window_size"] = int(pitch_shift_params["window_size"])
+            if "hop_size" in pitch_shift_params:
+                pitch_shift_kwargs["hop_size"] = int(pitch_shift_params["hop_size"])
+            if "resynthesis_hop" in pitch_shift_params:
+                pitch_shift_kwargs["resynthesis_hop"] = int(pitch_shift_params["resynthesis_hop"])
+
+        pitch_shift = PitchShiftNode(pitch_shift_name, **pitch_shift_kwargs)
+        graph.add_node(pitch_shift)
+
+        if pitch_shift_params is not None:
+            for key, value in pitch_shift_params.items():
+                if key in {"window_size", "hop_size", "resynthesis_hop"}:
+                    continue
+                pitch_shift.params[str(key)] = value
+
         timebase: ContinuousTimebaseNode | None = None
         if enable_timebase:
             timebase = ContinuousTimebaseNode(timebase_name, params=timebase_params)
             graph.add_node(timebase)
-            graph.connect_audio(driver.name, timebase.name)
+            graph.connect_audio(driver.name, pitch_shift.name)
+            graph.connect_audio(pitch_shift.name, timebase.name)
             graph.connect_audio(timebase.name, osc.name)
             graph.connect_mod(pitch.name, timebase.name, "pitch_in", scale=1.0, mode="add")
         else:
-            graph.connect_audio(driver.name, osc.name)
+            graph.connect_audio(driver.name, pitch_shift.name)
+            graph.connect_audio(pitch_shift.name, osc.name)
 
         graph.connect_mod(pitch.name, driver.name, "frequency", scale=1.0, mode="add")
 
-        return cls(pitch=pitch, driver=driver, oscillator=osc, timebase=timebase)
+        return cls(pitch=pitch, driver=driver, oscillator=osc, pitch_shift=pitch_shift, timebase=timebase)
 
 
 def build_graph(
@@ -122,6 +146,7 @@ def build_graph(
     *,
     enable_timebase: bool = False,
     timebase_params: Mapping[str, object] | None = None,
+    pitch_shift_params: Mapping[str, object] | None = None,
 ) -> Tuple[AudioGraph, PitchDriverOscModule]:
     graph = AudioGraph(sample_rate=sample_rate, output_channels=1)
 
@@ -129,6 +154,7 @@ def build_graph(
         graph,
         enable_timebase=enable_timebase,
         timebase_params=timebase_params,
+        pitch_shift_params=pitch_shift_params,
     )
     mix = MixNode("mix", params={"channels": 1})
     fft = FFTDivisionNode(
@@ -644,6 +670,59 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="Crossfade length in frames used when the timebase authority toggles (default: 128).",
     )
     parser.add_argument(
+        "--pitch-shift-algorithm",
+        choices=("sola", "wsola", "phase_vocoder"),
+        default="sola",
+        help=(
+            "Label the pitch-shift implementation for diagnostics and export (default: sola)."
+        ),
+    )
+    parser.add_argument(
+        "--pitch-track-mode",
+        choices=("hybrid", "oscillator", "driver"),
+        default="hybrid",
+        help=(
+            "Derive the pitch-shift ratio from oscillator-led, driver-led, or blended tracking "
+            "(default: hybrid)."
+        ),
+    )
+    parser.add_argument(
+        "--portamento-ms",
+        type=float,
+        default=12.0,
+        help="Smoothing window (ms) applied to pitch-shift ratio transitions (default: 12.0).",
+    )
+    parser.add_argument(
+        "--pitch-shift-window",
+        type=int,
+        default=PitchShiftNode.ANALYSIS_WINDOW,
+        help="Analysis window size in frames for the pitch-shift node (default: 1024).",
+    )
+    parser.add_argument(
+        "--pitch-shift-hop",
+        type=int,
+        default=PitchShiftNode.HOP_SIZE,
+        help="Hop size in frames for the pitch-shift node (default: 256).",
+    )
+    parser.add_argument(
+        "--pitch-shift-resynthesis-hop",
+        type=int,
+        default=PitchShiftNode.RESYNTHESIS_HOP,
+        help="Resynthesis hop size in frames for the pitch-shift node (default: 256).",
+    )
+    parser.add_argument(
+        "--pitch-shift-min-ratio",
+        type=float,
+        default=0.25,
+        help="Lower clamp applied to the computed pitch-shift ratio (default: 0.25).",
+    )
+    parser.add_argument(
+        "--pitch-shift-max-ratio",
+        type=float,
+        default=4.0,
+        help="Upper clamp applied to the computed pitch-shift ratio (default: 4.0).",
+    )
+    parser.add_argument(
         "--arpeggio-intervals",
         type=str,
         default="0,4,7",
@@ -711,14 +790,42 @@ def main(argv: Iterable[str]) -> int:
             "blend_crossfade": args.timebase_blend_crossfade,
         }
 
+    pitch_shift_params: Mapping[str, object] | None = {
+        "window_size": int(args.pitch_shift_window),
+        "hop_size": int(args.pitch_shift_hop),
+        "resynthesis_hop": int(args.pitch_shift_resynthesis_hop),
+        "algorithm": str(args.pitch_shift_algorithm),
+        "track_mode": str(args.pitch_track_mode),
+        "portamento_ms": float(args.portamento_ms),
+        "ratio_min": float(args.pitch_shift_min_ratio),
+        "ratio_max": float(args.pitch_shift_max_ratio),
+    }
+
     graph, module = build_graph(
         int(args.sr),
         enable_timebase=enable_timebase,
         timebase_params=timebase_params,
+        pitch_shift_params=pitch_shift_params,
     )
     pitch_node = module.pitch
     pitch_node.params["default_slew"] = max(0.0, float(args.pitch_slew))
     pitch_node.params["min_freq"] = max(0.0, float(args.driver_min_freq))
+    module.pitch_shift.params.setdefault("algorithm", str(args.pitch_shift_algorithm))
+    module.pitch_shift.params.setdefault("track_mode", str(args.pitch_track_mode))
+    module.pitch_shift.params.setdefault("portamento_ms", float(args.portamento_ms))
+    module.pitch_shift.params.setdefault("ratio_min", float(args.pitch_shift_min_ratio))
+    module.pitch_shift.params.setdefault("ratio_max", float(args.pitch_shift_max_ratio))
+    log(
+        "[demo] Pitch-shift node '%s' bridges driver '%s' → oscillator '%s' (algorithm=%s, track_mode=%s, portamento_ms=%.2f)"
+        % (
+            module.pitch_shift.name,
+            module.driver.name,
+            module.oscillator.name,
+            module.pitch_shift.params.get("algorithm", "<unset>"),
+            module.pitch_shift.params.get("track_mode", "<unset>"),
+            float(module.pitch_shift.params.get("portamento_ms", 0.0)),
+        )
+    )
     if module.timebase is not None:
         log(
             "[demo] Continuous timebase node '%s' configured (algorithm=%s)"
@@ -830,6 +937,45 @@ def main(argv: Iterable[str]) -> int:
 
         slew_curve = np.full(total_frames, max(0.0, float(args.op_amp_slew)), dtype=np.float64)
         pitch_slew_curve = np.full(total_frames, max(0.0, float(args.pitch_slew)), dtype=np.float64)
+        ratio_curve = np.ones(total_frames, dtype=np.float64)
+        if module.pitch_shift is not None:
+            driver_freq_safe = np.maximum(driver_freq_curve, 1.0e-6)
+            osc_freq_safe = np.maximum(master_freq_curve, 1.0e-6)
+            osc_ratio = np.divide(osc_freq_safe, driver_freq_safe, out=np.ones_like(driver_freq_safe), where=driver_freq_safe > 0.0)
+            min_ratio = float(module.pitch_shift.params.get("ratio_min", args.pitch_shift_min_ratio))
+            max_ratio = float(module.pitch_shift.params.get("ratio_max", args.pitch_shift_max_ratio))
+            min_ratio = min_ratio if min_ratio > 0.0 else 0.25
+            max_ratio = max(max_ratio, min_ratio)
+            track_mode = str(args.pitch_track_mode)
+            if track_mode == "driver":
+                ratio_curve.fill(1.0)
+            elif track_mode == "oscillator":
+                ratio_curve = osc_ratio.copy()
+            else:
+                blend = np.clip(render_mode_curve, 0.0, 1.0)
+                ratio_curve = blend * 1.0 + (1.0 - blend) * osc_ratio
+            if np.any(driver_hold_mask):
+                ratio_curve[driver_hold_mask] = osc_ratio[driver_hold_mask]
+            if np.any(osc_hold_mask):
+                ratio_curve[osc_hold_mask] = 1.0
+            ratio_curve = np.clip(ratio_curve, min_ratio, max_ratio)
+            portamento_ms = max(0.0, float(args.portamento_ms))
+            if portamento_ms > 0.0 and ratio_curve.size > 1:
+                samples = max(1, int(round(portamento_ms * float(args.sr) / 1000.0)))
+                alpha = max(0.0, min(1.0, 1.0 / float(samples)))
+                smoothed = ratio_curve.copy()
+                current = float(smoothed[0])
+                for idx in range(1, smoothed.size):
+                    target = float(ratio_curve[idx])
+                    current += (target - current) * alpha
+                    smoothed[idx] = current
+                ratio_curve = smoothed
+            ratio_min = float(ratio_curve.min()) if ratio_curve.size else 1.0
+            ratio_max_val = float(ratio_curve.max()) if ratio_curve.size else 1.0
+            log(
+                "[demo] Pitch-shift ratio prepared: min={:.5f}, max={:.5f}, mode={}, portamento_ms={:.2f}"
+                .format(ratio_min, ratio_max_val, track_mode, portamento_ms)
+            )
         log(
             "[demo] Pitch program stats: pitch[min={:.4f}, max={:.4f}] Hz, raw[min={:.4f}, max={:.4f}], "
             "norm[min={:.4f}, max={:.4f}]".format(
@@ -874,6 +1020,22 @@ def main(argv: Iterable[str]) -> int:
                     osc_mode_label,
                 )
             )
+
+        if module.pitch_shift is not None:
+            if np.any(driver_hold_mask):
+                osc_map_path = out_dir / "network_map_oscillator_led.json"
+                export_network_map(graph, osc_map_path)
+                log(
+                    "[demo] Exported oscillator-led network map (pitch shift between driver and oscillator): %s"
+                    % osc_map_path
+                )
+            if np.any(osc_hold_mask):
+                driver_map_path = out_dir / "network_map_driver_led.json"
+                export_network_map(graph, driver_map_path)
+                log(
+                    "[demo] Exported driver-led network map (pitch shift bridge preserved): %s"
+                    % driver_map_path
+                )
 
         pcm_blocks: list[np.ndarray] = []
         metrics_log: list[Tuple[int, float]] = []
@@ -922,6 +1084,9 @@ def main(argv: Iterable[str]) -> int:
                 module.oscillator.name: osc_params,
                 "fft": fft_params,
             }
+            if module.pitch_shift is not None:
+                pitch_shift_block = create_param_block({"ratio": ratio_curve[sl]})
+                base_params[module.pitch_shift.name] = pitch_shift_block
             try:
                 block_pcm = executor.run_block(frames_this, float(args.sr), base_params=base_params)
             except Exception as exc:
