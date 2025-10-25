@@ -2162,6 +2162,8 @@ typedef struct {
             double last_upper;
             double last_filter;
             double total_heat;
+            int dynamic_carrier_band_count;
+            double dynamic_carrier_last_sum;
         } fftdiv;
     } u;
 } node_state_t;
@@ -2767,10 +2769,15 @@ static double grid_warp_inverse_value(double u, const double *grid, const double
 
 #define FFT_ALGORITHM_RADIX2 0
 #define FFT_ALGORITHM_DFT 1
+#define FFT_ALGORITHM_NUFFT 2
+#define FFT_ALGORITHM_CZT 3
+#define FFT_ALGORITHM_DYNAMIC_OSCILLATORS 4
 
 #define FFT_WINDOW_RECTANGULAR 0
 #define FFT_WINDOW_HANN 1
 #define FFT_WINDOW_HAMMING 2
+
+#define FFT_DYNAMIC_CARRIER_LIMIT 64U
 
 static int round_to_int(double value) {
     if (value >= 0.0) {
@@ -2780,8 +2787,15 @@ static int round_to_int(double value) {
 }
 
 static int clamp_algorithm_kind(int kind) {
-    if (kind == FFT_ALGORITHM_DFT) {
-        return FFT_ALGORITHM_DFT;
+    switch (kind) {
+        case FFT_ALGORITHM_RADIX2:
+        case FFT_ALGORITHM_DFT:
+        case FFT_ALGORITHM_NUFFT:
+        case FFT_ALGORITHM_CZT:
+        case FFT_ALGORITHM_DYNAMIC_OSCILLATORS:
+            return kind;
+        default:
+            break;
     }
     return FFT_ALGORITHM_RADIX2;
 }
@@ -2855,6 +2869,67 @@ static double read_param_value(const EdgeRunnerParamView *view, size_t index, do
     return view->data[index];
 }
 
+typedef struct {
+    uint32_t band_count;
+    double last_sum;
+} fft_dynamic_carrier_summary_t;
+
+static int parse_dynamic_carrier_index(const char *name, uint32_t *index_out) {
+    if (name == NULL || index_out == NULL) {
+        return 0;
+    }
+    const char *prefix = "carrier_band";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(name, prefix, prefix_len) != 0) {
+        return 0;
+    }
+    const char *cursor = name + prefix_len;
+    if (*cursor == '_' || *cursor == '-') {
+        cursor++;
+    }
+    if (*cursor == '\0') {
+        return 0;
+    }
+    for (const char *probe = cursor; *probe != '\0'; ++probe) {
+        if (!isdigit((unsigned char)*probe)) {
+            return 0;
+        }
+    }
+    unsigned long parsed = strtoul(cursor, NULL, 10);
+    if (parsed >= FFT_DYNAMIC_CARRIER_LIMIT) {
+        return 0;
+    }
+    *index_out = (uint32_t)parsed;
+    return 1;
+}
+
+static fft_dynamic_carrier_summary_t summarize_dynamic_carriers(const EdgeRunnerNodeInputs *inputs) {
+    fft_dynamic_carrier_summary_t summary;
+    summary.band_count = 0U;
+    summary.last_sum = 0.0;
+    if (inputs == NULL) {
+        return summary;
+    }
+    uint32_t param_count = inputs->params.count;
+    EdgeRunnerParamView *items = inputs->params.items;
+    for (uint32_t i = 0; i < param_count; ++i) {
+        const EdgeRunnerParamView *view = &items[i];
+        uint32_t index = 0U;
+        if (!parse_dynamic_carrier_index(view->name, &index)) {
+            continue;
+        }
+        if (index + 1U > summary.band_count) {
+            summary.band_count = index + 1U;
+        }
+        size_t total = param_total_count(view);
+        if (total > 0U) {
+            double last_value = read_param_value(view, total - 1U, 0.0);
+            summary.last_sum += last_value;
+        }
+    }
+    return summary;
+}
+
 static int parse_algorithm_string(const char *json, size_t json_len, int default_value) {
     char buffer[32];
     if (!json_copy_string(json, json_len, "algorithm", buffer, sizeof(buffer))) {
@@ -2868,6 +2943,19 @@ static int parse_algorithm_string(const char *json, size_t json_len, int default
     }
     if (strcmp(buffer, "dft") == 0 || strcmp(buffer, "direct") == 0 || strcmp(buffer, "slow") == 0) {
         return FFT_ALGORITHM_DFT;
+    }
+    if (strcmp(buffer, "nufft") == 0 || strcmp(buffer, "nonuniform") == 0) {
+        return FFT_ALGORITHM_NUFFT;
+    }
+    if (strcmp(buffer, "czt") == 0 || strcmp(buffer, "chirpz") == 0 || strcmp(buffer, "chirpzt") == 0) {
+        return FFT_ALGORITHM_CZT;
+    }
+    if (
+        strcmp(buffer, "dynamic") == 0
+        || strcmp(buffer, "dynamic_oscillators") == 0
+        || strcmp(buffer, "dynamicoscillators") == 0
+    ) {
+        return FFT_ALGORITHM_DYNAMIC_OSCILLATORS;
     }
     return default_value;
 }
@@ -3006,6 +3094,179 @@ static void compute_dft(
     }
 }
 
+typedef void (*fft_algorithm_impl_fn)(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+);
+
+typedef struct {
+    int kind;
+    const char *label;
+    fft_algorithm_impl_fn forward;
+    fft_algorithm_impl_fn inverse;
+    int requires_power_of_two;
+    int supports_dynamic_carriers;
+} fft_algorithm_class_t;
+
+static void fft_algorithm_radix2_forward(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    compute_fft_radix2(in_real, in_imag, out_real, out_imag, n, 0);
+}
+
+static void fft_algorithm_radix2_inverse(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    compute_fft_radix2(in_real, in_imag, out_real, out_imag, n, 1);
+}
+
+static void fft_algorithm_dft_forward(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 0);
+}
+
+static void fft_algorithm_dft_inverse(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 1);
+}
+
+static void fft_algorithm_nufft_forward(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    /* Placeholder: NUFFT path currently reuses the direct DFT implementation. */
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 0);
+}
+
+static void fft_algorithm_nufft_inverse(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 1);
+}
+
+static void fft_algorithm_czt_forward(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    /* Placeholder: CZT path currently reuses the direct DFT implementation. */
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 0);
+}
+
+static void fft_algorithm_czt_inverse(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 1);
+}
+
+static void fft_algorithm_dynamic_forward(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    /* Placeholder: dynamic oscillator synthesis currently reuses the direct DFT implementation. */
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 0);
+}
+
+static void fft_algorithm_dynamic_inverse(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n
+) {
+    compute_dft(in_real, in_imag, out_real, out_imag, n, 1);
+}
+
+static const fft_algorithm_class_t FFT_ALGORITHM_CLASSES[] = {
+    {
+        FFT_ALGORITHM_RADIX2,
+        "radix2",
+        fft_algorithm_radix2_forward,
+        fft_algorithm_radix2_inverse,
+        1,
+        0,
+    },
+    {
+        FFT_ALGORITHM_DFT,
+        "dft",
+        fft_algorithm_dft_forward,
+        fft_algorithm_dft_inverse,
+        0,
+        0,
+    },
+    {
+        FFT_ALGORITHM_NUFFT,
+        "nufft",
+        fft_algorithm_nufft_forward,
+        fft_algorithm_nufft_inverse,
+        0,
+        0,
+    },
+    {
+        FFT_ALGORITHM_CZT,
+        "czt",
+        fft_algorithm_czt_forward,
+        fft_algorithm_czt_inverse,
+        0,
+        0,
+    },
+    {
+        FFT_ALGORITHM_DYNAMIC_OSCILLATORS,
+        "dynamic_oscillators",
+        fft_algorithm_dynamic_forward,
+        fft_algorithm_dynamic_inverse,
+        0,
+        1,
+    },
+};
+
+static const fft_algorithm_class_t *select_fft_algorithm(int kind) {
+    size_t count = sizeof(FFT_ALGORITHM_CLASSES) / sizeof(FFT_ALGORITHM_CLASSES[0]);
+    for (size_t i = 0; i < count; ++i) {
+        if (FFT_ALGORITHM_CLASSES[i].kind == kind) {
+            return &FFT_ALGORITHM_CLASSES[i];
+        }
+    }
+    return &FFT_ALGORITHM_CLASSES[0];
+}
+
 static void fill_window_weights(double *window, int window_size, int window_kind) {
     if (window == NULL || window_size <= 0) {
         return;
@@ -3089,6 +3350,8 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.last_lower = 0.0;
     state->u.fftdiv.last_upper = 1.0;
     state->u.fftdiv.last_filter = 1.0;
+    state->u.fftdiv.dynamic_carrier_band_count = 0;
+    state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
 }
 
 static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_size) {
@@ -3154,6 +3417,8 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
     state->u.fftdiv.last_upper = 1.0;
     state->u.fftdiv.last_filter = 1.0;
     state->u.fftdiv.total_heat = preserved_heat;
+    state->u.fftdiv.dynamic_carrier_band_count = 0;
+    state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
     return 0;
 }
 
@@ -4199,6 +4464,8 @@ static int run_fft_division_node(
     size_t upper_total = param_total_count(upper_view);
     size_t filter_total = param_total_count(filter_view);
 
+    fft_dynamic_carrier_summary_t carrier_summary = summarize_dynamic_carriers(inputs);
+
     for (int frame_index = 0; frame_index < frames; ++frame_index) {
         size_t base_index = (size_t)frame_index * (size_t)slot_count;
         double epsilon_frame = epsilon_json;
@@ -4219,9 +4486,11 @@ static int run_fft_division_node(
             double raw = read_param_value(algorithm_view, base_index, (double)algorithm_kind);
             algorithm_kind = clamp_algorithm_kind(round_to_int(raw));
         }
-        if (algorithm_kind == FFT_ALGORITHM_RADIX2 && !is_power_of_two_int(window_size)) {
-            algorithm_kind = FFT_ALGORITHM_DFT;
+        const fft_algorithm_class_t *algorithm_class = select_fft_algorithm(algorithm_kind);
+        if (algorithm_class->requires_power_of_two && !is_power_of_two_int(window_size)) {
+            algorithm_class = select_fft_algorithm(FFT_ALGORITHM_DFT);
         }
+        algorithm_kind = algorithm_class->kind;
         int window_kind = default_window_kind;
         if (window_total > 0U) {
             double raw_w = read_param_value(window_view, base_index, (double)window_kind);
@@ -4233,6 +4502,13 @@ static int run_fft_division_node(
         }
         state->u.fftdiv.algorithm = algorithm_kind;
         state->u.fftdiv.epsilon = epsilon_frame;
+        if (algorithm_class->supports_dynamic_carriers) {
+            state->u.fftdiv.dynamic_carrier_band_count = (int)carrier_summary.band_count;
+            state->u.fftdiv.dynamic_carrier_last_sum = carrier_summary.last_sum;
+        } else {
+            state->u.fftdiv.dynamic_carrier_band_count = 0;
+            state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
+        }
 
         int filled = state->u.fftdiv.filled;
         double phase_last = state->u.fftdiv.last_phase;
@@ -4330,13 +4606,8 @@ static int run_fft_division_node(
                 div_real[i] = divisor_ring[i] * w;
                 div_imag[i] = divisor_imag_ring[i] * w;
             }
-            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
-                compute_fft_radix2(work_real, work_imag, work_real, work_imag, window_size, 0);
-                compute_fft_radix2(div_real, div_imag, div_real, div_imag, window_size, 0);
-            } else {
-                compute_dft(work_real, work_imag, work_real, work_imag, window_size, 0);
-                compute_dft(div_real, div_imag, div_real, div_imag, window_size, 0);
-            }
+            algorithm_class->forward(work_real, work_imag, work_real, work_imag, window_size);
+            algorithm_class->forward(div_real, div_imag, div_real, div_imag, window_size);
             double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
             double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
             double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
@@ -4373,11 +4644,7 @@ static int run_fft_division_node(
                 work_real[i] = rotated_real;
                 work_imag[i] = rotated_imag;
             }
-            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
-                compute_fft_radix2(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
-            } else {
-                compute_dft(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
-            }
+            algorithm_class->inverse(work_real, work_imag, ifft_real, ifft_imag, window_size);
             for (int i = 0; i < window_size; ++i) {
                 state->u.fftdiv.result_buffer[offset + (size_t)i] = ifft_real[i];
             }
@@ -4508,6 +4775,8 @@ static int run_fft_division_node_backward(
     double upper_last_state = state->u.fftdiv.last_upper;
     double filter_last_state = state->u.fftdiv.last_filter;
 
+    fft_dynamic_carrier_summary_t carrier_summary = summarize_dynamic_carriers(inputs);
+
     for (int frame_index = 0; frame_index < frames; ++frame_index) {
         size_t base_index = (size_t)frame_index * (size_t)slot_count;
         double epsilon_frame = epsilon_json;
@@ -4528,9 +4797,11 @@ static int run_fft_division_node_backward(
             double raw = read_param_value(algorithm_view, base_index, (double)algorithm_kind);
             algorithm_kind = clamp_algorithm_kind(round_to_int(raw));
         }
-        if (algorithm_kind == FFT_ALGORITHM_RADIX2 && !is_power_of_two_int(window_size)) {
-            algorithm_kind = FFT_ALGORITHM_DFT;
+        const fft_algorithm_class_t *algorithm_class = select_fft_algorithm(algorithm_kind);
+        if (algorithm_class->requires_power_of_two && !is_power_of_two_int(window_size)) {
+            algorithm_class = select_fft_algorithm(FFT_ALGORITHM_DFT);
         }
+        algorithm_kind = algorithm_class->kind;
         int window_kind = default_window_kind;
         if (window_total > 0U) {
             double raw_w = read_param_value(window_view, base_index, (double)window_kind);
@@ -4542,6 +4813,13 @@ static int run_fft_division_node_backward(
         }
         state->u.fftdiv.algorithm = algorithm_kind;
         state->u.fftdiv.epsilon = epsilon_frame;
+        if (algorithm_class->supports_dynamic_carriers) {
+            state->u.fftdiv.dynamic_carrier_band_count = (int)carrier_summary.band_count;
+            state->u.fftdiv.dynamic_carrier_last_sum = carrier_summary.last_sum;
+        } else {
+            state->u.fftdiv.dynamic_carrier_band_count = 0;
+            state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
+        }
 
         double phase_last = phase_last_state;
         double lower_last = lower_last_state;
@@ -4685,11 +4963,7 @@ static int run_fft_division_node_backward(
                 div_real[i] = state->u.fftdiv.divisor_buffer[offset + (size_t)i] * w;
                 div_imag[i] = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i] * w;
             }
-            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
-                compute_fft_radix2(div_real, div_imag, div_real, div_imag, window_size, 0);
-            } else {
-                compute_dft(div_real, div_imag, div_real, div_imag, window_size, 0);
-            }
+            algorithm_class->forward(div_real, div_imag, div_real, div_imag, window_size);
             for (int i = 0; i < window_size; ++i) {
                 state->u.fftdiv.div_fft_real[offset + (size_t)i] = div_real[i];
                 state->u.fftdiv.div_fft_imag[offset + (size_t)i] = div_imag[i];
@@ -4700,11 +4974,7 @@ static int run_fft_division_node_backward(
                 work_real[i] = recomb_ring[i] * w;
                 work_imag[i] = 0.0;
             }
-            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
-                compute_fft_radix2(work_real, work_imag, work_real, work_imag, window_size, 0);
-            } else {
-                compute_dft(work_real, work_imag, work_real, work_imag, window_size, 0);
-            }
+            algorithm_class->forward(work_real, work_imag, work_real, work_imag, window_size);
             for (int i = 0; i < window_size; ++i) {
                 double ratio = window_size > 1 ? (double)i / (double)(window_size - 1) : 0.0;
                 double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
@@ -4724,11 +4994,7 @@ static int run_fft_division_node_backward(
                 work_real[i] = out_real_freq;
                 work_imag[i] = out_imag_freq;
             }
-            if (algorithm_kind == FFT_ALGORITHM_RADIX2) {
-                compute_fft_radix2(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
-            } else {
-                compute_dft(work_real, work_imag, ifft_real, ifft_imag, window_size, 1);
-            }
+            algorithm_class->inverse(work_real, work_imag, ifft_real, ifft_imag, window_size);
             buffer[base_index + (size_t)slot] = ifft_real[window_size - 1];
         }
     }
