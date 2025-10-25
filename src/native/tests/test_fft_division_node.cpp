@@ -1,0 +1,996 @@
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+extern "C" {
+#include "amp_native.h"
+}
+
+namespace {
+
+constexpr int FFT_ALGORITHM_RADIX2 = 0;
+constexpr int FFT_ALGORITHM_DFT = 1;
+
+constexpr int FFT_WINDOW_RECTANGULAR = 0;
+constexpr int FFT_WINDOW_HANN = 1;
+constexpr int FFT_WINDOW_HAMMING = 2;
+
+struct ParamDescriptor {
+    std::string name;
+    uint32_t batches{1};
+    uint32_t channels{1};
+    uint32_t frames{1};
+    std::vector<double> data;
+};
+
+void append_u32(std::vector<uint8_t> &buffer, uint32_t value) {
+    buffer.push_back(static_cast<uint8_t>(value & 0xFFU));
+    buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xFFU));
+    buffer.push_back(static_cast<uint8_t>((value >> 16) & 0xFFU));
+    buffer.push_back(static_cast<uint8_t>((value >> 24) & 0xFFU));
+}
+
+void append_u64(std::vector<uint8_t> &buffer, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        buffer.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFFU));
+    }
+}
+
+void append_string(std::vector<uint8_t> &buffer, const std::string &value) {
+    buffer.insert(buffer.end(), value.begin(), value.end());
+}
+
+void append_doubles(std::vector<uint8_t> &buffer, const std::vector<double> &values) {
+    for (double v : values) {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(double));
+        append_u64(buffer, bits);
+    }
+}
+
+void append_node(
+    std::vector<uint8_t> &buffer,
+    const std::string &name,
+    const std::string &type_name,
+    const std::vector<std::string> &audio_inputs,
+    const std::string &params_json,
+    const std::vector<ParamDescriptor> &params
+) {
+    append_u32(buffer, 0U); // type_id placeholder
+    append_u32(buffer, static_cast<uint32_t>(name.size()));
+    append_u32(buffer, static_cast<uint32_t>(type_name.size()));
+    append_u32(buffer, static_cast<uint32_t>(audio_inputs.size()));
+    append_u32(buffer, 0U); // mod connections
+    append_u32(buffer, static_cast<uint32_t>(params.size()));
+    append_u32(buffer, 0U); // shape count
+    append_u32(buffer, static_cast<uint32_t>(params_json.size()));
+
+    append_string(buffer, name);
+    append_string(buffer, type_name);
+
+    for (const std::string &src : audio_inputs) {
+        append_u32(buffer, static_cast<uint32_t>(src.size()));
+        append_string(buffer, src);
+    }
+
+    for (const ParamDescriptor &param : params) {
+        uint64_t blob_len = static_cast<uint64_t>(param.data.size() * sizeof(double));
+        append_u32(buffer, static_cast<uint32_t>(param.name.size()));
+        append_u32(buffer, param.batches);
+        append_u32(buffer, param.channels);
+        append_u32(buffer, param.frames);
+        append_u64(buffer, blob_len);
+        append_string(buffer, param.name);
+        append_doubles(buffer, param.data);
+    }
+
+    append_string(buffer, params_json);
+}
+
+int round_to_int(double value) {
+    if (value >= 0.0) {
+        return static_cast<int>(value + 0.5);
+    }
+    return static_cast<int>(value - 0.5);
+}
+
+int clamp_algorithm_kind(int kind) {
+    if (kind == FFT_ALGORITHM_DFT) {
+        return FFT_ALGORITHM_DFT;
+    }
+    return FFT_ALGORITHM_RADIX2;
+}
+
+int clamp_window_kind(int kind) {
+    switch (kind) {
+        case FFT_WINDOW_RECTANGULAR:
+        case FFT_WINDOW_HANN:
+        case FFT_WINDOW_HAMMING:
+            return kind;
+        default:
+            break;
+    }
+    return FFT_WINDOW_HANN;
+}
+
+double clamp_unit_double(double value) {
+    if (value < 0.0) {
+        return 0.0;
+    }
+    if (value > 1.0) {
+        return 1.0;
+    }
+    return value;
+}
+
+double compute_band_gain(double ratio, double lower, double upper, double intensity) {
+    double lower_clamped = clamp_unit_double(lower);
+    double upper_clamped = clamp_unit_double(upper);
+    if (upper_clamped < lower_clamped) {
+        std::swap(lower_clamped, upper_clamped);
+    }
+    double intensity_clamped = clamp_unit_double(intensity);
+    double inside_gain = intensity_clamped;
+    if (inside_gain < 1e-6) {
+        inside_gain = 1e-6;
+    }
+    double outside_gain = 1.0 - intensity_clamped;
+    if (outside_gain < 1e-6) {
+        outside_gain = 1e-6;
+    }
+    if (ratio >= lower_clamped && ratio <= upper_clamped) {
+        return inside_gain;
+    }
+    return outside_gain;
+}
+
+bool is_power_of_two(int value) {
+    if (value <= 0) {
+        return false;
+    }
+    return (value & (value - 1)) == 0;
+}
+
+int bit_reverse(int value, int bits) {
+    int reversed = 0;
+    for (int i = 0; i < bits; ++i) {
+        reversed = (reversed << 1) | (value & 1);
+        value >>= 1;
+    }
+    return reversed;
+}
+
+void compute_fft_radix2(std::vector<double> &real, std::vector<double> &imag, int inverse) {
+    const int n = static_cast<int>(real.size());
+    std::vector<double> out_real(n);
+    std::vector<double> out_imag(n);
+    for (int i = 0; i < n; ++i) {
+        out_real[i] = real[i];
+        out_imag[i] = imag[i];
+    }
+    int bits = 0;
+    while ((1 << bits) < n) {
+        ++bits;
+    }
+    for (int i = 0; i < n; ++i) {
+        int j = bit_reverse(i, bits);
+        if (j > i) {
+            std::swap(out_real[i], out_real[j]);
+            std::swap(out_imag[i], out_imag[j]);
+        }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        double angle = (inverse != 0 ? 2.0 : -2.0) * M_PI / static_cast<double>(len);
+        double wlen_real = std::cos(angle);
+        double wlen_imag = std::sin(angle);
+        for (int i = 0; i < n; i += len) {
+            double w_real = 1.0;
+            double w_imag = 0.0;
+            int half = len / 2;
+            for (int j = 0; j < half; ++j) {
+                int idx0 = i + j;
+                int idx1 = i + j + half;
+                double u_real = out_real[idx0];
+                double u_imag = out_imag[idx0];
+                double v_real = out_real[idx1] * w_real - out_imag[idx1] * w_imag;
+                double v_imag = out_real[idx1] * w_imag + out_imag[idx1] * w_real;
+                out_real[idx0] = u_real + v_real;
+                out_imag[idx0] = u_imag + v_imag;
+                out_real[idx1] = u_real - v_real;
+                out_imag[idx1] = u_imag - v_imag;
+                double next_real = w_real * wlen_real - w_imag * wlen_imag;
+                double next_imag = w_real * wlen_imag + w_imag * wlen_real;
+                w_real = next_real;
+                w_imag = next_imag;
+            }
+        }
+    }
+    if (inverse != 0) {
+        double inv_n = 1.0 / static_cast<double>(n);
+        for (int i = 0; i < n; ++i) {
+            out_real[i] *= inv_n;
+            out_imag[i] *= inv_n;
+        }
+    }
+    real.swap(out_real);
+    imag.swap(out_imag);
+}
+
+void compute_dft(std::vector<double> &real, std::vector<double> &imag, int inverse) {
+    const int n = static_cast<int>(real.size());
+    std::vector<double> out_real(n, 0.0);
+    std::vector<double> out_imag(n, 0.0);
+    double sign = inverse != 0 ? 1.0 : -1.0;
+    for (int k = 0; k < n; ++k) {
+        double sum_real = 0.0;
+        double sum_imag = 0.0;
+        for (int t = 0; t < n; ++t) {
+            double angle = sign * 2.0 * M_PI * static_cast<double>(k * t) / static_cast<double>(n);
+            double c = std::cos(angle);
+            double s = std::sin(angle);
+            sum_real += real[t] * c - imag[t] * s;
+            sum_imag += real[t] * s + imag[t] * c;
+        }
+        if (inverse != 0) {
+            sum_real /= static_cast<double>(n);
+            sum_imag /= static_cast<double>(n);
+        }
+        out_real[k] = sum_real;
+        out_imag[k] = sum_imag;
+    }
+    real.swap(out_real);
+    imag.swap(out_imag);
+}
+
+void fill_window(int window_kind, std::vector<double> &window) {
+    const int size = static_cast<int>(window.size());
+    if (size <= 0) {
+        return;
+    }
+    if (size == 1) {
+        window[0] = 1.0;
+        return;
+    }
+    for (int i = 0; i < size; ++i) {
+        double phase = static_cast<double>(i) / static_cast<double>(size - 1);
+        double value = 1.0;
+        switch (window_kind) {
+            case FFT_WINDOW_RECTANGULAR:
+                value = 1.0;
+                break;
+            case FFT_WINDOW_HANN:
+                value = 0.5 * (1.0 - std::cos(2.0 * M_PI * phase));
+                break;
+            case FFT_WINDOW_HAMMING:
+                value = 0.54 - 0.46 * std::cos(2.0 * M_PI * phase);
+                break;
+            default:
+                value = 1.0;
+                break;
+        }
+        window[i] = value;
+    }
+}
+
+std::vector<double> simulate_fft_division(
+    const std::vector<double> &signal,
+    const std::vector<double> &divisor_real,
+    const std::vector<double> &divisor_imag,
+    const std::vector<int> &algorithm_selector,
+    const std::vector<int> &window_selector,
+    const std::vector<double> &stabilizer,
+    const std::vector<double> &phase,
+    const std::vector<double> &lower,
+    const std::vector<double> &upper,
+    const std::vector<double> &filter,
+    int window_size,
+    double epsilon_default,
+    int default_algorithm,
+    int default_window_kind
+) {
+    const int frames = static_cast<int>(signal.size());
+    std::vector<double> buffer(window_size, 0.0);
+    std::vector<double> divisor_buf(window_size, 1.0);
+    std::vector<double> divisor_imag_buf(window_size, 0.0);
+    std::vector<double> phase_buf(window_size, 0.0);
+    std::vector<double> lower_buf(window_size, 0.0);
+    std::vector<double> upper_buf(window_size, 1.0);
+    std::vector<double> filter_buf(window_size, 1.0);
+    std::vector<double> window(window_size, 1.0);
+    int current_window_kind = -1;
+    int filled = 0;
+
+    std::vector<double> output(frames, 0.0);
+    for (int frame = 0; frame < frames; ++frame) {
+        double epsilon = epsilon_default;
+        if (!stabilizer.empty() && frame < static_cast<int>(stabilizer.size())) {
+            double candidate = stabilizer[frame];
+            if (candidate < 0.0) {
+                candidate = -candidate;
+            }
+            if (candidate > 0.0) {
+                epsilon = candidate;
+            }
+        }
+        if (epsilon < 1e-12) {
+            epsilon = 1e-12;
+        }
+        int algorithm = default_algorithm;
+        if (!algorithm_selector.empty() && frame < static_cast<int>(algorithm_selector.size())) {
+            algorithm = clamp_algorithm_kind(algorithm_selector[frame]);
+        }
+        if (algorithm == FFT_ALGORITHM_RADIX2 && !is_power_of_two(window_size)) {
+            algorithm = FFT_ALGORITHM_DFT;
+        }
+        int window_kind = default_window_kind;
+        if (!window_selector.empty() && frame < static_cast<int>(window_selector.size())) {
+            window_kind = clamp_window_kind(window_selector[frame]);
+        }
+        if (window_kind != current_window_kind) {
+            fill_window(window_kind, window);
+            current_window_kind = window_kind;
+        }
+
+        double current_sample = signal[frame];
+        double current_divisor = frame < static_cast<int>(divisor_real.size()) ? divisor_real[frame] : 1.0;
+        double current_divisor_imag = frame < static_cast<int>(divisor_imag.size()) ? divisor_imag[frame] : 0.0;
+        double current_phase = (!phase.empty() && frame < static_cast<int>(phase.size()))
+            ? phase[frame]
+            : (filled > 0 ? phase_buf[filled - 1] : 0.0);
+        double current_lower = (!lower.empty() && frame < static_cast<int>(lower.size()))
+            ? lower[frame]
+            : (filled > 0 ? lower_buf[filled - 1] : 0.0);
+        double current_upper = (!upper.empty() && frame < static_cast<int>(upper.size()))
+            ? upper[frame]
+            : (filled > 0 ? upper_buf[filled - 1] : 1.0);
+        double current_filter = (!filter.empty() && frame < static_cast<int>(filter.size()))
+            ? filter[frame]
+            : (filled > 0 ? filter_buf[filled - 1] : 1.0);
+
+        if (filled < window_size) {
+            buffer[filled] = current_sample;
+            divisor_buf[filled] = current_divisor;
+            divisor_imag_buf[filled] = current_divisor_imag;
+            phase_buf[filled] = current_phase;
+            lower_buf[filled] = current_lower;
+            upper_buf[filled] = current_upper;
+            filter_buf[filled] = current_filter;
+            filled += 1;
+        } else {
+            if (window_size > 1) {
+                std::memmove(buffer.data(), buffer.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+                std::memmove(divisor_buf.data(), divisor_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+                std::memmove(divisor_imag_buf.data(), divisor_imag_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+                std::memmove(phase_buf.data(), phase_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+                std::memmove(lower_buf.data(), lower_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+                std::memmove(upper_buf.data(), upper_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+                std::memmove(filter_buf.data(), filter_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+            }
+            buffer[window_size - 1] = current_sample;
+            divisor_buf[window_size - 1] = current_divisor;
+            divisor_imag_buf[window_size - 1] = current_divisor_imag;
+            phase_buf[window_size - 1] = current_phase;
+            lower_buf[window_size - 1] = current_lower;
+            upper_buf[window_size - 1] = current_upper;
+            filter_buf[window_size - 1] = current_filter;
+        }
+
+        if (filled < window_size) {
+            double safe_div = std::fabs(current_divisor) < epsilon ? (current_divisor >= 0.0 ? epsilon : -epsilon) : current_divisor;
+            output[frame] = current_sample / safe_div;
+            continue;
+        }
+
+        std::vector<double> signal_real(window_size, 0.0);
+        std::vector<double> signal_imag(window_size, 0.0);
+        std::vector<double> divisor_real_fft(window_size, 0.0);
+        std::vector<double> divisor_imag_fft(window_size, 0.0);
+        double phase_mod = phase_buf[window_size - 1];
+        double lower_mod = lower_buf[window_size - 1];
+        double upper_mod = upper_buf[window_size - 1];
+        double filter_mod = filter_buf[window_size - 1];
+        double lower_clamped = clamp_unit_double(lower_mod);
+        double upper_clamped = clamp_unit_double(upper_mod);
+        if (upper_clamped < lower_clamped) {
+            std::swap(lower_clamped, upper_clamped);
+        }
+        double intensity_clamped = clamp_unit_double(filter_mod);
+        double cos_phase = std::cos(phase_mod);
+        double sin_phase = std::sin(phase_mod);
+
+        for (int i = 0; i < window_size; ++i) {
+            double w = window[i];
+            signal_real[i] = buffer[i] * w;
+            signal_imag[i] = 0.0;
+            divisor_real_fft[i] = divisor_buf[i] * w;
+            divisor_imag_fft[i] = divisor_imag_buf[i] * w;
+        }
+
+        if (algorithm == FFT_ALGORITHM_RADIX2) {
+            compute_fft_radix2(signal_real, signal_imag, 0);
+            compute_fft_radix2(divisor_real_fft, divisor_imag_fft, 0);
+        } else {
+            compute_dft(signal_real, signal_imag, 0);
+            compute_dft(divisor_real_fft, divisor_imag_fft, 0);
+        }
+
+        for (int i = 0; i < window_size; ++i) {
+            double a = signal_real[i];
+            double b = signal_imag[i];
+            double c = divisor_real_fft[i];
+            double d = divisor_imag_fft[i];
+            double denom = c * c + d * d;
+            if (denom < epsilon) {
+                denom = epsilon;
+            }
+            double real_part = (a * c + b * d) / denom;
+            double imag_part = (b * c - a * d) / denom;
+            double ratio = window_size > 1 ? static_cast<double>(i) / static_cast<double>(window_size - 1) : 0.0;
+            double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+            double gated_real = real_part * gain;
+            double gated_imag = imag_part * gain;
+            double rotated_real = gated_real * cos_phase - gated_imag * sin_phase;
+            double rotated_imag = gated_real * sin_phase + gated_imag * cos_phase;
+            signal_real[i] = rotated_real;
+            signal_imag[i] = rotated_imag;
+        }
+
+        if (algorithm == FFT_ALGORITHM_RADIX2) {
+            compute_fft_radix2(signal_real, signal_imag, 1);
+        } else {
+            compute_dft(signal_real, signal_imag, 1);
+        }
+
+        output[frame] = signal_real[window_size - 1];
+    }
+
+    return output;
+}
+
+} // namespace
+
+int main() {
+    constexpr int kFrames = 8;
+    constexpr int kWindowSize = 4;
+
+    const std::vector<double> signal{
+        1.0, -0.5, 0.25, -0.125, 0.0625, -0.03125, 0.015625, -0.0078125
+    };
+    const std::vector<double> divisor_real{
+        1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5
+    };
+    const std::vector<double> divisor_imag{
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    };
+    const std::vector<int> algorithm_selector{
+        0, 0, 0, 0, 0, 0, 0, 0
+    };
+    const std::vector<int> window_selector{
+        1, 1, 1, 1, 1, 1, 1, 1
+    };
+    const std::vector<double> stabilizer{
+        1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9
+    };
+    std::vector<double> phase_metadata(kFrames, 0.0);
+    std::vector<double> lower_metadata(kFrames, 0.0);
+    std::vector<double> upper_metadata(kFrames, 1.0);
+    std::vector<double> filter_metadata(kFrames, 1.0);
+
+    auto verify_frames = [&](const double *actual, const std::vector<double> &expected, const char *label) {
+        for (int i = 0; i < kFrames; ++i) {
+            double diff = std::fabs(actual[i] - expected[i]);
+            if (diff > 1e-8) {
+                std::fprintf(
+                    stderr,
+                    "%s mismatch at frame %d: got %.12f expected %.12f diff %.12f\n",
+                    label,
+                    i,
+                    actual[i],
+                    expected[i],
+                    diff
+                );
+                assert(false && "FFT division output mismatch");
+            }
+        }
+    };
+
+    std::vector<uint8_t> descriptor;
+    descriptor.reserve(2048);
+    append_u32(descriptor, 3U);
+
+    append_node(
+        descriptor,
+        "carrier",
+        "ConstantNode",
+        {},
+        "{\"value\":1.0,\"channels\":1}",
+        {}
+    );
+
+    ParamDescriptor signal_param{
+        "gain",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        signal
+    };
+    append_node(
+        descriptor,
+        "signal",
+        "GainNode",
+        {"carrier"},
+        "{}",
+        {signal_param}
+    );
+
+    std::vector<double> algorithm_selector_d(algorithm_selector.begin(), algorithm_selector.end());
+    std::vector<double> window_selector_d(window_selector.begin(), window_selector.end());
+
+    ParamDescriptor divisor_param{
+        "divisor",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        divisor_real
+    };
+    ParamDescriptor divisor_imag_param{
+        "divisor_imag",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        divisor_imag
+    };
+    ParamDescriptor algorithm_param{
+        "algorithm_selector",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        algorithm_selector_d
+    };
+    ParamDescriptor window_param{
+        "window_selector",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        window_selector_d
+    };
+    ParamDescriptor stabilizer_param{
+        "stabilizer",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        stabilizer
+    };
+    ParamDescriptor phase_param{
+        "phase_offset",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        phase_metadata
+    };
+    ParamDescriptor lower_param{
+        "lower_band",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        lower_metadata
+    };
+    ParamDescriptor upper_param{
+        "upper_band",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        upper_metadata
+    };
+    ParamDescriptor filter_param{
+        "filter_intensity",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        filter_metadata
+    };
+
+    char fft_params[256];
+    std::snprintf(
+        fft_params,
+        sizeof(fft_params),
+        "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\","
+        "\"supports_v2\":true,\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9}",
+        kWindowSize,
+        kWindowSize - 1
+    );
+
+    append_node(
+        descriptor,
+        "fft_divider",
+        "FFTDivisionNode",
+        {"signal"},
+        fft_params,
+        {divisor_param, divisor_imag_param, algorithm_param, window_param, stabilizer_param, phase_param, lower_param, upper_param, filter_param}
+    );
+
+    AmpGraphRuntime *runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
+    assert(runtime != nullptr);
+    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
+
+    std::vector<double> expected = simulate_fft_division(
+        signal,
+        divisor_real,
+        divisor_imag,
+        algorithm_selector,
+        window_selector,
+        stabilizer,
+        phase_metadata,
+        lower_metadata,
+        upper_metadata,
+        filter_metadata,
+        kWindowSize,
+        1e-9,
+        FFT_ALGORITHM_RADIX2,
+        FFT_WINDOW_HANN
+    );
+
+    double *out_buffer = nullptr;
+    uint32_t out_batches = 0;
+    uint32_t out_channels = 0;
+    uint32_t out_frames = 0;
+    int exec_rc = amp_graph_runtime_execute(
+        runtime,
+        nullptr,
+        0U,
+        kFrames,
+        48000.0,
+        &out_buffer,
+        &out_batches,
+        &out_channels,
+        &out_frames
+    );
+    assert(exec_rc == 0);
+    assert(out_buffer != nullptr);
+    assert(out_batches == 1U);
+    assert(out_channels == 1U);
+    assert(out_frames == static_cast<uint32_t>(kFrames));
+    verify_frames(out_buffer, expected, "fft_baseline");
+
+    AmpGraphNodeSummary summary_fft{};
+    int describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_fft);
+    assert(describe_rc == 0);
+    assert(summary_fft.supports_v2 == 1);
+    assert(summary_fft.declared_delay_frames == static_cast<uint32_t>(kWindowSize - 1));
+    assert(summary_fft.has_metrics == 1);
+    assert(summary_fft.metrics.accumulated_heat > 0.0f);
+    assert(summary_fft.total_heat_accumulated >= static_cast<double>(summary_fft.metrics.accumulated_heat));
+    assert(summary_fft.total_heat_accumulated > 0.0);
+    assert(std::fabs(summary_fft.metrics.reserved[0] - static_cast<float>(phase_metadata.back())) < 1e-6f);
+    assert(std::fabs(summary_fft.metrics.reserved[1] - static_cast<float>(lower_metadata.back())) < 1e-6f);
+    assert(std::fabs(summary_fft.metrics.reserved[2] - static_cast<float>(upper_metadata.back())) < 1e-6f);
+    assert(std::fabs(summary_fft.metrics.reserved[3] - static_cast<float>(filter_metadata.back())) < 1e-6f);
+
+    amp_graph_runtime_buffer_free(out_buffer);
+    out_buffer = nullptr;
+    amp_graph_runtime_destroy(runtime);
+    runtime = nullptr;
+
+    // Override algorithm selector to use the DFT pathway on a fresh runtime instance and verify updates.
+    runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
+    assert(runtime != nullptr);
+    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
+
+    std::vector<double> algorithm_selector_param_dft(kFrames, 1.0);
+    assert(
+        amp_graph_runtime_set_param(
+            runtime,
+            "fft_divider",
+            "algorithm_selector",
+            algorithm_selector_param_dft.data(),
+            1U,
+            1U,
+            static_cast<uint32_t>(kFrames)
+        ) == 0
+    );
+
+    exec_rc = amp_graph_runtime_execute(
+        runtime,
+        nullptr,
+        0U,
+        kFrames,
+        48000.0,
+        &out_buffer,
+        &out_batches,
+        &out_channels,
+        &out_frames
+    );
+    assert(exec_rc == 0);
+    assert(out_buffer != nullptr);
+    assert(out_batches == 1U);
+    assert(out_channels == 1U);
+    assert(out_frames == static_cast<uint32_t>(kFrames));
+    bool diverged_from_fft = false;
+    for (int i = kWindowSize - 1; i < kFrames; ++i) {
+        double diff = std::fabs(out_buffer[i] - expected[i]);
+        if (diff > 1e-6) {
+            diverged_from_fft = true;
+            break;
+        }
+    }
+    assert(diverged_from_fft);
+    for (int i = 0; i < kFrames; ++i) {
+        assert(std::isfinite(out_buffer[i]));
+    }
+
+    AmpGraphNodeSummary summary_dft{};
+    describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dft);
+    assert(describe_rc == 0);
+    assert(summary_dft.has_metrics == 1);
+    assert(summary_dft.metrics.accumulated_heat > 0.0f);
+    assert(summary_dft.metrics.accumulated_heat < summary_fft.metrics.accumulated_heat);
+
+    amp_graph_runtime_buffer_free(out_buffer);
+    out_buffer = nullptr;
+    amp_graph_runtime_destroy(runtime);
+    runtime = nullptr;
+
+    // Override window selector to rectangular while restoring FFT algorithm on another fresh runtime.
+    runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
+    assert(runtime != nullptr);
+    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
+
+    std::vector<double> algorithm_selector_param_fft(kFrames, 0.0);
+    std::vector<double> window_selector_param_rect(kFrames, 0.0);
+    assert(
+        amp_graph_runtime_set_param(
+            runtime,
+            "fft_divider",
+            "algorithm_selector",
+            algorithm_selector_param_fft.data(),
+            1U,
+            1U,
+            static_cast<uint32_t>(kFrames)
+        ) == 0
+    );
+    assert(
+        amp_graph_runtime_set_param(
+            runtime,
+            "fft_divider",
+            "window_selector",
+            window_selector_param_rect.data(),
+            1U,
+            1U,
+            static_cast<uint32_t>(kFrames)
+        ) == 0
+    );
+
+    std::vector<int> window_selector_rect(kFrames, 0);
+    std::vector<double> expected_rect = simulate_fft_division(
+        signal,
+        divisor_real,
+        divisor_imag,
+        algorithm_selector,
+        window_selector_rect,
+        stabilizer,
+        phase_metadata,
+        lower_metadata,
+        upper_metadata,
+        filter_metadata,
+        kWindowSize,
+        1e-9,
+        FFT_ALGORITHM_RADIX2,
+        FFT_WINDOW_HANN
+    );
+
+    exec_rc = amp_graph_runtime_execute(
+        runtime,
+        nullptr,
+        0U,
+        kFrames,
+        48000.0,
+        &out_buffer,
+        &out_batches,
+        &out_channels,
+        &out_frames
+    );
+    assert(exec_rc == 0);
+    assert(out_buffer != nullptr);
+    assert(out_batches == 1U);
+    assert(out_channels == 1U);
+    assert(out_frames == static_cast<uint32_t>(kFrames));
+    verify_frames(out_buffer, expected_rect, "rectangular_window");
+
+    AmpGraphNodeSummary summary_rect{};
+    describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_rect);
+    assert(describe_rc == 0);
+    assert(summary_rect.has_metrics == 1);
+    assert(std::fabs(summary_rect.metrics.accumulated_heat - summary_fft.metrics.accumulated_heat) < 1e-6f);
+
+    amp_graph_runtime_buffer_free(out_buffer);
+    amp_graph_runtime_clear_params(runtime);
+    amp_graph_runtime_destroy(runtime);
+
+    // Directly exercise amp_run_node_v2 forward/backward metadata handling.
+    std::string direct_node_name = "fft_divider_direct";
+    std::string direct_type_name = "FFTDivisionNode";
+    std::string direct_params_json = fft_params;
+
+    EdgeRunnerNodeDescriptor direct_descriptor{};
+    direct_descriptor.name = direct_node_name.c_str();
+    direct_descriptor.name_len = direct_node_name.size();
+    direct_descriptor.type_name = direct_type_name.c_str();
+    direct_descriptor.type_len = direct_type_name.size();
+    direct_descriptor.params_json = direct_params_json.c_str();
+    direct_descriptor.params_len = direct_params_json.size();
+
+    EdgeRunnerAudioView forward_audio{};
+    forward_audio.has_audio = 1U;
+    forward_audio.batches = 1U;
+    forward_audio.channels = 1U;
+    forward_audio.frames = static_cast<uint32_t>(kFrames);
+    forward_audio.data = signal.data();
+
+    std::vector<double> custom_phase{0.0, 0.12, -0.18, 0.24, -0.3, 0.36, -0.12, 0.18};
+    std::vector<double> custom_lower(kFrames, 0.0);
+    std::vector<double> custom_upper(kFrames, 1.0);
+    std::vector<double> custom_filter{1.0, 0.95, 0.92, 0.96, 0.94, 0.98, 0.93, 0.97};
+
+    EdgeRunnerParamView direct_param_views[] = {
+        {"divisor", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_real.data()},
+        {"divisor_imag", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_imag.data()},
+        {"algorithm_selector", 1U, 1U, static_cast<uint32_t>(kFrames), algorithm_selector_d.data()},
+        {"window_selector", 1U, 1U, static_cast<uint32_t>(kFrames), window_selector_d.data()},
+        {"stabilizer", 1U, 1U, static_cast<uint32_t>(kFrames), stabilizer.data()},
+        {"phase_offset", 1U, 1U, static_cast<uint32_t>(kFrames), custom_phase.data()},
+        {"lower_band", 1U, 1U, static_cast<uint32_t>(kFrames), custom_lower.data()},
+        {"upper_band", 1U, 1U, static_cast<uint32_t>(kFrames), custom_upper.data()},
+        {"filter_intensity", 1U, 1U, static_cast<uint32_t>(kFrames), custom_filter.data()}
+    };
+
+    EdgeRunnerParamSet direct_param_set{};
+    direct_param_set.count = static_cast<uint32_t>(sizeof(direct_param_views) / sizeof(direct_param_views[0]));
+    direct_param_set.items = direct_param_views;
+
+    EdgeRunnerNodeInputs forward_inputs{};
+    forward_inputs.audio = forward_audio;
+    forward_inputs.params = direct_param_set;
+
+    AmpNodeMetrics forward_metrics{};
+    double *direct_forward_out = nullptr;
+    int direct_forward_channels = 0;
+    void *state_ptr = nullptr;
+
+    int direct_rc = amp_run_node_v2(
+        &direct_descriptor,
+        &forward_inputs,
+        1,
+        1,
+        kFrames,
+        48000.0,
+        &direct_forward_out,
+        &direct_forward_channels,
+        &state_ptr,
+        nullptr,
+        AMP_EXECUTION_MODE_FORWARD,
+        &forward_metrics
+    );
+    assert(direct_rc == 0);
+    assert(direct_forward_out != nullptr);
+    assert(direct_forward_channels == 1);
+
+    std::vector<double> expected_forward = simulate_fft_division(
+        signal,
+        divisor_real,
+        divisor_imag,
+        algorithm_selector,
+        window_selector,
+        stabilizer,
+        custom_phase,
+        custom_lower,
+        custom_upper,
+        custom_filter,
+        kWindowSize,
+        1e-9,
+        FFT_ALGORITHM_RADIX2,
+        FFT_WINDOW_HANN
+    );
+    verify_frames(direct_forward_out, expected_forward, "direct_forward");
+    assert(std::fabs(forward_metrics.reserved[0] - static_cast<float>(custom_phase.back())) < 1e-6f);
+    assert(std::fabs(forward_metrics.reserved[1] - static_cast<float>(custom_lower.back())) < 1e-6f);
+    assert(std::fabs(forward_metrics.reserved[2] - static_cast<float>(custom_upper.back())) < 1e-6f);
+    assert(std::fabs(forward_metrics.reserved[3] - static_cast<float>(custom_filter.back())) < 1e-6f);
+
+    std::vector<double> forward_copy(direct_forward_out, direct_forward_out + kFrames);
+
+    EdgeRunnerAudioView backward_audio = forward_audio;
+    backward_audio.data = direct_forward_out;
+    EdgeRunnerNodeInputs backward_inputs{};
+    backward_inputs.audio = backward_audio;
+    backward_inputs.params = direct_param_set;
+
+    AmpNodeMetrics backward_metrics{};
+    double *reconstructed_out = nullptr;
+    int reconstructed_channels = 0;
+    direct_rc = amp_run_node_v2(
+        &direct_descriptor,
+        &backward_inputs,
+        1,
+        1,
+        kFrames,
+        48000.0,
+        &reconstructed_out,
+        &reconstructed_channels,
+        &state_ptr,
+        nullptr,
+        AMP_EXECUTION_MODE_BACKWARD,
+        &backward_metrics
+    );
+    assert(direct_rc == 0);
+    assert(reconstructed_out != nullptr);
+    assert(reconstructed_channels == 1);
+    for (int i = 0; i < kFrames; ++i) {
+        double diff = std::fabs(reconstructed_out[i] - signal[i]);
+        if (diff > 1e-1) {
+            std::fprintf(stderr, "reconstruction mismatch at %d diff %.12f\n", i, diff);
+            assert(false && "Backward reconstruction mismatch");
+        }
+    }
+    assert(std::fabs(backward_metrics.reserved[0] - static_cast<float>(custom_phase.back())) < 1e-6f);
+    assert(std::fabs(backward_metrics.reserved[1] - static_cast<float>(custom_lower.back())) < 1e-6f);
+    assert(std::fabs(backward_metrics.reserved[2] - static_cast<float>(custom_upper.back())) < 1e-6f);
+    assert(std::fabs(backward_metrics.reserved[3] - static_cast<float>(custom_filter.back())) < 1e-6f);
+
+    amp_free(direct_forward_out);
+    amp_free(reconstructed_out);
+    amp_release_state(state_ptr);
+
+    EdgeRunnerAudioView fresh_backward_audio = forward_audio;
+    fresh_backward_audio.data = forward_copy.data();
+
+    EdgeRunnerNodeInputs fresh_backward_inputs{};
+    fresh_backward_inputs.audio = fresh_backward_audio;
+    fresh_backward_inputs.params = direct_param_set;
+
+    AmpNodeMetrics fresh_backward_metrics{};
+    double *fresh_reconstructed_out = nullptr;
+    int fresh_reconstructed_channels = 0;
+    void *fresh_state = nullptr;
+    direct_rc = amp_run_node_v2(
+        &direct_descriptor,
+        &fresh_backward_inputs,
+        1,
+        1,
+        kFrames,
+        48000.0,
+        &fresh_reconstructed_out,
+        &fresh_reconstructed_channels,
+        &fresh_state,
+        nullptr,
+        AMP_EXECUTION_MODE_BACKWARD,
+        &fresh_backward_metrics
+    );
+    assert(direct_rc == 0);
+    assert(fresh_reconstructed_out != nullptr);
+    assert(fresh_reconstructed_channels == 1);
+    for (int i = 0; i < kFrames; ++i) {
+        double diff = std::fabs(fresh_reconstructed_out[i] - signal[i]);
+        if (diff > 1e-1) {
+            std::fprintf(stderr, "fresh reconstruction mismatch at %d diff %.12f\n", i, diff);
+            assert(false && "Fresh backward reconstruction mismatch");
+        }
+    }
+    assert(std::fabs(fresh_backward_metrics.reserved[0] - static_cast<float>(custom_phase.back())) < 1e-6f);
+    assert(std::fabs(fresh_backward_metrics.reserved[1] - static_cast<float>(custom_lower.back())) < 1e-6f);
+    assert(std::fabs(fresh_backward_metrics.reserved[2] - static_cast<float>(custom_upper.back())) < 1e-6f);
+    assert(std::fabs(fresh_backward_metrics.reserved[3] - static_cast<float>(custom_filter.back())) < 1e-6f);
+
+    amp_free(fresh_reconstructed_out);
+    amp_release_state(fresh_state);
+
+    std::printf(
+        "test_fft_division_node: PASS (FFT division node streaming, algorithm, and window overrides validated)\n"
+    );
+    return 0;
+}
+
