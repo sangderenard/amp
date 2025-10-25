@@ -2006,7 +2006,6 @@ void osc_square_blep_c(const double* ph, const double* dphi, double pw, double* 
 }
 
 void osc_triangle_blep_c(const double* ph, const double* dphi, double* out, int B, int F, double* tri_state) {
-    int N = B * F;
     // Use square -> leaky integrator per-batch sequence
     for (int b = 0; b < B; ++b) {
         double s = 0.0;
@@ -2206,6 +2205,8 @@ typedef enum {
     OSC_MODE_INTEGRATOR = 1,
     OSC_MODE_OP_AMP = 2
 } osc_mode_t;
+
+static int json_copy_string(const char *json, size_t json_len, const char *key, char *out, size_t out_len);
 
 static int parse_osc_mode(const char *json, size_t json_len, int default_mode) {
     char buffer[32];
@@ -2534,34 +2535,40 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
             cursor++;
         }
         size_t length = (size_t)(cursor - start);
-            if (length >= out_len) {
-                /* log attempted oversize copy */
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    void *stack_probe = (void*)&pattern;
-                    /* log the destination and a stack probe so we can detect stack-derived buffers */
-                    fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
-                }
-                length = out_len > 0 ? out_len - 1 : 0;
-            } else {
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    void *stack_probe = (void*)&pattern;
-                    fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
-                }
+        if (length >= out_len) {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
+            /* log attempted oversize copy */
+            ensure_log_files_open();
+            if (log_f_memops) {
+                void *stack_probe = (void *)&pattern;
+                /* log the destination and a stack probe so we can detect stack-derived buffers */
+                fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
             }
-            /* use safe copy that respects the provided destination capacity */
-            if (out_len > 0 && length > 0) {
-                memcpy(out, start, length);
-                /* POSTCOPY: record that we actually wrote to 'out' */
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    fprintf(log_f_memops, "POSTCOPY json_copy_string dest=%p wrote=%zu\n", out, length);
-                }
+#endif
+            length = out_len > 0 ? out_len - 1 : 0;
+        } else {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
+            ensure_log_files_open();
+            if (log_f_memops) {
+                void *stack_probe = (void *)&pattern;
+                fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
             }
-            out[length] = '\0';
-            unregister_alloc(out);
-            return 1;
+#endif
+        }
+        /* use safe copy that respects the provided destination capacity */
+        if (out_len > 0 && length > 0) {
+            memcpy(out, start, length);
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
+            /* POSTCOPY: record that we actually wrote to 'out' */
+            ensure_log_files_open();
+            if (log_f_memops) {
+                fprintf(log_f_memops, "POSTCOPY json_copy_string dest=%p wrote=%zu\n", out, length);
+            }
+#endif
+        }
+        out[length] = '\0';
+        unregister_alloc(out);
+        return 1;
     }
     unregister_alloc(out);
     return 0;
@@ -2608,27 +2615,33 @@ static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) 
         }
         size_t len = (size_t)(cursor - start);
         if (len >= 63) {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
-                void *base = (void*)tokens;
+                void *base = (void *)tokens;
                 /* log both the tokens base and per-token dest so we can map to allocations */
                 fprintf(log_f_memops, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
             }
+#endif
             len = 63;
         } else {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
-                void *base = (void*)tokens;
+                void *base = (void *)tokens;
                 fprintf(log_f_memops, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
             }
+#endif
         }
         if (len > 0) {
             /* write with postcopy logging and bounds assertion */
             memcpy(tokens[count], start, len);
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
                 fprintf(log_f_memops, "POSTCOPY parse_csv_tokens dest=%p wrote=%zu token_idx=%d\n", tokens[count], len, count);
             }
+#endif
         }
         tokens[count][len] = '\0';
         count++;
@@ -2658,25 +2671,31 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
         }
         size_t key_len = (size_t)(eq - cursor);
         if (key_len >= sizeof(items[count].output)) {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
-                void *base = (void*)items;
+                void *base = (void *)items;
                 fprintf(log_f_memops, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
             }
+#endif
             key_len = sizeof(items[count].output) - 1;
         } else {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
-                void *base = (void*)items;
+                void *base = (void *)items;
                 fprintf(log_f_memops, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
             }
+#endif
         }
         if (key_len > 0) {
             memcpy(items[count].output, cursor, key_len);
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
                 fprintf(log_f_memops, "POSTCOPY parse_controller_sources.output dest=%p wrote=%zu idx=%d\n", items[count].output, key_len, count);
             }
+#endif
         }
         items[count].output[key_len] = '\0';
         cursor = eq + 1;
@@ -2686,25 +2705,31 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
         }
         size_t value_len = (size_t)(end - cursor);
         if (value_len >= sizeof(items[count].source)) {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
-                void *base = (void*)items;
+                void *base = (void *)items;
                 fprintf(log_f_memops, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
             }
+#endif
             value_len = sizeof(items[count].source) - 1;
         } else {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
-                void *base = (void*)items;
+                void *base = (void *)items;
                 fprintf(log_f_memops, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
             }
+#endif
         }
         if (value_len > 0) {
             memcpy(items[count].source, cursor, value_len);
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
             ensure_log_files_open();
             if (log_f_memops) {
                 fprintf(log_f_memops, "POSTCOPY parse_controller_sources.source dest=%p wrote=%zu idx=%d\n", items[count].source, value_len, count);
             }
+#endif
         }
         items[count].source[value_len] = '\0';
         cursor = end;
@@ -3855,22 +3880,26 @@ static int run_controller_node(
                 /* bounds checks and durable logging for write operations */
                 size_t total_len = total; /* copied to local for clarity */
                 if (dst_idx >= total_len) {
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
                     ensure_log_files_open();
                     if (log_f_memops) {
                         fprintf(log_f_memops, "BAD_WRITE run_controller_node dst_idx=%zu total=%zu src_idx=%zu c=%d b=%d f=%d resolved_channels=%d frames=%d\n", dst_idx, total_len, src_idx, c, b, f, resolved_channels, frames);
                         fflush(log_f_memops);
                     }
+#endif
                     /* attempt to continue safely */
                     continue;
                 }
                 /* ensure src_idx is in range of the data plane */
                 /* we don't know 'data' length statically; we will conservatively attempt to log if src_idx seems large */
                 buffer[dst_idx] = data[src_idx];
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
                 ensure_log_files_open();
                 if (log_f_memops) {
-                    fprintf(log_f_memops, "POSTWRITE run_controller_node dest=%p dst_idx=%zu wrote=1 src_idx=%zu node=%s\n", (void*)buffer, dst_idx, src_idx, descriptor->name ? descriptor->name : "<noname>");
+                    fprintf(log_f_memops, "POSTWRITE run_controller_node dest=%p dst_idx=%zu wrote=1 src_idx=%zu node=%s\n", (void *)buffer, dst_idx, src_idx, descriptor->name ? descriptor->name : "<noname>");
                     fflush(log_f_memops);
                 }
+#endif
             }
         }
         if (owned != NULL) {
@@ -6129,7 +6158,6 @@ static int run_fft_division_node(
         metrics->reserved[3] = (float)state->u.fftdiv.last_filter;
         metrics->reserved[4] = (float)window_size;
         metrics->reserved[5] = (float)state->u.fftdiv.algorithm;
-        metrics->reserved[6] = (float)state->u.fftdiv.remainder_energy;
     }
     return 0;
 }
