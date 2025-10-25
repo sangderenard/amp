@@ -2168,6 +2168,8 @@ typedef struct {
             double *dynamic_step_re;
             double *dynamic_step_im;
             int dynamic_k_active;
+            int enable_remainder;
+            double remainder_energy;
         } fftdiv;
     } u;
 } node_state_t;
@@ -2826,7 +2828,18 @@ static double clamp_unit_double(double value) {
     return value;
 }
 
+static double wrap_phase_two_pi(double phase) {
+    double wrapped = fmod(phase, 2.0 * M_PI);
+    if (wrapped < 0.0) {
+        wrapped += 2.0 * M_PI;
+    }
+    return wrapped;
+}
+
 static double compute_band_gain(double ratio, double lower, double upper, double intensity) {
+    /* The minimum inside/outside gain is clamped to 1e-6 to avoid hard
+       muting. Documented here so callers know we intentionally leave a floor
+       for numerical stability. */
     double lower_clamped = clamp_unit_double(lower);
     double upper_clamped = clamp_unit_double(upper);
     if (upper_clamped < lower_clamped) {
@@ -2847,6 +2860,57 @@ static double compute_band_gain(double ratio, double lower, double upper, double
         return inside_gain;
     }
     return outside_gain;
+}
+
+static int solve_linear_system(double *matrix, double *rhs, int dim) {
+    if (matrix == NULL || rhs == NULL || dim <= 0) {
+        return -1;
+    }
+    for (int col = 0; col < dim; ++col) {
+        int pivot = col;
+        double max_val = fabs(matrix[col * dim + col]);
+        for (int row = col + 1; row < dim; ++row) {
+            double candidate = fabs(matrix[row * dim + col]);
+            if (candidate > max_val) {
+                max_val = candidate;
+                pivot = row;
+            }
+        }
+        if (max_val < 1e-18) {
+            return -1;
+        }
+        if (pivot != col) {
+            for (int k = col; k < dim; ++k) {
+                double tmp = matrix[col * dim + k];
+                matrix[col * dim + k] = matrix[pivot * dim + k];
+                matrix[pivot * dim + k] = tmp;
+            }
+            double rhs_tmp = rhs[col];
+            rhs[col] = rhs[pivot];
+            rhs[pivot] = rhs_tmp;
+        }
+        double diag = matrix[col * dim + col];
+        for (int row = col + 1; row < dim; ++row) {
+            double factor = matrix[row * dim + col] / diag;
+            matrix[row * dim + col] = 0.0;
+            for (int k = col + 1; k < dim; ++k) {
+                matrix[row * dim + k] -= factor * matrix[col * dim + k];
+            }
+            rhs[row] -= factor * rhs[col];
+        }
+    }
+    for (int row = dim - 1; row >= 0; --row) {
+        double accum = rhs[row];
+        for (int k = row + 1; k < dim; ++k) {
+            accum -= matrix[row * dim + k] * rhs[k];
+        }
+        double diag = matrix[row * dim + row];
+        if (fabs(diag) < 1e-18) {
+            return -1;
+        }
+        rhs[row] = accum / diag;
+    }
+    return 0;
 }
 
 static size_t param_total_count(const EdgeRunnerParamView *view) {
@@ -3397,6 +3461,8 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.dynamic_carrier_band_count = 0;
     state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
     state->u.fftdiv.dynamic_k_active = 0;
+    state->u.fftdiv.enable_remainder = 1;
+    state->u.fftdiv.remainder_energy = 0.0;
 }
 
 static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_size) {
@@ -3469,6 +3535,8 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
     state->u.fftdiv.dynamic_carrier_band_count = 0;
     state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
     state->u.fftdiv.dynamic_k_active = 0;
+    state->u.fftdiv.enable_remainder = 1;
+    state->u.fftdiv.remainder_energy = 0.0;
     return 0;
 }
 
@@ -4467,6 +4535,12 @@ static int run_fft_division_node(
     if (epsilon_json <= 0.0) {
         epsilon_json = 1e-9;
     }
+    int enable_remainder = json_get_bool(
+        descriptor->params_json,
+        descriptor->params_len,
+        "enable_remainder",
+        1
+    );
 
     int default_algorithm = parse_algorithm_string(descriptor->params_json, descriptor->params_len, FFT_ALGORITHM_RADIX2);
     default_algorithm = clamp_algorithm_kind(default_algorithm);
@@ -4480,6 +4554,7 @@ static int run_fft_division_node(
     state->u.fftdiv.channels = input_channels;
     state->u.fftdiv.algorithm = default_algorithm;
     state->u.fftdiv.epsilon = epsilon_json;
+    state->u.fftdiv.enable_remainder = enable_remainder ? 1 : 0;
     if (state->u.fftdiv.window_kind != default_window_kind) {
         fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
         state->u.fftdiv.window_kind = default_window_kind;
@@ -4650,6 +4725,7 @@ static int run_fft_division_node(
         int dynamic_active_frame = 0;
         double dynamic_sum_frame = 0.0;
         state->u.fftdiv.dynamic_k_active = 0;
+        state->u.fftdiv.remainder_energy = 0.0;
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t offset = (size_t)slot * (size_t)window_size;
             double *input_ring = state->u.fftdiv.input_buffer + offset;
@@ -4677,6 +4753,21 @@ static int run_fft_division_node(
             if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
                 double carrier_fnorm[FFT_DYNAMIC_CARRIER_LIMIT];
                 int carrier_indices_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                double theta0[FFT_DYNAMIC_CARRIER_LIMIT];
+                double step_re_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                double step_im_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                double b_re[FFT_DYNAMIC_CARRIER_LIMIT];
+                double b_im[FFT_DYNAMIC_CARRIER_LIMIT];
+                double div_re_acc[FFT_DYNAMIC_CARRIER_LIMIT];
+                double div_im_acc[FFT_DYNAMIC_CARRIER_LIMIT];
+                double last_re[FFT_DYNAMIC_CARRIER_LIMIT];
+                double last_im[FFT_DYNAMIC_CARRIER_LIMIT];
+                double gram_real[FFT_DYNAMIC_CARRIER_LIMIT * FFT_DYNAMIC_CARRIER_LIMIT];
+                double gram_imag[FFT_DYNAMIC_CARRIER_LIMIT * FFT_DYNAMIC_CARRIER_LIMIT];
+                double amp_re[FFT_DYNAMIC_CARRIER_LIMIT];
+                double amp_im[FFT_DYNAMIC_CARRIER_LIMIT];
+                double ph_re_buffer[FFT_DYNAMIC_CARRIER_LIMIT];
+                double ph_im_buffer[FFT_DYNAMIC_CARRIER_LIMIT];
                 int active_count = 0;
                 double carrier_sum_slot = 0.0;
                 for (uint32_t idx = 0; idx < carrier_view_count && idx < FFT_DYNAMIC_CARRIER_LIMIT; ++idx) {
@@ -4703,66 +4794,169 @@ static int run_fft_division_node(
                     carrier_indices_local[active_count] = (int)idx;
                     active_count += 1;
                 }
+                double *remainder_ring = state->u.fftdiv.result_buffer + offset;
                 for (int i = 0; i < window_size; ++i) {
                     state->u.fftdiv.div_fft_real[offset + (size_t)i] = 0.0;
                     state->u.fftdiv.div_fft_imag[offset + (size_t)i] = 0.0;
-                    state->u.fftdiv.result_buffer[offset + (size_t)i] = 0.0;
+                    remainder_ring[i] = 0.0;
                 }
                 if (active_count > 0) {
                     size_t phase_offset = (size_t)slot * (size_t)FFT_DYNAMIC_CARRIER_LIMIT;
                     double inv_window = window_size > 0 ? 1.0 / (double)window_size : 1.0;
                     int has_divisor = (divisor_total > 0U) || (divisor_imag_total > 0U);
-                    double sample_dynamic = 0.0;
                     for (int k = 0; k < active_count; ++k) {
                         size_t carrier_index = (size_t)carrier_indices_local[k];
                         size_t phase_index = phase_offset + carrier_index;
                         double theta = state->u.fftdiv.dynamic_phase[phase_index];
-                        double ph_re = cos(theta);
-                        double ph_im = sin(theta);
+                        theta0[k] = theta;
                         double fnorm = carrier_fnorm[k];
                         double angle = 2.0 * M_PI * fnorm;
                         double step_re = cos(angle);
                         double step_im = sin(angle);
+                        step_re_local[k] = step_re;
+                        step_im_local[k] = step_im;
                         state->u.fftdiv.dynamic_step_re[phase_index] = step_re;
                         state->u.fftdiv.dynamic_step_im[phase_index] = step_im;
-                        double coeff_re = 0.0;
-                        double coeff_im = 0.0;
-                        double div_re_acc = 0.0;
-                        double div_im_acc = 0.0;
-                        double last_re = ph_re;
-                        double last_im = ph_im;
-                        for (int n = 0; n < window_size; ++n) {
-                            double w = window_weights != NULL ? window_weights[n] : 1.0;
-                            double xw = input_ring[n] * w;
-                            coeff_re += xw * ph_re;
-                            coeff_im -= xw * ph_im;
+                        ph_re_buffer[k] = cos(theta);
+                        ph_im_buffer[k] = sin(theta);
+                        b_re[k] = 0.0;
+                        b_im[k] = 0.0;
+                        div_re_acc[k] = 0.0;
+                        div_im_acc[k] = 0.0;
+                        last_re[k] = ph_re_buffer[k];
+                        last_im[k] = ph_im_buffer[k];
+                        for (int j = 0; j < active_count; ++j) {
+                            gram_real[k * active_count + j] = 0.0;
+                            gram_imag[k * active_count + j] = 0.0;
+                        }
+                    }
+                    double phi_re_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                    double phi_im_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                    for (int n = 0; n < window_size; ++n) {
+                        double w = window_weights != NULL ? window_weights[n] : 1.0;
+                        double xw = input_ring[n] * w;
+                        for (int k = 0; k < active_count; ++k) {
+                            double ph_re = ph_re_buffer[k];
+                            double ph_im = ph_im_buffer[k];
+                            double wr = ph_re * w;
+                            double wi = ph_im * w;
+                            phi_re_local[k] = wr;
+                            phi_im_local[k] = wi;
+                            b_re[k] += xw * wr;
+                            b_im[k] -= xw * wi;
                             if (has_divisor) {
                                 double dw_re = divisor_ring[n] * w;
                                 double dw_im = divisor_imag_ring[n] * w;
-                                div_re_acc += dw_re * ph_re + dw_im * ph_im;
-                                div_im_acc += -dw_re * ph_im + dw_im * ph_re;
+                                div_re_acc[k] += dw_re * ph_re + dw_im * ph_im;
+                                div_im_acc[k] += -dw_re * ph_im + dw_im * ph_re;
                             }
                             if (n == window_size - 1) {
-                                last_re = ph_re;
-                                last_im = ph_im;
+                                last_re[k] = ph_re;
+                                last_im[k] = ph_im;
                             }
-                            double next_re = ph_re * step_re - ph_im * step_im;
-                            double next_im = ph_re * step_im + ph_im * step_re;
-                            ph_re = next_re;
-                            ph_im = next_im;
                         }
-                        state->u.fftdiv.dynamic_phase[phase_index] += 2.0 * M_PI * fnorm * (double)window_size;
+                        for (int i_local = 0; i_local < active_count; ++i_local) {
+                            for (int j_local = i_local; j_local < active_count; ++j_local) {
+                                double a_re = phi_re_local[i_local];
+                                double a_im = phi_im_local[i_local];
+                                double b_re_local = phi_re_local[j_local];
+                                double b_im_local = phi_im_local[j_local];
+                                double re = a_re * b_re_local + a_im * b_im_local;
+                                double im = a_re * b_im_local - a_im * b_re_local;
+                                gram_real[i_local * active_count + j_local] += re;
+                                gram_imag[i_local * active_count + j_local] += im;
+                                if (i_local != j_local) {
+                                    gram_real[j_local * active_count + i_local] += re;
+                                    gram_imag[j_local * active_count + i_local] -= im;
+                                }
+                            }
+                        }
+                        for (int k = 0; k < active_count; ++k) {
+                            double next_re = ph_re_buffer[k] * step_re_local[k] - ph_im_buffer[k] * step_im_local[k];
+                            double next_im = ph_re_buffer[k] * step_im_local[k] + ph_im_buffer[k] * step_re_local[k];
+                            ph_re_buffer[k] = next_re;
+                            ph_im_buffer[k] = next_im;
+                        }
+                    }
+                    for (int k = 0; k < active_count; ++k) {
+                        size_t carrier_index = (size_t)carrier_indices_local[k];
+                        size_t phase_index = phase_offset + carrier_index;
+                        double theta_next = theta0[k] + 2.0 * M_PI * carrier_fnorm[k] * (double)window_size;
+                        state->u.fftdiv.dynamic_phase[phase_index] = wrap_phase_two_pi(theta_next);
+                        if (!has_divisor) {
+                            div_re_acc[k] = 1.0;
+                            div_im_acc[k] = 0.0;
+                        }
+                    }
+                    double coeff_re_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                    double coeff_im_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                    if (state->u.fftdiv.enable_remainder) {
+                        int dim = active_count * 2;
+                        double normal_matrix[FFT_DYNAMIC_CARRIER_LIMIT * 2 * FFT_DYNAMIC_CARRIER_LIMIT * 2];
+                        double rhs_vec[FFT_DYNAMIC_CARRIER_LIMIT * 2];
+                        for (int i_local = 0; i_local < dim * dim; ++i_local) {
+                            normal_matrix[i_local] = 0.0;
+                        }
+                        for (int i_local = 0; i_local < dim; ++i_local) {
+                            rhs_vec[i_local] = 0.0;
+                        }
+                        double trace = 0.0;
+                        for (int k = 0; k < active_count; ++k) {
+                            trace += gram_real[k * active_count + k];
+                        }
+                        double lambda = 0.0;
+                        if (active_count > 0 && trace > 0.0) {
+                            lambda = 1e-8 * (trace / (double)active_count);
+                        }
+                        for (int i_local = 0; i_local < active_count; ++i_local) {
+                            for (int j_local = 0; j_local < active_count; ++j_local) {
+                                double real_part = gram_real[i_local * active_count + j_local];
+                                double imag_part = gram_imag[i_local * active_count + j_local];
+                                if (i_local == j_local) {
+                                    real_part += lambda;
+                                }
+                                normal_matrix[i_local * dim + j_local] = real_part;
+                                normal_matrix[i_local * dim + (j_local + active_count)] = -imag_part;
+                                normal_matrix[(i_local + active_count) * dim + j_local] = imag_part;
+                                normal_matrix[(i_local + active_count) * dim + (j_local + active_count)] = real_part;
+                            }
+                            rhs_vec[i_local] = b_re[i_local];
+                            rhs_vec[i_local + active_count] = b_im[i_local];
+                        }
+                        if (solve_linear_system(normal_matrix, rhs_vec, dim) == 0) {
+                            for (int k = 0; k < active_count; ++k) {
+                                coeff_re_local[k] = rhs_vec[k];
+                                coeff_im_local[k] = rhs_vec[k + active_count];
+                            }
+                        } else {
+                            for (int k = 0; k < active_count; ++k) {
+                                coeff_re_local[k] = b_re[k];
+                                coeff_im_local[k] = b_im[k];
+                            }
+                        }
+                    } else {
+                        for (int k = 0; k < active_count; ++k) {
+                            coeff_re_local[k] = b_re[k];
+                            coeff_im_local[k] = b_im[k];
+                        }
+                    }
+                    double sample_dynamic = 0.0;
+                    for (int k = 0; k < active_count; ++k) {
+                        double coeff_re = coeff_re_local[k];
+                        double coeff_im = coeff_im_local[k];
+                        double div_re = div_re_acc[k];
+                        double div_im = div_im_acc[k];
                         if (has_divisor) {
-                            double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
+                            double denom = div_re * div_re + div_im * div_im;
                             if (denom < epsilon_frame) {
                                 denom = epsilon_frame;
                             }
-                            double real_tmp = (coeff_re * div_re_acc + coeff_im * div_im_acc) / denom;
-                            double imag_tmp = (coeff_im * div_re_acc - coeff_re * div_im_acc) / denom;
+                            double real_tmp = (coeff_re * div_re + coeff_im * div_im) / denom;
+                            double imag_tmp = (coeff_im * div_re - coeff_re * div_im) / denom;
                             coeff_re = real_tmp;
                             coeff_im = imag_tmp;
                         }
-                        double ratio = fnorm;
+                        double ratio = carrier_fnorm[k];
                         if (ratio < 0.0) {
                             ratio = 0.0;
                         } else if (ratio > 1.0) {
@@ -4773,9 +4967,41 @@ static int run_fft_division_node(
                         double gated_im = coeff_im * gain;
                         double rotated_re = gated_re * cos_phase - gated_im * sin_phase;
                         double rotated_im = gated_re * sin_phase + gated_im * cos_phase;
-                        sample_dynamic += (rotated_re * last_re - rotated_im * last_im) * inv_window;
+                        amp_re[k] = rotated_re;
+                        amp_im[k] = rotated_im;
+                        sample_dynamic += (rotated_re * last_re[k] - rotated_im * last_im[k]) * inv_window;
                     }
-                    state->u.fftdiv.result_buffer[offset + (size_t)(window_size > 0 ? window_size - 1 : 0)] = sample_dynamic;
+                    if (state->u.fftdiv.enable_remainder) {
+                        double *modeled_ring = state->u.fftdiv.work_real;
+                        for (int i = 0; i < window_size; ++i) {
+                            modeled_ring[i] = 0.0;
+                        }
+                        for (int k = 0; k < active_count; ++k) {
+                            ph_re_buffer[k] = cos(theta0[k]);
+                            ph_im_buffer[k] = sin(theta0[k]);
+                        }
+                        double remainder_energy_local = 0.0;
+                        for (int n = 0; n < window_size; ++n) {
+                            double sum_val = 0.0;
+                            for (int k = 0; k < active_count; ++k) {
+                                sum_val += amp_re[k] * ph_re_buffer[k] - amp_im[k] * ph_im_buffer[k];
+                            }
+                            modeled_ring[n] = sum_val * inv_window;
+                            double residual_val = input_ring[n] - modeled_ring[n];
+                            remainder_ring[n] = residual_val;
+                            remainder_energy_local += residual_val * residual_val;
+                            for (int k = 0; k < active_count; ++k) {
+                                double next_re = ph_re_buffer[k] * step_re_local[k] - ph_im_buffer[k] * step_im_local[k];
+                                double next_im = ph_re_buffer[k] * step_im_local[k] + ph_im_buffer[k] * step_re_local[k];
+                                ph_re_buffer[k] = next_re;
+                                ph_im_buffer[k] = next_im;
+                            }
+                        }
+                        state->u.fftdiv.remainder_energy += remainder_energy_local;
+                    } else {
+                        size_t tail_index = (size_t)(window_size > 0 ? window_size - 1 : 0);
+                        remainder_ring[tail_index] = sample_dynamic;
+                    }
                     buffer[base_index + (size_t)slot] = sample_dynamic;
                     if (active_count > dynamic_active_frame) {
                         dynamic_active_frame = active_count;
@@ -4860,6 +5086,7 @@ static int run_fft_division_node(
         metrics->reserved[3] = (float)state->u.fftdiv.last_filter;
         metrics->reserved[4] = (float)window_size;
         metrics->reserved[5] = (float)state->u.fftdiv.algorithm;
+        metrics->reserved[6] = (float)state->u.fftdiv.remainder_energy;
     }
     return 0;
 }
@@ -4876,7 +5103,6 @@ static int run_fft_division_node_backward(
     node_state_t *state,
     AmpNodeMetrics *metrics
 ) {
-    (void)sample_rate;
     if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
         return -1;
     }
@@ -4942,6 +5168,9 @@ static int run_fft_division_node_backward(
     size_t upper_total = param_total_count(upper_view);
     size_t filter_total = param_total_count(filter_view);
 
+    const EdgeRunnerParamView *carrier_views[FFT_DYNAMIC_CARRIER_LIMIT];
+    uint32_t carrier_view_count = collect_dynamic_carrier_views(inputs, carrier_views, FFT_DYNAMIC_CARRIER_LIMIT);
+
     size_t total_samples = (size_t)slot_count * (size_t)frames;
     double *buffer = (double *)malloc(total_samples * sizeof(double));
     amp_last_alloc_count = total_samples;
@@ -4984,9 +5213,150 @@ static int run_fft_division_node_backward(
         }
         algorithm_kind = algorithm_class->kind;
         if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            free(buffer);
-            // TODO: Implement exact adjoint for the dynamic oscillator path (phasor projection, gating, and phase rotation).
-            return -2;
+            double *window_weights = state->u.fftdiv.window;
+            double inv_window = window_size > 0 ? 1.0 / (double)window_size : 1.0;
+            int dynamic_active_frame = 0;
+            double dynamic_sum_frame = 0.0;
+            state->u.fftdiv.dynamic_k_active = 0;
+            state->u.fftdiv.algorithm = algorithm_kind;
+            state->u.fftdiv.epsilon = epsilon_frame;
+            for (int slot = 0; slot < slot_count; ++slot) {
+                size_t offset = (size_t)slot * (size_t)window_size;
+                double *recomb_ring = state->u.fftdiv.recomb_buffer + offset;
+                double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
+                double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
+                double *phase_ring = state->u.fftdiv.phase_buffer + offset;
+                double *lower_ring = state->u.fftdiv.lower_buffer + offset;
+                double *upper_ring = state->u.fftdiv.upper_buffer + offset;
+                double *filter_ring = state->u.fftdiv.filter_buffer + offset;
+                double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
+                double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
+                double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
+                double filter_mod = filter_ring[window_size > 0 ? window_size - 1 : 0];
+                double lower_clamped = clamp_unit_double(lower_mod);
+                double upper_clamped = clamp_unit_double(upper_mod);
+                if (upper_clamped < lower_clamped) {
+                    double tmp_bounds = lower_clamped;
+                    lower_clamped = upper_clamped;
+                    upper_clamped = tmp_bounds;
+                }
+                double intensity_clamped = clamp_unit_double(filter_mod);
+                double cos_phase = cos(phase_mod);
+                double sin_phase = sin(phase_mod);
+                int has_divisor = (divisor_total > 0U) || (divisor_imag_total > 0U);
+                double carrier_fnorm[FFT_DYNAMIC_CARRIER_LIMIT];
+                int carrier_indices_local[FFT_DYNAMIC_CARRIER_LIMIT];
+                int active_count = 0;
+                double carrier_sum_slot = 0.0;
+                for (uint32_t idx = 0; idx < carrier_view_count && idx < FFT_DYNAMIC_CARRIER_LIMIT; ++idx) {
+                    const EdgeRunnerParamView *carrier_view = carrier_views[idx];
+                    if (carrier_view == NULL) {
+                        continue;
+                    }
+                    size_t total = param_total_count(carrier_view);
+                    if (total == 0U) {
+                        continue;
+                    }
+                    double raw_value = read_param_value(
+                        carrier_view,
+                        base_index + (size_t)slot,
+                        0.0
+                    );
+                    carrier_sum_slot += raw_value;
+                    double normalized = raw_value;
+                    if (sample_rate > 0.0 && fabs(normalized) > 1.0) {
+                        normalized = raw_value / sample_rate;
+                    }
+                    normalized = clamp_unit_double(normalized);
+                    carrier_fnorm[active_count] = normalized;
+                    carrier_indices_local[active_count] = (int)idx;
+                    active_count += 1;
+                }
+                if (active_count > 0) {
+                    size_t phase_offset = (size_t)slot * (size_t)FFT_DYNAMIC_CARRIER_LIMIT;
+                    double *phasor_re = state->u.fftdiv.work_real;
+                    double *phasor_im = state->u.fftdiv.work_imag;
+                    double sample_dynamic = 0.0;
+                    for (int k = 0; k < active_count; ++k) {
+                        size_t carrier_index = (size_t)carrier_indices_local[k];
+                        size_t phase_index = phase_offset + carrier_index;
+                        double theta = state->u.fftdiv.dynamic_phase[phase_index];
+                        double fnorm = carrier_fnorm[k];
+                        double angle = 2.0 * M_PI * fnorm;
+                        double step_re = cos(angle);
+                        double step_im = sin(angle);
+                        state->u.fftdiv.dynamic_step_re[phase_index] = step_re;
+                        state->u.fftdiv.dynamic_step_im[phase_index] = step_im;
+                        double ph_re = cos(theta);
+                        double ph_im = sin(theta);
+                        double div_re_acc = 0.0;
+                        double div_im_acc = 0.0;
+                        double last_re = ph_re;
+                        double last_im = ph_im;
+                        for (int n = 0; n < window_size; ++n) {
+                            double w = window_weights != NULL ? window_weights[n] : 1.0;
+                            phasor_re[n] = ph_re;
+                            phasor_im[n] = ph_im;
+                            if (has_divisor) {
+                                double dw_re = divisor_ring[n] * w;
+                                double dw_im = divisor_imag_ring[n] * w;
+                                div_re_acc += dw_re * ph_re + dw_im * ph_im;
+                                div_im_acc += -dw_re * ph_im + dw_im * ph_re;
+                            }
+                            if (n == window_size - 1) {
+                                last_re = ph_re;
+                                last_im = ph_im;
+                            }
+                            double next_re = ph_re * step_re - ph_im * step_im;
+                            double next_im = ph_re * step_im + ph_im * step_re;
+                            ph_re = next_re;
+                            ph_im = next_im;
+                        }
+                        double theta_next = state->u.fftdiv.dynamic_phase[phase_index] + angle * (double)window_size;
+                        state->u.fftdiv.dynamic_phase[phase_index] = wrap_phase_two_pi(theta_next);
+                        if (!has_divisor) {
+                            div_re_acc = 1.0;
+                            div_im_acc = 0.0;
+                        }
+                        double ratio = clamp_unit_double(fnorm);
+                        double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+                        if (gain < 1e-6) {
+                            gain = 1e-6;
+                        }
+                        double rotated_re = last_re * cos_phase - last_im * sin_phase;
+                        double rotated_im = last_re * sin_phase + last_im * cos_phase;
+                        double scale_re = rotated_re * gain;
+                        double scale_im = rotated_im * gain;
+                        if (has_divisor) {
+                            double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
+                            if (denom < epsilon_frame) {
+                                denom = epsilon_frame;
+                            }
+                            double tmp_re = (scale_re * div_re_acc + scale_im * div_im_acc) / denom;
+                            double tmp_im = (scale_im * div_re_acc - scale_re * div_im_acc) / denom;
+                            scale_re = tmp_re;
+                            scale_im = tmp_im;
+                        }
+                        for (int n = 0; n < window_size; ++n) {
+                            double w = window_weights != NULL ? window_weights[n] : 1.0;
+                            double coeff = inv_window * w * (scale_re * phasor_re[n] + scale_im * phasor_im[n]);
+                            sample_dynamic += coeff * recomb_ring[n];
+                        }
+                    }
+                    buffer[base_index + (size_t)slot] = sample_dynamic;
+                    if (active_count > dynamic_active_frame) {
+                        dynamic_active_frame = active_count;
+                    }
+                    dynamic_sum_frame += carrier_sum_slot;
+                    continue;
+                }
+                buffer[base_index + (size_t)slot] = 0.0;
+            }
+            state->u.fftdiv.dynamic_carrier_band_count = dynamic_active_frame;
+            state->u.fftdiv.dynamic_carrier_last_sum = dynamic_sum_frame;
+            state->u.fftdiv.dynamic_k_active = dynamic_active_frame;
+            state->u.fftdiv.position = window_size > 0 ? window_size - 1 : 0;
+            continue;
         }
         int window_kind = default_window_kind;
         if (window_total > 0U) {
@@ -5190,7 +5560,24 @@ static int run_fft_division_node_backward(
     *out_channels = input_channels;
     if (metrics != NULL) {
         metrics->measured_delay_frames = (uint32_t)(window_size > 0 ? window_size - 1 : 0);
-        metrics->accumulated_heat = 0.0f;
+        double complexity = 0.0;
+        if (state->u.fftdiv.algorithm == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+            complexity = (double)slot_count * (double)state->u.fftdiv.dynamic_k_active * (double)window_size * 8.0;
+        } else if (state->u.fftdiv.algorithm == FFT_ALGORITHM_RADIX2) {
+            double stages = log((double)window_size) / log(2.0);
+            if (stages < 1.0) {
+                stages = 1.0;
+            }
+            complexity = (double)slot_count * (double)window_size * (stages * 6.0 + 4.0);
+        } else {
+            complexity = (double)slot_count * (double)window_size * (double)window_size * 2.0;
+        }
+        float heat = (float)(complexity / 1000.0);
+        if (heat < 0.001f) {
+            heat = 0.001f;
+        }
+        metrics->accumulated_heat = heat;
+        state->u.fftdiv.total_heat += (double)heat;
         metrics->reserved[0] = (float)state->u.fftdiv.last_phase;
         metrics->reserved[1] = (float)state->u.fftdiv.last_lower;
         metrics->reserved[2] = (float)state->u.fftdiv.last_upper;
