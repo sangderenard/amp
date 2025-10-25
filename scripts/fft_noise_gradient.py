@@ -88,6 +88,11 @@ def main() -> None:
     parser.add_argument("--blob", type=Path, default=Path("build") / "fft_noise_params.bin", help="Parameter blob output")
     parser.add_argument("--output", type=Path, default=Path("output.wav"), help="Destination WAV file")
     parser.add_argument("--build-root", type=Path, default=Path("build"), help="Root directory that contains the native build outputs")
+    parser.add_argument(
+        "--algorithm",
+        choices=("radix2", "dft", "nufft", "czt", "dynamic_oscillators"),
+        help="Override the FFTDivisionNode algorithm used by the native renderer",
+    )
     args = parser.parse_args()
 
     params = generate_parameters(args.frames, args.window, seed=args.seed)
@@ -101,6 +106,8 @@ def main() -> None:
         "--output",
         str(args.output),
     ]
+    if args.algorithm:
+        cmd.extend(["--algorithm", args.algorithm])
     env = os.environ.copy()
     print(f"[fft_noise_gradient] invoking native renderer: {' '.join(cmd)}")
     subprocess.run(cmd, check=True, env=env)

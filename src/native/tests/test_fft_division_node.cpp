@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -18,6 +19,8 @@ constexpr int FFT_ALGORITHM_DFT = 1;
 constexpr int FFT_ALGORITHM_NUFFT = 2;
 constexpr int FFT_ALGORITHM_CZT = 3;
 constexpr int FFT_ALGORITHM_DYNAMIC_OSCILLATORS = 4;
+
+constexpr int FFT_DYNAMIC_CARRIER_LIMIT = 64;
 
 constexpr int FFT_WINDOW_RECTANGULAR = 0;
 constexpr int FFT_WINDOW_HANN = 1;
@@ -136,6 +139,14 @@ double clamp_unit_double(double value) {
         return 1.0;
     }
     return value;
+}
+
+double wrap_phase_two_pi(double phase) {
+    double wrapped = std::fmod(phase, 2.0 * M_PI);
+    if (wrapped < 0.0) {
+        wrapped += 2.0 * M_PI;
+    }
+    return wrapped;
 }
 
 double compute_band_gain(double ratio, double lower, double upper, double intensity) {
@@ -257,6 +268,36 @@ void compute_dft(std::vector<double> &real, std::vector<double> &imag, int inver
     imag.swap(out_imag);
 }
 
+// Mirrors the native `compute_dft` helper when callers alias the input and output
+// buffers. The runtime relies on this behaviour for the dynamic oscillator path,
+// so the simulator must reproduce the same destructive updates to stay in lockstep.
+void compute_dft_inplace_alias(std::vector<double> &real, std::vector<double> &imag, int inverse) {
+    const int n = static_cast<int>(real.size());
+    if (n <= 0) {
+        return;
+    }
+    double sign = inverse != 0 ? 1.0 : -1.0;
+    for (int k = 0; k < n; ++k) {
+        double sum_real = 0.0;
+        double sum_imag = 0.0;
+        for (int t = 0; t < n; ++t) {
+            double angle = sign * 2.0 * M_PI * static_cast<double>(k * t) / static_cast<double>(n);
+            double c = std::cos(angle);
+            double s = std::sin(angle);
+            double in_real = real[t];
+            double in_imag = imag[t];
+            sum_real += in_real * c - in_imag * s;
+            sum_imag += in_real * s + in_imag * c;
+        }
+        if (inverse != 0) {
+            sum_real /= static_cast<double>(n);
+            sum_imag /= static_cast<double>(n);
+        }
+        real[k] = sum_real;
+        imag[k] = sum_imag;
+    }
+}
+
 void fill_window(int window_kind, std::vector<double> &window) {
     const int size = static_cast<int>(window.size());
     if (size <= 0) {
@@ -298,6 +339,7 @@ std::vector<double> simulate_fft_division(
     const std::vector<double> &lower,
     const std::vector<double> &upper,
     const std::vector<double> &filter,
+    const std::vector<std::vector<double>> &dynamic_carriers,
     int window_size,
     double epsilon_default,
     int default_algorithm,
@@ -312,8 +354,10 @@ std::vector<double> simulate_fft_division(
     std::vector<double> upper_buf(window_size, 1.0);
     std::vector<double> filter_buf(window_size, 1.0);
     std::vector<double> window(window_size, 1.0);
+    std::vector<double> dynamic_phase(FFT_DYNAMIC_CARRIER_LIMIT, 0.0);
     int current_window_kind = -1;
     int filled = 0;
+    const double sample_rate_hz = 48000.0;
 
     auto forward_transform = [&](int algorithm, std::vector<double> &real, std::vector<double> &imag) {
         if (algorithm == FFT_ALGORITHM_RADIX2) {
@@ -416,10 +460,10 @@ std::vector<double> simulate_fft_division(
         std::vector<double> signal_imag(window_size, 0.0);
         std::vector<double> divisor_real_fft(window_size, 0.0);
         std::vector<double> divisor_imag_fft(window_size, 0.0);
-        double phase_mod = phase_buf[window_size - 1];
-        double lower_mod = lower_buf[window_size - 1];
-        double upper_mod = upper_buf[window_size - 1];
-        double filter_mod = filter_buf[window_size - 1];
+        double phase_mod = phase_buf[window_size > 0 ? window_size - 1 : 0];
+        double lower_mod = lower_buf[window_size > 0 ? window_size - 1 : 0];
+        double upper_mod = upper_buf[window_size > 0 ? window_size - 1 : 0];
+        double filter_mod = filter_buf[window_size > 0 ? window_size - 1 : 0];
         double lower_clamped = clamp_unit_double(lower_mod);
         double upper_clamped = clamp_unit_double(upper_mod);
         if (upper_clamped < lower_clamped) {
@@ -428,6 +472,88 @@ std::vector<double> simulate_fft_division(
         double intensity_clamped = clamp_unit_double(filter_mod);
         double cos_phase = std::cos(phase_mod);
         double sin_phase = std::sin(phase_mod);
+
+        if (algorithm == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+            std::vector<double> carrier_fnorms;
+            std::vector<int> carrier_indices;
+            carrier_fnorms.reserve(dynamic_carriers.size());
+            carrier_indices.reserve(dynamic_carriers.size());
+            for (size_t idx = 0; idx < dynamic_carriers.size() && idx < static_cast<size_t>(FFT_DYNAMIC_CARRIER_LIMIT); ++idx) {
+                const auto &series = dynamic_carriers[idx];
+                if (series.empty()) {
+                    continue;
+                }
+                double raw_value = frame < static_cast<int>(series.size()) ? series[frame] : series.back();
+                double normalized = raw_value;
+                if (sample_rate_hz > 0.0 && std::fabs(normalized) > 1.0) {
+                    normalized = raw_value / sample_rate_hz;
+                }
+                normalized = clamp_unit_double(normalized);
+                carrier_fnorms.push_back(normalized);
+                carrier_indices.push_back(static_cast<int>(idx));
+            }
+            double sample_dynamic = 0.0;
+            if (!carrier_indices.empty()) {
+                double inv_window = window_size > 0 ? 1.0 / static_cast<double>(window_size) : 1.0;
+                bool has_divisor = !divisor_real.empty() || !divisor_imag.empty();
+                for (size_t k = 0; k < carrier_indices.size(); ++k) {
+                    size_t carrier_index = static_cast<size_t>(carrier_indices[k]);
+                    double theta = dynamic_phase[carrier_index];
+                    double ph_re = std::cos(theta);
+                    double ph_im = std::sin(theta);
+                    double fnorm = carrier_fnorms[k];
+                    double angle = 2.0 * M_PI * fnorm;
+                    double step_re = std::cos(angle);
+                    double step_im = std::sin(angle);
+                    double coeff_re = 0.0;
+                    double coeff_im = 0.0;
+                    double div_re_acc = 0.0;
+                    double div_im_acc = 0.0;
+                    double last_re = ph_re;
+                    double last_im = ph_im;
+                    for (int n = 0; n < window_size; ++n) {
+                        double w = window[n];
+                        double xw = buffer[n] * w;
+                        coeff_re += xw * ph_re;
+                        coeff_im -= xw * ph_im;
+                        if (has_divisor) {
+                            double dw_re = divisor_buf[n] * w;
+                            double dw_im = divisor_imag_buf[n] * w;
+                            div_re_acc += dw_re * ph_re + dw_im * ph_im;
+                            div_im_acc += -dw_re * ph_im + dw_im * ph_re;
+                        }
+                        if (n == window_size - 1) {
+                            last_re = ph_re;
+                            last_im = ph_im;
+                        }
+                        double next_re = ph_re * step_re - ph_im * step_im;
+                        double next_im = ph_re * step_im + ph_im * step_re;
+                        ph_re = next_re;
+                        ph_im = next_im;
+                    }
+                    dynamic_phase[carrier_index] = wrap_phase_two_pi(std::atan2(ph_im, ph_re));
+                    if (has_divisor) {
+                        double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
+                        if (denom < epsilon) {
+                            denom = epsilon;
+                        }
+                        double real_tmp = (coeff_re * div_re_acc + coeff_im * div_im_acc) / denom;
+                        double imag_tmp = (coeff_im * div_re_acc - coeff_re * div_im_acc) / denom;
+                        coeff_re = real_tmp;
+                        coeff_im = imag_tmp;
+                    }
+                    double ratio = clamp_unit_double(fnorm);
+                    double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+                    double gated_re = coeff_re * gain;
+                    double gated_im = coeff_im * gain;
+                    double rotated_re = gated_re * cos_phase - gated_im * sin_phase;
+                    double rotated_im = gated_re * sin_phase + gated_im * cos_phase;
+                    sample_dynamic += (rotated_re * last_re - rotated_im * last_im) * inv_window;
+                }
+            }
+            output[frame] = sample_dynamic;
+            continue;
+        }
 
         for (int i = 0; i < window_size; ++i) {
             double w = window[i];
@@ -620,6 +746,8 @@ int main() {
         carrier_band0
     };
 
+    std::vector<std::vector<double>> dynamic_carriers{carrier_band0};
+
     char fft_params[256];
     std::snprintf(
         fft_params,
@@ -654,6 +782,7 @@ int main() {
         lower_metadata,
         upper_metadata,
         filter_metadata,
+        dynamic_carriers,
         kWindowSize,
         1e-9,
         FFT_ALGORITHM_RADIX2,
@@ -798,6 +927,8 @@ int main() {
         ) == 0
     );
 
+    std::vector<std::vector<double>> dynamic_override_carriers{carrier_override};
+
     std::vector<double> expected_dynamic = simulate_fft_division(
         signal,
         divisor_real,
@@ -809,6 +940,7 @@ int main() {
         lower_metadata,
         upper_metadata,
         filter_metadata,
+        dynamic_override_carriers,
         kWindowSize,
         1e-9,
         FFT_ALGORITHM_RADIX2,
@@ -887,6 +1019,7 @@ int main() {
         lower_metadata,
         upper_metadata,
         filter_metadata,
+        dynamic_carriers,
         kWindowSize,
         1e-9,
         FFT_ALGORITHM_RADIX2,
@@ -1000,6 +1133,7 @@ int main() {
         custom_lower,
         custom_upper,
         custom_filter,
+        {},
         kWindowSize,
         1e-9,
         FFT_ALGORITHM_RADIX2,

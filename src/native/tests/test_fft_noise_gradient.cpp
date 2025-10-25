@@ -126,19 +126,23 @@ void generate_default_gradient(uint32_t frames, uint32_t window_size, GradientDa
     }
 }
 
-std::vector<double> run_fft_backward(const GradientData &data) {
+std::vector<double> run_fft_backward(const GradientData &data, const std::string &algorithm_override) {
     if (data.frames == 0U || data.window_size == 0U) {
         std::fprintf(stderr, "GradientData not initialised\n");
         return {};
     }
     const std::string name = "fft_noise";
     const std::string type_name = "FFTDivisionNode";
-    const std::string params_json = std::string("{\"window_size\":") +
+    std::string params_json = std::string("{\"window_size\":") +
         std::to_string(data.window_size) +
         ",\"stabilizer\":1e-9,\"epsilon\":1e-9,\"declared_delay\":" +
         std::to_string(data.window_size > 0 ? data.window_size - 1U : 0U) +
         ",\"oversample_ratio\":" + std::to_string(data.oversample_ratio) +
-        ",\"supports_v2\":true}";
+        ",\"supports_v2\":true";
+    if (!algorithm_override.empty()) {
+        params_json += ",\"algorithm\":\"" + algorithm_override + "\"";
+    }
+    params_json += "}";
 
     EdgeRunnerNodeDescriptor descriptor{};
     descriptor.name = name.c_str();
@@ -302,6 +306,7 @@ struct Arguments {
     std::filesystem::path output_wav{"output.wav"};
     uint32_t frames{32768};
     uint32_t window_size{1024};
+    std::string algorithm;
 };
 
 Arguments parse_arguments(int argc, char **argv) {
@@ -322,6 +327,10 @@ Arguments parse_arguments(int argc, char **argv) {
         }
         if (current == "--window" && i + 1 < argc) {
             args.window_size = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+            continue;
+        }
+        if (current == "--algorithm" && i + 1 < argc) {
+            args.algorithm = std::string(argv[++i]);
             continue;
         }
     }
@@ -348,7 +357,7 @@ int main(int argc, char **argv) {
         generate_default_gradient(args.frames, args.window_size, gradient);
     }
 
-    auto samples = run_fft_backward(gradient);
+    auto samples = run_fft_backward(gradient, args.algorithm);
     if (samples.empty()) {
         std::fprintf(stderr, "FFT gradient synthesis failed\n");
         return 3;
