@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__cplusplus)
+#include <Eigen/Dense>
+#endif
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #endif
@@ -2060,6 +2063,7 @@ typedef enum {
     NODE_KIND_DRIVER,
     NODE_KIND_SUBHARM,
     NODE_KIND_FFT_DIV,
+    NODE_KIND_SPECTRAL_DRIVE,
 } node_kind_t;
 
 typedef struct {
@@ -2197,6 +2201,9 @@ typedef struct {
             int enable_remainder;
             double remainder_energy;
         } fftdiv;
+        struct {
+            int mode;
+        } spectral_drive;
     } u;
 } node_state_t;
 
@@ -2433,6 +2440,10 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "FFTDivisionNode") == 0) {
         return NODE_KIND_FFT_DIV;
+    }
+    if (strcmp(descriptor->type_name, "SpectralDriveNode") == 0
+        || strcmp(descriptor->type_name, "spectral_drive") == 0) {
+        return NODE_KIND_SPECTRAL_DRIVE;
     }
     return NODE_KIND_UNKNOWN;
 }
@@ -3767,6 +3778,10 @@ static int run_controller_node(
     char (*output_names)[64] = NULL;
     controller_source_t *mappings = NULL;
     int output_count = 0;
+    int mapping_count = 0;
+    int resolved_channels = 0;
+    size_t total = 0;
+    double *buffer = NULL;
     int _rc = -1;
     size_t outputs_cap = 256;
     size_t sources_cap = 512;
@@ -3822,11 +3837,10 @@ static int run_controller_node(
         _rc = -1;
         goto cleanup_run_controller_node;
     }
-    int mapping_count = 0;
     if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_sources__", sources_csv, sources_cap)) {
         mapping_count = parse_controller_sources(sources_csv, mappings, 32);
     }
-    int resolved_channels = output_count;
+    resolved_channels = output_count;
     if (inputs != NULL && inputs->params.count > 0) {
         const EdgeRunnerParamView *view = &inputs->params.items[0];
         if (batches <= 0 && view->batches > 0) {
@@ -3842,8 +3856,8 @@ static int run_controller_node(
     if (frames <= 0) {
         frames = 1;
     }
-    size_t total = (size_t)batches * (size_t)resolved_channels * (size_t)frames;
-    double *buffer = (double *)malloc(total * sizeof(double));
+    total = (size_t)batches * (size_t)resolved_channels * (size_t)frames;
+    buffer = (double *)malloc(total * sizeof(double));
     amp_last_alloc_count = total;
     if (buffer == NULL) {
         _rc = -1;
@@ -4257,30 +4271,41 @@ static int run_pitch_node(
         free(owned_span);
         return -1;
     }
-    for (int b = 0; b < B; ++b) {
-        for (int f = 0; f < F; ++f) {
-            size_t idx = (size_t)b * (size_t)F + (size_t)f;
-            double ctrl_scaled = ctrl[idx] * span[idx];
-            double root_midi = root[idx];
-            double root_freq = 440.0 * pow(2.0, (root_midi - 69.0) / 12.0);
-            double cents = 0.0;
-            if (is_free_mode) {
-                if (strcmp(variant_buf, "weighted") == 0) {
-                    double u = ctrl_scaled * (double)grid_size;
-                    cents = grid_warp_inverse_value(u, grid_sorted_vals, grid_ext, grid_size);
-                } else if (strcmp(variant_buf, "stepped") == 0) {
-                    double u = round(ctrl_scaled * (double)grid_size);
-                    cents = grid_warp_inverse_value(u, grid_sorted_vals, grid_ext, grid_size);
+    using RowArrayXXd = Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    Eigen::Map<const RowArrayXXd> ctrl_map(ctrl, B, F);
+    Eigen::Map<const RowArrayXXd> span_map(span, B, F);
+    Eigen::Map<const RowArrayXXd> root_map(root, B, F);
+    RowArrayXXd ctrl_scaled = ctrl_map * span_map;
+    RowArrayXXd root_freq_array = ((root_map - 69.0) / 12.0 * M_LN2).exp() * 440.0;
+    Eigen::Map<RowArrayXXd> freq_target_map(freq_target, B, F);
+    int variant_weighted = strcmp(variant_buf, "weighted") == 0;
+    int variant_stepped = strcmp(variant_buf, "stepped") == 0;
+    if (is_free_mode && !variant_weighted && !variant_stepped) {
+        RowArrayXXd cents = ctrl_scaled * 1200.0;
+        freq_target_map = root_freq_array * ((cents / 1200.0 * M_LN2).exp());
+    } else {
+        for (int b = 0; b < B; ++b) {
+            for (int f = 0; f < F; ++f) {
+                double ctrl_scaled_val = ctrl_scaled(b, f);
+                double cents = 0.0;
+                if (is_free_mode) {
+                    if (variant_weighted) {
+                        double u = ctrl_scaled_val * (double)grid_size;
+                        cents = grid_warp_inverse_value(u, grid_sorted_vals, grid_ext, grid_size);
+                    } else if (variant_stepped) {
+                        double u = round(ctrl_scaled_val * (double)grid_size);
+                        cents = grid_warp_inverse_value(u, grid_sorted_vals, grid_ext, grid_size);
+                    } else {
+                        cents = ctrl_scaled_val * 1200.0;
+                    }
                 } else {
-                    cents = ctrl_scaled * 1200.0;
+                    double cents_unq = ctrl_scaled_val * 1200.0;
+                    double u = grid_warp_forward_value(cents_unq, grid_sorted_vals, grid_ext, grid_size);
+                    double u_round = round(u);
+                    cents = grid_warp_inverse_value(u_round, grid_sorted_vals, grid_ext, grid_size);
                 }
-            } else {
-                double cents_unq = ctrl_scaled * 1200.0;
-                double u = grid_warp_forward_value(cents_unq, grid_sorted_vals, grid_ext, grid_size);
-                double u_round = round(u);
-                cents = grid_warp_inverse_value(u_round, grid_sorted_vals, grid_ext, grid_size);
+                freq_target_map(b, f) = root_freq_array(b, f) * exp((cents / 1200.0) * M_LN2);
             }
-            freq_target[idx] = root_freq * pow(2.0, cents / 1200.0);
         }
     }
     free(owned_input);
@@ -4303,14 +4328,19 @@ static int run_pitch_node(
             free(output);
             return -1;
         }
+        Eigen::ArrayXd t_values;
+        if (F > 1) {
+            double t_last = (double)(F - 1) / (double)F;
+            t_values = Eigen::ArrayXd::LinSpaced(F, 0.0, t_last);
+        } else {
+            t_values = Eigen::ArrayXd::Zero(1);
+        }
+        Eigen::ArrayXd hermite = 3.0 * t_values.square() - 2.0 * t_values.cube();
         for (int b = 0; b < B; ++b) {
             double y0 = state->u.pitch.last_freq[b];
-            double y1 = freq_target[(size_t)b * (size_t)F + (size_t)(F - 1)];
-            for (int f = 0; f < F; ++f) {
-                double t = (double)f / (double)F;
-                double ramp = 3.0 * t * t - 2.0 * t * t * t;
-                output[(size_t)b * (size_t)F + (size_t)f] = y0 + (y1 - y0) * ramp;
-            }
+            double y1 = freq_target_map(b, F - 1);
+            Eigen::Map<Eigen::Array<double, Eigen::Dynamic, 1>> out_row(output + (size_t)b * (size_t)F, F);
+            out_row = hermite * (y1 - y0) + y0;
             state->u.pitch.last_freq[b] = y1;
         }
     } else {
@@ -4427,27 +4457,43 @@ static int run_oscillator_pitch_node(
         return -1;
     }
 
+    using RowArrayXXd = Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    RowArrayXXd target_array(B, F);
+    if (has_direct && pitch_curve != NULL) {
+        Eigen::Map<const RowArrayXXd> pitch_map(pitch_curve, B, F);
+        target_array = pitch_map;
+    } else if (!has_direct && root_curve != NULL && offset_curve != NULL) {
+        Eigen::Map<const RowArrayXXd> root_map(root_curve, B, F);
+        Eigen::Map<const RowArrayXXd> offset_map(offset_curve, B, F);
+        target_array = root_map * ((offset_map / 1200.0 * M_LN2).exp());
+    } else {
+        target_array.setZero();
+    }
+    if (add_curve != NULL) {
+        Eigen::Map<const RowArrayXXd> add_map(add_curve, B, F);
+        target_array += add_map;
+    }
+    target_array = target_array.max(min_freq);
+    double default_limit = default_slew > 0.0 ? default_slew / sample_rate : 0.0;
+    RowArrayXXd limit_array = RowArrayXXd::Constant(B, F, default_limit);
+    if (slew_curve != NULL) {
+        Eigen::Map<const RowArrayXXd> slew_map(slew_curve, B, F);
+        limit_array = slew_map.unaryExpr([sample_rate](double per_sec) {
+            if (per_sec <= 0.0) {
+                return 0.0;
+            }
+            return per_sec / sample_rate;
+        });
+    }
     for (int b = 0; b < B; ++b) {
         double current = state->u.osc_pitch.last_value[b];
         size_t base = (size_t)b * (size_t)F;
+        auto target_row = target_array.row(b);
+        auto limit_row = limit_array.row(b);
         for (int f = 0; f < F; ++f) {
             size_t idx = base + (size_t)f;
-            double target;
-            if (has_direct) {
-                target = pitch_curve[idx];
-            } else {
-                double cents = offset_curve[idx];
-                target = root_curve[idx] * pow(2.0, cents / 1200.0);
-            }
-            target += add_curve != NULL ? add_curve[idx] : 0.0;
-            if (target < min_freq) {
-                target = min_freq;
-            }
-            double per_sec = slew_curve != NULL ? slew_curve[idx] : default_slew;
-            if (per_sec < 0.0) {
-                per_sec = 0.0;
-            }
-            double limit = per_sec > 0.0 ? per_sec / sample_rate : 0.0;
+            double target = target_row(f);
+            double limit = limit_row(f);
             if (limit > 0.0) {
                 double delta = target - current;
                 if (delta > limit) {
@@ -4820,26 +4866,30 @@ static int run_osc_node(
             double op_state = state->u.osc.op_amp_state != NULL ? state->u.osc.op_amp_state[b] : 0.0;
             size_t base_wave = (size_t)b * (size_t)F;
             size_t base_driver = ((size_t)b * (size_t)driver_channels) * (size_t)F;
+            Eigen::ArrayXd target_row = Eigen::ArrayXd::Zero(F);
+            if (driver_data != NULL) {
+                if (driver_channels == 1) {
+                    Eigen::Map<const Eigen::Array<double, Eigen::Dynamic, 1>> driver_vec(
+                        driver_data + base_driver,
+                        F
+                    );
+                    target_row = driver_vec;
+                } else {
+                    using RowMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+                    Eigen::Map<const RowMatrixXd> driver_block(driver_data + base_driver, driver_channels, F);
+                    target_row = driver_block.colwise().mean().transpose().array();
+                }
+            }
+            Eigen::ArrayXd slew_row = Eigen::ArrayXd::Constant(F, per_sample_default);
+            if (slew_curve != NULL) {
+                Eigen::Map<const Eigen::Array<double, Eigen::Dynamic, 1>> slew_vec(slew_curve + base_wave, F);
+                slew_row = slew_vec.unaryExpr([per_sample_default, sample_rate](double candidate) {
+                    return candidate >= 0.0 ? candidate / sample_rate : per_sample_default;
+                });
+            }
             for (int f = 0; f < F; ++f) {
-                double target = 0.0;
-                if (driver_data != NULL) {
-                    if (driver_channels == 1) {
-                        target = driver_data[base_driver + (size_t)f];
-                    } else {
-                        size_t offset = base_driver + (size_t)f;
-                        for (int c = 0; c < driver_channels; ++c) {
-                            target += driver_data[offset + (size_t)c * (size_t)F];
-                        }
-                        target /= (double)driver_channels;
-                    }
-                }
-                double per_sample_slew = per_sample_default;
-                if (slew_curve != NULL) {
-                    double candidate = slew_curve[base_wave + (size_t)f];
-                    if (candidate >= 0.0) {
-                        per_sample_slew = candidate / sample_rate;
-                    }
-                }
+                double target = target_row[f];
+                double per_sample_slew = slew_row[f];
                 double delta = target - op_state;
                 if (per_sample_slew > 0.0) {
                     if (delta > per_sample_slew) delta = per_sample_slew;
@@ -7021,6 +7071,9 @@ static int amp_run_node_impl(
                     metrics
                 );
             }
+            break;
+        case NODE_KIND_SPECTRAL_DRIVE:
+            rc = AMP_E_UNSUPPORTED;
             break;
         default:
             rc = -3;
