@@ -15,6 +15,9 @@ namespace {
 
 constexpr int FFT_ALGORITHM_RADIX2 = 0;
 constexpr int FFT_ALGORITHM_DFT = 1;
+constexpr int FFT_ALGORITHM_NUFFT = 2;
+constexpr int FFT_ALGORITHM_CZT = 3;
+constexpr int FFT_ALGORITHM_DYNAMIC_OSCILLATORS = 4;
 
 constexpr int FFT_WINDOW_RECTANGULAR = 0;
 constexpr int FFT_WINDOW_HANN = 1;
@@ -100,8 +103,15 @@ int round_to_int(double value) {
 }
 
 int clamp_algorithm_kind(int kind) {
-    if (kind == FFT_ALGORITHM_DFT) {
-        return FFT_ALGORITHM_DFT;
+    switch (kind) {
+        case FFT_ALGORITHM_RADIX2:
+        case FFT_ALGORITHM_DFT:
+        case FFT_ALGORITHM_NUFFT:
+        case FFT_ALGORITHM_CZT:
+        case FFT_ALGORITHM_DYNAMIC_OSCILLATORS:
+            return kind;
+        default:
+            break;
     }
     return FFT_ALGORITHM_RADIX2;
 }
@@ -305,6 +315,22 @@ std::vector<double> simulate_fft_division(
     int current_window_kind = -1;
     int filled = 0;
 
+    auto forward_transform = [&](int algorithm, std::vector<double> &real, std::vector<double> &imag) {
+        if (algorithm == FFT_ALGORITHM_RADIX2) {
+            compute_fft_radix2(real, imag, 0);
+        } else {
+            compute_dft(real, imag, 0);
+        }
+    };
+
+    auto inverse_transform = [&](int algorithm, std::vector<double> &real, std::vector<double> &imag) {
+        if (algorithm == FFT_ALGORITHM_RADIX2) {
+            compute_fft_radix2(real, imag, 1);
+        } else {
+            compute_dft(real, imag, 1);
+        }
+    };
+
     std::vector<double> output(frames, 0.0);
     for (int frame = 0; frame < frames; ++frame) {
         double epsilon = epsilon_default;
@@ -411,13 +437,8 @@ std::vector<double> simulate_fft_division(
             divisor_imag_fft[i] = divisor_imag_buf[i] * w;
         }
 
-        if (algorithm == FFT_ALGORITHM_RADIX2) {
-            compute_fft_radix2(signal_real, signal_imag, 0);
-            compute_fft_radix2(divisor_real_fft, divisor_imag_fft, 0);
-        } else {
-            compute_dft(signal_real, signal_imag, 0);
-            compute_dft(divisor_real_fft, divisor_imag_fft, 0);
-        }
+        forward_transform(algorithm, signal_real, signal_imag);
+        forward_transform(algorithm, divisor_real_fft, divisor_imag_fft);
 
         for (int i = 0; i < window_size; ++i) {
             double a = signal_real[i];
@@ -440,11 +461,7 @@ std::vector<double> simulate_fft_division(
             signal_imag[i] = rotated_imag;
         }
 
-        if (algorithm == FFT_ALGORITHM_RADIX2) {
-            compute_fft_radix2(signal_real, signal_imag, 1);
-        } else {
-            compute_dft(signal_real, signal_imag, 1);
-        }
+        inverse_transform(algorithm, signal_real, signal_imag);
 
         output[frame] = signal_real[window_size - 1];
     }
@@ -480,6 +497,7 @@ int main() {
     std::vector<double> lower_metadata(kFrames, 0.0);
     std::vector<double> upper_metadata(kFrames, 1.0);
     std::vector<double> filter_metadata(kFrames, 1.0);
+    std::vector<double> carrier_band0(kFrames, 0.5);
 
     auto verify_frames = [&](const double *actual, const std::vector<double> &expected, const char *label) {
         for (int i = 0; i < kFrames; ++i) {
@@ -594,6 +612,13 @@ int main() {
         static_cast<uint32_t>(kFrames),
         filter_metadata
     };
+    ParamDescriptor carrier_band_param{
+        "carrier_band_0",
+        1U,
+        1U,
+        static_cast<uint32_t>(kFrames),
+        carrier_band0
+    };
 
     char fft_params[256];
     std::snprintf(
@@ -611,7 +636,7 @@ int main() {
         "FFTDivisionNode",
         {"signal"},
         fft_params,
-        {divisor_param, divisor_imag_param, algorithm_param, window_param, stabilizer_param, phase_param, lower_param, upper_param, filter_param}
+        {divisor_param, divisor_imag_param, algorithm_param, window_param, stabilizer_param, phase_param, lower_param, upper_param, filter_param, carrier_band_param}
     );
 
     AmpGraphRuntime *runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
@@ -729,6 +754,91 @@ int main() {
     assert(summary_dft.has_metrics == 1);
     assert(summary_dft.metrics.accumulated_heat > 0.0f);
     assert(summary_dft.metrics.accumulated_heat < summary_fft.metrics.accumulated_heat);
+
+    amp_graph_runtime_buffer_free(out_buffer);
+    out_buffer = nullptr;
+    amp_graph_runtime_destroy(runtime);
+    runtime = nullptr;
+
+    // Override algorithm selector to dynamic oscillator stub and verify the skeleton path behaves like the DFT fallback.
+    runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
+    assert(runtime != nullptr);
+    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
+
+    std::vector<int> algorithm_selector_dynamic(kFrames, FFT_ALGORITHM_DYNAMIC_OSCILLATORS);
+    std::vector<double> algorithm_selector_param_dynamic(
+        kFrames,
+        static_cast<double>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)
+    );
+    std::vector<double> carrier_override(kFrames, 0.25);
+    for (int i = 0; i < kFrames; ++i) {
+        carrier_override[i] = 0.1 + 0.05 * static_cast<double>(i);
+    }
+
+    assert(
+        amp_graph_runtime_set_param(
+            runtime,
+            "fft_divider",
+            "algorithm_selector",
+            algorithm_selector_param_dynamic.data(),
+            1U,
+            1U,
+            static_cast<uint32_t>(kFrames)
+        ) == 0
+    );
+    assert(
+        amp_graph_runtime_set_param(
+            runtime,
+            "fft_divider",
+            "carrier_band_0",
+            carrier_override.data(),
+            1U,
+            1U,
+            static_cast<uint32_t>(kFrames)
+        ) == 0
+    );
+
+    std::vector<double> expected_dynamic = simulate_fft_division(
+        signal,
+        divisor_real,
+        divisor_imag,
+        algorithm_selector_dynamic,
+        window_selector,
+        stabilizer,
+        phase_metadata,
+        lower_metadata,
+        upper_metadata,
+        filter_metadata,
+        kWindowSize,
+        1e-9,
+        FFT_ALGORITHM_RADIX2,
+        FFT_WINDOW_HANN
+    );
+
+    exec_rc = amp_graph_runtime_execute(
+        runtime,
+        nullptr,
+        0U,
+        kFrames,
+        48000.0,
+        &out_buffer,
+        &out_batches,
+        &out_channels,
+        &out_frames
+    );
+    assert(exec_rc == 0);
+    assert(out_buffer != nullptr);
+    assert(out_batches == 1U);
+    assert(out_channels == 1U);
+    assert(out_frames == static_cast<uint32_t>(kFrames));
+    verify_frames(out_buffer, expected_dynamic, "fft_dynamic_stub");
+
+    AmpGraphNodeSummary summary_dynamic{};
+    describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dynamic);
+    assert(describe_rc == 0);
+    assert(summary_dynamic.has_metrics == 1);
+    assert(summary_dynamic.metrics.accumulated_heat > 0.0f);
+    assert(std::fabs(summary_dynamic.metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
 
     amp_graph_runtime_buffer_free(out_buffer);
     out_buffer = nullptr;

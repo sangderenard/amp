@@ -12,7 +12,16 @@ runtime; no Python fallbacks are provided or allowed under project policy.
   `window_size`, per-frame `epsilon` stabiliser, and default FFT/window algorithms before
   touching the work buffers. Non-positive window sizes are clamped to one frame, epsilon values
   are floored to `1e-12`, and a non power-of-two size automatically falls back to the slower
-  direct DFT path.【F:src/native/amp_kernels.c†L4147-L4224】
+  direct DFT path.【F:src/native/amp_kernels.c†L4385-L4574】
+* **Algorithm scaffolding** – The selector now recognises `"nufft"`, `"czt"`, and
+  `"dynamic"` (dynamic oscillator synthesis) in addition to the existing radix-2 FFT and
+  direct DFT options. The new choices currently reuse the DFT kernels but keep their enum value
+  alive in state/metrics so the specialised implementations can be dropped in later without
+  altering the call surface.【F:src/native/amp_kernels.c†L2759-L2839】【F:src/native/amp_kernels.c†L3049-L3155】【F:src/native/tests/test_fft_division_node.cpp†L312-L360】
+* **Dynamic carrier summary** – When the dynamic oscillator algorithm is selected the node scans
+  for `carrier_band_{index}` parameter streams, records how many bands were provided, and stores a
+  simple aggregate so future oscillator nodes can contribute per-band carriers without changing
+  the runtime interface.【F:src/native/amp_kernels.c†L2759-L2839】【F:src/native/amp_kernels.c†L4385-L4574】
 * **Parameter inputs** – The node consumes complex divisor taps, optional algorithm/window
   selectors, per-frame stabilisers, phase offsets, and band bounds/intensity controls, all
   retrieved through `EdgeRunnerParamView` wrappers. Slots correspond to `batches × channels` and
@@ -40,8 +49,8 @@ runtime; no Python fallbacks are provided or allowed under project policy.
 ## Arbitrary binning mechanism
 * **Transform core (FFT or DFT)** – Arbitrary bin control always begins from a uniform spectrum.
   Power-of-two windows feed the radix-2 FFT; non power-of-two sizes fall back to the exact direct
-  DFT. No NUFFT-style resampling occurs—the bin grid is whichever transform the window size
-  implies.【F:src/native/amp_kernels.c†L4334-L4358】
+  DFT. The NUFFT/CZT/dynamic modes currently route to the DFT scaffolding until their dedicated
+  kernels land, so the bin grid still follows the selected window size.【F:src/native/amp_kernels.c†L4334-L4387】
 * **Normalised bin coordinate** – After the transform, the code computes `ratio = i /
   (window_size - 1)` for bin index `i`, yielding a fractional position in `[0, 1]` that the UI can
   drive. This coordinate is used only for comparisons; it does not spawn fractional bins on its
@@ -92,7 +101,7 @@ The adjoint closely mirrors the forward pass:
 * The native test suite (`test_fft_division_node.cpp`) verifies that the node reports the declared
   delay, exposes v2 metrics, and retains the most recent metadata in the metrics struct. The same
   harness compares node output to an in-test C++ simulation, covering both FFT and DFT code paths
-  and the arbitrary bin gating controls.【F:src/native/tests/test_fft_division_node.cpp†L598-L677】
+  plus the new dynamic algorithm stub (with carrier metadata) and the arbitrary bin gating controls.【F:src/native/tests/test_fft_division_node.cpp†L598-L773】
 
 ## Audit observations
 * The arbitrary bin control is purely algebraic—no lookup tables or Python fallbacks are involved
