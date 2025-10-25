@@ -25,6 +25,8 @@ if (NOT EXISTS "${EIGEN3_INCLUDE_DIR}/Eigen/Core")
     endif()
 endif()
 
+set_source_files_properties(amp_kernels.c PROPERTIES LANGUAGE CXX)
+
 add_library(amp_native SHARED
     graph_runtime.cpp
     amp_kernels.c

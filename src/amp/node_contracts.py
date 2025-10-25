@@ -134,6 +134,17 @@ def _bootstrap() -> None:
             allow_python_fallback=False,
         )
     )
+    register_node_contract(
+        NodeContract(
+            type_name="SpectralDriveNode",
+            channel_attributes=("channels",),
+            allow_python_fallback=False,
+            notes=(
+                "SpectralDriveNode delegates entirely to the native Eigen-backed"
+                " implementation; Python fallbacks are forbidden."
+            ),
+        )
+    )
 
 
 _bootstrap()

@@ -1408,6 +1408,209 @@ class ParametricDriverNode(Node):
         return out
 
 
+class SpectralDriveNode(Node):
+    """Spectral driver with native-only Eigen backends and three processing modes.
+
+    Ports
+    -----
+    audio_in
+        Broadband PCM slated for spectral manipulation.
+    audio_out
+        Multiband-driven output rendered entirely by the native runtime.
+
+    Notes
+    -----
+    The native implementation uses Eigen vectorisation and either the internal
+    FFT splitter, an RCI-style ladder, or a fast digital filter core depending
+    on ``mode``. Python fallbacks are strictly forbidden; this node exists
+    solely to exercise the C++ runtime.
+    """
+
+    MODE_FFT = "fft_multiband"
+    MODE_RCI = "rci_filter"
+    MODE_FAST = "fast_filter"
+    MODE_CHOICES = (MODE_FFT, MODE_RCI, MODE_FAST)
+
+    DEFAULT_FFT_EDGES = (120.0, 960.0, 6400.0)
+
+    def __init__(self, name: str, params: Mapping[str, object] | None = None) -> None:
+        super().__init__(name)
+        cfg = dict(params or {})
+        mode = str(cfg.get("mode", self.MODE_FFT))
+        if mode not in self.MODE_CHOICES:
+            raise ValueError(
+                f"{self.name}: unsupported mode '{mode}', expected one of {self.MODE_CHOICES}"
+            )
+        cfg["mode"] = mode
+        self._apply_defaults(cfg)
+        self._validate_common(cfg)
+        if mode == self.MODE_FFT:
+            self._validate_fft_mode(cfg)
+        elif mode == self.MODE_RCI:
+            self._validate_rci_mode(cfg)
+        else:
+            self._validate_fast_mode(cfg)
+        self.params.update(cfg)
+        self.oversample_ratio = int(cfg.get("oversample_ratio", 1))
+        self.declared_delay_frames = int(cfg.get("declared_delay_frames", 0))
+
+    def _apply_defaults(self, cfg: dict[str, object]) -> None:
+        mode = cfg["mode"]
+        cfg.setdefault("oversample_ratio", 2 if mode == self.MODE_FFT else 1)
+        cfg.setdefault("declared_delay_frames", 0)
+        if mode == self.MODE_FFT:
+            cfg.setdefault("band_edges", self.DEFAULT_FFT_EDGES)
+            cfg.setdefault("analysis_window", 1024)
+            cfg.setdefault("hop_size", 256)
+            cfg.setdefault("analysis_tap", "fft_division")
+            cfg.setdefault("slew_floor", 2.5e-4)
+            cfg.setdefault("slew_ceiling", 5.0e-2)
+        elif mode == self.MODE_RCI:
+            cfg.setdefault("rci_cutoff", 720.0)
+            cfg.setdefault("rci_q", 0.707)
+            cfg.setdefault("rci_gain", 1.0)
+            cfg.setdefault("rci_series_resistance", 0.0)
+        else:
+            cfg.setdefault("fast_slope", 12.0)
+            cfg.setdefault("fast_drive", 1.0)
+            cfg.setdefault("fast_mix", 1.0)
+            cfg.setdefault("fast_latency", 0)
+
+    def _validate_common(self, cfg: dict[str, object]) -> None:
+        oversample = cfg.get("oversample_ratio", 1)
+        try:
+            oversample_int = int(oversample)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}.oversample_ratio: expected integer >= 1, got {oversample!r}"
+            ) from exc
+        if oversample_int < 1:
+            raise ValueError(f"{self.name}.oversample_ratio: value must be >= 1")
+        cfg["oversample_ratio"] = oversample_int
+
+        delay_value = cfg.get("declared_delay_frames", 0)
+        try:
+            delay_frames = int(delay_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}.declared_delay_frames: expected non-negative integer, got {delay_value!r}"
+            ) from exc
+        if delay_frames < 0:
+            raise ValueError(f"{self.name}.declared_delay_frames: value must be >= 0")
+        cfg["declared_delay_frames"] = delay_frames
+
+    def _validate_fft_mode(self, cfg: dict[str, object]) -> None:
+        band_edges = cfg.get("band_edges", self.DEFAULT_FFT_EDGES)
+        if not isinstance(band_edges, Sequence) or isinstance(band_edges, (str, bytes)):
+            raise TypeError(f"{self.name}.band_edges: expected a sequence of crossover frequencies")
+        try:
+            edges = tuple(float(edge) for edge in band_edges)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{self.name}.band_edges: failed to parse floats from {band_edges!r}") from exc
+        if len(edges) < 1:
+            raise ValueError(f"{self.name}.band_edges: at least one crossover frequency is required")
+        for edge in edges:
+            if edge <= 0.0:
+                raise ValueError(f"{self.name}.band_edges: crossover frequencies must be positive")
+        if any(a >= b for a, b in zip(edges, edges[1:])):
+            raise ValueError(f"{self.name}.band_edges: crossover frequencies must be strictly increasing")
+        cfg["band_edges"] = edges
+
+        analysis_window = cfg.get("analysis_window", 1024)
+        hop_size = cfg.get("hop_size", 256)
+        try:
+            window_size = int(analysis_window)
+            hop = int(hop_size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}: analysis_window ({analysis_window!r}) and hop_size ({hop_size!r}) must be integers"
+            ) from exc
+        if window_size < 8:
+            raise ValueError(f"{self.name}.analysis_window: value must be >= 8")
+        if hop < 1:
+            raise ValueError(f"{self.name}.hop_size: value must be >= 1")
+        cfg["analysis_window"] = window_size
+        cfg["hop_size"] = hop
+
+        tap_name = cfg.get("analysis_tap", "fft_division")
+        if not isinstance(tap_name, str) or not tap_name:
+            raise ValueError(f"{self.name}.analysis_tap: expected non-empty string identifier")
+        cfg["analysis_tap"] = tap_name
+
+        slew_floor = cfg.get("slew_floor", 2.5e-4)
+        slew_ceiling = cfg.get("slew_ceiling", 5.0e-2)
+        try:
+            slew_floor_f = float(slew_floor)
+            slew_ceiling_f = float(slew_ceiling)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}: slew_floor ({slew_floor!r}) and slew_ceiling ({slew_ceiling!r}) must be floats"
+            ) from exc
+        if slew_floor_f < 0.0 or slew_ceiling_f < 0.0:
+            raise ValueError(f"{self.name}: slew limits must be non-negative")
+        if slew_floor_f > slew_ceiling_f:
+            raise ValueError(f"{self.name}: slew_floor must be <= slew_ceiling")
+        cfg["slew_floor"] = slew_floor_f
+        cfg["slew_ceiling"] = slew_ceiling_f
+
+    def _validate_rci_mode(self, cfg: dict[str, object]) -> None:
+        cutoff = cfg.get("rci_cutoff", 720.0)
+        q_value = cfg.get("rci_q", 0.707)
+        gain = cfg.get("rci_gain", 1.0)
+        series_r = cfg.get("rci_series_resistance", 0.0)
+        try:
+            cutoff_f = float(cutoff)
+            q_f = float(q_value)
+            gain_f = float(gain)
+            series_r_f = float(series_r)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}: rci_cutoff ({cutoff!r}), rci_q ({q_value!r}), rci_gain ({gain!r}), and "
+                f"rci_series_resistance ({series_r!r}) must be numeric"
+            ) from exc
+        if cutoff_f <= 0.0:
+            raise ValueError(f"{self.name}.rci_cutoff: value must be > 0")
+        if q_f <= 0.0:
+            raise ValueError(f"{self.name}.rci_q: value must be > 0")
+        if series_r_f < 0.0:
+            raise ValueError(f"{self.name}.rci_series_resistance: value must be >= 0")
+        cfg["rci_cutoff"] = cutoff_f
+        cfg["rci_q"] = q_f
+        cfg["rci_gain"] = gain_f
+        cfg["rci_series_resistance"] = series_r_f
+
+    def _validate_fast_mode(self, cfg: dict[str, object]) -> None:
+        slope = cfg.get("fast_slope", 12.0)
+        drive = cfg.get("fast_drive", 1.0)
+        mix = cfg.get("fast_mix", 1.0)
+        latency = cfg.get("fast_latency", 0)
+        try:
+            slope_f = float(slope)
+            drive_f = float(drive)
+            mix_f = float(mix)
+            latency_i = int(latency)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{self.name}: fast_slope ({slope!r}), fast_drive ({drive!r}), fast_mix ({mix!r}), and "
+                f"fast_latency ({latency!r}) must be numeric"
+            ) from exc
+        if slope_f <= 0.0:
+            raise ValueError(f"{self.name}.fast_slope: value must be > 0")
+        if mix_f < 0.0 or mix_f > 1.0:
+            raise ValueError(f"{self.name}.fast_mix: value must lie in [0.0, 1.0]")
+        if latency_i < 0:
+            raise ValueError(f"{self.name}.fast_latency: value must be >= 0")
+        cfg["fast_slope"] = slope_f
+        cfg["fast_drive"] = drive_f
+        cfg["fast_mix"] = mix_f
+        cfg["fast_latency"] = latency_i
+
+    def process(self, frames, sr, audio_in, mods, params):
+        raise RuntimeError(
+            "SpectralDriveNode must execute via the native runtime; Python fallback is not available."
+        )
+
+
 class ContinuousTimebaseNode(Node):
     """Bridge driver PCM to oscillator control using continuous time-base reconciliation.
 
@@ -1909,6 +2112,8 @@ NODE_TYPES = {
     "OscillatorPitchNode": OscillatorPitchNode,
     "parametric_driver": ParametricDriverNode,
     "ParametricDriverNode": ParametricDriverNode,
+    "spectral_drive": SpectralDriveNode,
+    "SpectralDriveNode": SpectralDriveNode,
     "continuous_timebase": ContinuousTimebaseNode,
     "ContinuousTimebaseNode": ContinuousTimebaseNode,
     "fft_division": FFTDivisionNode,
@@ -1938,6 +2143,7 @@ __all__ = [
     "AmplifierModulatorNode",
     "OscNode",
     "ParametricDriverNode",
+    "SpectralDriveNode",
     "ContinuousTimebaseNode",
     "FFTDivisionNode",
     "MixNode",

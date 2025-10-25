@@ -10,9 +10,19 @@ from __future__ import annotations
 import traceback
 from typing import Optional
 
+import io
+
 import os
 
+if "CXX" not in os.environ:
+    os.environ["CXX"] = "g++"
+if "CC" not in os.environ:
+    os.environ["CC"] = os.environ["CXX"]
+
 import numpy as np
+import shutil
+import tarfile
+import urllib.request
 
 AVAILABLE = False
 _impl = None
@@ -24,6 +34,41 @@ _DIAGNOSTIC_BUILD = os.environ.get("AMP_NATIVE_DIAGNOSTICS_BUILD", "")
 _EXTRA_COMPILE_ARGS: list[str] = []
 if _DIAGNOSTIC_BUILD.lower() in ("1", "true", "yes", "on"):
     _EXTRA_COMPILE_ARGS.append("-DAMP_NATIVE_ENABLE_LOGGING")
+
+if os.name == "nt":
+    _EXTRA_COMPILE_ARGS.extend(["/std:c++17", "/TP"])
+else:
+    _EXTRA_COMPILE_ARGS.append("-std=c++17")
+
+_EXTRA_LINK_ARGS: list[str] = []
+if os.name != "nt":
+    _EXTRA_LINK_ARGS.append("-lstdc++")
+
+_EIGEN_VERSION = "3.4.0"
+_EIGEN_TARBALL_URL = f"https://gitlab.com/libeigen/eigen/-/archive/{_EIGEN_VERSION}/eigen-{_EIGEN_VERSION}.tar.gz"
+
+
+def _prepare_eigen_headers(third_party_dir: Path) -> tuple[Path | None, Optional[str]]:
+    eigen_dir = third_party_dir / "eigen"
+    sentinel = eigen_dir / "Eigen" / "Core"
+    if sentinel.exists():
+        return eigen_dir, None
+    try:
+        third_party_dir.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(_EIGEN_TARBALL_URL) as response:
+            archive_data = response.read()
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
+            tar.extractall(path=third_party_dir)
+        extracted = third_party_dir / f"eigen-{_EIGEN_VERSION}"
+        if extracted.exists():
+            if eigen_dir.exists():
+                shutil.rmtree(eigen_dir)
+            extracted.rename(eigen_dir)
+        if sentinel.exists():
+            return eigen_dir, None
+        return None, f"Eigen headers missing after extraction (expected {sentinel})"
+    except Exception as exc:
+        return None, f"Failed to prepare Eigen headers: {exc}"
 
 try:
     import cffi
@@ -189,13 +234,19 @@ try:
     try:
         native_dir = Path(__file__).resolve().parents[1] / "native"
         include_dir = native_dir / "include"
+        third_party_dir = native_dir.parent.parent / "third_party"
+        eigen_dir, eigen_error = _prepare_eigen_headers(third_party_dir)
+        if eigen_dir is None:
+            raise RuntimeError(eigen_error or "Eigen headers unavailable")
         kernels_source = native_dir / "amp_kernels.c"
         ffi.set_source(
             "_amp_ckernels_cffi",
             '#include "amp_native.h"\n',
             sources=[str(kernels_source)],
-            include_dirs=[str(include_dir)],
+            include_dirs=[str(include_dir), str(eigen_dir)],
             extra_compile_args=_EXTRA_COMPILE_ARGS,
+            extra_link_args=_EXTRA_LINK_ARGS,
+            source_extension=".cc",
         )
         # compile lazy; this will create a module in-place and return its path
         module_path = ffi.compile(verbose=False)
