@@ -2056,6 +2056,7 @@ typedef enum {
     NODE_KIND_ENVELOPE,
     NODE_KIND_PITCH,
     NODE_KIND_OSC,
+    NODE_KIND_DRIVER,
     NODE_KIND_SUBHARM,
     NODE_KIND_FFT_DIV,
 } node_kind_t;
@@ -2088,11 +2089,22 @@ typedef struct {
             double *wave_buffer;
             double *dphi_buffer;
             double *tri_state;
+            double *integrator_state;
+            double *op_amp_state;
             int batches;
             int channels;
             double base_phase;
             int stereo;
+            int driver_channels;
+            int mode;
         } osc;
+        struct {
+            double *phase;
+            double *harmonics;
+            int harmonic_count;
+            int batches;
+            int mode;
+        } driver;
         struct {
             double *slew_state;
             int batches;
@@ -2174,6 +2186,56 @@ typedef struct {
     } u;
 } node_state_t;
 
+typedef enum {
+    OSC_MODE_POLYBLEP = 0,
+    OSC_MODE_INTEGRATOR = 1,
+    OSC_MODE_OP_AMP = 2
+} osc_mode_t;
+
+static int parse_osc_mode(const char *json, size_t json_len, int default_mode) {
+    char buffer[32];
+    if (!json_copy_string(json, json_len, "mode", buffer, sizeof(buffer))) {
+        return default_mode;
+    }
+    for (char *p = buffer; *p != '\0'; ++p) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = (char)(*p - 'A' + 'a');
+        }
+    }
+    if (strcmp(buffer, "integrator") == 0 || strcmp(buffer, "blep_integrator") == 0) {
+        return OSC_MODE_INTEGRATOR;
+    }
+    if (strcmp(buffer, "op_amp") == 0 || strcmp(buffer, "opamp") == 0 || strcmp(buffer, "slew_opamp") == 0) {
+        return OSC_MODE_OP_AMP;
+    }
+    return default_mode;
+}
+
+typedef enum {
+    DRIVER_MODE_QUARTZ = 0,
+    DRIVER_MODE_PIEZO = 1,
+    DRIVER_MODE_CUSTOM = 2
+} driver_mode_t;
+
+static int parse_driver_mode(const char *json, size_t json_len, int default_mode) {
+    char buffer[32];
+    if (!json_copy_string(json, json_len, "mode", buffer, sizeof(buffer))) {
+        return default_mode;
+    }
+    for (char *p = buffer; *p != '\0'; ++p) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = (char)(*p - 'A' + 'a');
+        }
+    }
+    if (strcmp(buffer, "piezo") == 0 || strcmp(buffer, "piezoelectric") == 0) {
+        return DRIVER_MODE_PIEZO;
+    }
+    if (strcmp(buffer, "custom") == 0 || strcmp(buffer, "harmonic") == 0) {
+        return DRIVER_MODE_CUSTOM;
+    }
+    return DRIVER_MODE_QUARTZ;
+}
+
 static void fft_state_free_buffers(node_state_t *state);
 
 static void release_node_state(node_state_t *state) {
@@ -2200,14 +2262,29 @@ static void release_node_state(node_state_t *state) {
         free(state->u.osc.wave_buffer);
         free(state->u.osc.dphi_buffer);
         free(state->u.osc.tri_state);
+        free(state->u.osc.integrator_state);
+        free(state->u.osc.op_amp_state);
         state->u.osc.phase = NULL;
         state->u.osc.phase_buffer = NULL;
         state->u.osc.wave_buffer = NULL;
         state->u.osc.dphi_buffer = NULL;
         state->u.osc.tri_state = NULL;
+        state->u.osc.integrator_state = NULL;
+        state->u.osc.op_amp_state = NULL;
         state->u.osc.batches = 0;
         state->u.osc.channels = 0;
         state->u.osc.stereo = 0;
+        state->u.osc.driver_channels = 0;
+        state->u.osc.mode = OSC_MODE_POLYBLEP;
+    }
+    if (state->kind == NODE_KIND_DRIVER) {
+        free(state->u.driver.phase);
+        free(state->u.driver.harmonics);
+        state->u.driver.phase = NULL;
+        state->u.driver.harmonics = NULL;
+        state->u.driver.harmonic_count = 0;
+        state->u.driver.batches = 0;
+        state->u.driver.mode = DRIVER_MODE_QUARTZ;
     }
     if (state->kind == NODE_KIND_LFO) {
         free(state->u.lfo.slew_state);
@@ -2304,6 +2381,10 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "OscNode") == 0) {
         return NODE_KIND_OSC;
+    }
+    if (strcmp(descriptor->type_name, "ParametricDriverNode") == 0
+        || strcmp(descriptor->type_name, "parametric_driver") == 0) {
+        return NODE_KIND_DRIVER;
     }
     if (strcmp(descriptor->type_name, "SubharmonicLowLifterNode") == 0) {
         return NODE_KIND_SUBHARM;
@@ -4307,99 +4388,253 @@ static int run_osc_node(
     int *out_channels,
     node_state_t *state
 ) {
-    if (out_buffer == NULL || out_channels == NULL || state == NULL) {
+    if (descriptor == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
         return -1;
     }
     if (sample_rate <= 0.0) {
         sample_rate = 48000.0;
     }
+
     char wave_buf[32];
     if (!json_copy_string(descriptor->params_json, descriptor->params_len, "wave", wave_buf, sizeof(wave_buf))) {
         strcpy(wave_buf, "sine");
     }
     int accept_reset = json_get_bool(descriptor->params_json, descriptor->params_len, "accept_reset", 1);
+    int mode = parse_osc_mode(descriptor->params_json, descriptor->params_len, state->u.osc.mode);
+    if (mode < OSC_MODE_POLYBLEP || mode > OSC_MODE_OP_AMP) {
+        mode = OSC_MODE_POLYBLEP;
+    }
+
+    double integration_leak = json_get_double(descriptor->params_json, descriptor->params_len, "integration_leak", 0.9995);
+    if (integration_leak < 0.0) integration_leak = 0.0;
+    if (integration_leak > 0.999999) integration_leak = 0.999999;
+    double integration_gain = json_get_double(descriptor->params_json, descriptor->params_len, "integration_gain", 1.0);
+    double integration_clamp = json_get_double(descriptor->params_json, descriptor->params_len, "integration_clamp", 1.2);
+    if (integration_clamp <= 0.0) integration_clamp = 1.2;
+
+    double base_slew_rate = json_get_double(descriptor->params_json, descriptor->params_len, "slew_rate", 12000.0);
+    if (base_slew_rate < 0.0) base_slew_rate = 0.0;
+    double slew_clamp = json_get_double(descriptor->params_json, descriptor->params_len, "slew_clamp", 1.2);
+    if (slew_clamp <= 0.0) slew_clamp = 1.2;
+
     const EdgeRunnerParamView *freq_view = find_param(inputs, "freq");
+    if (freq_view == NULL) {
+        freq_view = find_param(inputs, "frequency");
+    }
     const EdgeRunnerParamView *amp_view = find_param(inputs, "amp");
+    if (amp_view == NULL) {
+        amp_view = find_param(inputs, "amplitude");
+    }
     const EdgeRunnerParamView *pan_view = find_param(inputs, "pan");
     const EdgeRunnerParamView *reset_view = accept_reset ? find_param(inputs, "reset") : NULL;
+    const EdgeRunnerParamView *phase_offset_view = find_param(inputs, "phase_offset");
+    const EdgeRunnerParamView *frame_delay_view = find_param(inputs, "frame_delay");
+    const EdgeRunnerParamView *slew_view = find_param(inputs, "slew");
+
     int B = batches > 0 ? batches : 1;
     int F = frames > 0 ? frames : 1;
-    if (freq_view != NULL && freq_view->batches > 0) {
-        B = (int)freq_view->batches;
-    }
-    if (freq_view != NULL && freq_view->frames > 0) {
-        F = (int)freq_view->frames;
+    const EdgeRunnerParamView *shape_source = freq_view != NULL ? freq_view : amp_view;
+    if (shape_source != NULL) {
+        if (shape_source->batches > 0) {
+            B = (int)shape_source->batches;
+        }
+        if (shape_source->frames > 0) {
+            F = (int)shape_source->frames;
+        }
     }
     if (B <= 0) B = 1;
     if (F <= 0) F = 1;
+
     double *owned_freq = NULL;
     double *owned_amp = NULL;
     double *owned_pan = NULL;
     double *owned_reset = NULL;
+    double *owned_phase_offset = NULL;
+    double *owned_frame_delay = NULL;
+    double *owned_slew = NULL;
+
     const double *freq = ensure_param_plane(freq_view, B, F, 0.0, &owned_freq);
     const double *amp = ensure_param_plane(amp_view, B, F, 1.0, &owned_amp);
     const double *pan = ensure_param_plane(pan_view, B, F, 0.0, &owned_pan);
     const double *reset = ensure_param_plane(reset_view, B, F, 0.0, &owned_reset);
-    if (freq == NULL || amp == NULL) {
+    const double *phase_offset = ensure_param_plane(phase_offset_view, B, F, 0.0, &owned_phase_offset);
+    const double *frame_delay = ensure_param_plane(frame_delay_view, B, F, 0.0, &owned_frame_delay);
+    const double *slew_curve = ensure_param_plane(slew_view, B, F, -1.0, &owned_slew);
+
+    if ((mode != OSC_MODE_OP_AMP && freq == NULL) || amp == NULL) {
         free(owned_freq);
         free(owned_amp);
         free(owned_pan);
         free(owned_reset);
+        free(owned_phase_offset);
+        free(owned_frame_delay);
+        free(owned_slew);
         return -1;
     }
+
     size_t total = (size_t)B * (size_t)F;
     if (state->u.osc.phase == NULL || state->u.osc.batches != B) {
         free(state->u.osc.phase);
         state->u.osc.phase = (double *)calloc((size_t)B, sizeof(double));
-        state->u.osc.batches = B;
     }
-    if (state->u.osc.phase_buffer == NULL || state->u.osc.batches != B || state->u.osc.channels != 1) {
+    if (state->u.osc.phase_buffer == NULL || state->u.osc.batches != B) {
         free(state->u.osc.phase_buffer);
         state->u.osc.phase_buffer = (double *)malloc(total * sizeof(double));
     }
-    if (state->u.osc.wave_buffer == NULL || state->u.osc.batches != B || state->u.osc.channels != 1) {
+    if (state->u.osc.wave_buffer == NULL || state->u.osc.batches != B) {
         free(state->u.osc.wave_buffer);
         state->u.osc.wave_buffer = (double *)malloc(total * sizeof(double));
     }
-    if (state->u.osc.dphi_buffer == NULL || state->u.osc.batches != B || state->u.osc.channels != 1) {
+    if (state->u.osc.dphi_buffer == NULL || state->u.osc.batches != B) {
         free(state->u.osc.dphi_buffer);
         state->u.osc.dphi_buffer = (double *)malloc(total * sizeof(double));
     }
-    if (strcmp(wave_buf, "triangle") == 0) {
+    if (mode != OSC_MODE_OP_AMP && strcmp(wave_buf, "triangle") == 0) {
         if (state->u.osc.tri_state == NULL || state->u.osc.batches != B) {
             free(state->u.osc.tri_state);
             state->u.osc.tri_state = (double *)calloc((size_t)B, sizeof(double));
         }
     }
+    if (mode == OSC_MODE_INTEGRATOR) {
+        if (state->u.osc.integrator_state == NULL || state->u.osc.batches != B) {
+            free(state->u.osc.integrator_state);
+            state->u.osc.integrator_state = (double *)calloc((size_t)B, sizeof(double));
+        }
+    }
+
+    const double *driver_data = NULL;
+    int driver_channels = 1;
+    if (mode == OSC_MODE_OP_AMP && inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
+        driver_data = inputs->audio.data;
+        driver_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 1;
+    }
+    if (mode == OSC_MODE_OP_AMP) {
+        if (state->u.osc.op_amp_state == NULL || state->u.osc.batches != B || state->u.osc.driver_channels != driver_channels) {
+            free(state->u.osc.op_amp_state);
+            state->u.osc.op_amp_state = (double *)calloc((size_t)B, sizeof(double));
+            state->u.osc.driver_channels = driver_channels;
+        }
+    }
+
+    state->u.osc.batches = B;
+    state->u.osc.mode = mode;
+
     if (state->u.osc.phase == NULL || state->u.osc.phase_buffer == NULL || state->u.osc.wave_buffer == NULL || state->u.osc.dphi_buffer == NULL) {
         free(owned_freq);
         free(owned_amp);
         free(owned_pan);
         free(owned_reset);
+        free(owned_phase_offset);
+        free(owned_frame_delay);
+        free(owned_slew);
         return -1;
     }
+
     for (int b = 0; b < B; ++b) {
         for (int f = 0; f < F; ++f) {
             size_t idx = (size_t)b * (size_t)F + (size_t)f;
-            state->u.osc.dphi_buffer[idx] = freq[idx] / sample_rate;
+            double hz = (freq != NULL) ? freq[idx] : 0.0;
+            state->u.osc.dphi_buffer[idx] = hz / sample_rate;
         }
     }
+
     const double *reset_ptr = accept_reset ? reset : NULL;
     phase_advance(state->u.osc.dphi_buffer, state->u.osc.phase_buffer, B, F, state->u.osc.phase, reset_ptr);
-    if (strcmp(wave_buf, "saw") == 0) {
-        osc_saw_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, state->u.osc.wave_buffer, B, F);
-    } else if (strcmp(wave_buf, "square") == 0) {
-        osc_square_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, 0.5, state->u.osc.wave_buffer, B, F);
-    } else if (strcmp(wave_buf, "triangle") == 0) {
-        osc_triangle_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, state->u.osc.wave_buffer, B, F, state->u.osc.tri_state);
-    } else {
+
+    if ((phase_offset != NULL && owned_phase_offset != NULL) || (frame_delay != NULL && owned_frame_delay != NULL)) {
         for (int b = 0; b < B; ++b) {
+            size_t base = (size_t)b * (size_t)F;
             for (int f = 0; f < F; ++f) {
-                size_t idx = (size_t)b * (size_t)F + (size_t)f;
-                state->u.osc.wave_buffer[idx] = sin(state->u.osc.phase_buffer[idx] * 2.0 * M_PI);
+                size_t idx = base + (size_t)f;
+                double ph = state->u.osc.phase_buffer[idx];
+                if (phase_offset != NULL) {
+                    ph += phase_offset[idx];
+                }
+                if (frame_delay != NULL) {
+                    ph += state->u.osc.dphi_buffer[idx] * frame_delay[idx];
+                }
+                ph = ph - floor(ph);
+                state->u.osc.phase_buffer[idx] = ph;
             }
         }
     }
+
+    if (mode != OSC_MODE_OP_AMP) {
+        if (strcmp(wave_buf, "saw") == 0) {
+            osc_saw_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, state->u.osc.wave_buffer, B, F);
+        } else if (strcmp(wave_buf, "square") == 0) {
+            osc_square_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, 0.5, state->u.osc.wave_buffer, B, F);
+        } else if (strcmp(wave_buf, "triangle") == 0) {
+            if (state->u.osc.tri_state == NULL) {
+                state->u.osc.tri_state = (double *)calloc((size_t)B, sizeof(double));
+            }
+            osc_triangle_blep_c(state->u.osc.phase_buffer, state->u.osc.dphi_buffer, state->u.osc.wave_buffer, B, F, state->u.osc.tri_state);
+        } else {
+            for (int b = 0; b < B; ++b) {
+                size_t base = (size_t)b * (size_t)F;
+                for (int f = 0; f < F; ++f) {
+                    size_t idx = base + (size_t)f;
+                    state->u.osc.wave_buffer[idx] = sin(state->u.osc.phase_buffer[idx] * 2.0 * M_PI);
+                }
+            }
+        }
+    } else {
+        double per_sample_default = base_slew_rate > 0.0 ? base_slew_rate / sample_rate : 0.0;
+        for (int b = 0; b < B; ++b) {
+            double op_state = state->u.osc.op_amp_state != NULL ? state->u.osc.op_amp_state[b] : 0.0;
+            size_t base_wave = (size_t)b * (size_t)F;
+            size_t base_driver = ((size_t)b * (size_t)driver_channels) * (size_t)F;
+            for (int f = 0; f < F; ++f) {
+                double target = 0.0;
+                if (driver_data != NULL) {
+                    if (driver_channels == 1) {
+                        target = driver_data[base_driver + (size_t)f];
+                    } else {
+                        size_t offset = base_driver + (size_t)f;
+                        for (int c = 0; c < driver_channels; ++c) {
+                            target += driver_data[offset + (size_t)c * (size_t)F];
+                        }
+                        target /= (double)driver_channels;
+                    }
+                }
+                double per_sample_slew = per_sample_default;
+                if (slew_curve != NULL) {
+                    double candidate = slew_curve[base_wave + (size_t)f];
+                    if (candidate >= 0.0) {
+                        per_sample_slew = candidate / sample_rate;
+                    }
+                }
+                double delta = target - op_state;
+                if (per_sample_slew > 0.0) {
+                    if (delta > per_sample_slew) delta = per_sample_slew;
+                    else if (delta < -per_sample_slew) delta = -per_sample_slew;
+                }
+                op_state += delta;
+                if (op_state > slew_clamp) op_state = slew_clamp;
+                else if (op_state < -slew_clamp) op_state = -slew_clamp;
+                state->u.osc.wave_buffer[base_wave + (size_t)f] = op_state;
+            }
+            if (state->u.osc.op_amp_state != NULL) {
+                state->u.osc.op_amp_state[b] = op_state;
+            }
+        }
+    }
+
+    if (mode == OSC_MODE_INTEGRATOR && state->u.osc.integrator_state != NULL) {
+        for (int b = 0; b < B; ++b) {
+            double accum = state->u.osc.integrator_state[b];
+            size_t base = (size_t)b * (size_t)F;
+            for (int f = 0; f < F; ++f) {
+                size_t idx = base + (size_t)f;
+                accum = accum * integration_leak + integration_gain * state->u.osc.wave_buffer[idx];
+                if (accum > integration_clamp) accum = integration_clamp;
+                else if (accum < -integration_clamp) accum = -integration_clamp;
+                state->u.osc.wave_buffer[idx] = accum;
+            }
+            state->u.osc.integrator_state[b] = accum;
+        }
+    }
+
     int stereo = (pan_view != NULL && pan_view->data != NULL) ? 1 : 0;
     int channels = stereo ? 2 : 1;
     size_t total_out = (size_t)B * (size_t)channels * (size_t)F;
@@ -4409,8 +4644,12 @@ static int run_osc_node(
         free(owned_amp);
         free(owned_pan);
         free(owned_reset);
+        free(owned_phase_offset);
+        free(owned_frame_delay);
+        free(owned_slew);
         return -1;
     }
+
     for (int b = 0; b < B; ++b) {
         for (int f = 0; f < F; ++f) {
             size_t idx = (size_t)b * (size_t)F + (size_t)f;
@@ -4429,14 +4668,178 @@ static int run_osc_node(
             }
         }
     }
+
     free(owned_freq);
     free(owned_amp);
     free(owned_pan);
     free(owned_reset);
+    free(owned_phase_offset);
+    free(owned_frame_delay);
+    free(owned_slew);
+
     state->u.osc.channels = 1;
     state->u.osc.stereo = stereo;
+
     *out_buffer = buffer;
     *out_channels = stereo ? 2 : 1;
+    return 0;
+}
+
+static int run_parametric_driver_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    if (descriptor == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    if (sample_rate <= 0.0) {
+        sample_rate = 48000.0;
+    }
+
+    int mode = parse_driver_mode(descriptor->params_json, descriptor->params_len, state->u.driver.mode);
+    double harmonics_buffer[32];
+    int harmonic_count = 0;
+
+    if (mode == DRIVER_MODE_PIEZO) {
+        harmonics_buffer[0] = 1.0;
+        harmonics_buffer[1] = 0.35;
+        harmonics_buffer[2] = 0.12;
+        harmonic_count = 3;
+    } else if (mode == DRIVER_MODE_CUSTOM) {
+        char harmonic_csv[256];
+        if (json_copy_string(descriptor->params_json, descriptor->params_len, "harmonics", harmonic_csv, sizeof(harmonic_csv))) {
+            harmonic_count = parse_csv_doubles(harmonic_csv, harmonics_buffer, 32);
+        }
+        if (harmonic_count <= 0) {
+            harmonics_buffer[0] = 1.0;
+            harmonic_count = 1;
+        }
+    } else {
+        harmonics_buffer[0] = 1.0;
+        harmonic_count = 1;
+    }
+
+    if (state->u.driver.harmonics == NULL || state->u.driver.harmonic_count != harmonic_count || state->u.driver.mode != mode) {
+        free(state->u.driver.harmonics);
+        state->u.driver.harmonics = (double *)malloc((size_t)harmonic_count * sizeof(double));
+        if (state->u.driver.harmonics == NULL) {
+            state->u.driver.harmonic_count = 0;
+            return -1;
+        }
+        for (int i = 0; i < harmonic_count; ++i) {
+            state->u.driver.harmonics[i] = harmonics_buffer[i];
+        }
+        state->u.driver.harmonic_count = harmonic_count;
+    }
+    state->u.driver.mode = mode;
+
+    const EdgeRunnerParamView *freq_view = find_param(inputs, "frequency");
+    if (freq_view == NULL) {
+        freq_view = find_param(inputs, "freq");
+    }
+    const EdgeRunnerParamView *amp_view = find_param(inputs, "amplitude");
+    if (amp_view == NULL) {
+        amp_view = find_param(inputs, "amp");
+    }
+    const EdgeRunnerParamView *phase_view = find_param(inputs, "phase_offset");
+    if (phase_view == NULL) {
+        phase_view = find_param(inputs, "phase");
+    }
+
+    int B = batches > 0 ? batches : 1;
+    int F = frames > 0 ? frames : 1;
+    const EdgeRunnerParamView *shape_source = freq_view != NULL ? freq_view : amp_view;
+    if (shape_source != NULL) {
+        if (shape_source->batches > 0) {
+            B = (int)shape_source->batches;
+        }
+        if (shape_source->frames > 0) {
+            F = (int)shape_source->frames;
+        }
+    }
+    if (B <= 0) B = 1;
+    if (F <= 0) F = 1;
+
+    double *owned_freq = NULL;
+    double *owned_amp = NULL;
+    double *owned_phase = NULL;
+
+    const double *freq = ensure_param_plane(freq_view, B, F, 440.0, &owned_freq);
+    const double *amp = ensure_param_plane(amp_view, B, F, 1.0, &owned_amp);
+    const double *phase_offset = ensure_param_plane(phase_view, B, F, 0.0, &owned_phase);
+    if (freq == NULL || amp == NULL) {
+        free(owned_freq);
+        free(owned_amp);
+        free(owned_phase);
+        return -1;
+    }
+
+    if (state->u.driver.phase == NULL || state->u.driver.batches != B) {
+        free(state->u.driver.phase);
+        state->u.driver.phase = (double *)calloc((size_t)B, sizeof(double));
+        state->u.driver.batches = B;
+    }
+    if (state->u.driver.phase == NULL || state->u.driver.harmonics == NULL) {
+        free(owned_freq);
+        free(owned_amp);
+        free(owned_phase);
+        return -1;
+    }
+
+    size_t total = (size_t)B * (size_t)F;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        free(owned_freq);
+        free(owned_amp);
+        free(owned_phase);
+        return -1;
+    }
+
+    for (int b = 0; b < B; ++b) {
+        double phase = state->u.driver.phase[b];
+        size_t base = (size_t)b * (size_t)F;
+        for (int f = 0; f < F; ++f) {
+            size_t idx = base + (size_t)f;
+            double hz = freq[idx];
+            if (hz < 0.0) hz = 0.0;
+            double advance = hz / sample_rate;
+            phase += advance;
+            phase = phase - floor(phase);
+            double ph = phase;
+            if (phase_offset != NULL) {
+                ph += phase_offset[idx];
+                ph = ph - floor(ph);
+            }
+            double sample = 0.0;
+            if (mode == DRIVER_MODE_QUARTZ && state->u.driver.harmonic_count == 1) {
+                sample = sin(2.0 * M_PI * ph);
+            } else {
+                for (int h = 0; h < state->u.driver.harmonic_count; ++h) {
+                    double coeff = state->u.driver.harmonics[h];
+                    if (coeff == 0.0) {
+                        continue;
+                    }
+                    double harmonic_phase = 2.0 * M_PI * ph * (double)(h + 1);
+                    sample += coeff * sin(harmonic_phase);
+                }
+            }
+            buffer[idx] = sample * amp[idx];
+        }
+        state->u.driver.phase[b] = phase - floor(phase);
+    }
+
+    free(owned_freq);
+    free(owned_amp);
+    free(owned_phase);
+
+    *out_buffer = buffer;
+    *out_channels = 1;
     return 0;
 }
 
@@ -5900,6 +6303,11 @@ static int amp_run_node_impl(
         case NODE_KIND_OSC:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
                 ? run_osc_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
+            break;
+        case NODE_KIND_DRIVER:
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_parametric_driver_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
                 : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_SUBHARM:

@@ -932,11 +932,41 @@ class AmplifierModulatorNode(Node):
 
 
 class OscNode(Node):
-    def __init__(self, name, wave="sine", *, accept_reset: bool = True):
+    def __init__(
+        self,
+        name: str,
+        wave: str = "sine",
+        *,
+        mode: str = "polyblep",
+        accept_reset: bool = True,
+        integration_leak: float = 0.9995,
+        integration_gain: float = 1.0,
+        integration_clamp: float = 1.2,
+        slew_rate: float = 12000.0,
+        slew_clamp: float = 1.2,
+    ) -> None:
         super().__init__(name)
-        self.wave = wave
+        self.wave = str(wave)
+        self.mode = str(mode)
         self.phase = None
         self.accept_reset = bool(accept_reset)
+        self.integration_leak = float(integration_leak)
+        self.integration_gain = float(integration_gain)
+        self.integration_clamp = float(integration_clamp)
+        self.slew_rate = float(slew_rate)
+        self.slew_clamp = float(slew_clamp)
+        self.params.update(
+            {
+                "wave": self.wave,
+                "mode": self.mode,
+                "accept_reset": self.accept_reset,
+                "integration_leak": self.integration_leak,
+                "integration_gain": self.integration_gain,
+                "integration_clamp": self.integration_clamp,
+                "slew_rate": self.slew_rate,
+                "slew_clamp": self.slew_clamp,
+            }
+        )
         self._freq_state: np.ndarray | None = None
         self._voice_phase: dict[str, np.ndarray] = {}
         self._voice_phase_out: dict[str, np.ndarray] = {}
@@ -1073,6 +1103,13 @@ class OscNode(Node):
         B = audio_in.shape[0] if audio_in is not None else 1
         C = 1
         F = frames
+        mode = getattr(self, "mode", "polyblep")
+        if mode not in ("polyblep", "integrator", "op_amp"):
+            raise RuntimeError(f"{self.name}: unsupported oscillator mode '{mode}' in Python backend")
+        if mode in ("integrator", "op_amp"):
+            raise RuntimeError(
+                f"{self.name}: oscillator mode '{mode}' requires the native runtime; Python fallback is not permitted."
+            )
 
         f = self._ensure_array("osc.freq", params.get("freq", 0.0), B, F)
         a = self._ensure_array("osc.amp", params.get("amp", 1.0), B, F)
@@ -1220,6 +1257,46 @@ class OscNode(Node):
         out[:, 0, :] = left
         out[:, 1, :] = right
         return out
+
+class ParametricDriverNode(Node):
+    def __init__(self, name: str, *, mode: str = "quartz", harmonics: Sequence[float] | None = None) -> None:
+        super().__init__(name)
+        self.mode = str(mode)
+        if harmonics is None:
+            if self.mode == "piezo":
+                harmonics = (1.0, 0.35, 0.12)
+            else:
+                harmonics = ()
+        self.harmonics = tuple(float(h) for h in harmonics)
+        params: dict[str, object] = {"mode": self.mode}
+        if self.harmonics:
+            params["harmonics"] = ",".join(f"{h:.9g}" for h in self.harmonics)
+        self.params.update(params)
+        self._phase: np.ndarray | None = None
+
+    def process(self, frames, sr, audio_in, mods, params):
+        B = audio_in.shape[0] if audio_in is not None else 1
+        freq = as_BCF(params.get("frequency", 440.0), B, 1, frames, name=f"{self.name}.frequency")[:, 0, :]
+        amp = as_BCF(params.get("amplitude", 1.0), B, 1, frames, name=f"{self.name}.amplitude")[:, 0, :]
+        phase_offset = as_BCF(params.get("phase_offset", 0.0), B, 1, frames, name=f"{self.name}.phase_offset")[:, 0, :]
+        if self._phase is None or self._phase.shape[0] != B:
+            self._phase = np.zeros(B, dtype=RAW_DTYPE)
+        out = np.zeros((B, 1, frames), dtype=RAW_DTYPE)
+        harmonics = np.asarray(self.harmonics if self.harmonics else (1.0,), dtype=RAW_DTYPE)
+        for b in range(B):
+            phase = float(self._phase[b])
+            for f in range(frames):
+                phase = (phase + float(freq[b, f]) / float(sr)) % 1.0
+                ph = (phase + float(phase_offset[b, f])) % 1.0
+                sample = 0.0
+                for idx, coeff in enumerate(harmonics):
+                    if coeff == 0.0:
+                        continue
+                    sample += float(coeff) * np.sin(2.0 * np.pi * ph * (idx + 1))
+                out[b, 0, f] = sample * float(amp[b, f])
+            self._phase[b] = phase
+        return out
+
 
 class SamplerNode(Node):
     def __init__(self, name, sampler):
@@ -1527,6 +1604,8 @@ NODE_TYPES = {
     "sine_oscillator": SineOscillatorNode,
     "osc": OscNode,
     "oscillator": OscNode,
+    "parametric_driver": ParametricDriverNode,
+    "ParametricDriverNode": ParametricDriverNode,
     "envelope": EnvelopeModulatorNode,
     "envelope_modulator": EnvelopeModulatorNode,
     "pitch_quantizer": PitchQuantizerNode,
@@ -1548,6 +1627,7 @@ __all__ = [
     "EnvelopeModulatorNode",
     "AmplifierModulatorNode",
     "OscNode",
+    "ParametricDriverNode",
     "MixNode",
     "SafetyNode",
     "SubharmonicLowLifterNode",
