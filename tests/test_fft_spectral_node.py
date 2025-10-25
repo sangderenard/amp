@@ -63,7 +63,7 @@ def _load_fft_interface() -> tuple[FFI, object]:
         """
         typedef unsigned int uint32_t;
         typedef unsigned char uint8_t;
-        typedef unsigned long size_t;
+        typedef unsigned long long size_t;
 
         typedef struct {
             uint32_t has_audio;
@@ -142,6 +142,7 @@ def _generate_spectral_instruction_set(
     batches: int,
     channels: int,
     window_size: int,
+    width_scale: float = 1.0,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -187,7 +188,7 @@ def _generate_spectral_instruction_set(
         + 0.05 * micro_pulses
         + 0.03 * np.sin(2.0 * math.pi * time_grid * (batch_grid * 1.5 + channel_grid * 3.5))
     )
-    width = np.clip(width_base, 0.01, 0.7)
+    width = np.clip(width_base * float(width_scale), 0.005, 0.7)
     lower = np.clip(center - 0.5 * width, 0.0, 0.999)
     upper = np.clip(center + 0.5 * width, 0.001, 1.0)
     upper = np.maximum(upper, lower + 5.0e-4)

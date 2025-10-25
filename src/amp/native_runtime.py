@@ -98,6 +98,7 @@ typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef struct AmpGraphRuntime AmpGraphRuntime;
 typedef struct AmpGraphControlHistory AmpGraphControlHistory;
+typedef struct EdgeRunnerControlHistory EdgeRunnerControlHistory;
 typedef struct {
     uint32_t measured_delay_frames;
     float accumulated_heat;
