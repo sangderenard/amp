@@ -2055,6 +2055,7 @@ typedef enum {
     NODE_KIND_LFO,
     NODE_KIND_ENVELOPE,
     NODE_KIND_PITCH,
+    NODE_KIND_PITCH_SHIFT,
     NODE_KIND_OSC,
     NODE_KIND_OSC_PITCH,
     NODE_KIND_DRIVER,
@@ -2106,6 +2107,15 @@ typedef struct {
             int batches;
             int mode;
         } driver;
+        struct {
+            double *analysis_window;
+            double *synthesis_window;
+            double *prev_phase;
+            double *phase_accum;
+            int window_size;
+            int hop_size;
+            int resynthesis_hop;
+        } pitch_shift;
         struct {
             double *slew_state;
             int batches;
@@ -2317,6 +2327,19 @@ static void release_node_state(node_state_t *state) {
         state->u.pitch.last_freq = NULL;
         state->u.pitch.batches = 0;
     }
+    if (state->kind == NODE_KIND_PITCH_SHIFT) {
+        free(state->u.pitch_shift.analysis_window);
+        free(state->u.pitch_shift.synthesis_window);
+        free(state->u.pitch_shift.prev_phase);
+        free(state->u.pitch_shift.phase_accum);
+        state->u.pitch_shift.analysis_window = NULL;
+        state->u.pitch_shift.synthesis_window = NULL;
+        state->u.pitch_shift.prev_phase = NULL;
+        state->u.pitch_shift.phase_accum = NULL;
+        state->u.pitch_shift.window_size = 0;
+        state->u.pitch_shift.hop_size = 0;
+        state->u.pitch_shift.resynthesis_hop = 0;
+    }
     if (state->kind == NODE_KIND_OSC_PITCH) {
         free(state->u.osc_pitch.last_value);
         state->u.osc_pitch.last_value = NULL;
@@ -2388,6 +2411,10 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "PitchQuantizerNode") == 0) {
         return NODE_KIND_PITCH;
+    }
+    if (strcmp(descriptor->type_name, "PitchShiftNode") == 0
+        || strcmp(descriptor->type_name, "pitch_shift") == 0) {
+        return NODE_KIND_PITCH_SHIFT;
     }
     if (strcmp(descriptor->type_name, "OscillatorPitchNode") == 0
         || strcmp(descriptor->type_name, "oscillator_pitch") == 0) {
@@ -2873,6 +2900,10 @@ static double grid_warp_inverse_value(double u, const double *grid, const double
 #define FFT_ALGORITHM_NUFFT 2
 #define FFT_ALGORITHM_CZT 3
 #define FFT_ALGORITHM_DYNAMIC_OSCILLATORS 4
+
+#define PITCH_SHIFT_DEFAULT_WINDOW 1024
+#define PITCH_SHIFT_DEFAULT_HOP 256
+#define PITCH_SHIFT_DEFAULT_RESYNTH_HOP 256
 
 #define FFT_WINDOW_RECTANGULAR 0
 #define FFT_WINDOW_HANN 1
@@ -3897,6 +3928,9 @@ static int run_lfo_node(
     double slew_ms = json_get_double(descriptor->params_json, descriptor->params_len, "slew_ms", 0.0);
     int use_input = json_get_bool(descriptor->params_json, descriptor->params_len, "use_input", 0);
     int B = batches > 0 ? batches : 1;
+    if (inputs->audio.batches > 0) {
+        B = (int)inputs->audio.batches;
+    }
     int F = frames > 0 ? frames : 1;
     int audio_channels = 0;
     const double *audio_data = NULL;
@@ -5072,6 +5106,380 @@ static int run_parametric_driver_node(
 
     *out_buffer = buffer;
     *out_channels = 1;
+    return 0;
+}
+
+static int ensure_pitch_shift_state(node_state_t *state, int window_size, int hop_size, int resynthesis_hop) {
+    if (state == NULL) {
+        return -1;
+    }
+    if (window_size <= 0) {
+        window_size = PITCH_SHIFT_DEFAULT_WINDOW;
+    }
+    if (!is_power_of_two_int(window_size)) {
+        int next_power = 1;
+        while (next_power < window_size && next_power < 131072) {
+            next_power <<= 1;
+        }
+        window_size = next_power;
+    }
+    if (window_size <= 0) {
+        window_size = PITCH_SHIFT_DEFAULT_WINDOW;
+    }
+    if (hop_size <= 0) {
+        hop_size = PITCH_SHIFT_DEFAULT_HOP;
+    }
+    if (resynthesis_hop <= 0) {
+        resynthesis_hop = PITCH_SHIFT_DEFAULT_RESYNTH_HOP;
+    }
+
+    int needs_resize = (state->u.pitch_shift.analysis_window == NULL)
+        || (state->u.pitch_shift.window_size != window_size);
+    if (needs_resize) {
+        double *analysis = (double *)malloc((size_t)window_size * sizeof(double));
+        double *synthesis = (double *)malloc((size_t)window_size * sizeof(double));
+        double *prev_phase = (double *)malloc((size_t)window_size * sizeof(double));
+        double *phase_accum = (double *)malloc((size_t)window_size * sizeof(double));
+        if (analysis == NULL || synthesis == NULL || prev_phase == NULL || phase_accum == NULL) {
+            free(analysis);
+            free(synthesis);
+            free(prev_phase);
+            free(phase_accum);
+            return -1;
+        }
+        free(state->u.pitch_shift.analysis_window);
+        free(state->u.pitch_shift.synthesis_window);
+        free(state->u.pitch_shift.prev_phase);
+        free(state->u.pitch_shift.phase_accum);
+        state->u.pitch_shift.analysis_window = analysis;
+        state->u.pitch_shift.synthesis_window = synthesis;
+        state->u.pitch_shift.prev_phase = prev_phase;
+        state->u.pitch_shift.phase_accum = phase_accum;
+        state->u.pitch_shift.window_size = window_size;
+    }
+
+    if (state->u.pitch_shift.analysis_window == NULL || state->u.pitch_shift.synthesis_window == NULL
+        || state->u.pitch_shift.prev_phase == NULL || state->u.pitch_shift.phase_accum == NULL) {
+        return -1;
+    }
+
+    state->u.pitch_shift.window_size = window_size;
+    state->u.pitch_shift.hop_size = hop_size;
+    state->u.pitch_shift.resynthesis_hop = resynthesis_hop;
+
+    fill_window_weights(state->u.pitch_shift.analysis_window, window_size, FFT_WINDOW_HANN);
+    fill_window_weights(state->u.pitch_shift.synthesis_window, window_size, FFT_WINDOW_HANN);
+    memset(state->u.pitch_shift.prev_phase, 0, (size_t)window_size * sizeof(double));
+    memset(state->u.pitch_shift.phase_accum, 0, (size_t)window_size * sizeof(double));
+
+    return 0;
+}
+
+static double wrap_phase(double value) {
+    while (value > M_PI) {
+        value -= 2.0 * M_PI;
+    }
+    while (value < -M_PI) {
+        value += 2.0 * M_PI;
+    }
+    return value;
+}
+
+static int pitch_shift_process(
+    const double *input,
+    int frames,
+    double ratio,
+    node_state_t *state,
+    double *output
+) {
+    if (input == NULL || output == NULL || state == NULL) {
+        return -1;
+    }
+    int window_size = state->u.pitch_shift.window_size;
+    int hop_size = state->u.pitch_shift.hop_size;
+    int resynthesis_hop = state->u.pitch_shift.resynthesis_hop;
+    if (window_size <= 0 || hop_size <= 0) {
+        return -1;
+    }
+    if (frames <= 0) {
+        return 0;
+    }
+
+    if (ratio < 0.125) {
+        ratio = 0.125;
+    } else if (ratio > 8.0) {
+        ratio = 8.0;
+    }
+    double time_scale = 1.0 / ratio;
+    if (time_scale <= 0.0) {
+        time_scale = 1.0;
+    }
+    double synthesis_hop = (double)resynthesis_hop * time_scale;
+    if (synthesis_hop < 1e-6) {
+        synthesis_hop = 1.0;
+    }
+
+    int padded_len = frames + window_size;
+    int frame_count = 1;
+    if (hop_size > 0) {
+        frame_count = (frames + hop_size - 1) / hop_size + 1;
+    }
+    if (frame_count < 1) {
+        frame_count = 1;
+    }
+
+    double *analysis_real = (double *)malloc((size_t)window_size * sizeof(double));
+    double *analysis_imag = (double *)malloc((size_t)window_size * sizeof(double));
+    double *synth_real = (double *)malloc((size_t)window_size * sizeof(double));
+    double *synth_imag = (double *)malloc((size_t)window_size * sizeof(double));
+    double *ifft_real = (double *)malloc((size_t)window_size * sizeof(double));
+    double *ifft_imag = (double *)malloc((size_t)window_size * sizeof(double));
+    double *frame_buffer = (double *)malloc((size_t)window_size * sizeof(double));
+    double *input_padded = (double *)calloc((size_t)padded_len, sizeof(double));
+    if (analysis_real == NULL || analysis_imag == NULL || synth_real == NULL || synth_imag == NULL
+        || ifft_real == NULL || ifft_imag == NULL || frame_buffer == NULL || input_padded == NULL) {
+        free(analysis_real);
+        free(analysis_imag);
+        free(synth_real);
+        free(synth_imag);
+        free(ifft_real);
+        free(ifft_imag);
+        free(frame_buffer);
+        free(input_padded);
+        return -1;
+    }
+
+    for (int i = 0; i < frames; ++i) {
+        input_padded[i] = input[i];
+    }
+
+    double last_position = synthesis_hop * (double)(frame_count - 1);
+    int stretched_len = (int)ceil(last_position + (double)window_size + 2.0);
+    if (stretched_len < window_size) {
+        stretched_len = window_size;
+    }
+    double *stretched = (double *)calloc((size_t)stretched_len, sizeof(double));
+    if (stretched == NULL) {
+        free(analysis_real);
+        free(analysis_imag);
+        free(synth_real);
+        free(synth_imag);
+        free(ifft_real);
+        free(ifft_imag);
+        free(frame_buffer);
+        free(input_padded);
+        return -1;
+    }
+
+    memset(state->u.pitch_shift.prev_phase, 0, (size_t)window_size * sizeof(double));
+    memset(state->u.pitch_shift.phase_accum, 0, (size_t)window_size * sizeof(double));
+
+    double out_pos = 0.0;
+    for (int frame = 0; frame < frame_count; ++frame) {
+        int start = frame * hop_size;
+        for (int i = 0; i < window_size; ++i) {
+            int idx = start + i;
+            double sample = 0.0;
+            if (idx >= 0 && idx < padded_len) {
+                sample = input_padded[idx];
+            }
+            frame_buffer[i] = sample * state->u.pitch_shift.analysis_window[i];
+        }
+
+        compute_fft_radix2(frame_buffer, NULL, analysis_real, analysis_imag, window_size, 0);
+
+        for (int bin = 0; bin < window_size; ++bin) {
+            double real = analysis_real[bin];
+            double imag = analysis_imag[bin];
+            double magnitude = sqrt(real * real + imag * imag);
+            double phase = atan2(imag, real);
+            double omega = 2.0 * M_PI * (double)bin * (double)hop_size / (double)window_size;
+            double delta = wrap_phase(phase - state->u.pitch_shift.prev_phase[bin] - omega);
+            double true_phase = omega + delta;
+            state->u.pitch_shift.phase_accum[bin] += true_phase * time_scale;
+            state->u.pitch_shift.prev_phase[bin] = phase;
+            synth_real[bin] = magnitude * cos(state->u.pitch_shift.phase_accum[bin]);
+            synth_imag[bin] = magnitude * sin(state->u.pitch_shift.phase_accum[bin]);
+        }
+
+        compute_fft_radix2(synth_real, synth_imag, ifft_real, ifft_imag, window_size, 1);
+
+        int pos_floor = (int)floor(out_pos);
+        double pos_frac = out_pos - (double)pos_floor;
+        for (int i = 0; i < window_size; ++i) {
+            double sample = ifft_real[i] * state->u.pitch_shift.synthesis_window[i];
+            int idx0 = pos_floor + i;
+            int idx1 = idx0 + 1;
+            if (idx0 >= 0 && idx0 < stretched_len) {
+                stretched[idx0] += sample * (1.0 - pos_frac);
+            }
+            if (idx1 >= 0 && idx1 < stretched_len) {
+                stretched[idx1] += sample * pos_frac;
+            }
+        }
+        out_pos += synthesis_hop;
+    }
+
+    double input_energy = 0.0;
+    for (int i = 0; i < frames; ++i) {
+        input_energy += input[i] * input[i];
+    }
+
+    if (frames == 1) {
+        output[0] = stretched_len > 0 ? stretched[0] : 0.0;
+    } else {
+        double scale = (double)(stretched_len - 1) / (double)(frames - 1);
+        for (int i = 0; i < frames; ++i) {
+            double pos = (double)i * scale;
+            int base = (int)floor(pos);
+            double frac = pos - (double)base;
+            if (base < 0) {
+                base = 0;
+                frac = 0.0;
+            }
+            if (base >= stretched_len - 1) {
+                base = stretched_len - 1;
+                frac = 0.0;
+            }
+            double sample_a = stretched[base];
+            double sample_b = stretched_len > base + 1 ? stretched[base + 1] : stretched[base];
+            output[i] = sample_a + (sample_b - sample_a) * frac;
+        }
+    }
+
+    double output_energy = 0.0;
+    for (int i = 0; i < frames; ++i) {
+        output_energy += output[i] * output[i];
+    }
+    if (output_energy > 1e-12 && input_energy > 1e-12) {
+        double gain = sqrt(input_energy / output_energy);
+        for (int i = 0; i < frames; ++i) {
+            output[i] *= gain;
+        }
+    }
+
+    free(analysis_real);
+    free(analysis_imag);
+    free(synth_real);
+    free(synth_imag);
+    free(ifft_real);
+    free(ifft_imag);
+    free(frame_buffer);
+    free(input_padded);
+    free(stretched);
+    return 0;
+}
+
+static int run_pitch_shift_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    (void)sample_rate;
+    if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+
+    int window_size = json_get_int(descriptor->params_json, descriptor->params_len, "window_size", PITCH_SHIFT_DEFAULT_WINDOW);
+    int hop_size = json_get_int(descriptor->params_json, descriptor->params_len, "hop_size", PITCH_SHIFT_DEFAULT_HOP);
+    int resynthesis_hop = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "resynthesis_hop",
+        PITCH_SHIFT_DEFAULT_RESYNTH_HOP
+    );
+
+    if (ensure_pitch_shift_state(state, window_size, hop_size, resynthesis_hop) != 0) {
+        return -1;
+    }
+
+    int B = batches > 0 ? batches : 1;
+    int channels = (int)inputs->audio.channels;
+    if (channels <= 0) {
+        channels = 1;
+    }
+    int input_frames = frames > 0 ? frames : 1;
+    if (inputs->audio.frames > 0) {
+        input_frames = (int)inputs->audio.frames;
+    }
+    if (input_frames <= 0) {
+        input_frames = 1;
+    }
+
+    size_t total = (size_t)B * (size_t)channels * (size_t)input_frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+
+    const EdgeRunnerParamView *ratio_view = find_param(inputs, "ratio");
+    const EdgeRunnerParamView *semitone_view = find_param(inputs, "semitones");
+    double ratio_default = json_get_double(descriptor->params_json, descriptor->params_len, "ratio", 1.0);
+    double semitone_default = json_get_double(descriptor->params_json, descriptor->params_len, "semitones", 0.0);
+    double base_ratio = ratio_default;
+    if (semitone_default != 0.0) {
+        base_ratio *= pow(2.0, semitone_default / 12.0);
+    }
+    if (base_ratio <= 0.0) {
+        base_ratio = 1.0;
+    }
+
+    double *owned_ratio = NULL;
+    double *owned_semitone = NULL;
+    const double *ratio_plane = NULL;
+    const double *semitone_plane = NULL;
+    if (ratio_view != NULL) {
+        ratio_plane = ensure_param_plane(ratio_view, B, input_frames, base_ratio, &owned_ratio);
+    }
+    if (semitone_view != NULL) {
+        semitone_plane = ensure_param_plane(semitone_view, B, input_frames, 0.0, &owned_semitone);
+    }
+
+    if (!inputs->audio.has_audio || inputs->audio.data == NULL) {
+        memset(buffer, 0, total * sizeof(double));
+        *out_buffer = buffer;
+        *out_channels = channels;
+        free(owned_ratio);
+        free(owned_semitone);
+        return 0;
+    }
+
+    const double *audio = inputs->audio.data;
+    for (int b = 0; b < B; ++b) {
+        double ratio_value = base_ratio;
+        size_t idx_base = (size_t)b * (size_t)input_frames;
+        if (semitone_plane != NULL) {
+            size_t idx = idx_base + (size_t)(input_frames > 0 ? input_frames - 1 : 0);
+            ratio_value = pow(2.0, semitone_plane[idx] / 12.0);
+        } else if (ratio_plane != NULL) {
+            size_t idx = idx_base + (size_t)(input_frames > 0 ? input_frames - 1 : 0);
+            ratio_value = ratio_plane[idx];
+        }
+        if (ratio_value <= 0.0) {
+            ratio_value = base_ratio;
+        }
+        for (int c = 0; c < channels; ++c) {
+            size_t base = ((size_t)b * (size_t)channels + (size_t)c) * (size_t)input_frames;
+            const double *in_ptr = audio + base;
+            double *out_ptr = buffer + base;
+            if (pitch_shift_process(in_ptr, input_frames, ratio_value, state, out_ptr) != 0) {
+                free(buffer);
+                free(owned_ratio);
+                free(owned_semitone);
+                return -1;
+            }
+        }
+    }
+
+    free(owned_ratio);
+    free(owned_semitone);
+    *out_buffer = buffer;
+    *out_channels = channels;
     return 0;
 }
 
@@ -6530,6 +6938,11 @@ static int amp_run_node_impl(
         case NODE_KIND_PITCH:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
                 ? run_pitch_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
+            break;
+        case NODE_KIND_PITCH_SHIFT:
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_pitch_shift_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
                 : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_OSC_PITCH:

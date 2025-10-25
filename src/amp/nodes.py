@@ -1693,6 +1693,40 @@ class SafetyFilterNode(Node):
             y = c_kernels.safety_filter_py(x, float(self.a), self.prev_in, self.prev_dc, out=self._buffer)
         return y
 
+
+class PitchShiftNode(Node):
+    """Overlap-add pitch shifter backed by the native runtime implementation."""
+
+    ANALYSIS_WINDOW: int = 1024
+    HOP_SIZE: int = 256
+    RESYNTHESIS_HOP: int = 256
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        window_size: int | None = None,
+        hop_size: int | None = None,
+        resynthesis_hop: int | None = None,
+    ) -> None:
+        super().__init__(name)
+        self.window_size = int(window_size or self.ANALYSIS_WINDOW)
+        self.hop_size = int(hop_size or self.HOP_SIZE)
+        self.resynthesis_hop = int(resynthesis_hop or self.RESYNTHESIS_HOP)
+        self.params.update(
+            {
+                "window_size": self.window_size,
+                "hop_size": self.hop_size,
+                "resynthesis_hop": self.resynthesis_hop,
+            }
+        )
+
+    def process(self, frames, sr, audio_in, mods, params):
+        raise RuntimeError(
+            "PitchShiftNode must execute via the native runtime; Python fallbacks are not supported."
+        )
+
+
 class NormalizerCompressorNode(Node):
     def __init__(self, name, n_ch=2, alpha=0.5, attack=16, sustain=128, decay=256):
         super().__init__(name)
@@ -1886,6 +1920,8 @@ NODE_TYPES = {
     "mix": MixNode,
     "safety": SafetyNode,
     "subharmonic_low_lifter": SubharmonicLowLifterNode,
+    "pitch_shift": PitchShiftNode,
+    "PitchShiftNode": PitchShiftNode,
 }
 
 
@@ -1907,4 +1943,5 @@ __all__ = [
     "MixNode",
     "SafetyNode",
     "SubharmonicLowLifterNode",
+    "PitchShiftNode",
 ]
