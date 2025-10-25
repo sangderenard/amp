@@ -2056,6 +2056,7 @@ typedef enum {
     NODE_KIND_ENVELOPE,
     NODE_KIND_PITCH,
     NODE_KIND_OSC,
+    NODE_KIND_OSC_PITCH,
     NODE_KIND_DRIVER,
     NODE_KIND_SUBHARM,
     NODE_KIND_FFT_DIV,
@@ -2123,6 +2124,10 @@ typedef struct {
             double *last_freq;
             int batches;
         } pitch;
+        struct {
+            double *last_value;
+            int batches;
+        } osc_pitch;
         struct {
             double *hp_y;
             double *lp_y;
@@ -2312,6 +2317,11 @@ static void release_node_state(node_state_t *state) {
         state->u.pitch.last_freq = NULL;
         state->u.pitch.batches = 0;
     }
+    if (state->kind == NODE_KIND_OSC_PITCH) {
+        free(state->u.osc_pitch.last_value);
+        state->u.osc_pitch.last_value = NULL;
+        state->u.osc_pitch.batches = 0;
+    }
     if (state->kind == NODE_KIND_SUBHARM) {
         free(state->u.subharm.hp_y);
         free(state->u.subharm.lp_y);
@@ -2378,6 +2388,10 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "PitchQuantizerNode") == 0) {
         return NODE_KIND_PITCH;
+    }
+    if (strcmp(descriptor->type_name, "OscillatorPitchNode") == 0
+        || strcmp(descriptor->type_name, "oscillator_pitch") == 0) {
+        return NODE_KIND_OSC_PITCH;
     }
     if (strcmp(descriptor->type_name, "OscNode") == 0) {
         return NODE_KIND_OSC;
@@ -3643,6 +3657,7 @@ static int run_constant_node(
     size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
     double *buffer = (double *)malloc(total * sizeof(double));
     amp_last_alloc_count = total;
+    amp_last_alloc_count = total;
     if (buffer == NULL) {
         return -1;
     }
@@ -4244,6 +4259,164 @@ static int run_pitch_node(
     return 0;
 }
 
+static int run_oscillator_pitch_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state
+) {
+    if (out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    if (sample_rate <= 0.0) {
+        sample_rate = 48000.0;
+    }
+
+    double min_freq = json_get_double(descriptor->params_json, descriptor->params_len, "min_freq", 0.0);
+    double default_slew = json_get_double(descriptor->params_json, descriptor->params_len, "default_slew", 0.0);
+    if (default_slew < 0.0) {
+        default_slew = 0.0;
+    }
+
+    const EdgeRunnerParamView *pitch_view = find_param(inputs, "pitch_hz");
+    const EdgeRunnerParamView *root_view = find_param(inputs, "root_hz");
+    const EdgeRunnerParamView *offset_view = find_param(inputs, "offset_cents");
+    const EdgeRunnerParamView *add_view = find_param(inputs, "add_hz");
+    const EdgeRunnerParamView *slew_view = find_param(inputs, "slew_hz_per_s");
+
+    int B = batches > 0 ? batches : 1;
+    int F = frames > 0 ? frames : 1;
+    const EdgeRunnerParamView *shape_source = pitch_view != NULL ? pitch_view : root_view;
+    if (shape_source != NULL) {
+        if (shape_source->batches > 0) {
+            B = (int)shape_source->batches;
+        }
+        if (shape_source->frames > 0) {
+            F = (int)shape_source->frames;
+        }
+    }
+    if (B <= 0) {
+        B = 1;
+    }
+    if (F <= 0) {
+        F = 1;
+    }
+
+    double *owned_pitch = NULL;
+    double *owned_root = NULL;
+    double *owned_offset = NULL;
+    double *owned_add = NULL;
+    double *owned_slew = NULL;
+
+    int has_direct = (pitch_view != NULL && pitch_view->data != NULL);
+    const double *pitch_curve = ensure_param_plane(pitch_view, B, F, 0.0, &owned_pitch);
+    const double *root_curve = NULL;
+    const double *offset_curve = NULL;
+    if (!has_direct) {
+        root_curve = ensure_param_plane(root_view, B, F, min_freq > 0.0 ? min_freq : 0.0, &owned_root);
+        offset_curve = ensure_param_plane(offset_view, B, F, 0.0, &owned_offset);
+        if (root_curve == NULL || offset_curve == NULL) {
+            free(owned_pitch);
+            free(owned_root);
+            free(owned_offset);
+            return -1;
+        }
+    }
+    const double *add_curve = ensure_param_plane(add_view, B, F, 0.0, &owned_add);
+    const double *slew_curve = ensure_param_plane(slew_view, B, F, default_slew, &owned_slew);
+
+    if (pitch_curve == NULL && !has_direct) {
+        free(owned_pitch);
+        free(owned_root);
+        free(owned_offset);
+        free(owned_add);
+        free(owned_slew);
+        return -1;
+    }
+
+    size_t total = (size_t)B * (size_t)F;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        free(owned_pitch);
+        free(owned_root);
+        free(owned_offset);
+        free(owned_add);
+        free(owned_slew);
+        return -1;
+    }
+
+    if (state->u.osc_pitch.last_value == NULL || state->u.osc_pitch.batches != B) {
+        free(state->u.osc_pitch.last_value);
+        state->u.osc_pitch.last_value = (double *)calloc((size_t)B, sizeof(double));
+        state->u.osc_pitch.batches = B;
+    }
+    if (state->u.osc_pitch.last_value == NULL) {
+        free(buffer);
+        free(owned_pitch);
+        free(owned_root);
+        free(owned_offset);
+        free(owned_add);
+        free(owned_slew);
+        return -1;
+    }
+
+    for (int b = 0; b < B; ++b) {
+        double current = state->u.osc_pitch.last_value[b];
+        size_t base = (size_t)b * (size_t)F;
+        for (int f = 0; f < F; ++f) {
+            size_t idx = base + (size_t)f;
+            double target;
+            if (has_direct) {
+                target = pitch_curve[idx];
+            } else {
+                double cents = offset_curve[idx];
+                target = root_curve[idx] * pow(2.0, cents / 1200.0);
+            }
+            target += add_curve != NULL ? add_curve[idx] : 0.0;
+            if (target < min_freq) {
+                target = min_freq;
+            }
+            double per_sec = slew_curve != NULL ? slew_curve[idx] : default_slew;
+            if (per_sec < 0.0) {
+                per_sec = 0.0;
+            }
+            double limit = per_sec > 0.0 ? per_sec / sample_rate : 0.0;
+            if (limit > 0.0) {
+                double delta = target - current;
+                if (delta > limit) {
+                    delta = limit;
+                } else if (delta < -limit) {
+                    delta = -limit;
+                }
+                current += delta;
+            } else {
+                current = target;
+            }
+            if (current < min_freq) {
+                current = min_freq;
+            }
+            buffer[idx] = current;
+        }
+        state->u.osc_pitch.last_value[b] = current;
+    }
+
+    state->u.osc_pitch.batches = B;
+
+    free(owned_pitch);
+    free(owned_root);
+    free(owned_offset);
+    free(owned_add);
+    free(owned_slew);
+
+    *out_buffer = buffer;
+    *out_channels = 1;
+    return 0;
+}
+
 static double alpha_lp(double fc, double sr) {
     if (fc < 1.0) {
         fc = 1.0;
@@ -4751,6 +4924,7 @@ static int run_parametric_driver_node(
     if (phase_view == NULL) {
         phase_view = find_param(inputs, "phase");
     }
+    const EdgeRunnerParamView *render_view = find_param(inputs, "render_mode");
 
     int B = batches > 0 ? batches : 1;
     int F = frames > 0 ? frames : 1;
@@ -4769,14 +4943,17 @@ static int run_parametric_driver_node(
     double *owned_freq = NULL;
     double *owned_amp = NULL;
     double *owned_phase = NULL;
+    double *owned_render = NULL;
 
     const double *freq = ensure_param_plane(freq_view, B, F, 440.0, &owned_freq);
     const double *amp = ensure_param_plane(amp_view, B, F, 1.0, &owned_amp);
     const double *phase_offset = ensure_param_plane(phase_view, B, F, 0.0, &owned_phase);
+    const double *render_mode = ensure_param_plane(render_view, B, F, 0.0, &owned_render);
     if (freq == NULL || amp == NULL) {
         free(owned_freq);
         free(owned_amp);
         free(owned_phase);
+        free(owned_render);
         return -1;
     }
 
@@ -4798,7 +4975,32 @@ static int run_parametric_driver_node(
         free(owned_freq);
         free(owned_amp);
         free(owned_phase);
+        free(owned_render);
         return -1;
+    }
+
+    const double *driver_input = NULL;
+    int driver_in_channels = 1;
+    int driver_in_batches = B;
+    int driver_in_frames = F;
+    if (inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
+        driver_input = inputs->audio.data;
+        driver_in_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 1;
+        if (inputs->audio.batches > 0) {
+            driver_in_batches = (int)inputs->audio.batches;
+        }
+        if (inputs->audio.frames > 0) {
+            driver_in_frames = (int)inputs->audio.frames;
+        }
+    }
+    if (driver_in_batches <= 0) {
+        driver_in_batches = B > 0 ? B : 1;
+    }
+    if (driver_in_frames <= 0) {
+        driver_in_frames = F > 0 ? F : 1;
+    }
+    if (driver_in_channels <= 0) {
+        driver_in_channels = 1;
     }
 
     for (int b = 0; b < B; ++b) {
@@ -4829,7 +5031,36 @@ static int run_parametric_driver_node(
                     sample += coeff * sin(harmonic_phase);
                 }
             }
-            buffer[idx] = sample * amp[idx];
+            double blend = render_mode != NULL ? render_mode[idx] : 0.0;
+            if (blend < 0.0) {
+                blend = 0.0;
+            } else if (blend > 1.0) {
+                blend = 1.0;
+            }
+            double stream_val = 0.0;
+            if (driver_input != NULL) {
+                int bb = b;
+                if (bb >= driver_in_batches) {
+                    bb = driver_in_batches - 1;
+                }
+                if (bb < 0) {
+                    bb = 0;
+                }
+                int ff = f;
+                if (ff >= driver_in_frames) {
+                    ff = driver_in_frames - 1;
+                }
+                if (ff < 0) {
+                    ff = 0;
+                }
+                size_t base_audio = ((size_t)bb * (size_t)driver_in_channels) * (size_t)driver_in_frames;
+                for (int c = 0; c < driver_in_channels; ++c) {
+                    stream_val += driver_input[base_audio + (size_t)c * (size_t)driver_in_frames + (size_t)ff];
+                }
+                stream_val /= (double)driver_in_channels;
+            }
+            double combined = (1.0 - blend) * sample + blend * stream_val;
+            buffer[idx] = combined * amp[idx];
         }
         state->u.driver.phase[b] = phase - floor(phase);
     }
@@ -4837,6 +5068,7 @@ static int run_parametric_driver_node(
     free(owned_freq);
     free(owned_amp);
     free(owned_phase);
+    free(owned_render);
 
     *out_buffer = buffer;
     *out_channels = 1;
@@ -6298,6 +6530,11 @@ static int amp_run_node_impl(
         case NODE_KIND_PITCH:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
                 ? run_pitch_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
+            break;
+        case NODE_KIND_OSC_PITCH:
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_oscillator_pitch_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
                 : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_OSC:
