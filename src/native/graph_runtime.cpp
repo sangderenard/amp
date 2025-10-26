@@ -19,6 +19,7 @@
 #include <deque>
 #include <condition_variable>
 #include <mutex>
+#include <mutex>
 
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
@@ -171,6 +172,17 @@ struct VectorizationPolicy {
     bool archtypal_mode{false};
 };
 
+enum class EdgeRingReleasePolicy : uint8_t {
+    AllConsumers = 0,
+    PrimaryConsumer = 1
+};
+
+struct EdgeRingContract {
+    bool simultaneous_availability{true};
+    EdgeRingReleasePolicy release_policy{EdgeRingReleasePolicy::AllConsumers};
+    uint32_t primary_consumer{std::numeric_limits<uint32_t>::max()};
+};
+
 struct EdgeRing {
     std::shared_ptr<EigenTensorHolder> storage;
     uint32_t capacity{0};
@@ -180,6 +192,7 @@ struct EdgeRing {
     size_t frame_stride{0};
     std::unordered_map<uint32_t, uint32_t> reader_tails;
     bool constant{false};
+    EdgeRingContract contract{};
 };
 
 struct EdgeReader {
@@ -265,6 +278,7 @@ struct RuntimeNode {
     std::unordered_map<std::string, size_t> param_cache_index;
     bool param_cache_dirty{true};
     VectorizationPolicy vector_policy{};
+    EdgeRingContract output_contract{};
     std::shared_ptr<EdgeRing> output_edge;
     std::vector<EdgeReader> input_edges;
     bool prefill_only{false};
@@ -452,6 +466,33 @@ static bool parse_bool_metadata(const std::string &json, const char *key, bool f
     return fallback;
 }
 
+static std::string parse_string_metadata(const std::string &json, const char *key, const std::string &fallback = {}) {
+    if (key == nullptr) return fallback;
+    std::string needle;
+    needle.reserve(std::strlen(key) + 4U);
+    needle.push_back('"');
+    needle.append(key);
+    needle.append("\":");
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return fallback;
+    pos += needle.size();
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) ++pos;
+    if (pos >= json.size() || json[pos] != '"') return fallback;
+    ++pos;
+    size_t start = pos;
+    while (pos < json.size()) {
+        unsigned char ch = static_cast<unsigned char>(json[pos]);
+        if (ch == '\\') {
+            pos += 2U;
+            continue;
+        }
+        if (ch == '"') break;
+        ++pos;
+    }
+    if (pos >= json.size()) return fallback;
+    return json.substr(start, pos - start);
+}
+
 /*** Error helpers ***/
 static void runtime_clear_error(AmpGraphRuntime *runtime) {
     if (!runtime) return;
@@ -524,20 +565,31 @@ static void edge_ring_recompute_tail(EdgeRing &ring) {
         ring.tail = 0U;
         return;
     }
-    uint32_t min_tail = ring.head % ring.capacity;
+    uint32_t new_tail = ring.head % ring.capacity;
+    if (ring.contract.release_policy == EdgeRingReleasePolicy::PrimaryConsumer) {
+        auto it = ring.reader_tails.find(ring.contract.primary_consumer);
+        if (it != ring.reader_tails.end()) {
+            ring.tail = it->second % ring.capacity;
+            return;
+        }
+    }
     if (!ring.reader_tails.empty()) {
         for (const auto &entry : ring.reader_tails) {
             uint32_t pos = entry.second % ring.capacity;
-            if (pos < min_tail) {
-                min_tail = pos;
+            if (pos < new_tail) {
+                new_tail = pos;
             }
         }
     }
-    ring.tail = min_tail;
+    ring.tail = new_tail;
 }
 
 static void edge_ring_register_consumer(EdgeRing &ring, uint32_t consumer) {
     ring.reader_tails[consumer] = ring.tail;
+    if (ring.contract.release_policy == EdgeRingReleasePolicy::PrimaryConsumer &&
+        ring.contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
+        ring.contract.primary_consumer = consumer;
+    }
 }
 
 static void edge_ring_set_consumer_position(EdgeRing &ring, uint32_t consumer, uint32_t position) {
@@ -626,6 +678,7 @@ static std::shared_ptr<EdgeRing> ensure_edge_ring(
     if (it != runtime->edge_rings.end()) return it->second;
     auto ring = std::make_shared<EdgeRing>();
     ring->policy = policy;
+    ring->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
     runtime->edge_rings.emplace(key, ring);
     return ring;
 }
@@ -692,6 +745,10 @@ static void runtime_initialize_edge_rings(AmpGraphRuntime *runtime, uint32_t def
         edge->reader_tails.clear();
         edge->policy = node.vector_policy;
         edge->constant = node.constant_node;
+        edge->contract = node.output_contract;
+        if (edge->contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
+            edge->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
+        }
     }
 
     for (size_t idx = 0; idx < node_count; ++idx) {
@@ -1428,6 +1485,24 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             if (node->prefill_frames == 0U) node->prefill_frames = 1U;
         }
         node->supports_v2 = parse_bool_metadata(node->params_json, "supports_v2", node->supports_v2);
+        node->output_contract.simultaneous_availability = parse_bool_metadata(node->params_json, "fifo_simultaneous_output", true);
+        std::string release_policy = parse_string_metadata(node->params_json, "fifo_release_policy", "all");
+        if (release_policy == "primary" || release_policy == "primary_consumer") {
+            node->output_contract.release_policy = EdgeRingReleasePolicy::PrimaryConsumer;
+        } else {
+            node->output_contract.release_policy = EdgeRingReleasePolicy::AllConsumers;
+        }
+        uint32_t primary_consumer_index = parse_uint_metadata(
+            node->params_json,
+            "fifo_primary_consumer",
+            std::numeric_limits<uint32_t>::max()
+        );
+        if (primary_consumer_index != std::numeric_limits<uint32_t>::max()) {
+            node->output_contract.primary_consumer = primary_consumer_index;
+        }
+        if (node->output_contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
+            node->output_contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
+        }
 
         runtime->node_index[node->name] = runtime->nodes.size();
         runtime->nodes.push_back(std::move(node));
@@ -1443,6 +1518,12 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         }
         runtime->channels.emplace(entry->name, std::make_shared<KahnChannel>(entry->name));
         entry->output_edge = ensure_edge_ring(runtime, entry->name, entry->vector_policy);
+        if (entry->output_edge) {
+            entry->output_edge->contract = entry->output_contract;
+            if (entry->output_edge->contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
+                entry->output_edge->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
+            }
+        }
     }
 
     // Create input edges and register consumers
@@ -1783,20 +1864,78 @@ static int kpn_streamer_produce(
 
     uint32_t host_tail = edge_ring_consumer_tail(*sink_edge, EDGE_RING_HOST_CONSUMER);
 
-    while (edge_ring_available_for_consumer(*sink_edge, EDGE_RING_HOST_CONSUMER) < desired_frames) {
-        bool progress = false;
+    struct ReadyNodeEntry {
+        uint32_t node_index{0};
+        double priority{0.0};
+        bool archtypal{false};
+        bool operator<(const ReadyNodeEntry &rhs) const {
+            if (priority == rhs.priority) {
+                return node_index > rhs.node_index;
+            }
+            return priority < rhs.priority;
+        }
+    };
+
+    std::priority_queue<ReadyNodeEntry> ready_queue;
+    std::vector<uint32_t> archtypal_ready;
+
+    auto rebuild_ready_queue = [&](void) {
+        std::priority_queue<ReadyNodeEntry> empty;
+        ready_queue.swap(empty);
+        archtypal_ready.clear();
         for (uint32_t idx : runtime->execution_order) {
             if (idx >= runtime->nodes.size()) continue;
-            RuntimeNode &node = *runtime->nodes[idx];
-            if (node.prefill_only) continue;
-
-            uint32_t frames = node_required_block_frames(runtime, node, streamer->block_frames);
-            if (!kpn_node_ready(runtime, node, idx, frames)) continue;
-
-            int status = kpn_execute_node_block(runtime, idx, frames, streamer->sample_rate, history);
-            if (status < 0) return status;
-            if (status == 0) progress = true;
+            RuntimeNode &candidate = *runtime->nodes[idx];
+            if (candidate.prefill_only) continue;
+            uint32_t frames = node_required_block_frames(runtime, candidate, streamer->block_frames);
+            if (!kpn_node_ready(runtime, candidate, idx, frames)) continue;
+            double priority = compute_scheduler_priority(runtime, idx);
+            ReadyNodeEntry entry{idx, priority, candidate.vector_policy.archtypal_mode};
+            ready_queue.push(entry);
+            if (entry.archtypal) {
+                archtypal_ready.push_back(idx);
+            }
         }
+    };
+
+    while (edge_ring_available_for_consumer(*sink_edge, EDGE_RING_HOST_CONSUMER) < desired_frames) {
+        rebuild_ready_queue();
+        bool progress = false;
+
+        if (!archtypal_ready.empty()) {
+            for (uint32_t idx : archtypal_ready) {
+                if (idx >= runtime->nodes.size()) continue;
+                RuntimeNode &node = *runtime->nodes[idx];
+                if (node.prefill_only) continue;
+                uint32_t frames = node_required_block_frames(runtime, node, streamer->block_frames);
+                if (!kpn_node_ready(runtime, node, idx, frames)) continue;
+                int status = kpn_execute_node_block(runtime, idx, frames, streamer->sample_rate, history);
+                if (status < 0) return status;
+                if (status == 0) {
+                    progress = true;
+                }
+            }
+            if (progress) {
+                continue;
+            }
+        }
+
+        while (!ready_queue.empty()) {
+            ReadyNodeEntry entry = ready_queue.top();
+            ready_queue.pop();
+            if (entry.node_index >= runtime->nodes.size()) continue;
+            RuntimeNode &node = *runtime->nodes[entry.node_index];
+            if (node.prefill_only) continue;
+            uint32_t frames = node_required_block_frames(runtime, node, streamer->block_frames);
+            if (!kpn_node_ready(runtime, node, entry.node_index, frames)) continue;
+            int status = kpn_execute_node_block(runtime, entry.node_index, frames, streamer->sample_rate, history);
+            if (status < 0) return status;
+            if (status == 0) {
+                progress = true;
+                break;
+            }
+        }
+
         if (!progress) {
             return -1; // deadlock
         }
