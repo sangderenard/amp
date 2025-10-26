@@ -1,6 +1,12 @@
 
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS 1
+#endif
 #include <ctype.h>
 #include <float.h>
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,6 +27,10 @@
 #include <sys/types.h>
 
 #include "amp_native.h"
+
+#ifndef M_LN2
+#define M_LN2 0.693147180559945309417232121458176568
+#endif
 
 typedef struct {
     int *boundaries;
@@ -4473,7 +4483,7 @@ static int run_oscillator_pitch_node(
         Eigen::Map<const RowArrayXXd> add_map(add_curve, B, F);
         target_array += add_map;
     }
-    target_array = target_array.max(min_freq);
+    target_array = target_array.cwiseMax(min_freq);
     double default_limit = default_slew > 0.0 ? default_slew / sample_rate : 0.0;
     RowArrayXXd limit_array = RowArrayXXd::Constant(B, F, default_limit);
     if (slew_curve != NULL) {

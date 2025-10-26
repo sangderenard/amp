@@ -14,6 +14,7 @@ output*
 build/
 Release/
 src/native/build/
+src/native/amp_kernels_cffi.cc
 workspace/
 logs/
 _amp_ckernels_cffi.*
@@ -35,3 +36,5 @@ _amp_ckernels_cffi.*
 **/*.vcxproj.filters
 **/*.sln
 output/test_fft.wav
+third_party/*
+third_party

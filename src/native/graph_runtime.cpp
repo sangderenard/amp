@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
 #include <memory>
 #include <new>
 #include <queue>
@@ -13,6 +15,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <thread>
+#include <deque>
+#include <condition_variable>
 
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
@@ -130,6 +135,13 @@ struct DefaultParam {
 struct ParamBinding {
     TensorShape shape;
     std::vector<double> data;
+    bool dirty{true};
+    bool use_ring{false};
+    uint32_t ring_frames{0};
+    uint32_t ring_head{0};
+    uint32_t window_frames{0};
+    size_t frame_stride{0};
+    TensorShape full_shape{};
 };
 
 struct RuntimeNode;
@@ -163,6 +175,9 @@ struct RuntimeNode {
     uint32_t output_batches{0};
     uint32_t output_channels{0};
     uint32_t output_frames{0};
+    std::shared_ptr<EigenTensorHolder> output_ring;
+    uint32_t output_ring_capacity{0};
+    uint32_t output_ring_head{0};
     uint32_t channel_hint{1};
     void *state{nullptr};
     EdgeRunnerNodeDescriptor descriptor{};
@@ -172,6 +187,9 @@ struct RuntimeNode {
     bool has_latest_metrics{false};
     AmpNodeMetrics latest_metrics{};
     double total_heat_accumulated{0.0};
+    std::vector<std::pair<std::string, std::shared_ptr<EigenTensorHolder>>> param_cache;
+    std::unordered_map<std::string, size_t> param_cache_index;
+    bool param_cache_dirty{true};
 
     RuntimeNode() = default;
 
@@ -328,6 +346,41 @@ struct AmpGraphRuntime {
     RuntimeErrorState last_error;
 };
 
+struct StreamDumpChunk {
+    std::vector<double> data;
+    uint32_t batches{0};
+    uint32_t channels{0};
+    uint32_t frames{0};
+    uint64_t sequence{0};
+};
+
+struct AmpGraphStreamer {
+    AmpGraphRuntime *runtime{nullptr};
+    std::vector<uint8_t> control_blob;
+    AmpGraphControlHistory *history{nullptr};
+    bool history_owned{false};
+    double sample_rate{0.0};
+    uint32_t ring_frames{0};
+    uint32_t block_frames{0};
+    uint32_t batches{0};
+    uint32_t channels{0};
+    size_t frame_stride{0};
+    std::vector<double> ring_buffer;
+    std::atomic<uint64_t> write_index{0};
+    std::atomic<uint64_t> read_index{0};
+    std::atomic<uint64_t> produced_frames{0};
+    std::atomic<uint64_t> consumed_frames{0};
+    std::deque<StreamDumpChunk> dump_queue;
+    std::mutex dump_mutex;
+    std::condition_variable dump_cv;
+    std::thread worker;
+    std::atomic<bool> running{false};
+    std::atomic<bool> stop_requested{false};
+    int frames_hint{0};
+    int last_status{0};
+    mutable std::mutex status_mutex;
+};
+
 static void runtime_clear_error(AmpGraphRuntime *runtime) {
     if (runtime == nullptr) {
         return;
@@ -445,20 +498,23 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
                 return false;
             }
             std::string param_name;
-            if (!reader.read_string(param_name_len, param_name)) {
-                return false;
-            }
-            DefaultParam param{};
-            param.name = std::move(param_name);
-            param.shape = make_shape(batches, channels, frames);
-            size_t value_count = static_cast<size_t>(blob_len) / sizeof(double);
-            param.data.resize(value_count);
-            if (reader.remaining < blob_len) {
-                return false;
-            }
-            std::memcpy(param.data.data(), reader.cursor, blob_len);
-            reader.skip(blob_len);
-            node->defaults.push_back(std::move(param));
+        if (!reader.read_string(param_name_len, param_name)) {
+            return false;
+        }
+        DefaultParam param{};
+        param.name = std::move(param_name);
+        param.shape = make_shape(batches, channels, frames);
+        size_t value_count = static_cast<size_t>(blob_len) / sizeof(double);
+        param.data.resize(value_count);
+        if (reader.remaining < blob_len) {
+            return false;
+        }
+        std::memcpy(param.data.data(), reader.cursor, blob_len);
+        reader.skip(blob_len);
+        node->param_cache_index[param.name] = node->param_cache.size();
+        node->param_cache.emplace_back(param.name, std::shared_ptr<EigenTensorHolder>());
+        node->defaults.push_back(std::move(param));
+        node->param_cache_dirty = true;
         }
         for (uint32_t s = 0; s < shape_count; ++s) {
             uint32_t b = 0, c = 0, f = 0;
@@ -719,28 +775,93 @@ static void apply_modulation(
     }
 }
 
-static std::vector<std::pair<std::string, std::shared_ptr<EigenTensorHolder>>> build_param_tensors(
+static const DefaultParam *find_default_param(const RuntimeNode &node, const std::string &name) {
+    for (const DefaultParam &param : node.defaults) {
+        if (param.name == name) {
+            return &param;
+        }
+    }
+    return nullptr;
+}
+
+static std::vector<std::pair<std::string, std::shared_ptr<EigenTensorHolder>>> &build_param_tensors(
     RuntimeNode &node
 ) {
-    std::vector<std::pair<std::string, std::shared_ptr<EigenTensorHolder>>> tensors;
-    tensors.reserve(node.defaults.size() + node.bindings.size());
-    for (const DefaultParam &param : node.defaults) {
-        tensors.emplace_back(param.name, clone_param_tensor(param));
+    for (const auto &binding_entry : node.bindings) {
+        if (node.param_cache_index.find(binding_entry.first) == node.param_cache_index.end()) {
+            node.param_cache_index[binding_entry.first] = node.param_cache.size();
+            node.param_cache.emplace_back(binding_entry.first, std::shared_ptr<EigenTensorHolder>());
+            node.param_cache_dirty = true;
+        }
     }
-    for (const auto &entry : node.bindings) {
-        bool replaced = false;
-        for (auto &existing : tensors) {
-            if (existing.first == entry.first) {
-                existing.second = clone_binding_tensor(entry.second);
-                replaced = true;
-                break;
+    if (!node.param_cache_dirty) {
+        return node.param_cache;
+    }
+    for (auto &entry : node.param_cache) {
+        const std::string &name = entry.first;
+        std::shared_ptr<EigenTensorHolder> tensor = entry.second;
+        auto binding_it = node.bindings.find(name);
+        if (binding_it != node.bindings.end()) {
+            ParamBinding &binding = binding_it->second;
+            if (!tensor || !shapes_equal(tensor->shape, binding.shape)) {
+                tensor = make_tensor(binding.shape);
+                entry.second = tensor;
             }
+            if (binding.use_ring || binding.dirty) {
+                tensor->shape = binding.shape;
+                double *dst = tensor->data();
+                const double *src = binding.data.data();
+                size_t frame_stride = binding.frame_stride;
+                uint32_t window_frames = binding.window_frames;
+                if (!binding.use_ring) {
+                    size_t copy_size = std::min(binding.data.size(), static_cast<size_t>(tensor->values.size()));
+                    if (copy_size < static_cast<size_t>(tensor->values.size())) {
+                        tensor->values.setZero();
+                    }
+                    if (copy_size > 0U) {
+                        std::memcpy(dst, src, copy_size * sizeof(double));
+                    }
+                } else {
+                    tensor->values.setZero();
+                    if (frame_stride > 0U && binding.ring_frames > 0U) {
+                        for (uint32_t f = 0; f < window_frames; ++f) {
+                            uint32_t ring_pos = static_cast<uint32_t>((binding.ring_head + f) % binding.ring_frames);
+                            std::memcpy(
+                                dst + static_cast<size_t>(f) * frame_stride,
+                                src + static_cast<size_t>(ring_pos) * frame_stride,
+                                frame_stride * sizeof(double)
+                            );
+                        }
+                    }
+                }
+            }
+            binding.dirty = false;
+            continue;
         }
-        if (!replaced) {
-            tensors.emplace_back(entry.first, clone_binding_tensor(entry.second));
+        const DefaultParam *def = find_default_param(node, name);
+        if (def == nullptr) {
+            if (tensor) {
+                tensor->values.setZero();
+            }
+            continue;
         }
+        if (!tensor || !shapes_equal(tensor->shape, def->shape)) {
+            tensor = make_tensor(def->shape);
+            entry.second = tensor;
+        }
+        if (!def->data.empty()) {
+            size_t copy_size = std::min(def->data.size(), static_cast<size_t>(tensor->values.size()));
+            if (copy_size < static_cast<size_t>(tensor->values.size())) {
+                tensor->values.setZero();
+            }
+            std::memcpy(tensor->data(), def->data.data(), copy_size * sizeof(double));
+        } else {
+            tensor->values.setZero();
+        }
+        tensor->shape = def->shape;
     }
-    return tensors;
+    node.param_cache_dirty = false;
+    return node.param_cache;
 }
 
 static std::shared_ptr<EigenTensorHolder> ensure_param_tensor(
@@ -759,10 +880,22 @@ static std::shared_ptr<EigenTensorHolder> ensure_param_tensor(
     return tensor;
 }
 
-static int execute_runtime(
+struct HistoryGuard {
+    EdgeRunnerControlHistory *ptr;
+    bool owned;
+
+    HistoryGuard(EdgeRunnerControlHistory *p, bool take) : ptr(p), owned(take) {}
+    ~HistoryGuard() {
+        if (owned && ptr != nullptr) {
+            amp_release_control_history(ptr);
+        }
+    }
+};
+
+static int execute_runtime_with_history_impl(
     AmpGraphRuntime *runtime,
-    const uint8_t *control_blob,
-    size_t control_len,
+    EdgeRunnerControlHistory *history,
+    bool history_owned,
     int frames_hint,
     double sample_rate,
     double **out_buffer,
@@ -778,14 +911,8 @@ static int execute_runtime(
         runtime_set_error(runtime, -1, "execute_runtime", nullptr, "output buffers must not be null");
         return -1;
     }
-    EdgeRunnerControlHistory *history = nullptr;
-    if (control_blob != nullptr && control_len > 0U) {
-        history = amp_load_control_history(control_blob, control_len, frames_hint);
-        if (history == nullptr) {
-            runtime_set_error(runtime, -1, "load_control_history", nullptr, "amp_load_control_history returned null");
-            return -1;
-        }
-    }
+    HistoryGuard guard(history, history_owned);
+    const EdgeRunnerControlHistory *history_view = history;
     for (auto &entry : runtime->nodes) {
         if (entry->output) {
             entry->output.reset();
@@ -802,9 +929,6 @@ static int execute_runtime(
     scratch.reserve(8);
     for (uint32_t order : runtime->execution_order) {
         if (order >= runtime->nodes.size()) {
-            if (history != nullptr) {
-                amp_release_control_history(history);
-            }
             std::string detail = std::string("execution order index out of range: ") + std::to_string(order);
             runtime_set_error(runtime, -1, "schedule_bounds", nullptr, std::move(detail));
             return -1;
@@ -813,9 +937,6 @@ static int execute_runtime(
         scratch.clear();
         std::shared_ptr<EigenTensorHolder> audio_tensor = merge_audio_inputs(runtime, node, scratch);
         if (!audio_tensor && !node.audio_indices.empty()) {
-            if (history != nullptr) {
-                amp_release_control_history(history);
-            }
             runtime_set_error(runtime, -1, "merge_audio_inputs", &node, "required audio input missing");
             return -1;
         }
@@ -830,7 +951,7 @@ static int execute_runtime(
             frames = audio_tensor->shape.frames;
             input_channels = audio_tensor->shape.channels;
         }
-        auto param_tensors = build_param_tensors(node);
+        auto &param_tensors = build_param_tensors(node);
         for (const ModConnectionInfo &mod : node.mod_connections) {
             auto channel_it = runtime->channels.find(mod.source);
             if (channel_it == runtime->channels.end()) {
@@ -909,7 +1030,7 @@ static int execute_runtime(
                     &frame_buffer,
                     &out_channels,
                     &state_arg,
-                    history,
+                    history_view,
                     AMP_EXECUTION_MODE_FORWARD,
                     &frame_metrics
                 );
@@ -919,9 +1040,6 @@ static int execute_runtime(
                 } else if (v2_status != 0) {
                     if (frame_buffer != nullptr) {
                         amp_free(frame_buffer);
-                    }
-                    if (history != nullptr) {
-                        amp_release_control_history(history);
                     }
                     std::string detail = std::string("amp_run_node_v2 returned status ") + std::to_string(v2_status)
                         + std::string(" at frame ") + std::to_string(frame_index);
@@ -945,14 +1063,11 @@ static int execute_runtime(
                     &frame_buffer,
                     &out_channels,
                     &state_arg,
-                    history
+                    history_view
                 );
                 if (status != 0 || frame_buffer == nullptr) {
                     if (frame_buffer != nullptr) {
                         amp_free(frame_buffer);
-                    }
-                    if (history != nullptr) {
-                        amp_release_control_history(history);
                     }
                     std::string detail;
                     int code = status;
@@ -968,9 +1083,6 @@ static int execute_runtime(
                 }
                 node.has_latest_metrics = false;
             } else if (frame_buffer == nullptr) {
-                if (history != nullptr) {
-                    amp_release_control_history(history);
-                }
                 runtime_set_error(runtime, -1, "run_node_v2", &node, "amp_run_node_v2 returned null buffer");
                 return -1;
             }
@@ -982,14 +1094,53 @@ static int execute_runtime(
                 node_output = make_tensor(shape);
                 node_output->shape = shape;
             }
+            if (node.output_ring_capacity == 0U) {
+                node.output_ring_capacity = node_output->shape.frames;
+            }
+            uint32_t history_frames = node.output_ring_capacity > 0U ? node.output_ring_capacity : node_output->shape.frames;
+            if (!node.output_ring || !node.output_ring->values.size()
+                || node_output->shape.batches != node.output_ring->shape.batches
+                || node_output->shape.channels != node.output_ring->shape.channels
+                || node.output_ring->shape.frames != history_frames) {
+                TensorShape ring_shape{};
+                ring_shape.batches = node_output->shape.batches;
+                ring_shape.channels = node_output->shape.channels;
+                ring_shape.frames = history_frames;
+                node.output_ring = make_tensor(ring_shape);
+                node.output_ring->shape = ring_shape;
+                node.output_ring_head = 0;
+            }
             size_t stride = static_cast<size_t>(node_output->shape.batches) * static_cast<size_t>(node_output->shape.channels);
             std::memcpy(
                 node_output->data() + frame_index * stride,
                 frame_buffer,
                 stride * sizeof(double)
             );
+            if (node.output_ring) {
+                size_t ring_stride = stride;
+                uint32_t ring_frames = node.output_ring->shape.frames;
+                if (ring_frames > 0U) {
+                    uint32_t ring_index = static_cast<uint32_t>((node.output_ring_head + frame_index) % ring_frames);
+                    std::memcpy(
+                        node.output_ring->data() + static_cast<size_t>(ring_index) * ring_stride,
+                        frame_buffer,
+                        ring_stride * sizeof(double)
+                    );
+                }
+            }
             amp_free(frame_buffer);
             state = state_arg;
+        }
+        if (node.output_ring && node.output_ring->shape.frames > 0U) {
+            uint32_t ring_frames = node.output_ring->shape.frames;
+            node.output_ring_head = static_cast<uint32_t>((node.output_ring_head + frames) % ring_frames);
+        }
+        for (auto &binding_entry : node.bindings) {
+            ParamBinding &binding = binding_entry.second;
+            if (binding.use_ring && binding.ring_frames > 0U) {
+                binding.ring_head = static_cast<uint32_t>((binding.ring_head + frames) % binding.ring_frames);
+                binding.dirty = true;
+            }
         }
         if (node.state != state) {
             if (node.state != nullptr) {
@@ -998,9 +1149,6 @@ static int execute_runtime(
         }
         node.state = state;
         if (!node_output) {
-            if (history != nullptr) {
-                amp_release_control_history(history);
-            }
             runtime_set_error(runtime, -1, "node_output", &node, "node produced no output");
             return -1;
         }
@@ -1012,9 +1160,6 @@ static int execute_runtime(
         if (channel_it != runtime->channels.end()) {
             channel_it->second->token = node_output;
         }
-    }
-    if (history != nullptr) {
-        amp_release_control_history(history);
     }
     if (runtime->sink_index >= runtime->nodes.size()) {
         runtime_set_error(runtime, -1, "sink_lookup", nullptr, "sink index out of range");
@@ -1032,6 +1177,339 @@ static int execute_runtime(
     return 0;
 }
 
+static int execute_runtime_impl(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    double **out_buffer,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+) {
+    EdgeRunnerControlHistory *history = nullptr;
+    bool history_owned = false;
+    if (control_blob != nullptr && control_len > 0U) {
+        history = amp_load_control_history(control_blob, control_len, frames_hint);
+        if (history == nullptr) {
+            runtime_set_error(runtime, -1, "load_control_history", nullptr, "amp_load_control_history returned null");
+            return -1;
+        }
+        history_owned = true;
+    }
+    return execute_runtime_with_history_impl(
+        runtime,
+        history,
+        history_owned,
+        frames_hint,
+        sample_rate,
+        out_buffer,
+        out_batches,
+        out_channels,
+        out_frames
+    );
+}
+
+static int execute_runtime_history_into_impl(
+    AmpGraphRuntime *runtime,
+    EdgeRunnerControlHistory *history,
+    bool history_owned,
+    int frames_hint,
+    double sample_rate,
+    double *out_buffer,
+    size_t out_buffer_len,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+) {
+    double *native_buffer = nullptr;
+    uint32_t batches = 0;
+    uint32_t channels = 0;
+    uint32_t frames = 0;
+    int status = execute_runtime_with_history_impl(
+        runtime,
+        history,
+        history_owned,
+        frames_hint,
+        sample_rate,
+        &native_buffer,
+        &batches,
+        &channels,
+        &frames
+    );
+    if (status != 0) {
+        return status;
+    }
+    size_t required = static_cast<size_t>(batches) * static_cast<size_t>(channels) * static_cast<size_t>(frames);
+    if (out_buffer == nullptr || out_buffer_len < required) {
+        runtime_set_error(runtime, -1, "execute_into", nullptr, "output buffer too small");
+        return -1;
+    }
+    std::memcpy(out_buffer, native_buffer, required * sizeof(double));
+    *out_batches = batches;
+    *out_channels = channels;
+    *out_frames = frames;
+    return 0;
+}
+
+static int execute_runtime_into_impl(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    double *out_buffer,
+    size_t out_buffer_len,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+) {
+    EdgeRunnerControlHistory *history = nullptr;
+    bool history_owned = false;
+    if (control_blob != nullptr && control_len > 0U) {
+        history = amp_load_control_history(control_blob, control_len, frames_hint);
+        if (history == nullptr) {
+            runtime_set_error(runtime, -1, "load_control_history", nullptr, "amp_load_control_history returned null");
+            return -1;
+        }
+        history_owned = true;
+    }
+    return execute_runtime_history_into_impl(
+        runtime,
+        history,
+        history_owned,
+        frames_hint,
+        sample_rate,
+        out_buffer,
+        out_buffer_len,
+        out_batches,
+        out_channels,
+        out_frames
+    );
+}
+
+static size_t streamer_ring_size(const AmpGraphStreamer *streamer) {
+    uint64_t w = streamer->write_index.load(std::memory_order_acquire);
+    uint64_t r = streamer->read_index.load(std::memory_order_acquire);
+    if (w < r) {
+        return 0;
+    }
+    uint64_t diff = w - r;
+    if (diff > streamer->ring_frames) {
+        diff = streamer->ring_frames;
+    }
+    return static_cast<size_t>(diff);
+}
+
+static size_t streamer_ring_free(const AmpGraphStreamer *streamer) {
+    size_t used = streamer_ring_size(streamer);
+    if (streamer->ring_frames <= used) {
+        return 0;
+    }
+    return streamer->ring_frames - used;
+}
+
+static void streamer_copy_from_ring(
+    const AmpGraphStreamer *streamer,
+    uint64_t start_index,
+    size_t frames,
+    double *destination
+) {
+    if (frames == 0 || streamer->frame_stride == 0 || streamer->ring_buffer.empty()) {
+        return;
+    }
+    size_t stride = streamer->frame_stride;
+    size_t capacity = streamer->ring_frames;
+    size_t remaining = frames;
+    size_t dst_offset = 0;
+    uint64_t index = start_index;
+    while (remaining > 0) {
+        size_t ring_pos = static_cast<size_t>(index % capacity);
+        size_t contiguous = std::min(remaining, capacity - ring_pos);
+        const double *src_ptr = streamer->ring_buffer.data() + static_cast<size_t>(ring_pos) * stride;
+        std::memcpy(
+            destination + dst_offset * stride,
+            src_ptr,
+            contiguous * stride * sizeof(double)
+        );
+        index += contiguous;
+        dst_offset += contiguous;
+        remaining -= contiguous;
+    }
+}
+
+static void streamer_copy_to_ring(
+    AmpGraphStreamer *streamer,
+    uint64_t start_index,
+    const double *source,
+    size_t frames
+) {
+    if (frames == 0 || streamer->frame_stride == 0 || streamer->ring_buffer.empty()) {
+        return;
+    }
+    size_t stride = streamer->frame_stride;
+    size_t capacity = streamer->ring_frames;
+    size_t remaining = frames;
+    size_t src_offset = 0;
+    uint64_t index = start_index;
+    while (remaining > 0) {
+        size_t ring_pos = static_cast<size_t>(index % capacity);
+        size_t contiguous = std::min(remaining, capacity - ring_pos);
+        double *dst_ptr = streamer->ring_buffer.data() + static_cast<size_t>(ring_pos) * stride;
+        std::memcpy(
+            dst_ptr,
+            source + src_offset * stride,
+            contiguous * stride * sizeof(double)
+        );
+        index += contiguous;
+        src_offset += contiguous;
+        remaining -= contiguous;
+    }
+}
+
+static void streamer_flush_ring_to_dump(AmpGraphStreamer *streamer) {
+    size_t current = streamer_ring_size(streamer);
+    if (current == 0 || streamer->frame_stride == 0 || streamer->ring_buffer.empty()) {
+        return;
+    }
+    StreamDumpChunk chunk;
+    chunk.batches = streamer->batches;
+    chunk.channels = streamer->channels;
+    chunk.frames = static_cast<uint32_t>(current);
+    uint64_t start_index = streamer->read_index.load(std::memory_order_acquire);
+    chunk.sequence = start_index;
+    chunk.data.resize(current * streamer->frame_stride);
+    streamer_copy_from_ring(streamer, start_index, current, chunk.data.data());
+    {
+        std::lock_guard<std::mutex> lock(streamer->dump_mutex);
+        streamer->dump_queue.push_back(std::move(chunk));
+    }
+    streamer->read_index.store(streamer->write_index.load(std::memory_order_acquire), std::memory_order_release);
+    streamer->consumed_frames.fetch_add(current, std::memory_order_release);
+    streamer->dump_cv.notify_all();
+}
+
+static void streamer_enqueue_chunk(
+    AmpGraphStreamer *streamer,
+    const double *frames,
+    size_t frame_count,
+    uint32_t batches,
+    uint32_t channels,
+    uint64_t sequence_start
+) {
+    if (frame_count == 0 || streamer->frame_stride == 0) {
+        return;
+    }
+    StreamDumpChunk chunk;
+    chunk.batches = batches;
+    chunk.channels = channels;
+    chunk.frames = static_cast<uint32_t>(frame_count);
+    chunk.sequence = sequence_start;
+    chunk.data.resize(frame_count * streamer->frame_stride);
+    std::memcpy(chunk.data.data(), frames, frame_count * streamer->frame_stride * sizeof(double));
+    {
+        std::lock_guard<std::mutex> lock(streamer->dump_mutex);
+        streamer->dump_queue.push_back(std::move(chunk));
+    }
+    streamer->dump_cv.notify_all();
+}
+
+static void streamer_write_frames(
+    AmpGraphStreamer *streamer,
+    const double *frames,
+    size_t frame_count
+) {
+    if (frame_count == 0) {
+        return;
+    }
+    if (streamer->ring_buffer.empty()) {
+        streamer->ring_buffer.resize(static_cast<size_t>(streamer->ring_frames) * streamer->frame_stride);
+        std::fill(streamer->ring_buffer.begin(), streamer->ring_buffer.end(), 0.0);
+    }
+    if (frame_count > streamer->ring_frames) {
+        // chunk larger than ring - push directly to dump queue
+        streamer_enqueue_chunk(streamer, frames, frame_count, streamer->batches, streamer->channels, streamer->produced_frames.load());
+        streamer->produced_frames.fetch_add(frame_count, std::memory_order_release);
+        return;
+    }
+    if (streamer_ring_free(streamer) < frame_count) {
+        streamer_flush_ring_to_dump(streamer);
+    }
+    if (streamer_ring_free(streamer) < frame_count) {
+        // still not enough due to very small ring - push to dump queue
+        streamer_enqueue_chunk(streamer, frames, frame_count, streamer->batches, streamer->channels, streamer->produced_frames.load());
+        streamer->produced_frames.fetch_add(frame_count, std::memory_order_release);
+        return;
+    }
+    uint64_t start = streamer->write_index.load(std::memory_order_relaxed);
+    streamer_copy_to_ring(streamer, start, frames, frame_count);
+    streamer->write_index.store(start + frame_count, std::memory_order_release);
+    streamer->produced_frames.fetch_add(frame_count, std::memory_order_release);
+}
+
+static void streamer_worker_main(AmpGraphStreamer *streamer) {
+    streamer->running.store(true, std::memory_order_release);
+    EdgeRunnerControlHistory *history = streamer->history;
+    if (history == nullptr && !streamer->control_blob.empty()) {
+        history = amp_load_control_history(
+            streamer->control_blob.data(),
+            streamer->control_blob.size(),
+            streamer->frames_hint > 0 ? streamer->frames_hint : static_cast<int>(streamer->block_frames)
+        );
+        if (history == nullptr) {
+            streamer->last_status = -1;
+            streamer->running.store(false, std::memory_order_release);
+            return;
+        }
+        streamer->history = history;
+        streamer->history_owned = true;
+    }
+    double *out_ptr = nullptr;
+    uint32_t out_batches = 0;
+    uint32_t out_channels = 0;
+    uint32_t out_frames = 0;
+    while (!streamer->stop_requested.load(std::memory_order_acquire)) {
+        out_ptr = nullptr;
+        out_batches = out_channels = out_frames = 0;
+        int status = execute_runtime_with_history_impl(
+            streamer->runtime,
+            history,
+            false,
+            static_cast<int>(streamer->block_frames),
+            streamer->sample_rate,
+            &out_ptr,
+            &out_batches,
+            &out_channels,
+            &out_frames
+        );
+        if (status != 0) {
+            streamer->last_status = status;
+            break;
+        }
+        if (out_ptr == nullptr || out_frames == 0 || out_channels == 0 || out_batches == 0) {
+            continue;
+        }
+        if (streamer->batches == 0) {
+            streamer->batches = out_batches;
+            streamer->channels = out_channels;
+            streamer->frame_stride = static_cast<size_t>(out_batches) * static_cast<size_t>(out_channels);
+        }
+        const size_t frame_count = static_cast<size_t>(out_frames);
+        std::vector<double> tmp(frame_count * streamer->frame_stride);
+        std::memcpy(tmp.data(), out_ptr, tmp.size() * sizeof(double));
+        streamer_write_frames(streamer, tmp.data(), frame_count);
+    }
+    streamer_flush_ring_to_dump(streamer);
+    if (streamer->history_owned && history != nullptr) {
+        amp_release_control_history(history);
+        streamer->history = nullptr;
+        streamer->history_owned = false;
+    }
+    streamer->running.store(false, std::memory_order_release);
+    streamer->dump_cv.notify_all();
+}
+
 static void clear_runtime(AmpGraphRuntime *runtime) {
     if (runtime == nullptr) {
         return;
@@ -1041,6 +1519,12 @@ static void clear_runtime(AmpGraphRuntime *runtime) {
             amp_release_state(node->state);
             node->state = nullptr;
         }
+        node->output_ring.reset();
+        node->output_ring_capacity = 0;
+        node->output_ring_head = 0;
+        node->param_cache.clear();
+        node->param_cache_index.clear();
+        node->param_cache_dirty = true;
     }
     runtime->nodes.clear();
     runtime->node_index.clear();
@@ -1114,6 +1598,7 @@ AMP_API void amp_graph_runtime_clear_params(AmpGraphRuntime *runtime) {
     }
     for (auto &node : runtime->nodes) {
         node->bindings.clear();
+        node->param_cache_dirty = true;
     }
 }
 
@@ -1143,7 +1628,8 @@ AMP_API int amp_graph_runtime_set_param(
     RuntimeNode &node = *runtime->nodes[it->second];
     ParamBinding binding{};
     binding.shape = make_shape(batches, channels, frames);
-    size_t total = static_cast<size_t>(binding.shape.batches) * static_cast<size_t>(binding.shape.channels) * static_cast<size_t>(binding.shape.frames);
+    TensorShape incoming_shape = binding.shape;
+    size_t total = static_cast<size_t>(incoming_shape.batches) * static_cast<size_t>(incoming_shape.channels) * static_cast<size_t>(incoming_shape.frames);
     if (total == 0U) {
         runtime_set_error(runtime, -1, "set_param", &node, "parameter tensor has zero elements");
         return -1;
@@ -1161,33 +1647,75 @@ AMP_API int amp_graph_runtime_set_param(
             expected_shape = &existing->second.shape;
         }
     }
-    if (expected_shape != nullptr && !shapes_equal(*expected_shape, binding.shape)) {
-        AMP_LOG_NATIVE_CALL("amp_graph_runtime_set_param_shape_mismatch", expected_shape->element_count(), binding.shape.element_count());
+    uint32_t target_batches = expected_shape != nullptr ? expected_shape->batches : incoming_shape.batches;
+    uint32_t target_channels = expected_shape != nullptr ? expected_shape->channels : incoming_shape.channels;
+    uint32_t target_frames = incoming_shape.frames;
+    if (expected_shape != nullptr && expected_shape->frames > 0U) {
+        target_frames = expected_shape->frames;
+    } else if (expected_shape == nullptr && runtime->default_frames > 0U) {
+        target_frames = runtime->default_frames;
+    }
+    bool enable_ring = false;
+    bool shape_valid = true;
+    if (incoming_shape.batches != target_batches || incoming_shape.channels != target_channels) {
+        shape_valid = false;
+    } else if (incoming_shape.frames != target_frames) {
+        if (target_frames > 0U && incoming_shape.frames % target_frames == 0U) {
+            enable_ring = true;
+        } else {
+            shape_valid = false;
+        }
+    }
+    if (!shape_valid) {
+        AMP_LOG_NATIVE_CALL(
+            "amp_graph_runtime_set_param_shape_mismatch",
+            expected_shape != nullptr ? expected_shape->element_count() : 0U,
+            incoming_shape.element_count()
+        );
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
         std::fprintf(
             stderr,
             "amp_graph_runtime_set_param: shape mismatch for %s.%s (expected %u x %u x %u, got %u x %u x %u)\n",
             node_name,
             param_name,
-            expected_shape->batches,
-            expected_shape->channels,
-            expected_shape->frames,
-            binding.shape.batches,
-            binding.shape.channels,
-            binding.shape.frames
+            target_batches,
+            target_channels,
+            target_frames,
+            incoming_shape.batches,
+            incoming_shape.channels,
+            incoming_shape.frames
         );
 #endif
         std::string detail = std::string("shape mismatch for ") + node.name + "." + param_name
-            + std::string(" (expected ") + std::to_string(expected_shape->batches) + " x "
-            + std::to_string(expected_shape->channels) + " x " + std::to_string(expected_shape->frames)
-            + ", got " + std::to_string(binding.shape.batches) + " x " + std::to_string(binding.shape.channels)
-            + " x " + std::to_string(binding.shape.frames) + ")";
+            + std::string(" (expected ") + std::to_string(target_batches) + " x "
+            + std::to_string(target_channels) + " x " + std::to_string(target_frames)
+            + ", got " + std::to_string(incoming_shape.batches) + " x " + std::to_string(incoming_shape.channels)
+            + " x " + std::to_string(incoming_shape.frames) + ")";
         runtime_set_error(runtime, -2, "set_param", &node, std::move(detail));
         return -2;
     }
+    binding.full_shape = incoming_shape;
+    binding.frame_stride = static_cast<size_t>(incoming_shape.batches) * static_cast<size_t>(incoming_shape.channels);
+    binding.window_frames = enable_ring ? target_frames : incoming_shape.frames;
+    binding.use_ring = enable_ring;
+    binding.ring_frames = enable_ring ? incoming_shape.frames : binding.window_frames;
+    binding.ring_head = 0;
+    binding.shape = make_shape(target_batches, target_channels, binding.window_frames);
     binding.data.resize(total);
     std::memcpy(binding.data.data(), data, total * sizeof(double));
-    node.bindings[param_name] = std::move(binding);
+    binding.dirty = true;
+    node.output_ring_capacity = std::max(node.output_ring_capacity, binding.ring_frames);
+    auto existing_binding = node.bindings.find(param_name);
+    if (existing_binding != node.bindings.end()) {
+        existing_binding->second = std::move(binding);
+    } else {
+        node.bindings.emplace(param_name, std::move(binding));
+    }
+    if (node.param_cache_index.find(param_name) == node.param_cache_index.end()) {
+        node.param_cache_index[param_name] = node.param_cache.size();
+        node.param_cache.emplace_back(param_name, std::shared_ptr<EigenTensorHolder>());
+    }
+    node.param_cache_dirty = true;
     return 0;
 }
 
@@ -1234,7 +1762,96 @@ AMP_API int amp_graph_runtime_execute(
     uint32_t *out_frames
 ) {
     AMP_LOG_NATIVE_CALL("amp_graph_runtime_execute", (size_t)(control_blob != nullptr ? control_len : 0U), static_cast<size_t>(frames_hint));
-    return execute_runtime(runtime, control_blob, control_len, frames_hint, sample_rate, out_buffer, out_batches, out_channels, out_frames);
+    return execute_runtime_impl(runtime, control_blob, control_len, frames_hint, sample_rate, out_buffer, out_batches, out_channels, out_frames);
+}
+
+AMP_API int amp_graph_runtime_execute_with_history(
+    AmpGraphRuntime *runtime,
+    AmpGraphControlHistory *history,
+    int frames_hint,
+    double sample_rate,
+    double **out_buffer,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+) {
+    AMP_LOG_NATIVE_CALL(
+        "amp_graph_runtime_execute_with_history",
+        static_cast<size_t>(history != nullptr),
+        static_cast<size_t>(frames_hint)
+    );
+    return execute_runtime_with_history_impl(
+        runtime,
+        history,
+        false,
+        frames_hint,
+        sample_rate,
+        out_buffer,
+        out_batches,
+        out_channels,
+        out_frames
+    );
+}
+
+AMP_API int amp_graph_runtime_execute_into(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    double *out_buffer,
+    size_t out_buffer_len,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+) {
+    AMP_LOG_NATIVE_CALL(
+        "amp_graph_runtime_execute_into",
+        (size_t)(control_blob != nullptr ? control_len : 0U),
+        static_cast<size_t>(frames_hint)
+    );
+    return execute_runtime_into_impl(
+        runtime,
+        control_blob,
+        control_len,
+        frames_hint,
+        sample_rate,
+        out_buffer,
+        out_buffer_len,
+        out_batches,
+        out_channels,
+        out_frames
+    );
+}
+
+AMP_API int amp_graph_runtime_execute_history_into(
+    AmpGraphRuntime *runtime,
+    AmpGraphControlHistory *history,
+    int frames_hint,
+    double sample_rate,
+    double *out_buffer,
+    size_t out_buffer_len,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+) {
+    AMP_LOG_NATIVE_CALL(
+        "amp_graph_runtime_execute_history_into",
+        static_cast<size_t>(history != nullptr),
+        static_cast<size_t>(frames_hint)
+    );
+    return execute_runtime_history_into_impl(
+        runtime,
+        history,
+        false,
+        frames_hint,
+        sample_rate,
+        out_buffer,
+        out_buffer_len,
+        out_batches,
+        out_channels,
+        out_frames
+    );
 }
 
 AMP_API int amp_graph_runtime_last_error(
@@ -1268,6 +1885,213 @@ AMP_API AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size
 AMP_API void amp_graph_history_destroy(AmpGraphControlHistory *history) {
     AMP_LOG_NATIVE_CALL("amp_graph_history_destroy", (size_t)(history != nullptr), 0);
     amp_release_control_history(history);
+}
+
+AMP_API AmpGraphStreamer *amp_graph_streamer_create(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    uint32_t ring_frames,
+    uint32_t block_frames
+) {
+    AMP_LOG_NATIVE_CALL(
+        "amp_graph_streamer_create",
+        static_cast<size_t>(runtime != nullptr),
+        static_cast<size_t>(ring_frames)
+    );
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    auto *streamer = new (std::nothrow) AmpGraphStreamer();
+    if (streamer == nullptr) {
+        return nullptr;
+    }
+    streamer->runtime = runtime;
+    if (control_blob != nullptr && control_len > 0U) {
+        streamer->control_blob.assign(control_blob, control_blob + control_len);
+    }
+    streamer->frames_hint = frames_hint;
+    streamer->sample_rate = sample_rate;
+    streamer->ring_frames = ring_frames > 0U ? ring_frames : block_frames;
+    if (streamer->ring_frames == 0U) {
+        streamer->ring_frames = 1024U;
+    }
+    streamer->block_frames = block_frames > 0U ? block_frames : streamer->ring_frames / 2U;
+    if (streamer->block_frames == 0U) {
+        streamer->block_frames = 256U;
+    }
+    streamer->write_index.store(0, std::memory_order_relaxed);
+    streamer->read_index.store(0, std::memory_order_relaxed);
+    streamer->produced_frames.store(0, std::memory_order_relaxed);
+    streamer->consumed_frames.store(0, std::memory_order_relaxed);
+    streamer->stop_requested.store(false, std::memory_order_relaxed);
+    uint32_t batches = runtime->default_batches > 0U ? runtime->default_batches : 1U;
+    amp_graph_runtime_configure(runtime, batches, streamer->block_frames);
+    if (streamer->control_blob.empty()) {
+        streamer->history = nullptr;
+        streamer->history_owned = false;
+    }
+    return streamer;
+}
+
+AMP_API int amp_graph_streamer_start(AmpGraphStreamer *streamer) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_start", (size_t)(streamer != nullptr), 0);
+    if (streamer == nullptr) {
+        return -1;
+    }
+    if (streamer->running.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    streamer->stop_requested.store(false, std::memory_order_release);
+    streamer->worker = std::thread(streamer_worker_main, streamer);
+    return 0;
+}
+
+AMP_API void amp_graph_streamer_stop(AmpGraphStreamer *streamer) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_stop", (size_t)(streamer != nullptr), 0);
+    if (streamer == nullptr) {
+        return;
+    }
+    streamer->stop_requested.store(true, std::memory_order_release);
+    if (streamer->worker.joinable()) {
+        streamer->worker.join();
+    }
+}
+
+AMP_API void amp_graph_streamer_destroy(AmpGraphStreamer *streamer) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_destroy", (size_t)(streamer != nullptr), 0);
+    if (streamer == nullptr) {
+        return;
+    }
+    amp_graph_streamer_stop(streamer);
+    if (streamer->history_owned && streamer->history != nullptr) {
+        amp_release_control_history(streamer->history);
+        streamer->history = nullptr;
+        streamer->history_owned = false;
+    }
+    delete streamer;
+}
+
+AMP_API int amp_graph_streamer_available(AmpGraphStreamer *streamer, uint64_t *out_frames) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_available", (size_t)(streamer != nullptr), 0);
+    if (streamer == nullptr || out_frames == nullptr) {
+        return -1;
+    }
+    *out_frames = streamer_ring_size(streamer);
+    return 0;
+}
+
+AMP_API int amp_graph_streamer_read(
+    AmpGraphStreamer *streamer,
+    double *destination,
+    size_t max_frames,
+    uint32_t *out_frames,
+    uint32_t *out_channels,
+    uint64_t *out_sequence
+) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_read", (size_t)(streamer != nullptr), max_frames);
+    if (streamer == nullptr || destination == nullptr || max_frames == 0) {
+        return -1;
+    }
+    size_t available = streamer_ring_size(streamer);
+    if (available == 0) {
+        if (out_frames) *out_frames = 0;
+        if (out_channels) *out_channels = streamer->channels;
+        if (out_sequence) *out_sequence = streamer->read_index.load(std::memory_order_acquire);
+        return 0;
+    }
+    size_t to_copy = std::min(max_frames, available);
+    uint64_t start_index = streamer->read_index.load(std::memory_order_acquire);
+    streamer_copy_from_ring(streamer, start_index, to_copy, destination);
+    streamer->read_index.store(start_index + to_copy, std::memory_order_release);
+    streamer->consumed_frames.fetch_add(to_copy, std::memory_order_release);
+    if (out_frames) {
+        *out_frames = static_cast<uint32_t>(to_copy);
+    }
+    if (out_channels) {
+        *out_channels = streamer->channels;
+    }
+    if (out_sequence) {
+        *out_sequence = start_index;
+    }
+    return 0;
+}
+
+AMP_API int amp_graph_streamer_dump_count(AmpGraphStreamer *streamer, uint32_t *out_count) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_dump_count", (size_t)(streamer != nullptr), 0);
+    if (streamer == nullptr || out_count == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(streamer->dump_mutex);
+    *out_count = static_cast<uint32_t>(streamer->dump_queue.size());
+    return 0;
+}
+
+AMP_API int amp_graph_streamer_pop_dump(
+    AmpGraphStreamer *streamer,
+    double *destination,
+    size_t max_frames,
+    uint32_t *out_frames,
+    uint32_t *out_channels,
+    uint64_t *out_sequence
+) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_pop_dump", (size_t)(streamer != nullptr), max_frames);
+    if (streamer == nullptr) {
+        return -1;
+    }
+    StreamDumpChunk chunk;
+    std::unique_lock<std::mutex> lock(streamer->dump_mutex);
+    if (streamer->dump_queue.empty()) {
+        if (out_frames) *out_frames = 0;
+        if (out_channels) *out_channels = streamer->channels;
+        if (out_sequence) *out_sequence = streamer->produced_frames.load(std::memory_order_acquire);
+        return 0;
+    }
+    chunk = std::move(streamer->dump_queue.front());
+    streamer->dump_queue.pop_front();
+    lock.unlock();
+    size_t frames = chunk.frames;
+    if (destination == nullptr || max_frames < frames) {
+        lock.lock();
+        streamer->dump_queue.push_front(std::move(chunk));
+        lock.unlock();
+        if (out_frames) *out_frames = static_cast<uint32_t>(frames);
+        if (out_channels) *out_channels = chunk.channels;
+        if (out_sequence) *out_sequence = chunk.sequence;
+        return 1;
+    }
+    std::memcpy(destination, chunk.data.data(), frames * streamer->frame_stride * sizeof(double));
+    streamer->consumed_frames.fetch_add(frames, std::memory_order_release);
+    if (out_frames) {
+        *out_frames = static_cast<uint32_t>(frames);
+    }
+    if (out_channels) {
+        *out_channels = chunk.channels;
+    }
+    if (out_sequence) {
+        *out_sequence = chunk.sequence;
+    }
+    return 0;
+}
+
+AMP_API int amp_graph_streamer_status(
+    AmpGraphStreamer *streamer,
+    uint64_t *out_produced_frames,
+    uint64_t *out_consumed_frames
+) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_status", (size_t)(streamer != nullptr), 0);
+    if (streamer == nullptr) {
+        return -1;
+    }
+    if (out_produced_frames) {
+        *out_produced_frames = streamer->produced_frames.load(std::memory_order_acquire);
+    }
+    if (out_consumed_frames) {
+        *out_consumed_frames = streamer->consumed_frames.load(std::memory_order_acquire);
+    }
+    return streamer->last_status;
 }
 
 }  // extern "C"

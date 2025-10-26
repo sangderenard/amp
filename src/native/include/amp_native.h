@@ -326,6 +326,39 @@ AMP_CAPI int amp_graph_runtime_execute(
     uint32_t *out_channels,
     uint32_t *out_frames
 );
+AMP_CAPI int amp_graph_runtime_execute_with_history(
+    AmpGraphRuntime *runtime,
+    AmpGraphControlHistory *history,
+    int frames_hint,
+    double sample_rate,
+    double **out_buffer,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+);
+AMP_CAPI int amp_graph_runtime_execute_into(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    double *out_buffer,
+    size_t out_buffer_len,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+);
+AMP_CAPI int amp_graph_runtime_execute_history_into(
+    AmpGraphRuntime *runtime,
+    AmpGraphControlHistory *history,
+    int frames_hint,
+    double sample_rate,
+    double *out_buffer,
+    size_t out_buffer_len,
+    uint32_t *out_batches,
+    uint32_t *out_channels,
+    uint32_t *out_frames
+);
 AMP_CAPI int amp_graph_runtime_last_error(
     AmpGraphRuntime *runtime,
     AmpGraphRuntimeErrorInfo *out_error
@@ -333,6 +366,44 @@ AMP_CAPI int amp_graph_runtime_last_error(
 AMP_CAPI void amp_graph_runtime_buffer_free(double *buffer);
 AMP_CAPI AmpGraphControlHistory *amp_graph_history_load(const uint8_t *blob, size_t blob_len, int frames_hint);
 AMP_CAPI void amp_graph_history_destroy(AmpGraphControlHistory *history);
+
+typedef struct AmpGraphStreamer AmpGraphStreamer;
+
+AMP_CAPI AmpGraphStreamer *amp_graph_streamer_create(
+    AmpGraphRuntime *runtime,
+    const uint8_t *control_blob,
+    size_t control_len,
+    int frames_hint,
+    double sample_rate,
+    uint32_t ring_frames,
+    uint32_t block_frames
+);
+AMP_CAPI int amp_graph_streamer_start(AmpGraphStreamer *streamer);
+AMP_CAPI void amp_graph_streamer_stop(AmpGraphStreamer *streamer);
+AMP_CAPI void amp_graph_streamer_destroy(AmpGraphStreamer *streamer);
+AMP_CAPI int amp_graph_streamer_available(AmpGraphStreamer *streamer, uint64_t *out_frames);
+AMP_CAPI int amp_graph_streamer_read(
+    AmpGraphStreamer *streamer,
+    double *destination,
+    size_t max_frames,
+    uint32_t *out_frames,
+    uint32_t *out_channels,
+    uint64_t *out_sequence
+);
+AMP_CAPI int amp_graph_streamer_dump_count(AmpGraphStreamer *streamer, uint32_t *out_count);
+AMP_CAPI int amp_graph_streamer_pop_dump(
+    AmpGraphStreamer *streamer,
+    double *destination,
+    size_t max_frames,
+    uint32_t *out_frames,
+    uint32_t *out_channels,
+    uint64_t *out_sequence
+);
+AMP_CAPI int amp_graph_streamer_status(
+    AmpGraphStreamer *streamer,
+    uint64_t *out_produced_frames,
+    uint64_t *out_consumed_frames
+);
 
 #ifdef __cplusplus
 }

@@ -11,7 +11,7 @@ import traceback
 from typing import Optional
 
 import io
-
+import filecmp
 import os
 
 if "CXX" not in os.environ:
@@ -239,10 +239,34 @@ try:
         if eigen_dir is None:
             raise RuntimeError(eigen_error or "Eigen headers unavailable")
         kernels_source = native_dir / "amp_kernels.c"
+        source_for_build = kernels_source
+        if os.name == "nt":
+            # MSVC treats *.c as C even with /TP if /Tc is also present. Keep a
+            # C++ copy so the compiler consistently parses Eigen aliases.
+            cffi_cxx = native_dir / "amp_kernels_cffi.cc"
+            try:
+                source_stat = kernels_source.stat()
+                source_mtime = source_stat.st_mtime
+                replicate = not cffi_cxx.exists()
+                if not replicate:
+                    target_stat = cffi_cxx.stat()
+                    if target_stat.st_size != source_stat.st_size:
+                        replicate = True
+                    elif target_stat.st_mtime < source_mtime:
+                        try:
+                            identical = filecmp.cmp(kernels_source, cffi_cxx, shallow=False)
+                        except OSError:
+                            identical = False
+                        replicate = not identical
+                if replicate:
+                    shutil.copy2(kernels_source, cffi_cxx)
+            except OSError as exc:
+                raise RuntimeError(f"Failed to stage C++ kernel source: {exc}") from exc
+            source_for_build = cffi_cxx
         ffi.set_source(
             "_amp_ckernels_cffi",
             '#include "amp_native.h"\n',
-            sources=[str(kernels_source)],
+            sources=[str(source_for_build)],
             include_dirs=[str(include_dir), str(eigen_dir)],
             extra_compile_args=_EXTRA_COMPILE_ARGS,
             extra_link_args=_EXTRA_LINK_ARGS,

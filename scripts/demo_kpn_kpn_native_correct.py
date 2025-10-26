@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 import sys
 import wave
 from dataclasses import dataclass
@@ -816,7 +817,7 @@ def main(argv: Iterable[str]) -> int:
     module.pitch_shift.params.setdefault("ratio_min", float(args.pitch_shift_min_ratio))
     module.pitch_shift.params.setdefault("ratio_max", float(args.pitch_shift_max_ratio))
     log(
-        "[demo] Pitch-shift node '%s' bridges driver '%s' → oscillator '%s' (algorithm=%s, track_mode=%s, portamento_ms=%.2f)"
+        "[demo] Pitch-shift node '%s' bridges driver '%s' -> oscillator '%s' (algorithm=%s, track_mode=%s, portamento_ms=%.2f)"
         % (
             module.pitch_shift.name,
             module.driver.name,
@@ -1037,82 +1038,71 @@ def main(argv: Iterable[str]) -> int:
                     % driver_map_path
                 )
 
-        pcm_blocks: list[np.ndarray] = []
-        metrics_log: list[Tuple[int, float]] = []
-
-        produced = 0
-        block_index = 0
-        while produced < total_frames:
-            frames_this = min(block_size, total_frames - produced)
-            sl = slice(produced, produced + frames_this)
-            log(f"[demo] Block {block_index}: rendering {frames_this} frames (produced={produced})")
-            driver_params = create_param_block(
-                {
-                    "frequency": driver_freq_curve[sl],
-                    "amplitude": driver_amp_curve[sl],
-                    "render_mode": render_mode_curve[sl],
-                }
-            )
-            pitch_params = create_param_block(
-                {
-                    "pitch_hz": pitch_schedule[sl],
-                    "slew_hz_per_s": pitch_slew_curve[sl],
-                }
-            )
-            osc_params = create_param_block(
-                {
-                    "freq": master_freq_curve[sl],
-                    "amp": np.full(frames_this, base_amp, dtype=np.float64),
-                    "slew": slew_curve[sl],
-                }
-            )
-            fft_params = create_param_block(
-                {
-                    "divisor": np.ones(frames_this, dtype=np.float64),
-                    "divisor_imag": np.zeros(frames_this, dtype=np.float64),
-                    "phase_offset": np.zeros(frames_this, dtype=np.float64),
-                    "lower_band": np.zeros(frames_this, dtype=np.float64),
-                    "upper_band": np.ones(frames_this, dtype=np.float64),
-                    "filter_intensity": np.ones(frames_this, dtype=np.float64),
-                    "stabilizer": np.full(frames_this, 1.0e-9, dtype=np.float64),
-                }
-            )
-
-            base_params = {
-                module.pitch.name: pitch_params,
-                module.driver.name: driver_params,
-                module.oscillator.name: osc_params,
-                "fft": fft_params,
-            }
-            if module.pitch_shift is not None:
-                pitch_shift_block = create_param_block({"ratio": ratio_curve[sl]})
-                base_params[module.pitch_shift.name] = pitch_shift_block
-            try:
-                block_pcm = executor.run_block(frames_this, float(args.sr), base_params=base_params)
-            except Exception as exc:
-                log(f"[demo] Native execution failed at block {block_index}: {exc}")
-                err = executor.last_error()
-                if err:
-                    stage = err.get("stage") or "<unknown>"
-                    node_name = err.get("node") or "<none>"
-                    detail = err.get("detail") or ""
-                    log(
-                        "[demo] Last native error: "
-                        f"code={err.get('code')} stage={stage} node={node_name} detail={detail}"
+        avg_heat = None
+        driver_params = create_param_block({
+            "frequency": driver_freq_curve,
+            "amplitude": driver_amp_curve,
+            "render_mode": render_mode_curve,
+        })
+        pitch_params = create_param_block({
+            "pitch_hz": pitch_schedule,
+            "slew_hz_per_s": pitch_slew_curve,
+        })
+        osc_params = create_param_block({
+            "freq": master_freq_curve,
+            "amp": np.full(total_frames, base_amp, dtype=np.float64),
+            "slew": slew_curve,
+        })
+        fft_params = create_param_block({
+            "divisor": np.ones(total_frames, dtype=np.float64),
+            "divisor_imag": np.zeros(total_frames, dtype=np.float64),
+            "phase_offset": np.zeros(total_frames, dtype=np.float64),
+            "lower_band": np.zeros(total_frames, dtype=np.float64),
+            "upper_band": np.ones(total_frames, dtype=np.float64),
+            "filter_intensity": np.ones(total_frames, dtype=np.float64),
+            "stabilizer": np.full(total_frames, 1.0e-9, dtype=np.float64),
+        })
+        base_params = {
+            module.pitch.name: pitch_params,
+            module.driver.name: driver_params,
+            module.oscillator.name: osc_params,
+            "fft": fft_params,
+        }
+        if module.pitch_shift is not None:
+            base_params[module.pitch_shift.name] = create_param_block({"ratio": ratio_curve})
+        try:
+            control_history_blob = graph.export_control_history_blob(0.0, args.duration)
+        except Exception:
+            control_history_blob = b""
+        # NOTE: Python only orchestrates set-up/teardown here; the native streamer keeps the hot path entirely in C.
+        streamer = executor.create_streamer(
+            total_frames=total_frames,
+            sample_rate=float(args.sr),
+            base_params=base_params,
+            control_history_blob=control_history_blob,
+            ring_frames=total_frames,
+            block_frames=block_size,
+        )
+        log(
+            f"[demo] Streaming native renderer (ring size {total_frames}, block {block_size})..."
+        )
+        with streamer:
+            streamer.start()
+            while True:
+                produced_frames, consumed_frames, last_status = streamer.status()
+                if last_status != 0:
+                    raise RuntimeError(
+                        f"streamer encountered error status {last_status}"
                     )
-                raise
-            log(f"[demo] Block {block_index}: completed")
-            pcm_blocks.append(block_pcm.reshape(-1))
-
-            summary = executor.ffi.new("AmpGraphNodeSummary *")
-            rc = executor.lib.amp_graph_runtime_describe_node(executor._runtime, b"fft", summary)
-            if int(rc) == 0 and summary.has_metrics:
-                metrics_log.append((block_index, float(summary.metrics.accumulated_heat)))
-
-            produced += frames_this
-            block_index += 1
-
-    pcm = np.concatenate(pcm_blocks)
+                if produced_frames >= total_frames:
+                    break
+                time.sleep(0.01)
+            streamer.stop()
+            pcm_tensor = streamer.collect(total_frames)
+        pcm = pcm_tensor.reshape(-1)
+        summary = executor.ffi.new("AmpGraphNodeSummary *")
+        rc = executor.lib.amp_graph_runtime_describe_node(executor._runtime, b"fft", summary)
+        avg_heat = float(summary.metrics.accumulated_heat) if int(rc) == 0 and summary.has_metrics else None
 
     log("[demo] Rendering spectrogram...")
     window_size = int(graph._nodes["fft"].params.get("window_size", 512))
@@ -1127,9 +1117,8 @@ def main(argv: Iterable[str]) -> int:
 
     log(f"[demo] Wrote spectrogram: {png_path}")
     log(f"[demo] Wrote PCM: {wav_path}")
-    if metrics_log:
-        avg_heat = sum(m[1] for m in metrics_log) / len(metrics_log)
-        log(f"[demo] FFT node average accumulated heat per block: {avg_heat:.6f}")
+    if avg_heat is not None:
+        log(f"[demo] FFT node accumulated heat: {avg_heat:.6f}")
     return 0
 
 
