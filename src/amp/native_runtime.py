@@ -12,13 +12,15 @@ from typing import Callable, Mapping, List, Optional, Tuple
 import numpy as np
 
 from .utils import lanczos_resample
+from . import native_build
 
 AVAILABLE = False
 _IMPL = None
 UNAVAILABLE_REASON: str | None = None
 
-_DIAGNOSTIC_BUILD = os.environ.get("AMP_NATIVE_DIAGNOSTICS_BUILD", "")
-_LOGGING_ENABLED = _DIAGNOSTIC_BUILD.lower() in ("1", "true", "yes", "on")
+native_build.ensure_toolchain_env()
+_BUILD_CONFIG = native_build.get_build_config()
+_LOGGING_ENABLED = _BUILD_CONFIG.logging_enabled
 
 _LIBRARY_OVERRIDE_ENV = "AMP_NATIVE_RUNTIME_PATH"
 _FORCE_REBUILD_ENV = "AMP_NATIVE_FORCE_REBUILD"
@@ -80,12 +82,14 @@ def _build_native_library(force: bool = False) -> Path:
     if extra_config:
         cmake_args.extend(shlex.split(extra_config))
 
-    subprocess.run(cmake_args, check=True, cwd=native_dir)
+    env = native_build.command_environment()
+
+    subprocess.run(cmake_args, check=True, cwd=native_dir, env=env)
 
     build_cmd = ["cmake", "--build", str(build_dir), "--config", "Release"]
     if force and sys.platform != "win32":
         build_cmd.append("--clean-first")
-    subprocess.run(build_cmd, check=True, cwd=native_dir)
+    subprocess.run(build_cmd, check=True, cwd=native_dir, env=env)
 
     library_name = _library_name()
     candidates = [build_dir / library_name]
@@ -553,6 +557,18 @@ class NativeGraphExecutor:
             if self._set_dsp_sample_rate is not None:
                 self._set_dsp_sample_rate(self._runtime, float(dsp_rate))
             keepalive = self._bind_base_params(batches, dsp_frames, base_params)
+            if out_buffer is not None:
+                if out_buffer.dtype != np.float64:
+                    raise TypeError("out_buffer must use float64 samples")
+                if out_buffer.ndim != 3:
+                    raise ValueError("out_buffer must have shape (batches, channels, frames)")
+                if not out_buffer.flags.c_contiguous:
+                    raise ValueError("out_buffer must be C-contiguous")
+                out_target = out_buffer
+                target_ptr = self.ffi.cast("double *", out_target.ctypes.data)
+            else:
+                out_target = None
+                target_ptr = None
             history_handle = self.ffi.NULL
             ctrl_blob_bytes = b""
             if control_history_blob:
