@@ -143,6 +143,17 @@ typedef struct {
 typedef struct AmpGraphRuntime AmpGraphRuntime;
 typedef EdgeRunnerControlHistory AmpGraphControlHistory;
 
+typedef enum {
+    AMP_SCHEDULER_ORDERED = 0,
+    AMP_SCHEDULER_LEARNED = 1
+} AmpGraphSchedulerMode;
+
+typedef struct {
+    double early_bias;
+    double late_bias;
+    double saturation_bias;
+} AmpGraphSchedulerParams;
+
 void lfo_slew(const double *x, double *out, int B, int F, double r, double alpha, double *z0);
 void safety_filter(const double *x, double *y, int B, int C, int F, double a, double *prev_in, double *prev_dc);
 void dc_block(const double *x, double *out, int B, int C, int F, double a, double *state);
@@ -310,6 +321,8 @@ AMP_CAPI AmpGraphRuntime *amp_graph_runtime_create(
 AMP_CAPI void amp_graph_runtime_destroy(AmpGraphRuntime *runtime);
 AMP_CAPI int amp_graph_runtime_configure(AmpGraphRuntime *runtime, uint32_t batches, uint32_t frames);
 AMP_CAPI void amp_graph_runtime_set_dsp_sample_rate(AmpGraphRuntime *runtime, double sample_rate);
+AMP_CAPI int amp_graph_runtime_set_scheduler_mode(AmpGraphRuntime *runtime, AmpGraphSchedulerMode mode);
+AMP_CAPI int amp_graph_runtime_set_scheduler_params(AmpGraphRuntime *runtime, const AmpGraphSchedulerParams *params);
 AMP_CAPI void amp_graph_runtime_clear_params(AmpGraphRuntime *runtime);
 AMP_CAPI int amp_graph_runtime_set_param(
     AmpGraphRuntime *runtime,

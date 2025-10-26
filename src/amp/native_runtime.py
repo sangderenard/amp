@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from enum import IntEnum
 from typing import Callable, Mapping, List, Optional, Tuple
 
 import numpy as np
@@ -129,6 +130,15 @@ typedef struct {
     AmpNodeMetrics metrics;
     double total_heat_accumulated;
 } AmpGraphNodeSummary;
+typedef enum {
+    AMP_SCHEDULER_ORDERED = 0,
+    AMP_SCHEDULER_LEARNED = 1
+} AmpGraphSchedulerMode;
+typedef struct {
+    double early_bias;
+    double late_bias;
+    double saturation_bias;
+} AmpGraphSchedulerParams;
 typedef struct {
     int code;
     const char *stage;
@@ -144,6 +154,8 @@ AmpGraphRuntime *amp_graph_runtime_create(
 void amp_graph_runtime_destroy(AmpGraphRuntime *runtime);
 int amp_graph_runtime_configure(AmpGraphRuntime *runtime, uint32_t batches, uint32_t frames);
 void amp_graph_runtime_set_dsp_sample_rate(AmpGraphRuntime *runtime, double sample_rate);
+int amp_graph_runtime_set_scheduler_mode(AmpGraphRuntime *runtime, AmpGraphSchedulerMode mode);
+int amp_graph_runtime_set_scheduler_params(AmpGraphRuntime *runtime, const AmpGraphSchedulerParams *params);
 void amp_graph_runtime_clear_params(AmpGraphRuntime *runtime);
 int amp_graph_runtime_set_param(
     AmpGraphRuntime *runtime,
@@ -263,6 +275,13 @@ int amp_graph_streamer_status(
     uint64_t *out_consumed_frames
 );
 """
+
+
+class SchedulerMode(IntEnum):
+    ORDERED = 0
+    LEARNED = 1
+
+
 def _load_impl() -> tuple["cffi.FFI", object]:
     global AVAILABLE, _IMPL, UNAVAILABLE_REASON
     if _IMPL is not None:
@@ -344,6 +363,30 @@ class NativeGraphExecutor:
             self._set_dsp_sample_rate = self.lib.amp_graph_runtime_set_dsp_sample_rate
         except AttributeError:
             self._set_dsp_sample_rate = None
+        self._set_scheduler_mode: Callable[[object, int], int] | None
+        try:
+            self._set_scheduler_mode = self.lib.amp_graph_runtime_set_scheduler_mode
+        except AttributeError:
+            self._set_scheduler_mode = None
+        self._set_scheduler_params: Callable[[object, object], int] | None
+        try:
+            self._set_scheduler_params = self.lib.amp_graph_runtime_set_scheduler_params
+        except AttributeError:
+            self._set_scheduler_params = None
+        if self._set_scheduler_mode is not None:
+            try:
+                self._set_scheduler_mode(self._runtime, int(SchedulerMode.LEARNED))
+            except Exception:
+                pass
+        if self._set_scheduler_params is not None:
+            try:
+                params = self.ffi.new("AmpGraphSchedulerParams *")
+                params.early_bias = 0.5
+                params.late_bias = 0.5
+                params.saturation_bias = 1.0
+                self._set_scheduler_params(self._runtime, params)
+            except Exception:
+                pass
         self._param_cache: dict[str, dict[str, np.ndarray]] = {}
         self._history_handle = self.ffi.NULL
         self._history_blob: bytes | None = None
@@ -402,6 +445,24 @@ class NativeGraphExecutor:
         self._history_frames_hint = frames_hint
         self._history_buffer = buffer_obj
         return handle
+
+    def set_scheduler_mode(self, mode: SchedulerMode | int) -> None:
+        if self._set_scheduler_mode is None:
+            raise RuntimeError("native runtime does not expose scheduler mode controls")
+        if isinstance(mode, SchedulerMode):
+            value = int(mode)
+        else:
+            value = int(SchedulerMode(mode))
+        self._set_scheduler_mode(self._runtime, value)
+
+    def set_scheduler_params(self, early_bias: float, late_bias: float, saturation_bias: float) -> None:
+        if self._set_scheduler_params is None:
+            raise RuntimeError("native runtime does not expose scheduler parameter controls")
+        params = self.ffi.new("AmpGraphSchedulerParams *")
+        params.early_bias = float(early_bias)
+        params.late_bias = float(late_bias)
+        params.saturation_bias = float(saturation_bias)
+        self._set_scheduler_params(self._runtime, params)
 
     def _bind_base_params(
         self,
@@ -915,6 +976,7 @@ __all__ = [
     "get_graph_runtime_impl",
     "NativeGraphExecutor",
     "NativeGraphStreamer",
+    "SchedulerMode",
 ]
 
 try:  # Attempt eager load so AVAILABLE reflects the environment
