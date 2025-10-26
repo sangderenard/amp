@@ -29,6 +29,7 @@ set_source_files_properties(amp_kernels.c PROPERTIES LANGUAGE CXX)
 
 add_library(amp_native SHARED
     graph_runtime.cpp
+    fft_backend.cpp
     amp_kernels.c
 )
 
