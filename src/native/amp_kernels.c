@@ -3,6 +3,7 @@
 #define _CRT_SECURE_NO_WARNINGS 1
 #endif
 #include <ctype.h>
+#include <errno.h>
 #include <float.h>
 #ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
@@ -6222,12 +6223,12 @@ static int run_fft_division_node(
         }
         metrics->accumulated_heat = heat;
         state->u.fftdiv.total_heat += (double)heat;
-        metrics->reserved[0] = (float)state->u.fftdiv.last_phase;
-        metrics->reserved[1] = (float)state->u.fftdiv.last_lower;
-        metrics->reserved[2] = (float)state->u.fftdiv.last_upper;
-        metrics->reserved[3] = (float)state->u.fftdiv.last_filter;
-        metrics->reserved[4] = (float)window_size;
-        metrics->reserved[5] = (float)state->u.fftdiv.algorithm;
+        metrics->reserved[0] = state->u.fftdiv.last_phase;
+        metrics->reserved[1] = state->u.fftdiv.last_lower;
+        metrics->reserved[2] = state->u.fftdiv.last_upper;
+        metrics->reserved[3] = state->u.fftdiv.last_filter;
+        metrics->reserved[4] = (double)window_size;
+        metrics->reserved[5] = (double)state->u.fftdiv.algorithm;
     }
     return 0;
 }
@@ -6719,12 +6720,12 @@ static int run_fft_division_node_backward(
         }
         metrics->accumulated_heat = heat;
         state->u.fftdiv.total_heat += (double)heat;
-        metrics->reserved[0] = (float)state->u.fftdiv.last_phase;
-        metrics->reserved[1] = (float)state->u.fftdiv.last_lower;
-        metrics->reserved[2] = (float)state->u.fftdiv.last_upper;
-        metrics->reserved[3] = (float)state->u.fftdiv.last_filter;
-        metrics->reserved[4] = (float)window_size;
-        metrics->reserved[5] = (float)state->u.fftdiv.algorithm;
+        metrics->reserved[0] = state->u.fftdiv.last_phase;
+        metrics->reserved[1] = state->u.fftdiv.last_lower;
+        metrics->reserved[2] = state->u.fftdiv.last_upper;
+        metrics->reserved[3] = state->u.fftdiv.last_filter;
+        metrics->reserved[4] = (double)window_size;
+        metrics->reserved[5] = (double)state->u.fftdiv.algorithm;
     }
     return 0;
 }
@@ -6941,10 +6942,12 @@ static void amp_reset_metrics(AmpNodeMetrics *metrics) {
     }
     metrics->measured_delay_frames = 0U;
     metrics->accumulated_heat = 0.0f;
-    metrics->processing_time_seconds = 0.0f;
-    metrics->logging_time_seconds = 0.0f;
+    metrics->processing_time_seconds = 0.0;
+    metrics->logging_time_seconds = 0.0;
+    metrics->total_time_seconds = 0.0;
+    metrics->thread_cpu_time_seconds = 0.0;
     for (size_t i = 0; i < sizeof(metrics->reserved) / sizeof(metrics->reserved[0]); ++i) {
-        metrics->reserved[i] = 0.0f;
+        metrics->reserved[i] = 0.0;
     }
 }
 
@@ -6954,9 +6957,11 @@ static void amp_reset_metrics(AmpNodeMetrics *metrics) {
 #if defined(_MSC_VER)
 __declspec(thread) static double _tl_logging_accum = 0.0;
 __declspec(thread) static const char *_tl_current_node = NULL;
+__declspec(thread) static double _tl_thread_cpu_start = 0.0;
 #else
 static __thread double _tl_logging_accum = 0.0;
 static __thread const char *_tl_current_node = NULL;
+static __thread double _tl_thread_cpu_start = 0.0;
 #endif
 
 /* High-resolution monotonic time (seconds). Use platform-specific APIs for
@@ -6983,24 +6988,278 @@ static inline double _now_clock_seconds(void) {
 }
 #endif
 
-static void _node_timing_begin(const char *node_name) {
-    _tl_logging_accum = 0.0;
-    _tl_current_node = node_name;
+static inline double _now_thread_cpu_seconds(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    HANDLE thread = GetCurrentThread();
+    if (GetThreadTimes(thread, &creation_time, &exit_time, &kernel_time, &user_time)) {
+        ULARGE_INTEGER kernel_ticks;
+        ULARGE_INTEGER user_ticks;
+        kernel_ticks.LowPart = kernel_time.dwLowDateTime;
+        kernel_ticks.HighPart = kernel_time.dwHighDateTime;
+        user_ticks.LowPart = user_time.dwLowDateTime;
+        user_ticks.HighPart = user_time.dwHighDateTime;
+        unsigned long long total_ticks = kernel_ticks.QuadPart + user_ticks.QuadPart;
+        return (double)total_ticks * 1.0e-7; /* FILETIME is 100-ns units */
+    }
+    return 0.0;
+#else
+#ifdef CLOCK_THREAD_CPUTIME_ID
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    }
+#endif
+    clock_t ticks = clock();
+    if (ticks == (clock_t)-1) {
+        return 0.0;
+    }
+    return (double)ticks / (double)CLOCKS_PER_SEC;
+#endif
 }
 
-static void _node_timing_end(AmpNodeMetrics *metrics, double start_clock) {
-    if (metrics == NULL) return;
+typedef struct {
+    double total_seconds;
+    double processing_seconds;
+    double logging_seconds;
+    double thread_cpu_seconds;
+} node_timing_info;
+
+static double _node_timing_begin(const char *node_name) {
+    _tl_logging_accum = 0.0;
+    _tl_thread_cpu_start = _now_thread_cpu_seconds();
+    _tl_current_node = node_name;
+    return _now_clock_seconds();
+}
+
+static node_timing_info _node_timing_end(double start_clock) {
+    node_timing_info info;
     double end_clock = _now_clock_seconds();
-    double total = end_clock - start_clock;
+    info.total_seconds = end_clock - start_clock;
+    if (info.total_seconds < 0.0) {
+        info.total_seconds = 0.0;
+    }
     double logging = _tl_logging_accum;
     if (logging < 0.0) logging = 0.0;
-    double processing = total - logging;
-    if (processing < 0.0) processing = 0.0;
-    metrics->logging_time_seconds = (float)logging;
-    metrics->processing_time_seconds = (float)processing;
-    /* leave reserved as-is */
+    info.logging_seconds = logging;
+    info.processing_seconds = info.total_seconds - logging;
+    if (info.processing_seconds < 0.0) {
+        info.processing_seconds = 0.0;
+    }
+    double cpu_elapsed = _now_thread_cpu_seconds() - _tl_thread_cpu_start;
+    if (cpu_elapsed < 0.0) {
+        cpu_elapsed = 0.0;
+    }
+    info.thread_cpu_seconds = cpu_elapsed;
     _tl_current_node = NULL;
     _tl_logging_accum = 0.0;
+    _tl_thread_cpu_start = 0.0;
+    return info;
+}
+
+static const char *_node_dump_root_dir(void) {
+    static int initialised = 0;
+    static char root_dir[1024];
+    if (!initialised) {
+        const char *env = getenv("AMP_NODE_DUMP_DIR");
+        if (env != NULL && env[0] != '\0') {
+            size_t len = strlen(env);
+            if (len >= sizeof(root_dir)) {
+                len = sizeof(root_dir) - 1;
+            }
+            memcpy(root_dir, env, len);
+            root_dir[len] = '\0';
+        } else {
+            root_dir[0] = '\0';
+        }
+        initialised = 1;
+    }
+    if (root_dir[0] == '\0') {
+        return NULL;
+    }
+    return root_dir;
+}
+
+static void _sanitize_node_name(const char *name, char *out, size_t out_len) {
+    if (out_len == 0) {
+        return;
+    }
+    const char *src = (name != NULL && name[0] != '\0') ? name : "unnamed";
+    size_t written = 0;
+    for (; src[0] != '\0' && written + 1 < out_len; ++src) {
+        unsigned char ch = (unsigned char)*src;
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+            out[written++] = (char)ch;
+        } else if (ch == '-' || ch == '_') {
+            out[written++] = (char)ch;
+        } else {
+            out[written++] = '_';
+        }
+    }
+    if (written == 0) {
+        out[written++] = 'n';
+        if (written + 1 < out_len) {
+            out[written++] = 'o';
+        }
+        if (written + 1 < out_len) {
+            out[written++] = 'd';
+        }
+    }
+    out[written] = '\0';
+}
+
+static void _write_json_string(FILE *stream, const char *text) {
+    if (stream == NULL) {
+        return;
+    }
+    if (text == NULL) {
+        fputs("null", stream);
+        return;
+    }
+    fputc('"', stream);
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; ++p) {
+        unsigned char ch = *p;
+        switch (ch) {
+            case '\\':
+                fputs("\\\\", stream);
+                break;
+            case '"':
+                fputs("\\\"", stream);
+                break;
+            case '\n':
+                fputs("\\n", stream);
+                break;
+            case '\r':
+                fputs("\\r", stream);
+                break;
+            case '\t':
+                fputs("\\t", stream);
+                break;
+            default:
+                if (ch < 0x20U) {
+                    fprintf(stream, "\\u%04x", ch);
+                } else {
+                    fputc((int)ch, stream);
+                }
+                break;
+        }
+    }
+    fputc('"', stream);
+}
+
+#if defined(_WIN32) || defined(_WIN64)
+static volatile LONG64 _node_dump_sequence_counter = 0;
+#else
+static volatile uint64_t _node_dump_sequence_counter = 0;
+#endif
+
+static uint64_t _next_dump_sequence(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    LONG64 value = InterlockedIncrement64(&_node_dump_sequence_counter);
+    if (value <= 0) {
+        return 0ULL;
+    }
+    return (uint64_t)(value - 1);
+#else
+    return __sync_fetch_and_add(&_node_dump_sequence_counter, 1ULL);
+#endif
+}
+
+static void maybe_dump_node_output(
+    const char *node_name,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    const double *buffer,
+    const AmpNodeMetrics *metrics,
+    node_timing_info timing
+) {
+    (void)metrics;
+    if (buffer == NULL) {
+        return;
+    }
+    if (batches <= 0 || channels <= 0 || frames <= 0) {
+        return;
+    }
+    const char *root = _node_dump_root_dir();
+    if (root == NULL) {
+        return;
+    }
+    char safe_name[128];
+    _sanitize_node_name(node_name, safe_name, sizeof(safe_name));
+    char node_dir[1024];
+    if (snprintf(node_dir, sizeof(node_dir), "%s/%s", root, safe_name) >= (int)sizeof(node_dir)) {
+        return;
+    }
+#if defined(_WIN32) || defined(_WIN64)
+    if (!CreateDirectoryA(node_dir, NULL)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS) {
+            return;
+        }
+    }
+#else
+    if (mkdir(node_dir, 0775) != 0 && errno != EEXIST) {
+        return;
+    }
+#endif
+    uint64_t sequence = _next_dump_sequence();
+    char base_path[1024];
+    if (snprintf(base_path, sizeof(base_path), "%s/%s/%s_%06llu", root, safe_name, safe_name, (unsigned long long)sequence)
+        >= (int)sizeof(base_path)) {
+        return;
+    }
+    char raw_path[1024];
+    if (snprintf(raw_path, sizeof(raw_path), "%s.raw", base_path) >= (int)sizeof(raw_path)) {
+        return;
+    }
+    char meta_path[1024];
+    if (snprintf(meta_path, sizeof(meta_path), "%s.meta.json", base_path) >= (int)sizeof(meta_path)) {
+        return;
+    }
+    size_t total = (size_t)batches * (size_t)channels * (size_t)frames;
+    float *temp = (float *)malloc(total * sizeof(float));
+    if (temp == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < total; ++i) {
+        temp[i] = (float)buffer[i];
+    }
+    FILE *raw_file = fopen(raw_path, "wb");
+    if (raw_file == NULL) {
+        free(temp);
+        return;
+    }
+    size_t written = fwrite(temp, sizeof(float), total, raw_file);
+    fclose(raw_file);
+    free(temp);
+    if (written != total) {
+        remove(raw_path);
+        return;
+    }
+    FILE *meta_file = fopen(meta_path, "w");
+    if (meta_file == NULL) {
+        return;
+    }
+    fprintf(meta_file, "{\n");
+    fprintf(meta_file, "  \"node_name\": ");
+    _write_json_string(meta_file, node_name);
+    fprintf(meta_file, ",\n  \"safe_node_name\": ");
+    _write_json_string(meta_file, safe_name);
+    fprintf(meta_file, ",\n  \"sequence\": %llu,\n", (unsigned long long)sequence);
+    fprintf(meta_file, "  \"batches\": %d,\n", batches);
+    fprintf(meta_file, "  \"channels\": %d,\n", channels);
+    fprintf(meta_file, "  \"frames\": %d,\n", frames);
+    fprintf(meta_file, "  \"sample_rate\": %.9f,\n", sample_rate);
+    fprintf(meta_file, "  \"total_time_seconds\": %.12g,\n", timing.total_seconds);
+    fprintf(meta_file, "  \"processing_time_seconds\": %.12g,\n", timing.processing_seconds);
+    fprintf(meta_file, "  \"logging_time_seconds\": %.12g,\n", timing.logging_seconds);
+    fprintf(meta_file, "  \"thread_cpu_time_seconds\": %.12g,\n", timing.thread_cpu_seconds);
+    fprintf(meta_file, "  \"dtype\": \"float32\",\n");
+    fprintf(meta_file, "  \"layout\": \"BCF\"\n");
+    fprintf(meta_file, "}\n");
+    fclose(meta_file);
 }
 
 static int amp_run_node_impl(
@@ -7050,8 +7309,7 @@ static int amp_run_node_impl(
 
     int rc = 0;
     /* Begin per-node timing window: set current node context and mark start. */
-    _node_timing_begin(descriptor != NULL ? descriptor->name : NULL);
-    double _node_start_clock = _now_clock_seconds();
+    double _node_start_clock = _node_timing_begin(descriptor != NULL ? descriptor->name : NULL);
     switch (kind) {
         case NODE_KIND_CONSTANT:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
@@ -7160,27 +7418,27 @@ static int amp_run_node_impl(
             break;
     }
     /* End timing window and attribute timing to metrics if requested. */
-    double _node_end_clock = _now_clock_seconds();
-    if (rc == 0 && metrics != NULL && kind != NODE_KIND_FFT_DIV) {
-        double total = _node_end_clock - _node_start_clock;
-        double logging = _tl_logging_accum;
-        if (logging < 0.0) logging = 0.0;
-        double processing = total - logging;
-        if (processing < 0.0) processing = 0.0;
-        if (mode == AMP_EXECUTION_MODE_FORWARD) {
-            /* Populate basic metrics. */
-            metrics->measured_delay_frames = 0U;
-            metrics->accumulated_heat = 0.0f;
-        } else {
+    node_timing_info _timing = _node_timing_end(_node_start_clock);
+    if (metrics != NULL) {
+        if (rc == 0 && kind != NODE_KIND_FFT_DIV) {
             metrics->measured_delay_frames = 0U;
             metrics->accumulated_heat = 0.0f;
         }
-        metrics->processing_time_seconds = (float)processing;
-        metrics->logging_time_seconds = (float)logging;
+        metrics->processing_time_seconds = _timing.processing_seconds;
+        metrics->logging_time_seconds = _timing.logging_seconds;
+        metrics->total_time_seconds = _timing.total_seconds;
+        metrics->thread_cpu_time_seconds = _timing.thread_cpu_seconds;
     }
-    /* Clear current node context and logging accumulator for this thread. */
-    _tl_current_node = NULL;
-    _tl_logging_accum = 0.0;
+    maybe_dump_node_output(
+        descriptor != NULL ? descriptor->name : NULL,
+        batches,
+        (out_channels != NULL) ? *out_channels : 0,
+        frames,
+        sample_rate,
+        (out_buffer != NULL && *out_buffer != NULL) ? *out_buffer : NULL,
+        metrics,
+        _timing
+    );
     return rc;
 }
 
