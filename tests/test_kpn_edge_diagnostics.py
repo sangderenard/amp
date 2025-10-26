@@ -11,6 +11,13 @@ from typing import Dict, Iterable, Tuple
 import numpy as np
 import pytest
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+for path in (SRC_ROOT, REPO_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from amp.native_runtime import AVAILABLE as NATIVE_AVAILABLE
 
 
@@ -145,3 +152,7 @@ def test_kpn_edge_waveforms_and_spectrograms(tmp_path: Path) -> None:
     stats_path = tmp_path / "edge_stats.json"
     stats_path.write_text(json.dumps(reports, indent=2, sort_keys=True), encoding="utf-8")
     assert stats_path.exists()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main(sys.argv))
