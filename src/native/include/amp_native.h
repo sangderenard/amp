@@ -254,7 +254,14 @@ typedef enum {
 typedef struct {
     uint32_t measured_delay_frames;
     float accumulated_heat;
-    float reserved[6];
+    /* Per-node timing (seconds) accumulated during the most recent invocation.
+       - processing_time: wall/CPU time spent performing the node's work (excluding logging)
+       - logging_time: time spent inside native logging helpers while the node was active
+       The reserved array size is reduced to keep struct size stable-ish for ABI.
+    */
+    float processing_time_seconds;
+    float logging_time_seconds;
+    float reserved[4];
 } AmpNodeMetrics;
 
 typedef struct {

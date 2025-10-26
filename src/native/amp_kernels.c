@@ -250,8 +250,13 @@ AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b)
     }
     ensure_log_files_open();
     if (!log_f_cgenerated) return;
+    double _start = _now_clock_seconds();
     fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, py_ts, a, b);
     fflush(log_f_cgenerated);
+    double _end = _now_clock_seconds();
+    if (_tl_current_node != NULL) {
+        _tl_logging_accum += (_end - _start);
+    }
 }
 
 /* Exported helper for other C files to log native-entry calls into the
@@ -262,6 +267,7 @@ AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
     }
     ensure_log_files_open();
     if (!log_f_ccalls) return;
+    double _start = _now_clock_seconds();
     double t = (double)time(NULL);
 #if defined(_WIN32) || defined(_WIN64)
     unsigned long tid = (unsigned long) GetCurrentThreadId();
@@ -271,6 +277,10 @@ AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
     fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
 #endif
     fflush(log_f_ccalls);
+    double _end = _now_clock_seconds();
+    if (_tl_current_node != NULL) {
+        _tl_logging_accum += (_end - _start);
+    }
 }
 
 AMP_CAPI void amp_native_logging_set(int enabled) {
@@ -6931,9 +6941,66 @@ static void amp_reset_metrics(AmpNodeMetrics *metrics) {
     }
     metrics->measured_delay_frames = 0U;
     metrics->accumulated_heat = 0.0f;
+    metrics->processing_time_seconds = 0.0f;
+    metrics->logging_time_seconds = 0.0f;
     for (size_t i = 0; i < sizeof(metrics->reserved) / sizeof(metrics->reserved[0]); ++i) {
         metrics->reserved[i] = 0.0f;
     }
+}
+
+/* Thread-local accumulators used to separate time spent in logging helpers
+   from the node processing time. We use clock() to measure CPU time which is
+   sufficient for profiling relative contributions of logging vs processing. */
+#if defined(_MSC_VER)
+__declspec(thread) static double _tl_logging_accum = 0.0;
+__declspec(thread) static const char *_tl_current_node = NULL;
+#else
+static __thread double _tl_logging_accum = 0.0;
+static __thread const char *_tl_current_node = NULL;
+#endif
+
+/* High-resolution monotonic time (seconds). Use platform-specific APIs for
+   better resolution than clock() which may be coarse on some platforms. */
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+static inline double _now_clock_seconds(void) {
+    static LARGE_INTEGER _freq = {0};
+    LARGE_INTEGER v;
+    if (_freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&_freq);
+    }
+    QueryPerformanceCounter(&v);
+    return (double)v.QuadPart / (double)_freq.QuadPart;
+}
+#else
+#include <time.h>
+static inline double _now_clock_seconds(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return (double)time(NULL);
+    }
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+#endif
+
+static void _node_timing_begin(const char *node_name) {
+    _tl_logging_accum = 0.0;
+    _tl_current_node = node_name;
+}
+
+static void _node_timing_end(AmpNodeMetrics *metrics, double start_clock) {
+    if (metrics == NULL) return;
+    double end_clock = _now_clock_seconds();
+    double total = end_clock - start_clock;
+    double logging = _tl_logging_accum;
+    if (logging < 0.0) logging = 0.0;
+    double processing = total - logging;
+    if (processing < 0.0) processing = 0.0;
+    metrics->logging_time_seconds = (float)logging;
+    metrics->processing_time_seconds = (float)processing;
+    /* leave reserved as-is */
+    _tl_current_node = NULL;
+    _tl_logging_accum = 0.0;
 }
 
 static int amp_run_node_impl(
@@ -6982,6 +7049,9 @@ static int amp_run_node_impl(
     }
 
     int rc = 0;
+    /* Begin per-node timing window: set current node context and mark start. */
+    _node_timing_begin(descriptor != NULL ? descriptor->name : NULL);
+    double _node_start_clock = _now_clock_seconds();
     switch (kind) {
         case NODE_KIND_CONSTANT:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
@@ -7089,16 +7159,28 @@ static int amp_run_node_impl(
             rc = -3;
             break;
     }
+    /* End timing window and attribute timing to metrics if requested. */
+    double _node_end_clock = _now_clock_seconds();
     if (rc == 0 && metrics != NULL && kind != NODE_KIND_FFT_DIV) {
+        double total = _node_end_clock - _node_start_clock;
+        double logging = _tl_logging_accum;
+        if (logging < 0.0) logging = 0.0;
+        double processing = total - logging;
+        if (processing < 0.0) processing = 0.0;
         if (mode == AMP_EXECUTION_MODE_FORWARD) {
-            /* Placeholder metrics until specialised node implementations fill them. */
+            /* Populate basic metrics. */
             metrics->measured_delay_frames = 0U;
             metrics->accumulated_heat = 0.0f;
         } else {
             metrics->measured_delay_frames = 0U;
             metrics->accumulated_heat = 0.0f;
         }
+        metrics->processing_time_seconds = (float)processing;
+        metrics->logging_time_seconds = (float)logging;
     }
+    /* Clear current node context and logging accumulator for this thread. */
+    _tl_current_node = NULL;
+    _tl_logging_accum = 0.0;
     return rc;
 }
 

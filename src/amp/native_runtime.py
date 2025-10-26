@@ -111,7 +111,9 @@ typedef struct EdgeRunnerControlHistory EdgeRunnerControlHistory;
 typedef struct {
     uint32_t measured_delay_frames;
     float accumulated_heat;
-    float reserved[6];
+    float processing_time_seconds;
+    float logging_time_seconds;
+    float reserved[4];
 } AmpNodeMetrics;
 typedef enum {
     AMP_EXECUTION_MODE_FORWARD = 0,
