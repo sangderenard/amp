@@ -155,11 +155,6 @@ struct EigenTensorHolder {
     }
 };
 
-enum AmpGraphSchedulerMode : uint32_t {
-    AMP_SCHEDULER_ORDERED = 0,
-    AMP_SCHEDULER_LEARNED = 1
-};
-
 struct SchedulerParams {
     double early_bias{0.5};
     double late_bias{0.5};
