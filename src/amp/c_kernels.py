@@ -1,9 +1,9 @@
-"""Optional C-backed kernels for tight loops.
+"""Authoritative C-backed kernels for tight loops.
 
-This module attempts to build a small C kernel using cffi. If compilation
-is not available in the environment (no compiler or cffi not installed),
-the module exposes python fallbacks so callers can transparently fall back
-to pure-Python/numpy implementations.
+This module builds the canonical native kernels via cffi. Project policy forbids
+Python fallbacks for production graph execution, so callers must rely on the
+compiled extension on supported platforms. Build diagnostics are captured to aid
+environments that still need to surface why the native path failed.
 """
 from __future__ import annotations
 
@@ -14,15 +14,15 @@ import io
 import filecmp
 import os
 
-if "CXX" not in os.environ:
-    os.environ["CXX"] = "g++"
-if "CC" not in os.environ:
-    os.environ["CC"] = os.environ["CXX"]
-
 import numpy as np
 import shutil
 import tarfile
 import urllib.request
+
+from . import native_build
+
+native_build.ensure_toolchain_env()
+_BUILD_CONFIG = native_build.get_build_config()
 
 AVAILABLE = False
 _impl = None
@@ -30,19 +30,8 @@ UNAVAILABLE_REASON: str | None = None
 
 from pathlib import Path
 
-_DIAGNOSTIC_BUILD = os.environ.get("AMP_NATIVE_DIAGNOSTICS_BUILD", "")
-_EXTRA_COMPILE_ARGS: list[str] = []
-if _DIAGNOSTIC_BUILD.lower() in ("1", "true", "yes", "on"):
-    _EXTRA_COMPILE_ARGS.append("-DAMP_NATIVE_ENABLE_LOGGING")
-
-if os.name == "nt":
-    _EXTRA_COMPILE_ARGS.extend(["/std:c++17", "/TP"])
-else:
-    _EXTRA_COMPILE_ARGS.append("-std=c++17")
-
-_EXTRA_LINK_ARGS: list[str] = []
-if os.name != "nt":
-    _EXTRA_LINK_ARGS.append("-lstdc++")
+_EXTRA_COMPILE_ARGS: list[str] = list(_BUILD_CONFIG.compile_args)
+_EXTRA_LINK_ARGS: list[str] = list(_BUILD_CONFIG.link_args)
 
 _EIGEN_VERSION = "3.4.0"
 _EIGEN_TARBALL_URL = f"https://gitlab.com/libeigen/eigen/-/archive/{_EIGEN_VERSION}/eigen-{_EIGEN_VERSION}.tar.gz"
@@ -240,29 +229,29 @@ try:
             raise RuntimeError(eigen_error or "Eigen headers unavailable")
         kernels_source = native_dir / "amp_kernels.c"
         source_for_build = kernels_source
-        if os.name == "nt":
-            # MSVC treats *.c as C even with /TP if /Tc is also present. Keep a
-            # C++ copy so the compiler consistently parses Eigen aliases.
-            cffi_cxx = native_dir / "amp_kernels_cffi.cc"
-            try:
-                source_stat = kernels_source.stat()
-                source_mtime = source_stat.st_mtime
-                replicate = not cffi_cxx.exists()
-                if not replicate:
-                    target_stat = cffi_cxx.stat()
-                    if target_stat.st_size != source_stat.st_size:
-                        replicate = True
-                    elif target_stat.st_mtime < source_mtime:
-                        try:
-                            identical = filecmp.cmp(kernels_source, cffi_cxx, shallow=False)
-                        except OSError:
-                            identical = False
-                        replicate = not identical
-                if replicate:
-                    shutil.copy2(kernels_source, cffi_cxx)
-            except OSError as exc:
-                raise RuntimeError(f"Failed to stage C++ kernel source: {exc}") from exc
-            source_for_build = cffi_cxx
+        # Force a C++ translation unit so Eigen aliases compile correctly across
+        # toolchains.  Some compilers treat ``*.c`` as C even when a C++ dialect
+        # flag is provided, so keep a ``.cc`` sibling in sync and compile that.
+        cffi_cxx = native_dir / "amp_kernels_cffi.cc"
+        try:
+            source_stat = kernels_source.stat()
+            source_mtime = source_stat.st_mtime
+            replicate = not cffi_cxx.exists()
+            if not replicate:
+                target_stat = cffi_cxx.stat()
+                if target_stat.st_size != source_stat.st_size:
+                    replicate = True
+                elif target_stat.st_mtime < source_mtime:
+                    try:
+                        identical = filecmp.cmp(kernels_source, cffi_cxx, shallow=False)
+                    except OSError:
+                        identical = False
+                    replicate = not identical
+            if replicate:
+                shutil.copy2(kernels_source, cffi_cxx)
+        except OSError as exc:
+            raise RuntimeError(f"Failed to stage C++ kernel source: {exc}") from exc
+        source_for_build = cffi_cxx
         ffi.set_source(
             "_amp_ckernels_cffi",
             '#include "amp_native.h"\n',

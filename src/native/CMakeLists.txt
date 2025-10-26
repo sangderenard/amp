@@ -45,6 +45,18 @@ if (AMP_NATIVE_ENABLE_LOGGING)
     target_compile_definitions(amp_native PRIVATE AMP_NATIVE_ENABLE_LOGGING)
 endif()
 
+set(_AMP_NATIVE_EXTRA_COMPILE_OPTIONS "$ENV{AMP_NATIVE_EXTRA_COMPILE_ARGS}")
+if (_AMP_NATIVE_EXTRA_COMPILE_OPTIONS)
+    separate_arguments(_AMP_NATIVE_EXTRA_COMPILE_OPTIONS NATIVE_COMMAND ${_AMP_NATIVE_EXTRA_COMPILE_OPTIONS})
+    target_compile_options(amp_native PRIVATE ${_AMP_NATIVE_EXTRA_COMPILE_OPTIONS})
+endif()
+
+set(_AMP_NATIVE_EXTRA_LINK_OPTIONS "$ENV{AMP_NATIVE_EXTRA_LINK_ARGS}")
+if (_AMP_NATIVE_EXTRA_LINK_OPTIONS)
+    separate_arguments(_AMP_NATIVE_EXTRA_LINK_OPTIONS NATIVE_COMMAND ${_AMP_NATIVE_EXTRA_LINK_OPTIONS})
+    target_link_options(amp_native PRIVATE ${_AMP_NATIVE_EXTRA_LINK_OPTIONS})
+endif()
+
 set_target_properties(amp_native PROPERTIES
     OUTPUT_NAME "amp_native"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -122,4 +134,24 @@ if (AMP_NATIVE_BUILD_TESTS)
     )
     target_link_libraries(test_pitch_shift_node PRIVATE amp_native)
     add_test(NAME test_pitch_shift_node COMMAND test_pitch_shift_node)
+
+    set(_AMP_NATIVE_TEST_TARGETS
+        kpn_unit_test
+        test_thermo_param
+        test_amp_run_node_v2
+        test_fft_noise_gradient
+        test_fft_division_node
+        test_pitch_shift_node
+    )
+
+    foreach(_target IN LISTS _AMP_NATIVE_TEST_TARGETS)
+        if(TARGET ${_target})
+            if(_AMP_NATIVE_EXTRA_COMPILE_OPTIONS)
+                target_compile_options(${_target} PRIVATE ${_AMP_NATIVE_EXTRA_COMPILE_OPTIONS})
+            endif()
+            if(_AMP_NATIVE_EXTRA_LINK_OPTIONS)
+                target_link_options(${_target} PRIVATE ${_AMP_NATIVE_EXTRA_LINK_OPTIONS})
+            endif()
+        endif()
+    endforeach()
 endif()
