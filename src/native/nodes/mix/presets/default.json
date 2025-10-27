@@ -1,0 +1,11 @@
+{
+  "name": "default",
+  "node": "MixNode",
+  "description": "Unity gain mono mix used by the native demo before host output.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "channels": 1,
+    "mode": "sum",
+    "normalize": false
+  }
+}

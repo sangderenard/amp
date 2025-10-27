@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "node": "MixNode",
+  "description": "Default tap contract for the native mixer. Aggregates multiple PCM sources into a host-facing bus.",
+  "tap_groups": [
+    {
+      "name": "bus",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 2,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 32768,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "fifo_pc",
+        "full_percent_target": 85,
+        "low_watermark_percent": 40,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_publish"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "dense_active"
+      },
+      "channels": [
+        {
+          "name": "main",
+          "enabled": true,
+          "count": 2,
+          "active_indices": [
+            0,
+            1
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "subchannels": [
+            {
+              "name": "signal",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+include(GNUInstallDirs)
+
 set(EIGEN3_SUBMODULE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/eigen")
 set(EIGEN3_INCLUDE_DIR "${EIGEN3_SUBMODULE_DIR}")
 if (NOT EXISTS "${EIGEN3_INCLUDE_DIR}/Eigen/Core")
@@ -33,7 +35,10 @@ add_library(amp_native SHARED
     fft_backend.cpp
     amp_debug_alloc.c
     amp_kernels.c
+    amp_descriptor_builder.c
 )
+set_property(TARGET amp_native PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+set_property(TARGET amp_native PROPERTY MSVC_DEBUG_INFORMATION_FORMAT None)
 
 find_package(Threads REQUIRED)
 
@@ -46,9 +51,49 @@ target_include_directories(amp_native
 target_compile_definitions(amp_native PRIVATE AMP_NATIVE_BUILD)
 target_link_libraries(amp_native PRIVATE Threads::Threads)
 
+add_executable(demo_kpn_native
+    demo_kpn_native.cpp
+)
+target_link_libraries(demo_kpn_native PRIVATE amp_native)
+set_property(TARGET demo_kpn_native PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+set_property(TARGET demo_kpn_native PROPERTY MSVC_DEBUG_INFORMATION_FORMAT None)
+if (_AMP_NATIVE_EXTRA_COMPILE_OPTIONS)
+    target_compile_options(demo_kpn_native PRIVATE ${_AMP_NATIVE_EXTRA_COMPILE_OPTIONS})
+endif()
+if (_AMP_NATIVE_EXTRA_LINK_OPTIONS)
+    target_link_options(demo_kpn_native PRIVATE ${_AMP_NATIVE_EXTRA_LINK_OPTIONS})
+endif()
+if (MSVC)
+    target_compile_options(demo_kpn_native PRIVATE $<$<CONFIG:Release>:/Od> /FS)
+    target_link_options(demo_kpn_native PRIVATE $<$<CONFIG:Release>:/DEBUG:NONE>)
+endif()
+
 option(AMP_NATIVE_ENABLE_LOGGING "Enable native runtime logging" OFF)
 if (AMP_NATIVE_ENABLE_LOGGING)
     target_compile_definitions(amp_native PRIVATE AMP_NATIVE_ENABLE_LOGGING)
+endif()
+
+set(_AMP_NATIVE_NODE_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nodes")
+if (EXISTS "${_AMP_NATIVE_NODE_ASSETS_DIR}")
+    set(_AMP_NATIVE_NODE_ASSETS_OUTPUT "${CMAKE_BINARY_DIR}/node_assets")
+    set(_AMP_NATIVE_NODE_ASSETS_STAMP "${_AMP_NATIVE_NODE_ASSETS_OUTPUT}/.stamp")
+    add_custom_command(
+        OUTPUT "${_AMP_NATIVE_NODE_ASSETS_STAMP}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_AMP_NATIVE_NODE_ASSETS_OUTPUT}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_AMP_NATIVE_NODE_ASSETS_DIR}" "${_AMP_NATIVE_NODE_ASSETS_OUTPUT}"
+        COMMAND ${CMAKE_COMMAND} -E touch "${_AMP_NATIVE_NODE_ASSETS_STAMP}"
+        COMMENT "Syncing native node asset bundles"
+        VERBATIM
+    )
+    add_custom_target(amp_native_node_assets ALL
+        DEPENDS "${_AMP_NATIVE_NODE_ASSETS_STAMP}"
+    )
+    add_dependencies(amp_native amp_native_node_assets)
+    add_dependencies(demo_kpn_native amp_native_node_assets)
+    install(
+        DIRECTORY "${_AMP_NATIVE_NODE_ASSETS_DIR}/"
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/amp/nodes"
+    )
 endif()
 
 set(_AMP_NATIVE_EXTRA_COMPILE_OPTIONS "$ENV{AMP_NATIVE_EXTRA_COMPILE_ARGS}")

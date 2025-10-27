@@ -1,0 +1,12 @@
+{
+  "name": "default",
+  "node": "ParametricDriverNode",
+  "description": "Baseline preset used by the native KPN demo.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "frequency": 2.0,
+    "amplitude": 1.0,
+    "phase_offset": 0.0,
+    "render_mode": 0.0
+  }
+}

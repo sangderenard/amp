@@ -1,0 +1,15 @@
+{
+  "name": "default",
+  "node": "OscNode",
+  "description": "Baseline saw oscillator preset used by the native KPN demo.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "wave": "saw",
+    "mode": "integrator",
+    "frequency": 330.0,
+    "amp": 0.5,
+    "integration_leak": 0.997,
+    "integration_gain": 0.5,
+    "accept_reset": false
+  }
+}

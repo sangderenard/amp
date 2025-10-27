@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "node": "FFTDivisionNode",
+  "description": "Default tap contract for the FFT division node. Provides a spectral analysis bus alongside the passthrough PCM feed used by the demo spectrogram.",
+  "tap_groups": [
+    {
+      "name": "spectral_bins",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 1,
+        "frames": 64
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 65536,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "multicast",
+        "full_percent_target": 75,
+        "low_watermark_percent": 25,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "band",
+          "subchannel",
+          "unit"
+        ],
+        "band_indexing": "dense_active"
+      },
+      "channels": [
+        {
+          "name": "band",
+          "enabled": true,
+          "count": 2048,
+          "active_indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 64
+          },
+          "subchannels": [
+            {
+              "name": "real",
+              "enabled": true,
+              "stride_elems": 1
+            },
+            {
+              "name": "imag",
+              "enabled": true,
+              "stride_elems": 1
+            },
+            {
+              "name": "power",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "pcm_tap",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 1,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 16384,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "fifo_pc",
+        "full_percent_target": 90,
+        "low_watermark_percent": 35,
+        "multicast": {
+          "ack_policy": "any",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "absolute"
+      },
+      "channels": [
+        {
+          "name": "pcm",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "subchannels": [
+            {
+              "name": "signal",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

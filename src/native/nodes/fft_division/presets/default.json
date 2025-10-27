@@ -1,0 +1,14 @@
+{
+  "name": "default",
+  "node": "FFTDivisionNode",
+  "description": "Spectral analysis preset used by the native KPN demo.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "window_size": 512,
+    "hop_size": 256,
+    "oversample_ratio": 1,
+    "declared_delay": 511,
+    "supports_v2": true,
+    "analysis_tap": "pcm_tap"
+  }
+}

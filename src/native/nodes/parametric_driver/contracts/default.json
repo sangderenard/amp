@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "node": "ParametricDriverNode",
+  "description": "Default tap contract for the parametric driver. Produces a single control lane that may be multicasted to downstream modulators.",
+  "tap_groups": [
+    {
+      "name": "control_bus",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 1,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 4096,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "multicast",
+        "full_percent_target": 80,
+        "low_watermark_percent": 30,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "absolute"
+      },
+      "channels": [
+        {
+          "name": "control",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 1
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
