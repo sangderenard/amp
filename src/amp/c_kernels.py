@@ -59,6 +59,29 @@ def _prepare_eigen_headers(third_party_dir: Path) -> tuple[Path | None, Optional
     except Exception as exc:
         return None, f"Failed to prepare Eigen headers: {exc}"
 
+def _stage_cffi_source(source: Path, target_name: str) -> Path:
+    target = source.with_name(target_name)
+    try:
+        source_stat = source.stat()
+        source_mtime = source_stat.st_mtime
+        replicate = not target.exists()
+        if not replicate:
+            target_stat = target.stat()
+            if target_stat.st_size != source_stat.st_size:
+                replicate = True
+            elif target_stat.st_mtime < source_mtime:
+                try:
+                    identical = filecmp.cmp(source, target, shallow=False)
+                except OSError:
+                    identical = False
+                replicate = not identical
+        if replicate:
+            shutil.copy2(source, target)
+        return target
+    except OSError as exc:
+        raise RuntimeError(f"Failed to stage {source.name} for CFFI build: {exc}") from exc
+
+
 try:
     import cffi
     ffi = cffi.FFI()
@@ -228,36 +251,15 @@ try:
         if eigen_dir is None:
             raise RuntimeError(eigen_error or "Eigen headers unavailable")
         kernels_source = native_dir / "amp_kernels.c"
-        source_for_build = kernels_source
-        # Force a C++ translation unit so Eigen aliases compile correctly across
-        # toolchains.  Some compilers treat ``*.c`` as C even when a C++ dialect
-        # flag is provided, so keep a ``.cc`` sibling in sync and compile that.
-        cffi_cxx = native_dir / "amp_kernels_cffi.cc"
-        try:
-            source_stat = kernels_source.stat()
-            source_mtime = source_stat.st_mtime
-            replicate = not cffi_cxx.exists()
-            if not replicate:
-                target_stat = cffi_cxx.stat()
-                if target_stat.st_size != source_stat.st_size:
-                    replicate = True
-                elif target_stat.st_mtime < source_mtime:
-                    try:
-                        identical = filecmp.cmp(kernels_source, cffi_cxx, shallow=False)
-                    except OSError:
-                        identical = False
-                    replicate = not identical
-            if replicate:
-                shutil.copy2(kernels_source, cffi_cxx)
-        except OSError as exc:
-            raise RuntimeError(f"Failed to stage C++ kernel source: {exc}") from exc
-        source_for_build = cffi_cxx
+        kernels_cxx = _stage_cffi_source(kernels_source, "amp_kernels_cffi.cc")
+        debug_alloc_source = native_dir / "amp_debug_alloc.c"
+        debug_alloc_cxx = _stage_cffi_source(debug_alloc_source, "amp_debug_alloc_cffi.cc")
         ffi.set_source(
             "_amp_ckernels_cffi",
             '#include "amp_native.h"\n',
             sources=[
-                str(source_for_build),
-                str(native_dir / "amp_debug_alloc.c"),
+                str(kernels_cxx),
+                str(debug_alloc_cxx),
                 str(native_dir / "fft_backend.cpp"),
             ],
             include_dirs=[str(include_dir), str(eigen_dir)],

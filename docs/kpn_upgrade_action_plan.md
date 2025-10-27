@@ -26,6 +26,7 @@ This document sequences the work required to align the AMP native KPN runtime, o
   - Add shape validation and diagnostic logging to `amp_graph_runtime_set_param` so mismatched overrides return a distinct error code and emit clear log entries.【F:src/native/graph_runtime.cpp†L906-L955】
   - Introduce a lightweight native test (e.g., `test_thermo_param.cpp`) that exercises a reserved `thermo.heat` parameter through `amp_graph_runtime_set_param` and ensures execution remains stable.【F:src/native/tests/test_thermo_param.cpp†L1-L170】
   - Document the `thermo.heat` convention in the new contract markdown and mention it in `oscillator_design_notes.h` if additional clarity is needed.【F:docs/kpn_contract.md†L1-L120】【F:src/native/include/oscillator_design_notes.h†L1-L160】
+  - Ensure the CMake target and the cffi extension both link the diagnostics allocator and FFT backend on Linux and macOS, adding any required pthread or standard-library flags to keep the cross-platform build green.【F:src/native/CMakeLists.txt†L1-L113】【F:src/amp/c_kernels.py†L1-L330】【F:src/amp/native_build.py†L1-L140】
 - **Delegation prompt**:
   ```text
   Update amp_graph_runtime_set_param to validate incoming tensor shapes against defaults, returning -2 on mismatch with AMP logging enabled. Add src/native/tests/test_thermo_param.cpp that sets a thermo.heat override on a GainNode, runs amp_graph_runtime_execute, and asserts success.
@@ -55,7 +56,7 @@ This document sequences the work required to align the AMP native KPN runtime, o
 ## Phase 6 — CI & Golden Validation
 - **Goal**: Ensure deterministic test execution across platforms through the native runtime.
 - **Tasks**:
-  - Add GitHub Actions workflows that build the native targets (Windows + Linux), run `kpn_unit_test` plus the new thermo test, and archive logs.
+  - ✅ Added `.github/workflows/native-kpn-ci.yml` to build the native targets on Windows and Linux, run `kpn_unit_test` and `test_thermo_param`, and upload the resulting logs for review.
   - Integrate golden oscillator renders that compare native outputs against stored references with documented tolerances.
 - **Delegation prompt**:
   ```text

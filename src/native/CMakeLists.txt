@@ -26,6 +26,7 @@ if (NOT EXISTS "${EIGEN3_INCLUDE_DIR}/Eigen/Core")
 endif()
 
 set_source_files_properties(amp_kernels.c PROPERTIES LANGUAGE CXX)
+set_source_files_properties(amp_debug_alloc.c PROPERTIES LANGUAGE CXX)
 
 add_library(amp_native SHARED
     graph_runtime.cpp
@@ -34,6 +35,8 @@ add_library(amp_native SHARED
     amp_kernels.c
 )
 
+find_package(Threads REQUIRED)
+
 target_include_directories(amp_native
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -41,6 +44,7 @@ target_include_directories(amp_native
 )
 
 target_compile_definitions(amp_native PRIVATE AMP_NATIVE_BUILD)
+target_link_libraries(amp_native PRIVATE Threads::Threads)
 
 option(AMP_NATIVE_ENABLE_LOGGING "Enable native runtime logging" OFF)
 if (AMP_NATIVE_ENABLE_LOGGING)
