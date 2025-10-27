@@ -26,31 +26,13 @@
 
 extern "C" {
 #include "amp_native.h"
+#include "amp_debug_alloc.h"
 }
 
 #if defined(_WIN32) || defined(_WIN64)
 #  define AMP_API __declspec(dllexport)
 #else
 #  define AMP_API
-#endif
-
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-extern "C" {
-int amp_native_logging_enabled(void);
-void amp_log_native_call_external(const char *fn, size_t a, size_t b);
-}
-
-static void _log_native_call(const char *fn, size_t a, size_t b) {
-    if (!amp_native_logging_enabled()) {
-        return;
-    }
-    if (&amp_log_native_call_external) {
-        amp_log_native_call_external(fn, a, b);
-    }
-}
-#  define AMP_LOG_NATIVE_CALL(fn, a, b) _log_native_call((fn), (a), (b))
-#else
-#  define AMP_LOG_NATIVE_CALL(fn, a, b) ((void)0)
 #endif
 
 extern "C" {

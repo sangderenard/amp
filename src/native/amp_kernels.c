@@ -29,6 +29,7 @@
 
 #include "amp_native.h"
 #include "amp_fft_backend.h"
+#include "amp_debug_alloc.h"
 
 #ifndef M_LN2
 #define M_LN2 0.693147180559945309417232121458176568
@@ -64,649 +65,7 @@ AMP_CAPI size_t amp_last_alloc_count_get(void) {
  *  -1   -> allocation failure / invalid contract usage
  *  -3   -> unsupported node kind (caller should fall back to Python)
  */
-/* Persistent log file handles. Lazily opened on first use so builds that run
-   in read-only or log-less environments can continue without crashing. */
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-static FILE *log_f_alloc = NULL;
-static FILE *log_f_memops = NULL;
-static FILE *log_f_ccalls = NULL;
-static FILE *log_f_cgenerated = NULL;
-
-#if defined(_WIN32) || defined(_WIN64)
-static CRITICAL_SECTION log_lock;
-static int log_lock_initialized = 0;
-#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { InitializeCriticalSection(&log_lock); log_lock_initialized = 1; } } while(0)
-#define LOG_LOCK() EnterCriticalSection(&log_lock)
-#define LOG_UNLOCK() LeaveCriticalSection(&log_lock)
-#else
-#include <pthread.h>
-static pthread_mutex_t log_lock;
-static int log_lock_initialized = 0;
-#define LOG_LOCK_INIT() do { if (!log_lock_initialized) { pthread_mutex_init(&log_lock, NULL); log_lock_initialized = 1; } } while(0)
-#define LOG_LOCK() pthread_mutex_lock(&log_lock)
-#define LOG_UNLOCK() pthread_mutex_unlock(&log_lock)
-#endif
-
-static void close_all_logs(void);
-
-#if defined(__GNUC__)
-#define AMP_LIKELY(x) __builtin_expect(!!(x), 1)
-#define AMP_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-#define AMP_LIKELY(x) (x)
-#define AMP_UNLIKELY(x) (x)
-#endif
-
-/* Logging is opt-in: diagnostics remain disabled until explicitly enabled. */
-static int logging_mode_enabled = 0;
-
-static int amp_native_logging_enabled_internal(void) {
-    return logging_mode_enabled;
-}
-
-AMP_CAPI int amp_native_logging_enabled(void) {
-    return amp_native_logging_enabled_internal();
-}
-
-static void ensure_log_files_open(void) {
-    if (!amp_native_logging_enabled_internal()) {
-        return;
-    }
-    if (!log_lock_initialized) LOG_LOCK_INIT();
-    LOG_LOCK();
-    /* Create logs directory if it doesn't exist. On Windows CreateDirectoryA
-       is a no-op if the directory already exists; on POSIX use mkdir(). */
-#if defined(_WIN32) || defined(_WIN64)
-    CreateDirectoryA("logs", NULL);
-#else
-    /* ignore errors: directory may already exist */
-    mkdir("logs", 0775);
-#endif
-
-    if (log_f_alloc == NULL) log_f_alloc = fopen("logs/native_alloc_trace.log", "a");
-    if (log_f_memops == NULL) log_f_memops = fopen("logs/native_mem_ops.log", "a");
-    if (log_f_ccalls == NULL) log_f_ccalls = fopen("logs/native_c_calls.log", "a");
-    if (log_f_cgenerated == NULL) log_f_cgenerated = fopen("logs/native_c_generated.log", "a");
-    LOG_UNLOCK();
-
-    /* Register close handler once (safe to call repeatedly). We do this
-       outside the lock to avoid re-entrancy issues on some platforms. */
-    static int atexit_registered = 0;
-    if (!atexit_registered) {
-        atexit(close_all_logs);
-        atexit_registered = 1;
-    }
-}
-
-/* Lightweight native-entry logger. Appends one-line records to logs/native_c_calls.log
-   Format: <timestamp> <py_thread_state_ptr_or_tid> <function> <arg1> <arg2>\n
-   Keep this function minimal and tolerant of failures (best-effort logging only).
-*/
-static void _log_native_call(const char *fn, size_t a, size_t b) {
-    if (!amp_native_logging_enabled_internal()) {
-        return;
-    }
-    ensure_log_files_open();
-    if (log_f_ccalls == NULL) {
-        return;
-    }
-    double t = (double)time(NULL);
-#ifdef PyThreadState_Get
-    void *py_ts = (void *)PyThreadState_Get();
-    fprintf(log_f_ccalls, "%.3f %p %s %zu %zu\n", t, py_ts, fn, a, b);
-#else
-#if defined(_WIN32) || defined(_WIN64)
-    unsigned long tid = (unsigned long) GetCurrentThreadId();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#else
-    unsigned long tid = (unsigned long) pthread_self();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#endif
-#endif
-    fflush(log_f_ccalls);
-}
-
-/* Generated-wrapper logger: record wrapper entry and a couple numeric args. */
-static void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
-    if (!amp_native_logging_enabled_internal()) {
-        return;
-    }
-    ensure_log_files_open();
-    if (log_f_cgenerated == NULL) return;
-#ifdef PyThreadState_Get
-    void *py_ts = (void *)PyThreadState_Get();
-    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, py_ts, a, b);
-#else
-    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, (void*)0, a, b);
-#endif
-    fflush(log_f_cgenerated);
-}
-
-/*
- * Debug allocation wrappers that capture caller file/line/function.
- * To ensure the wrappers call the real libc allocation functions we
- * temporarily undef the common allocation macros, declare wrappers that
- * accept caller metadata, then re-map the allocation names to pass
- * __FILE__/__LINE__/__func__ automatically.
- */
-#undef malloc
-#undef calloc
-#undef realloc
-#undef free
-
-#undef memcpy
-#undef memset
-
-static void *(*real_malloc_fn)(size_t) = malloc;
-static void *(*real_calloc_fn)(size_t, size_t) = calloc;
-static void *(*real_realloc_fn)(void *, size_t) = realloc;
-static void (*real_free_fn)(void *) = free;
-static void *(*real_memcpy_fn)(void *, const void *, size_t) = memcpy;
-static void *(*real_memset_fn)(void *, int, size_t) = memset;
-
-/* Simple in-memory allocation registry to detect writes into freed or
-   undersized buffers. This is intentionally lightweight and only used
-   in debug runs. We maintain a singly-linked list of allocation records
-   updated by the allocation wrappers and consulted by the mem-op wrappers. */
-typedef struct alloc_rec {
-    void *ptr;
-    size_t size;
-    struct alloc_rec *next;
-    /* recorded backtrace captured at registration time */
-    void *bt[32];
-    unsigned short bt_count;
-} alloc_rec;
-
-static alloc_rec *alloc_list = NULL;
-
-/* forward declaration for backtrace dumper (defined below) */
-static void dump_backtrace(FILE *g);
-/* forward declarations for allocation backtrace helpers */
-static void capture_stack_frames(void **out_frames, unsigned short *out_count);
-static void dump_alloc_backtrace(FILE *g, struct alloc_rec *r);
-
-static void close_all_logs(void) {
-    if (!log_lock_initialized) LOG_LOCK_INIT();
-    LOG_LOCK();
-    FILE *alloc_handle = log_f_alloc;
-    FILE *memops_handle = log_f_memops;
-    FILE *ccalls_handle = log_f_ccalls;
-    FILE *cgen_handle = log_f_cgenerated;
-    log_f_alloc = NULL;
-    log_f_memops = NULL;
-    log_f_ccalls = NULL;
-    log_f_cgenerated = NULL;
-    LOG_UNLOCK();
-    if (alloc_handle) { fflush(alloc_handle); fclose(alloc_handle); }
-    if (memops_handle) { fflush(memops_handle); fclose(memops_handle); }
-    if (ccalls_handle) { fflush(ccalls_handle); fclose(ccalls_handle); }
-    if (cgen_handle) { fflush(cgen_handle); fclose(cgen_handle); }
-}
-
-/* Exported helper for other compilation units to emit generated-wrapper logs
-   using the same cached-file backing store. This avoids repeated fopen()/fclose()
-   in additional C files. */
-AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b) {
-    if (!amp_native_logging_enabled_internal()) {
-        return;
-    }
-    ensure_log_files_open();
-    if (!log_f_cgenerated) return;
-    double _start = _now_clock_seconds();
-    fprintf(log_f_cgenerated, "%s %p %zu %zu\n", fn, py_ts, a, b);
-    fflush(log_f_cgenerated);
-    double _end = _now_clock_seconds();
-    if (_tl_current_node != NULL) {
-        _tl_logging_accum += (_end - _start);
-    }
-}
-
-/* Exported helper for other C files to log native-entry calls into the
-   cached native_c_calls log. Mirrors the previous one-line format. */
-AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
-    if (!amp_native_logging_enabled_internal()) {
-        return;
-    }
-    ensure_log_files_open();
-    if (!log_f_ccalls) return;
-    double _start = _now_clock_seconds();
-    double t = (double)time(NULL);
-#if defined(_WIN32) || defined(_WIN64)
-    unsigned long tid = (unsigned long) GetCurrentThreadId();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#else
-    unsigned long tid = (unsigned long) pthread_self();
-    fprintf(log_f_ccalls, "%.3f %lu %s %zu %zu\n", t, tid, fn, a, b);
-#endif
-    fflush(log_f_ccalls);
-    double _end = _now_clock_seconds();
-    if (_tl_current_node != NULL) {
-        _tl_logging_accum += (_end - _start);
-    }
-}
-
-AMP_CAPI void amp_native_logging_set(int enabled) {
-    int normalised = enabled ? 1 : 0;
-    if (!normalised) {
-        close_all_logs();
-    }
-    if (!log_lock_initialized) LOG_LOCK_INIT();
-    LOG_LOCK();
-    logging_mode_enabled = normalised;
-    LOG_UNLOCK();
-    if (normalised) {
-        ensure_log_files_open();
-    }
-}
-
-/* Dump a compact snapshot of the live allocation registry to the given file.
- * This is intended to be called when we observe unexpected unregisters so
- * the offline correlator can inspect the live registry at the moment of the
- * event. Keep the output compact but include pointer, size and (if present)
- * the recorded registration backtrace id.
- */
-static void dump_alloc_snapshot(FILE *g) {
-    if (!amp_native_logging_enabled_internal()) return;
-    alloc_rec *it = alloc_list;
-    fprintf(g, "ALLOC_SNAPSHOT_BEGIN\n");
-    while (it) {
-        fprintf(g, "ALLOC_ENTRY ptr=%p size=%zu bt_count=%u\n", it->ptr, it->size, (unsigned)it->bt_count);
-        /* print the recorded registration backtrace (if available) inline */
-        for (unsigned i = 0; i < it->bt_count; ++i) {
-            fprintf(g, "RBT %p\n", it->bt[i]);
-        }
-        it = it->next;
-    }
-    fprintf(g, "ALLOC_SNAPSHOT_END\n");
-}
-
-static void register_alloc(void *ptr, size_t size) {
-    if (!amp_native_logging_enabled_internal()) return;
-    if (ptr == NULL) return;
-    /* If already registered, update size and record an update log instead
-       of creating duplicate entries. This avoids confusing duplicate
-       REGISTER lines and makes unregistering deterministic. */
-    alloc_rec *it = alloc_list;
-    while (it) {
-        if (it->ptr == ptr) {
-            /* update size if changed */
-            if (it->size != size) {
-                ensure_log_files_open();
-                if (log_f_alloc) {
-                    fprintf(log_f_alloc, "REGISTER_UPDATE %p old=%zu new=%zu\n", ptr, it->size, size);
-                    dump_alloc_snapshot(log_f_alloc);
-                    dump_backtrace(log_f_alloc);
-                    fflush(log_f_alloc);
-                }
-                it->size = size;
-            }
-            return;
-        }
-        it = it->next;
-    }
-    alloc_rec *r = (alloc_rec *)malloc(sizeof(alloc_rec));
-    if (r == NULL) return;
-    r->ptr = ptr;
-    r->size = size;
-    r->next = alloc_list;
-    /* record allocation backtrace for correlation */
-    r->bt_count = 0;
-    capture_stack_frames(r->bt, &r->bt_count);
-    alloc_list = r;
-    /* Durable log so post-processing can see registrations that
-       originate from stack-local buffers or manual calls to register_alloc. */
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "REGISTER %p size=%zu\n", ptr, size);
-        /* print recorded registration backtrace for easier offline mapping */
-        dump_alloc_backtrace(log_f_alloc, r);
-        fflush(log_f_alloc);
-    }
-}
-
-static void unregister_alloc(void *ptr) {
-    if (!amp_native_logging_enabled_internal()) return;
-    if (ptr == NULL) return;
-    /* Remove all matching entries for ptr (shouldn't be duplicates if
-       register_alloc prevents them, but be robust). Record if no entry
-       was found to help detect double-free or mismatched lifetime. */
-    alloc_rec **pp = &alloc_list;
-    int removed = 0;
-    while (*pp) {
-        if ((*pp)->ptr == ptr) {
-            alloc_rec *remove = *pp;
-            *pp = remove->next;
-            ensure_log_files_open();
-            if (log_f_alloc) {
-                fprintf(log_f_alloc, "UNREGISTER %p\n", ptr);
-                /* dump the registry and the recorded registration backtrace */
-                dump_alloc_snapshot(log_f_alloc);
-                dump_alloc_backtrace(log_f_alloc, remove);
-                dump_backtrace(log_f_alloc);
-                fflush(log_f_alloc);
-            }
-            free(remove);
-            removed = 1;
-            /* continue scanning to remove duplicates */
-            continue;
-        }
-        pp = &(*pp)->next;
-    }
-    if (!removed) {
-        ensure_log_files_open();
-        if (log_f_alloc) {
-            fprintf(log_f_alloc, "UNREGISTER_NOTFOUND %p\n", ptr);
-            dump_alloc_snapshot(log_f_alloc);
-            dump_backtrace(log_f_alloc);
-            fflush(log_f_alloc);
-        }
-    }
-}
-
-/* Check whether [addr, addr+len) is fully contained inside a known
-   allocated record. Returns 1 if contained, 0 otherwise. */
-static int range_within_alloc(void *addr, size_t len) {
-    if (addr == NULL) return 0;
-    unsigned char *a = (unsigned char *)addr;
-    alloc_rec *r = alloc_list;
-    while (r) {
-        unsigned char *base = (unsigned char *)r->ptr;
-        if (a >= base && (a + len) <= (base + r->size)) return 1;
-        r = r->next;
-    }
-    return 0;
-}
-
-/* Portable backtrace dumper: prints a compact list of return addresses or
-   symbolified strings (where available) to the provided file stream. This
-   is intentionally small and best-effort: the presence of addresses in the
-   BAD_* logs will significantly speed offline correlation even without
-   symbol resolution. */
-static void dump_backtrace(FILE *g) {
-    if (!amp_native_logging_enabled_internal()) return;
-    if (g == NULL) return;
-#if defined(_WIN32) || defined(_WIN64)
-    /* Use CaptureStackBackTrace which is available on Windows. We print
-       raw return addresses; symbol resolution can be done offline if
-       required. */
-    void *frames[64];
-    USHORT count = CaptureStackBackTrace(0, (ULONG) (sizeof(frames)/sizeof(frames[0])), frames, NULL);
-    fprintf(g, "BACKTRACE_FRAMES %u\n", (unsigned)count);
-    for (USHORT i = 0; i < count; ++i) {
-        fprintf(g, "BT %p\n", frames[i]);
-    }
-#else
-    /* POSIX: use backtrace/backtrace_symbols where available. */
-#ifdef __GNUC__
-    void *frames[64];
-    int count = backtrace(frames, (int)(sizeof(frames)/sizeof(frames[0])));
-    char **symbols = backtrace_symbols(frames, count);
-    if (symbols != NULL) {
-        fprintf(g, "BACKTRACE_FRAMES %d\n", count);
-        for (int i = 0; i < count; ++i) {
-            fprintf(g, "BT %s\n", symbols[i]);
-        }
-        free(symbols);
-    } else {
-        fprintf(g, "BACKTRACE_FRAMES %d\n", count);
-        for (int i = 0; i < count; ++i) fprintf(g, "BT %p\n", frames[i]);
-    }
-#else
-    (void)g; /* no-op if backtrace APIs unavailable */
-#endif
-#endif
-}
-
-/* Capture stack frames into the provided buffer and set count. This is
-   used to record a backtrace at allocation time for later correlation. */
-static void capture_stack_frames(void **out_frames, unsigned short *out_count) {
-    if (!amp_native_logging_enabled_internal()) return;
-    if (out_frames == NULL || out_count == NULL) return;
-#if defined(_WIN32) || defined(_WIN64)
-    void *frames[64];
-    USHORT count = CaptureStackBackTrace(0, (ULONG)(sizeof(frames)/sizeof(frames[0])), frames, NULL);
-    unsigned short copy_count = (unsigned short)((count > 32) ? 32 : count);
-    for (unsigned short i = 0; i < copy_count; ++i) out_frames[i] = frames[i];
-    *out_count = copy_count;
-#else
-#ifdef __GNUC__
-    void *frames[64];
-    int count = backtrace(frames, (int)(sizeof(frames)/sizeof(frames[0])));
-    int copy_count = (count > 32) ? 32 : count;
-    for (int i = 0; i < copy_count; ++i) out_frames[i] = frames[i];
-    *out_count = (unsigned short)copy_count;
-#else
-    *out_count = 0;
-#endif
-#endif
-}
-
-/* Print the recorded allocation backtrace stored in alloc_rec (if any). */
-static void dump_alloc_backtrace(FILE *g, alloc_rec *r) {
-    if (!amp_native_logging_enabled_internal()) return;
-    if (g == NULL || r == NULL) return;
-    fprintf(g, "REGISTER_BACKTRACE %u\n", (unsigned)r->bt_count);
-    for (unsigned i = 0; i < r->bt_count; ++i) {
-        fprintf(g, "RBT %p\n", r->bt[i]);
-    }
-}
-
-static void *_dbg_malloc(size_t s, const char *file, int line, const char *func) {
-    if (!amp_native_logging_enabled_internal()) {
-        return real_malloc_fn(s);
-    }
-    void *p = malloc(s); /* calls real malloc because we undef'd macro above */
-    /* log: op=malloc, size, ptr, caller */
-    _log_native_call("malloc", (size_t)s, (size_t)(uintptr_t)p);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "MALLOC %s:%d %s size=%zu ptr=%p\n", file, line, func, s, p);
-        fflush(log_f_alloc);
-    }
-    if (p != NULL) register_alloc(p, s);
-    return p;
-}
-
-static void *_dbg_calloc(size_t n, size_t size, const char *file, int line, const char *func) {
-    if (!amp_native_logging_enabled_internal()) {
-        return real_calloc_fn(n, size);
-    }
-    void *p = calloc(n, size);
-    _log_native_call("calloc", (size_t)(n * size), (size_t)(uintptr_t)p);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "CALLOC %s:%d %s nmemb=%zu size=%zu ptr=%p\n", file, line, func, n, size, p);
-        fflush(log_f_alloc);
-    }
-    if (p != NULL) register_alloc(p, n * size);
-    return p;
-}
-
-static void *_dbg_realloc(void *ptr, size_t s, const char *file, int line, const char *func) {
-    if (!amp_native_logging_enabled_internal()) {
-        return real_realloc_fn(ptr, s);
-    }
-    void *p = realloc(ptr, s);
-    _log_native_call("realloc_old", (size_t)(uintptr_t)ptr, (size_t)(uintptr_t)p);
-    _log_native_call("realloc_new", (size_t)s, (size_t)(uintptr_t)p);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "REALLOC %s:%d %s old=%p new=%p size=%zu\n", file, line, func, ptr, p, s);
-        dump_backtrace(log_f_alloc);
-        fflush(log_f_alloc);
-    }
-    /* update registry: remove old entry and register new pointer */
-    if (ptr != NULL) unregister_alloc(ptr);
-    if (p != NULL) register_alloc(p, s);
-    return p;
-}
-
-static void _dbg_free(void *ptr, const char *file, int line, const char *func) {
-    if (!amp_native_logging_enabled_internal()) {
-        if (ptr != NULL) real_free_fn(ptr);
-        return;
-    }
-    _log_native_call("free", (size_t)(uintptr_t)ptr, 0);
-    ensure_log_files_open();
-    if (log_f_alloc) {
-        fprintf(log_f_alloc, "FREE %s:%d %s ptr=%p\n", file, line, func, ptr);
-        dump_backtrace(log_f_alloc);
-        fflush(log_f_alloc);
-    }
-    if (ptr != NULL) {
-        unregister_alloc(ptr);
-        free(ptr);
-    }
-}
-
-/* Debug wrappers for memcpy/memset to log memory writes/copies. These use
-   simple byte loops to avoid calling the (possibly macro-redirected)
-   libc functions and to keep the logging minimal and self-contained. */
-static void *_dbg_memcpy(void *dest, const void *src, size_t n, const char *file, int line, const char *func) {
-    if (!amp_native_logging_enabled_internal()) {
-        return real_memcpy_fn(dest, src, n);
-    }
-    ensure_log_files_open();
-    if (log_f_memops) fprintf(log_f_memops, "MEMCPY %s:%d %s dest=%p src=%p n=%zu\n", file, line, func, dest, src, n);
-    if (dest == NULL || src == NULL || n == 0) {
-        return dest;
-    }
-    /* Check destination range against known allocations. If not found,
-       allow destinations that are likely on the current stack to avoid
-       false positives for local buffers. We use a heuristic window around
-       the current stack pointer. */
-        if (!range_within_alloc(dest, n)) {
-        uintptr_t stack_probe = (uintptr_t)&stack_probe;
-        uintptr_t d = (uintptr_t)dest;
-        const uintptr_t STACK_WINDOW = 0x100000; /* 1MB */
-        if (!(d >= stack_probe - STACK_WINDOW && d <= stack_probe + STACK_WINDOW)) {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "BAD_MEMCPY %s:%d %s dest=%p n=%zu stack_probe=%p (no matching alloc or too small)\n", file, line, func, dest, n, (void*)stack_probe);
-                /* dump live allocation registry snapshot for post-mortem correlation */
-                alloc_rec *it = alloc_list;
-                while (it) {
-                    fprintf(log_f_memops, "ALLOC_SNAPSHOT ptr=%p size=%zu\n", it->ptr, it->size);
-                    it = it->next;
-                }
-                /* Append a backtrace; best-effort and compact. */
-                dump_backtrace(log_f_memops);
-                fflush(log_f_memops);
-            }
-        }
-    }
-    unsigned char *d = (unsigned char *)dest;
-    const unsigned char *s = (const unsigned char *)src;
-    for (size_t i = 0; i < n; ++i) {
-        d[i] = s[i];
-    }
-    return dest;
-}
-
-static void *_dbg_memset(void *s_ptr, int c, size_t n, const char *file, int line, const char *func) {
-    if (!amp_native_logging_enabled_internal()) {
-        return real_memset_fn(s_ptr, c, n);
-    }
-    ensure_log_files_open();
-    if (log_f_memops) fprintf(log_f_memops, "MEMSET %s:%d %s ptr=%p val=%d n=%zu\n", file, line, func, s_ptr, c, n);
-    if (s_ptr == NULL || n == 0) return s_ptr;
-    if (!range_within_alloc(s_ptr, n)) {
-        uintptr_t stack_probe = (uintptr_t)&stack_probe;
-        uintptr_t d = (uintptr_t)s_ptr;
-        const uintptr_t STACK_WINDOW = 0x100000; /* 1MB */
-        if (!(d >= stack_probe - STACK_WINDOW && d <= stack_probe + STACK_WINDOW)) {
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "BAD_MEMSET %s:%d %s ptr=%p n=%zu stack_probe=%p (no matching alloc or too small)\n", file, line, func, s_ptr, n, (void*)stack_probe);
-                dump_backtrace(log_f_memops);
-                fflush(log_f_memops);
-            }
-        }
-    }
-    unsigned char *p = (unsigned char *)s_ptr;
-    unsigned char v = (unsigned char)c;
-    for (size_t i = 0; i < n; ++i) p[i] = v;
-    return s_ptr;
-}
-
-/* Re-map the allocation names so callers automatically pass caller metadata. */
-#define malloc(s) _dbg_malloc((s), __FILE__, __LINE__, __func__)
-#define calloc(n,s) _dbg_calloc((n),(s), __FILE__, __LINE__, __func__)
-#define realloc(p,s) _dbg_realloc((p),(s), __FILE__, __LINE__, __func__)
-#define free(p) _dbg_free((p), __FILE__, __LINE__, __func__)
-
-/* Redirect memcpy/memset to debug wrappers so we capture large buffer writes */
-#define memcpy(d,s,n) _dbg_memcpy((d),(s),(n), __FILE__, __LINE__, __func__)
-#define memset(p,c,n) _dbg_memset((p),(c),(n), __FILE__, __LINE__, __func__)
-
-#define AMP_LOG_NATIVE_CALL(fn, a, b) _log_native_call((fn), (a), (b))
-#define AMP_LOG_GENERATED(fn, a, b) _gen_wrapper_log((fn), (a), (b))
-
-#else  /* !AMP_NATIVE_ENABLE_LOGGING */
-
-static inline int amp_native_logging_enabled_internal(void) {
-    return 0;
-}
-
-AMP_CAPI int amp_native_logging_enabled(void) {
-    return 0;
-}
-
-static inline void ensure_log_files_open(void) {
-    (void)0;
-}
-
-static inline void close_all_logs(void) {
-    (void)0;
-}
-
-static inline void _log_native_call(const char *fn, size_t a, size_t b) {
-    (void)fn;
-    (void)a;
-    (void)b;
-}
-
-static inline void _gen_wrapper_log(const char *fn, size_t a, size_t b) {
-    (void)fn;
-    (void)a;
-    (void)b;
-}
-
-AMP_CAPI void amp_log_generated(const char *fn, void *py_ts, size_t a, size_t b) {
-    (void)fn;
-    (void)py_ts;
-    (void)a;
-    (void)b;
-}
-
-#define log_f_alloc ((FILE *)0)
-#define log_f_memops ((FILE *)0)
-#define log_f_ccalls ((FILE *)0)
-#define log_f_cgenerated ((FILE *)0)
-
-static inline void register_alloc(void *ptr, size_t size) {
-    (void)ptr;
-    (void)size;
-}
-
-static inline void unregister_alloc(void *ptr) {
-    (void)ptr;
-}
-
-AMP_CAPI void amp_log_native_call_external(const char *fn, size_t a, size_t b) {
-    (void)fn;
-    (void)a;
-    (void)b;
-}
-
-AMP_CAPI void amp_native_logging_set(int enabled) {
-    (void)enabled;
-}
-
-#define AMP_LOG_NATIVE_CALL(fn, a, b) ((void)0)
-#define AMP_LOG_GENERATED(fn, a, b) ((void)0)
-
-#endif /* AMP_NATIVE_ENABLE_LOGGING */
+/* Persistent log file handles and allocator wrappers now reside in amp_debug_alloc.c. */
 
 static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
     if (plan == NULL) {
@@ -2531,7 +1890,7 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
         return 0;
     }
     /* Register destination buffer so mem-op logging can correlate writes. */
-    register_alloc(out, out_len);
+    amp_debug_register_alloc(out, out_len);
     out[0] = '\0';
     if (json == NULL || key == NULL) {
         return 0;
@@ -2571,21 +1930,14 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
         if (length >= out_len) {
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
             /* log attempted oversize copy */
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *stack_probe = (void *)&pattern;
-                /* log the destination and a stack probe so we can detect stack-derived buffers */
-                fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
-            }
+            void *stack_probe = (void *)&pattern;
+            AMP_DEBUG_LOG_MEMOPS("PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
 #endif
             length = out_len > 0 ? out_len - 1 : 0;
         } else {
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *stack_probe = (void *)&pattern;
-                fprintf(log_f_memops, "PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
-            }
+            void *stack_probe = (void *)&pattern;
+            AMP_DEBUG_LOG_MEMOPS("PRECOPY json_copy_string base=%p dest=%p dest_cap=%zu req_len=%zu stack=%p\n", out, out, out_len, length, stack_probe);
 #endif
         }
         /* use safe copy that respects the provided destination capacity */
@@ -2593,17 +1945,14 @@ static int json_copy_string(const char *json, size_t json_len, const char *key, 
             memcpy(out, start, length);
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
             /* POSTCOPY: record that we actually wrote to 'out' */
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "POSTCOPY json_copy_string dest=%p wrote=%zu\n", out, length);
-            }
+            AMP_DEBUG_LOG_MEMOPS("POSTCOPY json_copy_string dest=%p wrote=%zu\n", out, length);
 #endif
         }
         out[length] = '\0';
-        unregister_alloc(out);
+        amp_debug_unregister_alloc(out);
         return 1;
     }
-    unregister_alloc(out);
+    amp_debug_unregister_alloc(out);
     return 0;
 }
 
@@ -2632,7 +1981,7 @@ static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) 
         return 0;
     }
     /* Register tokens buffer for correlation of PRECOPY/MEMCPY events */
-    register_alloc(tokens, (size_t)max_tokens * 64);
+    amp_debug_register_alloc(tokens, (size_t)max_tokens * 64);
     int count = 0;
     const char *cursor = csv;
     while (*cursor != '\0' && count < max_tokens) {
@@ -2646,40 +1995,25 @@ static int parse_csv_tokens(const char *csv, char tokens[][64], int max_tokens) 
         while (*cursor != '\0' && *cursor != ',') {
             cursor++;
         }
-        size_t len = (size_t)(cursor - start);
-        if (len >= 63) {
+    size_t len = (size_t)(cursor - start);
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void *)tokens;
-                /* log both the tokens base and per-token dest so we can map to allocations */
-                fprintf(log_f_memops, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
-            }
+    void *tokens_base = (void *)tokens;
+    AMP_DEBUG_LOG_MEMOPS("PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", tokens_base, tokens[count], 64, len);
 #endif
-            len = 63;
-        } else {
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void *)tokens;
-                fprintf(log_f_memops, "PRECOPY parse_csv_tokens base=%p dest=%p dest_cap=%d req_len=%zu\n", base, tokens[count], 64, len);
-            }
-#endif
-        }
-        if (len > 0) {
-            /* write with postcopy logging and bounds assertion */
-            memcpy(tokens[count], start, len);
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "POSTCOPY parse_csv_tokens dest=%p wrote=%zu token_idx=%d\n", tokens[count], len, count);
-            }
-#endif
-        }
-        tokens[count][len] = '\0';
-        count++;
+    if (len >= 63) {
+        len = 63;
     }
-    unregister_alloc(tokens);
+    if (len > 0) {
+        /* write with postcopy logging and bounds assertion */
+        memcpy(tokens[count], start, len);
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
+        AMP_DEBUG_LOG_MEMOPS("POSTCOPY parse_csv_tokens dest=%p wrote=%zu token_idx=%d\n", tokens[count], len, count);
+#endif
+    }
+    tokens[count][len] = '\0';
+    count++;
+    }
+    amp_debug_unregister_alloc(tokens);
     return count;
 }
 
@@ -2688,7 +2022,7 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
         return 0;
     }
     /* Register items buffer so writes to items->output/source are tracked */
-    register_alloc(items, (size_t)max_items * sizeof(controller_source_t));
+    amp_debug_register_alloc(items, (size_t)max_items * sizeof(controller_source_t));
     int count = 0;
     const char *cursor = csv;
     while (*cursor != '\0' && count < max_items) {
@@ -2703,31 +2037,17 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
             break;
         }
         size_t key_len = (size_t)(eq - cursor);
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
+        void *items_base = (void *)items;
+        AMP_DEBUG_LOG_MEMOPS("PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", items_base, items[count].output, (size_t)sizeof(items[count].output), key_len);
+#endif
         if (key_len >= sizeof(items[count].output)) {
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void *)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
-            }
-#endif
             key_len = sizeof(items[count].output) - 1;
-        } else {
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void *)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.output base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].output, (size_t)sizeof(items[count].output), key_len);
-            }
-#endif
         }
         if (key_len > 0) {
             memcpy(items[count].output, cursor, key_len);
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "POSTCOPY parse_controller_sources.output dest=%p wrote=%zu idx=%d\n", items[count].output, key_len, count);
-            }
+            AMP_DEBUG_LOG_MEMOPS("POSTCOPY parse_controller_sources.output dest=%p wrote=%zu idx=%d\n", items[count].output, key_len, count);
 #endif
         }
         items[count].output[key_len] = '\0';
@@ -2737,38 +2057,24 @@ static int parse_controller_sources(const char *csv, controller_source_t *items,
             end = cursor + strlen(cursor);
         }
         size_t value_len = (size_t)(end - cursor);
+#if defined(AMP_NATIVE_ENABLE_LOGGING)
+        void *items_base_src = (void *)items;
+        AMP_DEBUG_LOG_MEMOPS("PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", items_base_src, items[count].source, (size_t)sizeof(items[count].source), value_len);
+#endif
         if (value_len >= sizeof(items[count].source)) {
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void *)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
-            }
-#endif
             value_len = sizeof(items[count].source) - 1;
-        } else {
-#if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                void *base = (void *)items;
-                fprintf(log_f_memops, "PRECOPY parse_controller_sources.source base=%p dest=%p dest_cap=%zu req_len=%zu\n", base, items[count].source, (size_t)sizeof(items[count].source), value_len);
-            }
-#endif
         }
         if (value_len > 0) {
             memcpy(items[count].source, cursor, value_len);
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
-            ensure_log_files_open();
-            if (log_f_memops) {
-                fprintf(log_f_memops, "POSTCOPY parse_controller_sources.source dest=%p wrote=%zu idx=%d\n", items[count].source, value_len, count);
-            }
+            AMP_DEBUG_LOG_MEMOPS("POSTCOPY parse_controller_sources.source dest=%p wrote=%zu idx=%d\n", items[count].source, value_len, count);
 #endif
         }
         items[count].source[value_len] = '\0';
         cursor = end;
         count++;
     }
-    unregister_alloc(items);
+    amp_debug_unregister_alloc(items);
     return count;
 }
 
@@ -3718,25 +3024,25 @@ static int run_controller_node(
         _rc = -1;
         goto cleanup_run_controller_node;
     }
-    register_alloc(outputs_csv, outputs_cap);
+    amp_debug_register_alloc(outputs_csv, outputs_cap);
     sources_csv = (char *)malloc(sources_cap);
     if (sources_csv == NULL) {
         _rc = -1;
         goto cleanup_run_controller_node;
     }
-    register_alloc(sources_csv, sources_cap);
+    amp_debug_register_alloc(sources_csv, sources_cap);
     output_names = (char (*)[64])malloc((size_t)32 * 64);
     if (output_names == NULL) {
         _rc = -1;
         goto cleanup_run_controller_node;
     }
-    register_alloc(output_names, (size_t)32 * 64);
+    amp_debug_register_alloc(output_names, (size_t)32 * 64);
     mappings = (controller_source_t *)malloc((size_t)32 * sizeof(controller_source_t));
     if (mappings == NULL) {
         _rc = -1;
         goto cleanup_run_controller_node;
     }
-    register_alloc(mappings, (size_t)32 * sizeof(controller_source_t));
+    amp_debug_register_alloc(mappings, (size_t)32 * sizeof(controller_source_t));
     if (json_copy_string(descriptor->params_json, descriptor->params_len, "__controller_outputs__", outputs_csv, outputs_cap)) {
         output_count = parse_csv_tokens(outputs_csv, output_names, 32);
     }
@@ -3813,11 +3119,8 @@ static int run_controller_node(
                 size_t total_len = total; /* copied to local for clarity */
                 if (dst_idx >= total_len) {
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
-                    ensure_log_files_open();
-                    if (log_f_memops) {
-                        fprintf(log_f_memops, "BAD_WRITE run_controller_node dst_idx=%zu total=%zu src_idx=%zu c=%d b=%d f=%d resolved_channels=%d frames=%d\n", dst_idx, total_len, src_idx, c, b, f, resolved_channels, frames);
-                        fflush(log_f_memops);
-                    }
+                    AMP_DEBUG_LOG_MEMOPS("BAD_WRITE run_controller_node dst_idx=%zu total=%zu src_idx=%zu c=%d b=%d f=%d resolved_channels=%d frames=%d\n", dst_idx, total_len, src_idx, c, b, f, resolved_channels, frames);
+                    AMP_DEBUG_FLUSH_MEMOPS();
 #endif
                     /* attempt to continue safely */
                     continue;
@@ -3826,11 +3129,8 @@ static int run_controller_node(
                 /* we don't know 'data' length statically; we will conservatively attempt to log if src_idx seems large */
                 buffer[dst_idx] = data[src_idx];
 #if defined(AMP_NATIVE_ENABLE_LOGGING)
-                ensure_log_files_open();
-                if (log_f_memops) {
-                    fprintf(log_f_memops, "POSTWRITE run_controller_node dest=%p dst_idx=%zu wrote=1 src_idx=%zu node=%s\n", (void *)buffer, dst_idx, src_idx, descriptor->name ? descriptor->name : "<noname>");
-                    fflush(log_f_memops);
-                }
+                AMP_DEBUG_LOG_MEMOPS("POSTWRITE run_controller_node dest=%p dst_idx=%zu wrote=1 src_idx=%zu node=%s\n", (void *)buffer, dst_idx, src_idx, descriptor->name ? descriptor->name : "<noname>");
+                AMP_DEBUG_FLUSH_MEMOPS();
 #endif
             }
         }
@@ -3845,22 +3145,22 @@ static int run_controller_node(
 cleanup_run_controller_node:
     /* Free and unregister any heap buffers allocated above. Keep this idempotent. */
     if (outputs_csv != NULL) {
-        unregister_alloc(outputs_csv);
+        amp_debug_unregister_alloc(outputs_csv);
         free(outputs_csv);
         outputs_csv = NULL;
     }
     if (sources_csv != NULL) {
-        unregister_alloc(sources_csv);
+        amp_debug_unregister_alloc(sources_csv);
         free(sources_csv);
         sources_csv = NULL;
     }
     if (output_names != NULL) {
-        unregister_alloc(output_names);
+        amp_debug_unregister_alloc(output_names);
         free(output_names);
         output_names = NULL;
     }
     if (mappings != NULL) {
-        unregister_alloc(mappings);
+        amp_debug_unregister_alloc(mappings);
         free(mappings);
         mappings = NULL;
     }
@@ -6882,37 +6182,9 @@ static void amp_reset_metrics(AmpNodeMetrics *metrics) {
    from the node processing time. We use clock() to measure CPU time which is
    sufficient for profiling relative contributions of logging vs processing. */
 #if defined(_MSC_VER)
-__declspec(thread) static double _tl_logging_accum = 0.0;
-__declspec(thread) static const char *_tl_current_node = NULL;
 __declspec(thread) static double _tl_thread_cpu_start = 0.0;
 #else
-static __thread double _tl_logging_accum = 0.0;
-static __thread const char *_tl_current_node = NULL;
 static __thread double _tl_thread_cpu_start = 0.0;
-#endif
-
-/* High-resolution monotonic time (seconds). Use platform-specific APIs for
-   better resolution than clock() which may be coarse on some platforms. */
-#if defined(_WIN32) || defined(_WIN64)
-#include <windows.h>
-static inline double _now_clock_seconds(void) {
-    static LARGE_INTEGER _freq = {0};
-    LARGE_INTEGER v;
-    if (_freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&_freq);
-    }
-    QueryPerformanceCounter(&v);
-    return (double)v.QuadPart / (double)_freq.QuadPart;
-}
-#else
-#include <time.h>
-static inline double _now_clock_seconds(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return (double)time(NULL);
-    }
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
 #endif
 
 static inline double _now_thread_cpu_seconds(void) {
@@ -6953,20 +6225,20 @@ typedef struct {
 } node_timing_info;
 
 static double _node_timing_begin(const char *node_name) {
-    _tl_logging_accum = 0.0;
+    amp_debug_logging_accum = 0.0;
     _tl_thread_cpu_start = _now_thread_cpu_seconds();
-    _tl_current_node = node_name;
-    return _now_clock_seconds();
+    amp_debug_current_node = node_name;
+    return amp_debug_now_seconds();
 }
 
 static node_timing_info _node_timing_end(double start_clock) {
     node_timing_info info;
-    double end_clock = _now_clock_seconds();
+    double end_clock = amp_debug_now_seconds();
     info.total_seconds = end_clock - start_clock;
     if (info.total_seconds < 0.0) {
         info.total_seconds = 0.0;
     }
-    double logging = _tl_logging_accum;
+    double logging = amp_debug_logging_accum;
     if (logging < 0.0) logging = 0.0;
     info.logging_seconds = logging;
     info.processing_seconds = info.total_seconds - logging;
@@ -6978,8 +6250,8 @@ static node_timing_info _node_timing_end(double start_clock) {
         cpu_elapsed = 0.0;
     }
     info.thread_cpu_seconds = cpu_elapsed;
-    _tl_current_node = NULL;
-    _tl_logging_accum = 0.0;
+    amp_debug_current_node = NULL;
+    amp_debug_logging_accum = 0.0;
     _tl_thread_cpu_start = 0.0;
     return info;
 }

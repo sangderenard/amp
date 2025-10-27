@@ -255,7 +255,11 @@ try:
         ffi.set_source(
             "_amp_ckernels_cffi",
             '#include "amp_native.h"\n',
-            sources=[str(source_for_build)],
+            sources=[
+                str(source_for_build),
+                str(native_dir / "amp_debug_alloc.c"),
+                str(native_dir / "fft_backend.cpp"),
+            ],
             include_dirs=[str(include_dir), str(eigen_dir)],
             extra_compile_args=_EXTRA_COMPILE_ARGS,
             extra_link_args=_EXTRA_LINK_ARGS,
