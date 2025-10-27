@@ -1,0 +1,51 @@
+name: Native KPN CI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native-kpn-ci.yml'
+      - 'src/native/**'
+      - 'docs/kpn_upgrade_action_plan.md'
+  pull_request:
+    paths:
+      - '.github/workflows/native-kpn-ci.yml'
+      - 'src/native/**'
+      - 'docs/kpn_upgrade_action_plan.md'
+
+jobs:
+  build-and-test:
+    name: Build and run native diagnostics
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -S src/native -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build native targets
+        shell: bash
+        run: |
+          cmake --build build --config Release
+
+      - name: Run targeted native tests
+        shell: bash
+        run: |
+          mkdir -p native-logs
+          ctest --test-dir build --build-config Release --output-on-failure -R "^(kpn_unit_test|test_thermo_param)$" | tee native-logs/ctest.log
+          if [ -f build/Testing/Temporary/LastTest.log ]; then
+            cp build/Testing/Temporary/LastTest.log native-logs/LastTest.log
+          fi
+
+      - name: Upload native test logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-test-logs-${{ matrix.os }}
+          path: native-logs
+          if-no-files-found: error

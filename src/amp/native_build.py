@@ -77,14 +77,14 @@ def get_build_config() -> NativeBuildConfig:
     if sys.platform == "win32":
         compile_args.extend(["/std:c++17", "/TP"])
     else:
-        compile_args.append("-std=c++17")
+        compile_args.extend(["-std=c++17", "-pthread"])
 
     extra_compile = list(_parse_extra_args(_EXTRA_COMPILE_ENV))
     compile_args.extend(extra_compile)
 
     link_args: list[str] = []
     if sys.platform != "win32":
-        link_args.append("-lstdc++")
+        link_args.append("-pthread")
     link_args.extend(_parse_extra_args(_EXTRA_LINK_ENV))
 
     c_candidates, cxx_candidates = _candidate_compilers()
