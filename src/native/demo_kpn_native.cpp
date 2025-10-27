@@ -2,10 +2,9 @@
 #include "amp_descriptor_builder.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
-#include <complex>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -70,10 +69,16 @@ static void amp_generate_oscillator_curves(
     }
 }
 
+enum class StreamSource {
+    Dump,
+    Ring,
+};
+
 struct StreamChunk {
     uint64_t sequence;
     uint32_t frames;
     uint32_t channels;
+    StreamSource source;
     std::vector<double> data;
 };
 
@@ -125,6 +130,7 @@ static bool pop_all_dumps(AmpGraphStreamer *streamer, uint32_t max_frames, std::
         chunk.sequence = sequence;
         chunk.frames = out_frames;
         chunk.channels = out_channels ? out_channels : 1U;
+        chunk.source = StreamSource::Dump;
         chunk.data = std::move(buffer);
         chunks.emplace_back(std::move(chunk));
     }
@@ -164,156 +170,194 @@ static bool read_ring_snapshot(AmpGraphStreamer *streamer, uint32_t max_frames, 
     chunk.sequence = sequence;
     chunk.frames = out_frames;
     chunk.channels = out_channels ? out_channels : 1U;
+    chunk.source = StreamSource::Ring;
     chunk.data = std::move(buffer);
     chunks.emplace_back(std::move(chunk));
     return true;
 }
 
-static std::vector<double> collect_pcm_from_streamer(
+struct TapCollection {
+    std::vector<double> pcm;
+    uint32_t pcm_channels{1U};
+    uint32_t pcm_frames{0U};
+    std::vector<double> spectral_power;
+    uint32_t spectral_bins{0U};
+    uint32_t spectral_columns{0U};
+};
+
+static bool collect_tap_streams(
     AmpGraphStreamer *streamer,
     uint32_t total_frames,
-    uint32_t &out_channels
+    TapCollection &collection
 ) {
-    std::vector<StreamChunk> chunks;
-    if (!pop_all_dumps(streamer, total_frames, chunks)) {
-        return {};
-    }
-    if (!read_ring_snapshot(streamer, total_frames, chunks)) {
-        return {};
+    std::vector<StreamChunk> dump_chunks;
+    if (!pop_all_dumps(streamer, total_frames, dump_chunks)) {
+        return false;
     }
 
-    std::sort(chunks.begin(), chunks.end(), [](const StreamChunk &a, const StreamChunk &b) {
-        return a.sequence < b.sequence;
-    });
+    std::vector<StreamChunk> pcm_chunks;
+    std::vector<StreamChunk> spectral_chunks;
+    pcm_chunks.reserve(dump_chunks.size());
+    spectral_chunks.reserve(dump_chunks.size());
 
-    out_channels = 1U;
-    uint64_t gathered_frames = 0;
-    for (const StreamChunk &chunk : chunks) {
-        gathered_frames += chunk.frames;
-        out_channels = std::max<uint32_t>(out_channels, chunk.channels);
-    }
-
-    std::vector<double> pcm;
-    pcm.reserve(static_cast<size_t>(gathered_frames) * static_cast<size_t>(out_channels));
-    for (const StreamChunk &chunk : chunks) {
-        pcm.insert(pcm.end(), chunk.data.begin(), chunk.data.end());
-    }
-
-    const size_t expected = static_cast<size_t>(total_frames) * static_cast<size_t>(out_channels);
-    if (pcm.size() < expected) {
-        pcm.resize(expected, 0.0);
-    } else if (pcm.size() > expected) {
-        pcm.resize(expected);
-    }
-
-    return pcm;
-}
-
-static std::vector<double> collapse_to_mono(const std::vector<double> &interleaved, uint32_t frames, uint32_t channels) {
-    if (frames == 0U) {
-        return {};
-    }
-    if (channels <= 1U) {
-        return std::vector<double>(interleaved.begin(), interleaved.begin() + static_cast<std::ptrdiff_t>(frames));
-    }
-    std::vector<double> mono(frames, 0.0);
-    for (uint32_t frame = 0; frame < frames; ++frame) {
-        double accum = 0.0;
-        for (uint32_t channel = 0; channel < channels; ++channel) {
-            accum += interleaved[static_cast<size_t>(frame) * static_cast<size_t>(channels) + channel];
+    // The dump queue carries tap payloads produced by FFTDivisionNode. PCM tap frames surface as
+    // single-channel payloads while the spectral bins tap exposes a dense band × subchannel stride.
+    // That separation lets us safely classify chunks by channel count without inspecting metadata.
+    for (StreamChunk &chunk : dump_chunks) {
+        const uint32_t channels = chunk.channels ? chunk.channels : 1U;
+        if (channels == 1U) {
+            pcm_chunks.emplace_back(std::move(chunk));
+        } else {
+            spectral_chunks.emplace_back(std::move(chunk));
         }
-        mono[frame] = accum / static_cast<double>(channels);
     }
-    return mono;
+
+    std::vector<StreamChunk> ring_chunks;
+    if (!read_ring_snapshot(streamer, total_frames, ring_chunks)) {
+        return false;
+    }
+
+    const bool queue_provided_pcm = !pcm_chunks.empty();
+    if (!queue_provided_pcm) {
+        // Preserve the legacy PCM ring fallback so we still emit audio if the tap queue is empty.
+        // The ring is the same sink buffer MixNode exposes, so it is safe to fall back without
+        // double-counting frames when the dedicated tap is healthy.
+        for (StreamChunk &chunk : ring_chunks) {
+            pcm_chunks.emplace_back(std::move(chunk));
+        }
+    }
+
+    auto by_sequence = [](const StreamChunk &a, const StreamChunk &b) {
+        return a.sequence < b.sequence;
+    };
+    std::sort(pcm_chunks.begin(), pcm_chunks.end(), by_sequence);
+    std::sort(spectral_chunks.begin(), spectral_chunks.end(), by_sequence);
+
+    uint64_t gathered_pcm_frames = 0;
+    uint32_t pcm_channels = 1U;
+    for (const StreamChunk &chunk : pcm_chunks) {
+        gathered_pcm_frames += chunk.frames;
+        pcm_channels = std::max<uint32_t>(pcm_channels, chunk.channels ? chunk.channels : 1U);
+    }
+
+    collection.pcm.clear();
+    collection.pcm.reserve(static_cast<size_t>(gathered_pcm_frames) * static_cast<size_t>(pcm_channels));
+    for (const StreamChunk &chunk : pcm_chunks) {
+        collection.pcm.insert(collection.pcm.end(), chunk.data.begin(), chunk.data.end());
+    }
+    collection.pcm_channels = pcm_channels;
+    collection.pcm_frames = total_frames;
+
+    const size_t expected_pcm = static_cast<size_t>(collection.pcm_frames) * static_cast<size_t>(collection.pcm_channels);
+    if (collection.pcm.size() < expected_pcm) {
+        collection.pcm.resize(expected_pcm, 0.0);
+    } else if (collection.pcm.size() > expected_pcm) {
+        collection.pcm.resize(expected_pcm);
+    }
+
+    uint32_t spectral_channels = 0U;
+    uint64_t spectral_frames = 0;
+    for (const StreamChunk &chunk : spectral_chunks) {
+        if (spectral_channels == 0U) {
+            spectral_channels = chunk.channels;
+        }
+        spectral_channels = std::max<uint32_t>(spectral_channels, chunk.channels);
+        spectral_frames += chunk.frames;
+    }
+
+    if (spectral_channels > 0U) {
+        const uint32_t subchannel_stride = 3U;
+        if (spectral_channels % subchannel_stride != 0U) {
+            return false;
+        }
+        const uint32_t band_count = spectral_channels / subchannel_stride;
+        collection.spectral_power.clear();
+        collection.spectral_power.reserve(static_cast<size_t>(band_count) * static_cast<size_t>(spectral_frames));
+
+        for (const StreamChunk &chunk : spectral_chunks) {
+            const uint32_t channels = chunk.channels ? chunk.channels : spectral_channels;
+            if (channels != spectral_channels) {
+                continue;
+            }
+            const size_t stride = static_cast<size_t>(channels);
+            for (uint32_t frame = 0; frame < chunk.frames; ++frame) {
+                const size_t base = static_cast<size_t>(frame) * stride;
+                for (uint32_t band = 0; band < band_count; ++band) {
+                    const size_t power_index = base + static_cast<size_t>(band) * subchannel_stride + 2U;
+                    if (power_index < chunk.data.size()) {
+                        collection.spectral_power.push_back(chunk.data[power_index]);
+                    }
+                }
+            }
+        }
+
+        collection.spectral_bins = band_count;
+        collection.spectral_columns = static_cast<uint32_t>(spectral_frames);
+    } else {
+        collection.spectral_power.clear();
+        collection.spectral_bins = 0U;
+        collection.spectral_columns = 0U;
+    }
+
+    return true;
 }
 
-static std::vector<uint8_t> compute_spectrogram_image(
-    const std::vector<double> &pcm,
-    double sample_rate,
-    uint32_t window_size,
-    uint32_t hop_size,
+static std::vector<uint8_t> render_spectrogram_image(
+    const std::vector<double> &power_columns,
+    uint32_t band_count,
+    uint32_t column_count,
     uint32_t &out_width,
     uint32_t &out_height
 ) {
-    (void)sample_rate;
-    if (window_size == 0U || hop_size == 0U) {
+    if (band_count == 0U || column_count == 0U) {
         out_width = 0U;
         out_height = 0U;
         return {};
     }
 
-    std::vector<double> padded = pcm;
-    if (padded.size() < window_size) {
-        padded.resize(window_size, 0.0);
-    }
-    const size_t total_samples = padded.size();
-    if (total_samples < window_size) {
+    const size_t expected = static_cast<size_t>(band_count) * static_cast<size_t>(column_count);
+    if (power_columns.size() < expected) {
         out_width = 0U;
         out_height = 0U;
         return {};
     }
 
-    const size_t segment_count = 1U + (total_samples - window_size) / hop_size;
-    const size_t bins = window_size / 2U + 1U;
-
-    std::vector<double> window(window_size);
-    for (size_t n = 0; n < window_size; ++n) {
-        window[n] = 0.5 - 0.5 * std::cos(2.0 * M_PI * static_cast<double>(n) / static_cast<double>(window_size - 1U));
-    }
-
-    std::vector<double> log_spectra(segment_count * bins, 0.0);
-    std::vector<double> tapered(window_size, 0.0);
-
-    for (size_t segment = 0; segment < segment_count; ++segment) {
-        size_t start = segment * hop_size;
-        for (size_t n = 0; n < window_size; ++n) {
-            tapered[n] = padded[start + n] * window[n];
-        }
-        for (size_t k = 0; k < bins; ++k) {
-            double real = 0.0;
-            double imag = 0.0;
-            const double angular = -2.0 * M_PI * static_cast<double>(k) / static_cast<double>(window_size);
-            for (size_t n = 0; n < window_size; ++n) {
-                double angle = angular * static_cast<double>(n);
-                double value = tapered[n];
-                real += value * std::cos(angle);
-                imag += value * std::sin(angle);
-            }
-            double magnitude = std::sqrt(real * real + imag * imag);
-            double log_mag = std::log10(magnitude + 1e-6);
-            log_spectra[segment * bins + k] = log_mag;
-        }
-    }
-
+    std::vector<double> log_scaled(power_columns.begin(), power_columns.begin() + static_cast<std::ptrdiff_t>(expected));
     double max_val = -std::numeric_limits<double>::infinity();
     double min_val = std::numeric_limits<double>::infinity();
-    for (double value : log_spectra) {
-        max_val = std::max(max_val, value);
-        min_val = std::min(min_val, value);
+    for (double &value : log_scaled) {
+        double log_mag = std::log10(std::max(value, 1e-12));
+        value = log_mag;
+        max_val = std::max(max_val, log_mag);
+        min_val = std::min(min_val, log_mag);
     }
+
     if (!std::isfinite(max_val) || !std::isfinite(min_val) || max_val == min_val) {
         out_width = 0U;
         out_height = 0U;
         return {};
     }
 
-    for (double &value : log_spectra) {
-        value = (value - min_val) / (max_val - min_val);
-        value = std::clamp(value, 0.0, 1.0);
+    const double range = max_val - min_val;
+    for (double &value : log_scaled) {
+        value = std::clamp((value - min_val) / range, 0.0, 1.0);
     }
 
-    std::vector<uint8_t> image(segment_count * bins, 0U);
-    for (size_t row = 0; row < bins; ++row) {
-        for (size_t col = 0; col < segment_count; ++col) {
-            size_t src_row = bins - 1U - row;
-            double normalized = log_spectra[col * bins + src_row];
-            double pixel = 1.0 - normalized;
-            image[row * segment_count + col] = static_cast<uint8_t>(std::lround(pixel * 255.0));
+    std::vector<uint8_t> image(expected, 0U);
+    for (uint32_t band = 0; band < band_count; ++band) {
+        const uint32_t dest_row = band_count - 1U - band;
+        for (uint32_t column = 0; column < column_count; ++column) {
+            const size_t src_index = static_cast<size_t>(band) * column_count + column;
+            const double normalized = log_scaled[src_index];
+            const double pixel = 1.0 - normalized;
+            image[static_cast<size_t>(dest_row) * column_count + column] = static_cast<uint8_t>(
+                std::lround(std::clamp(pixel, 0.0, 1.0) * 255.0)
+            );
         }
     }
 
-    out_width = static_cast<uint32_t>(segment_count);
-    out_height = static_cast<uint32_t>(bins);
+    out_width = column_count;
+    out_height = band_count;
     return image;
 }
 
@@ -559,6 +603,7 @@ int main() {
         const char *const *pitch_inputs = nullptr;
         const char *const *driver_inputs = nullptr;
         static const char *const osc_inputs[] = {"driver"};
+        static const char *const fft_inputs[] = {"mix"};
         static const char *const mix_inputs[] = {"osc"};
 
         static const char pitch_json[] =
@@ -569,6 +614,8 @@ int main() {
             "{\"accept_reset\":false,\"declared_delay\":0,\"integration_clamp\":1.2,"
             "\"integration_gain\":0.5,\"integration_leak\":0.997,\"mode\":\"op_amp\","\
             "\"oversample_ratio\":1,\"slew_clamp\":1.2,\"slew_rate\":12000.0,\"supports_v2\":true,\"wave\":\"saw\"}";
+        static const char fft_json[] =
+            "{\"algorithm\":\"radix2\",\"declared_delay\":511,\"enable_remainder\":true,\"oversample_ratio\":1,\"supports_v2\":true,\"window_size\":512,\"hop_size\":256}";
         static const char mix_json[] =
             "{\"channels\":1,\"declared_delay\":0,\"oversample_ratio\":1,\"supports_v2\":true}";
 
@@ -616,6 +663,20 @@ int main() {
         }
         if (amp_descriptor_builder_append_node(
                 &descriptor_builder,
+                "fft",
+                "FFTDivisionNode",
+                fft_inputs,
+                1U,
+                fft_json,
+                nullptr,
+                0U
+            ) != 0) {
+            std::fprintf(stderr, "[demo] failed to append FFT node\n");
+            exit_code = 4;
+            break;
+        }
+        if (amp_descriptor_builder_append_node(
+                &descriptor_builder,
                 "mix",
                 "MixNode",
                 mix_inputs,
@@ -635,6 +696,7 @@ int main() {
             break;
         }
 
+        // TODO: Load the compiled plan blob here once the serialized plan is available instead of the nullptr placeholder.
         runtime = amp_graph_runtime_create(descriptor.data, descriptor.size, nullptr, 0U);
         if (runtime == nullptr) {
             std::fprintf(stderr, "[demo] amp_graph_runtime_create failed\n");
@@ -648,7 +710,7 @@ int main() {
             break;
         }
         amp_graph_runtime_set_dsp_sample_rate(runtime, sample_rate);
-        amp_graph_runtime_set_scheduler_mode(runtime, AMP_SCHEDULER_LEARNED);
+        amp_graph_runtime_set_scheduler_mode(runtime, AMP_SCHEDULER_ORDERED);
         AmpGraphSchedulerParams scheduler_params{};
         scheduler_params.early_bias = 0.5;
         scheduler_params.late_bias = 0.5;
@@ -740,38 +802,42 @@ int main() {
             streamer_started = false;
         }
 
-        uint32_t output_channels = 1U;
-        std::vector<double> pcm_interleaved = collect_pcm_from_streamer(streamer, frames, output_channels);
-        if (pcm_interleaved.empty()) {
-            std::fprintf(stderr, "[demo] streamer produced no PCM data\n");
+        TapCollection taps{};
+        if (!collect_tap_streams(streamer, frames, taps)) {
+            std::fprintf(stderr, "[demo] failed to collect tap streams\n");
             exit_code = 10;
             break;
         }
-
-        std::vector<double> pcm_mono = collapse_to_mono(pcm_interleaved, frames, output_channels);
+        if (taps.pcm.empty()) {
+            std::fprintf(stderr, "[demo] PCM tap stream was empty\n");
+            exit_code = 10;
+            break;
+        }
+        if (taps.spectral_power.empty()) {
+            std::fprintf(stderr, "[demo] spectral tap stream was empty\n");
+            exit_code = 10;
+            break;
+        }
 
         fs::path output_dir("output/demo_kpn_native");
         std::error_code dir_error;
         fs::create_directories(output_dir, dir_error);
 
         const fs::path wav_path = output_dir / "output.wav";
-        amp_write_wav16(wav_path, pcm_interleaved.data(), output_channels, frames, sample_rate);
+        amp_write_wav16(wav_path, taps.pcm.data(), taps.pcm_channels, frames, sample_rate);
         std::printf(
             "[demo] wrote %s (%u channels, %u frames)\n",
             wav_path.string().c_str(),
-            output_channels,
+            taps.pcm_channels,
             frames
         );
 
-        const uint32_t window_size = 512U;
-        const uint32_t hop_size = window_size / 4U;
         uint32_t image_width = 0U;
         uint32_t image_height = 0U;
-        std::vector<uint8_t> spectrogram = compute_spectrogram_image(
-            pcm_mono,
-            sample_rate,
-            window_size,
-            hop_size,
+        std::vector<uint8_t> spectrogram = render_spectrogram_image(
+            taps.spectral_power,
+            taps.spectral_bins,
+            taps.spectral_columns,
             image_width,
             image_height
         );
