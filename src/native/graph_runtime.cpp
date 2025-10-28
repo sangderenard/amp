@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <new>
 #include <queue>
@@ -13,6 +15,7 @@
 #include <string>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <thread>
@@ -20,6 +23,13 @@
 #include <condition_variable>
 #include <mutex>
 #include <mutex>
+
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
 
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
@@ -73,6 +83,18 @@ extern void amp_release_state(void *state);
 }
 
 using EigenTensor = Eigen::Tensor<double, 3, Eigen::RowMajor>;
+
+static uint64_t steady_now_millis() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+static uint64_t elapsed_since(uint64_t now, uint64_t then) {
+    if (then == 0 || now <= then) {
+        return 0;
+    }
+    return now - then;
+}
 
 struct TensorShape {
     uint32_t batches{1};
@@ -145,7 +167,10 @@ struct SchedulerParams {
 
 struct VectorizationPolicy {
     uint32_t channel_expand{1};
-    uint32_t block_frames{0};
+    uint32_t block_frames{0}; // preferred frames (legacy)
+    uint32_t min_block_frames{0};
+    uint32_t max_block_frames{0};
+    double priority_weight{1.0};
     bool archtypal_mode{false};
 };
 
@@ -170,11 +195,22 @@ struct EdgeRing {
     std::unordered_map<uint32_t, uint32_t> reader_tails;
     bool constant{false};
     EdgeRingContract contract{};
+    uint64_t produced_total{0};
 };
 
 struct EdgeReader {
     std::shared_ptr<EdgeRing> ring;
     uint32_t consumer_index{0};
+    std::string tap_name;
+    uint32_t producer_node_index{std::numeric_limits<uint32_t>::max()};
+    uint32_t producer_output_index{std::numeric_limits<uint32_t>::max()};
+};
+
+struct OutputTap {
+    std::string name;
+    std::shared_ptr<EdgeRing> ring;
+    EdgeRingContract contract{};
+    bool primary{false};
 };
 
 struct ModConnectionInfo {
@@ -251,12 +287,29 @@ struct RuntimeNode {
     bool has_latest_metrics{false};
     AmpNodeMetrics latest_metrics{};
     double total_heat_accumulated{0.0};
+    struct DebugFrameCache {
+        uint64_t sequence{0};
+        uint64_t sample_count{0};
+        uint64_t total_frames{0};
+        uint64_t total_batches{0};
+        uint64_t total_channels{0};
+        double sum_processing_seconds{0.0};
+        double sum_logging_seconds{0.0};
+        double sum_total_seconds{0.0};
+        double sum_thread_cpu_seconds{0.0};
+    uint64_t metrics_samples{0};
+        uint32_t last_frames{0};
+        uint32_t last_batches{0};
+        uint32_t last_channels{0};
+        uint64_t last_timestamp_millis{0};
+        AmpNodeMetrics last_metrics{};
+    } debug_frame_cache;
     std::vector<std::pair<std::string, std::shared_ptr<EigenTensorHolder>>> param_cache;
     std::unordered_map<std::string, size_t> param_cache_index;
     bool param_cache_dirty{true};
     VectorizationPolicy vector_policy{};
     EdgeRingContract output_contract{};
-    std::shared_ptr<EdgeRing> output_edge;
+    std::vector<OutputTap> outputs;
     std::vector<EdgeReader> input_edges;
     bool prefill_only{false};
     uint32_t prefill_frames{0};
@@ -276,6 +329,61 @@ struct RuntimeNode {
         descriptor.params_len = params_json.size();
     }
 };
+
+static OutputTap *runtime_primary_output(RuntimeNode &node) {
+    for (auto &tap : node.outputs) {
+        if (tap.primary) {
+            return &tap;
+        }
+    }
+    if (!node.outputs.empty()) {
+        return &node.outputs.front();
+    }
+    return nullptr;
+}
+
+static const OutputTap *runtime_primary_output(const RuntimeNode &node) {
+    for (const auto &tap : node.outputs) {
+        if (tap.primary) {
+            return &tap;
+        }
+    }
+    if (!node.outputs.empty()) {
+        return &node.outputs.front();
+    }
+    return nullptr;
+}
+
+struct BlockFrameContract {
+    uint32_t min_frames{1U};
+    uint32_t preferred_frames{1U};
+    uint32_t max_frames{1U};
+    double priority_weight{1.0};
+};
+
+static BlockFrameContract node_block_frame_contract(
+    const AmpGraphRuntime *runtime,
+    const RuntimeNode &node,
+    uint32_t default_frames
+);
+
+static void runtime_node_record_debug_frame(RuntimeNode &node, uint32_t batches, uint32_t channels, uint32_t frames) {
+    if (frames == 0U) {
+        return;
+    }
+
+    RuntimeNode::DebugFrameCache &cache = node.debug_frame_cache;
+    cache.sequence += 1ULL;
+    cache.sample_count += 1ULL;
+    cache.total_frames += static_cast<uint64_t>(frames);
+    cache.total_batches += static_cast<uint64_t>(std::max<uint32_t>(1U, batches));
+    cache.total_channels += static_cast<uint64_t>(std::max<uint32_t>(1U, channels));
+    cache.last_frames = frames;
+    cache.last_batches = std::max<uint32_t>(1U, batches);
+    cache.last_channels = std::max<uint32_t>(1U, channels);
+    cache.last_timestamp_millis = steady_now_millis();
+
+}
 
 struct AmpGraphRuntime {
     std::vector<std::unique_ptr<RuntimeNode>> nodes;
@@ -328,7 +436,90 @@ struct AmpGraphStreamer {
     int frames_hint{0};
     int last_status{0};
     mutable std::mutex status_mutex;
+    std::atomic<uint64_t> start_time_millis{0};
+    std::atomic<uint64_t> last_produced_millis{0};
+    std::atomic<uint64_t> last_consumed_millis{0};
+    std::atomic<uint64_t> last_dump_millis{0};
+    uint64_t expected_output_frames{0};
 };
+
+static BlockFrameContract node_block_frame_contract(
+    const AmpGraphRuntime *runtime,
+    const RuntimeNode &node,
+    uint32_t default_frames
+) {
+    // Derive vector contract bounds using metadata hints and runtime defaults.
+    BlockFrameContract contract{};
+
+    double weight = node.vector_policy.priority_weight;
+    contract.priority_weight = weight > 0.0 ? weight : 1.0;
+
+    uint32_t hint = default_frames;
+    if (hint == 0U && runtime != nullptr) {
+        hint = runtime->default_frames;
+    }
+    if (hint == 0U) {
+        hint = node.vector_policy.block_frames;
+    }
+    if (hint == 0U && node.prefill_frames > 0U) {
+        hint = node.prefill_frames;
+    }
+    if (hint == 0U && node.output_frames > 0U) {
+        hint = node.output_frames;
+    }
+    if (hint == 0U) {
+        hint = 1U;
+    }
+
+    uint32_t min_frames = node.vector_policy.min_block_frames;
+    if (min_frames == 0U) {
+        if (node.prefill_only && node.prefill_frames > 0U) {
+            min_frames = node.prefill_frames;
+        } else {
+            min_frames = 1U;
+        }
+    }
+    if (min_frames == 0U) {
+        min_frames = 1U;
+    }
+
+    uint32_t preferred_frames = node.vector_policy.block_frames;
+    if (preferred_frames == 0U) {
+        preferred_frames = hint;
+    }
+    if (preferred_frames == 0U) {
+        preferred_frames = min_frames;
+    }
+    if (node.prefill_frames > 0U) {
+        preferred_frames = std::max(preferred_frames, node.prefill_frames);
+    }
+
+    uint32_t max_frames = node.vector_policy.max_block_frames;
+    if (max_frames == 0U) {
+        max_frames = preferred_frames;
+        if (hint > 0U) {
+            max_frames = std::max(max_frames, hint);
+        }
+        if (node.prefill_frames > 0U) {
+            max_frames = std::max(max_frames, node.prefill_frames);
+        }
+        if (node.output_ring_capacity > 0U) {
+            max_frames = std::max(max_frames, node.output_ring_capacity);
+        }
+    }
+
+    if (preferred_frames < min_frames) {
+        preferred_frames = min_frames;
+    }
+    if (max_frames < preferred_frames) {
+        max_frames = preferred_frames;
+    }
+
+    contract.min_frames = min_frames;
+    contract.preferred_frames = preferred_frames;
+    contract.max_frames = max_frames;
+    return contract;
+}
 
 /*** Forward declarations for functions used before definition ***/
 static std::shared_ptr<EdgeRing> ensure_edge_ring(
@@ -443,6 +634,26 @@ static bool parse_bool_metadata(const std::string &json, const char *key, bool f
     return fallback;
 }
 
+static double parse_double_metadata(const std::string &json, const char *key, double fallback) {
+    if (key == nullptr) return fallback;
+    std::string needle;
+    needle.reserve(std::strlen(key) + 4U);
+    needle.push_back('"');
+    needle.append(key);
+    needle.push_back('"');
+    needle.push_back(':');
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return fallback;
+    pos += needle.size();
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])) != 0) ++pos;
+    if (pos >= json.size()) return fallback;
+    const char *start = json.c_str() + pos;
+    char *endptr = nullptr;
+    double value = std::strtod(start, &endptr);
+    if (start == endptr) return fallback;
+    return value;
+}
+
 static std::string parse_string_metadata(const std::string &json, const char *key, const std::string &fallback = {}) {
     if (key == nullptr) return fallback;
     std::string needle;
@@ -511,6 +722,11 @@ static uint32_t align_frames_up(uint32_t value, uint32_t block) {
     if (aligned > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
         return std::numeric_limits<uint32_t>::max();
     return static_cast<uint32_t>(aligned);
+}
+
+static uint32_t align_frames_down(uint32_t value, uint32_t block) {
+    if (block == 0U || value == 0U) return value;
+    return (value / block) * block;
 }
 
 static bool shapes_equal(const TensorShape &lhs, const TensorShape &rhs) {
@@ -635,6 +851,7 @@ static void edge_ring_write(EdgeRing &ring, const double *src, uint32_t frames) 
     if (frames == 0U || ring.capacity == 0U) return;
     edge_ring_copy_segment(ring, ring.head, frames, const_cast<double *>(src), false);
     ring.head = (ring.head + frames) % ring.capacity;
+    ring.produced_total += frames;
 }
 
 static void edge_ring_advance_consumer(EdgeRing &ring, uint32_t consumer, uint32_t frames) {
@@ -660,16 +877,6 @@ static std::shared_ptr<EdgeRing> ensure_edge_ring(
     return ring;
 }
 
-/*** Node block sizing ***/
-static uint32_t node_required_block_frames(const AmpGraphRuntime *runtime, const RuntimeNode &node, uint32_t default_frames) {
-    uint32_t frames = node.vector_policy.block_frames > 0U ? node.vector_policy.block_frames : default_frames;
-    if (frames == 0U) {
-        frames = (runtime && runtime->default_frames > 0U) ? runtime->default_frames : 1U;
-    }
-    if (node.prefill_frames > 0U) frames = std::max(frames, node.prefill_frames);
-    return frames > 0U ? frames : 1U;
-}
-
 /*** Topology-dependent init of edge rings ***/
 static void runtime_initialize_edge_rings(AmpGraphRuntime *runtime, uint32_t default_frames) {
     if (!runtime) return;
@@ -678,53 +885,87 @@ static void runtime_initialize_edge_rings(AmpGraphRuntime *runtime, uint32_t def
 
     for (size_t idx = 0; idx < node_count; ++idx) {
         RuntimeNode &node = *runtime->nodes[idx];
-        auto edge = node.output_edge;
-        if (!edge) {
-            edge = ensure_edge_ring(runtime, node.name, node.vector_policy);
-            node.output_edge = edge;
+        node.debug_frame_cache = RuntimeNode::DebugFrameCache{};
+        if (node.outputs.empty()) {
+            OutputTap tap{};
+            tap.name = "default";
+            tap.contract = node.output_contract;
+            tap.primary = true;
+            node.outputs.push_back(std::move(tap));
         }
-        if (!edge) continue;
 
-        uint32_t base_frames = node_required_block_frames(runtime, node, default_frames);
-        uint32_t capacity = base_frames > 0U ? base_frames : 1U;
-
-        if (!node.prefill_only && base_frames > 0U) {
-            uint64_t scaled = static_cast<uint64_t>(base_frames) * 4ULL;
-            if (scaled > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
-                scaled = std::numeric_limits<uint32_t>::max();
+        for (OutputTap &tap : node.outputs) {
+            std::string key = node.name;
+            if (!tap.name.empty()) {
+                key.append("::").append(tap.name);
             }
-            capacity = std::max<uint32_t>(capacity, static_cast<uint32_t>(scaled));
-        }
-        capacity = std::max<uint32_t>(capacity, base_frames + 1U);
-        capacity = align_frames_up(capacity, std::max<uint32_t>(base_frames, 1U));
-        if (capacity == 0U) capacity = base_frames + 1U;
+            if (!tap.ring) {
+                tap.ring = ensure_edge_ring(runtime, key, node.vector_policy);
+            }
+            if (!tap.ring) {
+                continue;
+            }
 
-        uint32_t batches = batches_default;
-        if (!node.buffer_shapes.empty() && node.buffer_shapes[0].batches > 0U) {
-            batches = node.buffer_shapes[0].batches;
-        }
-        uint32_t channels = node.channel_hint > 0U ? node.channel_hint : 1U;
-        if (!node.buffer_shapes.empty() && node.buffer_shapes[0].channels > 0U) {
-            channels = node.buffer_shapes[0].channels;
-        }
+            BlockFrameContract contract = node_block_frame_contract(runtime, node, default_frames);
+            uint32_t min_frames = std::max<uint32_t>(1U, contract.min_frames);
+            uint32_t preferred_frames = std::max<uint32_t>(min_frames, contract.preferred_frames);
+            uint32_t max_frames = std::max<uint32_t>(preferred_frames, contract.max_frames);
 
-        TensorShape ring_shape{};
-        ring_shape.batches = batches;
-        ring_shape.channels = channels;
-        ring_shape.frames = capacity;
+            uint32_t base_frames = preferred_frames;
+            uint32_t capacity = base_frames > 0U ? base_frames : 1U;
 
-        edge->storage = make_tensor(ring_shape);
-        edge->storage->shape = ring_shape;
-        edge->frame_stride = static_cast<size_t>(ring_shape.batches) * ring_shape.channels;
-        edge->capacity = capacity;
-        edge->head = 0U;
-        edge->tail = 0U;
-        edge->reader_tails.clear();
-        edge->policy = node.vector_policy;
-        edge->constant = node.constant_node;
-        edge->contract = node.output_contract;
-        if (edge->contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
-            edge->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
+            if (!node.prefill_only && base_frames > 0U) {
+                uint64_t scaled = static_cast<uint64_t>(base_frames) * 4ULL;
+                if (scaled > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+                    scaled = std::numeric_limits<uint32_t>::max();
+                }
+                capacity = std::max<uint32_t>(capacity, static_cast<uint32_t>(scaled));
+            }
+            capacity = std::max<uint32_t>(capacity, base_frames + 1U);
+            capacity = std::max<uint32_t>(capacity, max_frames);
+            uint32_t align_unit = std::max<uint32_t>(min_frames, 1U);
+            capacity = align_frames_up(capacity, align_unit);
+
+            // Always reserve a parking slot so consumers that need an entire block
+            // can observe it without the ring collapsing to empty after wraparound.
+            if (capacity < std::numeric_limits<uint32_t>::max()) {
+                uint64_t expanded = static_cast<uint64_t>(capacity) + 1ULL;
+                if (expanded > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+                    capacity = std::numeric_limits<uint32_t>::max();
+                } else {
+                    capacity = align_frames_up(static_cast<uint32_t>(expanded), align_unit);
+                }
+            }
+            if (capacity == 0U) capacity = base_frames + 1U;
+
+            uint32_t batches = batches_default;
+            if (!node.buffer_shapes.empty() && node.buffer_shapes[0].batches > 0U) {
+                batches = node.buffer_shapes[0].batches;
+            }
+            uint32_t channels = node.channel_hint > 0U ? node.channel_hint : 1U;
+            if (!node.buffer_shapes.empty() && node.buffer_shapes[0].channels > 0U) {
+                channels = node.buffer_shapes[0].channels;
+            }
+
+            TensorShape ring_shape{};
+            ring_shape.batches = batches;
+            ring_shape.channels = channels;
+            ring_shape.frames = capacity;
+
+            tap.ring->storage = make_tensor(ring_shape);
+            tap.ring->storage->shape = ring_shape;
+            tap.ring->frame_stride = static_cast<size_t>(ring_shape.batches) * ring_shape.channels;
+            tap.ring->capacity = capacity;
+            tap.ring->head = 0U;
+            tap.ring->tail = 0U;
+            tap.ring->reader_tails.clear();
+            tap.ring->policy = node.vector_policy;
+            tap.ring->constant = node.constant_node;
+            tap.ring->contract = tap.contract;
+            tap.ring->produced_total = 0U;
+            if (tap.ring->contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
+                tap.ring->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
+            }
         }
     }
 
@@ -742,16 +983,70 @@ static bool kpn_node_ready(
     const AmpGraphRuntime *runtime,
     const RuntimeNode &node,
     uint32_t /*node_index*/,
-    uint32_t frames
+    uint32_t default_frames,
+    uint32_t &out_frames
 ) {
-    (void)runtime;
-    if (frames == 0U) return true;
-    if (!node.output_edge || node.output_edge->capacity == 0U) return false;
-    if (edge_ring_free(*node.output_edge) < frames) return false;
+    BlockFrameContract contract = node_block_frame_contract(runtime, node, default_frames);
+    uint32_t min_frames = std::max<uint32_t>(1U, contract.min_frames);
+    uint32_t preferred_frames = std::max<uint32_t>(min_frames, contract.preferred_frames);
+    uint32_t max_frames = std::max<uint32_t>(preferred_frames, contract.max_frames);
+
+    const OutputTap *primary = runtime_primary_output(node);
+    if (primary == nullptr || !primary->ring || primary->ring->capacity == 0U) {
+        return false;
+    }
+
+    uint32_t feasible = max_frames;
+    if (feasible == 0U || feasible == std::numeric_limits<uint32_t>::max()) {
+        feasible = primary->ring->capacity > 0U ? primary->ring->capacity : preferred_frames;
+    }
+
     for (const EdgeReader &reader : node.input_edges) {
         if (!reader.ring) continue;
-        if (edge_ring_available_for_consumer(*reader.ring, reader.consumer_index) < frames) return false;
+        uint32_t ready = edge_ring_available_for_consumer(*reader.ring, reader.consumer_index);
+        if (ready < min_frames) {
+            return false;
+        }
+        ready = align_frames_down(ready, min_frames);
+        if (ready < min_frames) {
+            return false;
+        }
+        feasible = std::min(feasible, ready);
     }
+
+    uint32_t free_space = edge_ring_free(*primary->ring);
+    if (free_space < min_frames) {
+        return false;
+    }
+    free_space = align_frames_down(free_space, min_frames);
+    if (free_space < min_frames) {
+        return false;
+    }
+    feasible = std::min(feasible, free_space);
+
+    if (node.input_edges.empty()) {
+        uint32_t implicit = align_frames_down(preferred_frames, min_frames);
+        if (implicit < min_frames) {
+            implicit = min_frames;
+        }
+        feasible = std::min(feasible, implicit);
+    }
+
+    feasible = std::min(feasible, max_frames);
+    if (feasible < min_frames) {
+        return false;
+    }
+
+    uint32_t target = std::min(preferred_frames, feasible);
+    target = align_frames_down(target, min_frames);
+    if (target < min_frames) {
+        target = align_frames_down(feasible, min_frames);
+    }
+    if (target < min_frames) {
+        return false;
+    }
+
+    out_frames = target;
     return true;
 }
 
@@ -770,9 +1065,34 @@ static int kpn_execute_node_block(
     if (frames == 0U) return 0;
 
     RuntimeNode &node = *runtime->nodes[node_index];
-    if (!node.output_edge) node.output_edge = ensure_edge_ring(runtime, node.name, node.vector_policy);
-    if (!node.output_edge) return -1;
-    if (!kpn_node_ready(runtime, node, node_index, frames)) return 1; // not ready
+    uint32_t default_hint = runtime && runtime->default_frames > 0U
+        ? runtime->default_frames
+        : frames;
+    BlockFrameContract contract = node_block_frame_contract(runtime, node, default_hint);
+    OutputTap *primary = runtime_primary_output(node);
+    if (primary == nullptr) {
+        OutputTap tap{};
+        tap.name = "default";
+        tap.contract = node.output_contract;
+        tap.primary = true;
+        node.outputs.push_back(std::move(tap));
+        primary = runtime_primary_output(node);
+    }
+    if (primary == nullptr) {
+        return -1;
+    }
+    if (!primary->ring) {
+        std::string key = node.name;
+        if (!primary->name.empty()) {
+            key.append("::").append(primary->name);
+        }
+        primary->ring = ensure_edge_ring(runtime, key, node.vector_policy);
+    }
+    if (!primary->ring) return -1;
+    uint32_t ready_frames = 0U;
+    if (!kpn_node_ready(runtime, node, node_index, default_hint, ready_frames) || ready_frames < frames) {
+        return 1; // not ready
+    }
 
     size_t workspace_batches = runtime->default_batches > 0U ? runtime->default_batches : 1U;
     uint32_t total_channels = 0U;
@@ -933,12 +1253,17 @@ static int kpn_execute_node_block(
         return execution_status != 0 ? execution_status : -1;
     }
 
-    auto output_edge = node.output_edge;
+    auto output_edge = primary->ring;
     if (!output_edge) {
         amp_free(frame_buffer);
         return -1;
     }
     edge_ring_write(*output_edge, frame_buffer, frames);
+    uint32_t debug_batches = static_cast<uint32_t>(workspace_batches > 0 ? workspace_batches : 1U);
+    uint32_t debug_channels = out_channels > 0
+        ? static_cast<uint32_t>(out_channels)
+        : std::max<uint32_t>(1U, node.channel_hint);
+    runtime_node_record_debug_frame(node, debug_batches, debug_channels, frames);
 
     TensorShape output_shape{};
     output_shape.batches = static_cast<uint32_t>(workspace_batches);
@@ -966,9 +1291,13 @@ static int kpn_execute_node_block(
         channel.token = node.output;
         channel.ring = output_edge->storage;
         channel.ring_frames = output_edge->capacity;
-        channel.block_frames = node.vector_policy.block_frames > 0U
-            ? node.vector_policy.block_frames
+        uint32_t channel_block = contract.preferred_frames > 0U
+            ? contract.preferred_frames
             : node.output_frames;
+        if (channel_block == 0U) {
+            channel_block = node.output_frames;
+        }
+        channel.block_frames = channel_block;
         channel.frame_stride = edge_ring_frame_stride(*output_edge);
         if (channel.ring_frames > 0U && channel.block_frames > 0U) {
             uint32_t span = std::min<uint32_t>(channel.block_frames, channel.ring_frames);
@@ -986,7 +1315,9 @@ static int kpn_execute_node_block(
         if (!reader.ring) continue;
         edge_ring_advance_consumer(*reader.ring, reader.consumer_index, frames);
     }
-    edge_ring_recompute_tail(*node.output_edge);
+    if (output_edge) {
+        edge_ring_recompute_tail(*output_edge);
+    }
     return 0;
 }
 
@@ -1061,9 +1392,26 @@ static void runtime_update_scheduler_topology(AmpGraphRuntime *runtime) {
 
     for (size_t idx = 0; idx < node_count; ++idx) {
         RuntimeNode &node = *runtime->nodes[idx];
-        node.output_edge = ensure_edge_ring(runtime, node.name, node.vector_policy);
-        if (node.output_edge) {
-            node.output_edge->reader_tails.erase(static_cast<uint32_t>(idx));
+        OutputTap *primary = runtime_primary_output(node);
+        if (primary == nullptr) {
+            OutputTap tap{};
+            tap.name = "default";
+            tap.contract = node.output_contract;
+            tap.primary = true;
+            node.outputs.push_back(std::move(tap));
+            primary = runtime_primary_output(node);
+        }
+        if (primary != nullptr) {
+            if (!primary->ring) {
+                std::string key = node.name;
+                if (!primary->name.empty()) {
+                    key.append("::").append(primary->name);
+                }
+                primary->ring = ensure_edge_ring(runtime, key, node.vector_policy);
+            }
+            if (primary->ring) {
+                primary->ring->reader_tails.erase(static_cast<uint32_t>(idx));
+            }
         }
         node.input_edges.clear();
         for (uint32_t source : node.audio_indices) {
@@ -1071,10 +1419,29 @@ static void runtime_update_scheduler_topology(AmpGraphRuntime *runtime) {
             runtime->dependents[source].push_back(static_cast<uint32_t>(idx));
             runtime->indegree[idx] += 1U;
             auto &source_node = runtime->nodes[source];
-            auto edge = ensure_edge_ring(runtime, source_node->name, source_node->vector_policy);
+            OutputTap *source_primary = runtime_primary_output(*source_node);
+            if (source_primary == nullptr) {
+                OutputTap tap{};
+                tap.name = "default";
+                tap.primary = true;
+                tap.contract = source_node->output_contract;
+                source_node->outputs.push_back(std::move(tap));
+                source_primary = runtime_primary_output(*source_node);
+            }
+            if (source_primary && !source_primary->ring) {
+                std::string key = source_node->name;
+                if (!source_primary->name.empty()) {
+                    key.append("::").append(source_primary->name);
+                }
+                    source_primary->ring = ensure_edge_ring(runtime, key, source_node->vector_policy);
+            }
+            auto edge = source_primary ? source_primary->ring : nullptr;
             EdgeReader reader{};
             reader.ring = edge;
             reader.consumer_index = static_cast<uint32_t>(idx);
+            reader.tap_name = source_primary ? source_primary->name : std::string{};
+            reader.producer_node_index = static_cast<uint32_t>(source);
+            reader.producer_output_index = 0U;
             if (edge) {
                 edge_ring_register_consumer(*edge, reader.consumer_index);
             }
@@ -1087,6 +1454,11 @@ static double compute_scheduler_priority(const AmpGraphRuntime *runtime, uint32_
     if (!runtime || node_index >= runtime->nodes.size()) return 0.0;
     const RuntimeNode &node = *runtime->nodes[node_index];
     const SchedulerParams &params = runtime->scheduler_params;
+    BlockFrameContract contract = node_block_frame_contract(
+        runtime,
+        node,
+        runtime->default_frames
+    );
 
     double normalized_order = 0.0;
     if (!runtime->execution_rank.empty() && runtime->execution_order.size() > 1U) {
@@ -1121,10 +1493,11 @@ static double compute_scheduler_priority(const AmpGraphRuntime *runtime, uint32_
     if (node.vector_policy.channel_expand > 1U) {
         vector_component += static_cast<double>(node.vector_policy.channel_expand - 1U);
     }
-    if (node.vector_policy.block_frames > 0U) {
-        vector_component += 1.0 / static_cast<double>(node.vector_policy.block_frames);
+    if (contract.preferred_frames > 0U) {
+        vector_component += 1.0 / static_cast<double>(contract.preferred_frames);
     }
-    return early_component + late_component + saturation_component + vector_component;
+    double priority = early_component + late_component + saturation_component + vector_component;
+    return priority * contract.priority_weight;
 }
 
 static void build_execution_schedule(const AmpGraphRuntime *runtime, std::vector<uint32_t> &out) {
@@ -1453,6 +1826,9 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         if (vector_expand == 0U) vector_expand = 1U;
         node->vector_policy.channel_expand = vector_expand;
         node->vector_policy.block_frames = parse_uint_metadata(node->params_json, "vector_block_frames", 0U);
+    node->vector_policy.min_block_frames = parse_uint_metadata(node->params_json, "vector_min_block_frames", 0U);
+    node->vector_policy.max_block_frames = parse_uint_metadata(node->params_json, "vector_max_block_frames", 0U);
+    node->vector_policy.priority_weight = parse_double_metadata(node->params_json, "vector_priority_weight", 1.0);
         node->vector_policy.archtypal_mode = parse_bool_metadata(node->params_json, "vector_archtypal_mode", false);
         node->prefill_frames = parse_uint_metadata(node->params_json, "prefill_frames", 0U);
         node->prefill_only = parse_bool_metadata(node->params_json, "prefill_only", false);
@@ -1494,11 +1870,22 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             entry->audio_indices.push_back(static_cast<uint32_t>(it->second));
         }
         runtime->channels.emplace(entry->name, std::make_shared<KahnChannel>(entry->name));
-        entry->output_edge = ensure_edge_ring(runtime, entry->name, entry->vector_policy);
-        if (entry->output_edge) {
-            entry->output_edge->contract = entry->output_contract;
-            if (entry->output_edge->contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
-                entry->output_edge->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
+        if (entry->outputs.empty()) {
+            OutputTap tap{};
+            tap.name = "default";
+            tap.primary = true;
+            tap.contract = entry->output_contract;
+            entry->outputs.push_back(std::move(tap));
+        } else {
+            bool found_primary = false;
+            for (auto &tap : entry->outputs) {
+                if (tap.primary) {
+                    found_primary = true;
+                    break;
+                }
+            }
+            if (!found_primary) {
+                entry->outputs.front().primary = true;
             }
         }
     }
@@ -1509,12 +1896,33 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         for (uint32_t idx : entry->audio_indices) {
             if (idx >= runtime->nodes.size()) return false;
             auto &source = runtime->nodes[idx];
-            auto edge = ensure_edge_ring(runtime, source->name, source->vector_policy);
+            OutputTap *source_primary = runtime_primary_output(*source);
+            if (source_primary == nullptr) {
+                OutputTap tap{};
+                tap.name = "default";
+                tap.primary = true;
+                tap.contract = source->output_contract;
+                source->outputs.push_back(std::move(tap));
+                source_primary = runtime_primary_output(*source);
+            }
+            if (source_primary && !source_primary->ring) {
+                std::string key = source->name;
+                if (!source_primary->name.empty()) {
+                    key.append("::").append(source_primary->name);
+                }
+                source_primary->ring = ensure_edge_ring(runtime, key, source->vector_policy);
+            }
+            auto edge = source_primary ? source_primary->ring : nullptr;
             size_t consumer_index = runtime->node_index[entry->name];
             EdgeReader reader{};
             reader.ring = edge;
             reader.consumer_index = static_cast<uint32_t>(consumer_index);
-            edge_ring_register_consumer(*edge, reader.consumer_index);
+            reader.tap_name = source_primary ? source_primary->name : std::string{};
+            reader.producer_node_index = static_cast<uint32_t>(idx);
+            reader.producer_output_index = 0U;
+            if (edge) {
+                edge_ring_register_consumer(*edge, reader.consumer_index);
+            }
             entry->input_edges.push_back(reader);
         }
     }
@@ -1651,7 +2059,10 @@ static int runtime_execute_prepass(
             if (node.prefill_frames == 0U || node.prepass_done) continue;
 
             uint32_t frames = node.prefill_frames;
-            if (!kpn_node_ready(runtime, node, idx, frames)) continue;
+            uint32_t ready_frames = 0U;
+            if (!kpn_node_ready(runtime, node, idx, frames, ready_frames) || ready_frames < frames) {
+                continue;
+            }
 
             int status = kpn_execute_node_block(runtime, idx, frames, sample_rate, history);
             if (status > 0) continue;
@@ -1758,6 +2169,9 @@ static void streamer_flush_ring_to_dump(AmpGraphStreamer *streamer) {
     }
     streamer->read_index.store(streamer->write_index.load(std::memory_order_acquire), std::memory_order_release);
     streamer->consumed_frames.fetch_add(current, std::memory_order_release);
+    uint64_t now = steady_now_millis();
+    streamer->last_dump_millis.store(now, std::memory_order_release);
+    streamer->last_consumed_millis.store(now, std::memory_order_release);
     streamer->dump_cv.notify_all();
 }
 
@@ -1781,6 +2195,7 @@ static void streamer_enqueue_chunk(
         std::lock_guard<std::mutex> lock(streamer->dump_mutex);
         streamer->dump_queue.push_back(std::move(chunk));
     }
+    streamer->last_dump_millis.store(steady_now_millis(), std::memory_order_release);
     streamer->dump_cv.notify_all();
 }
 
@@ -1797,6 +2212,7 @@ static void streamer_write_frames(
     if (frame_count > streamer->ring_frames) {
         streamer_enqueue_chunk(streamer, frames, frame_count, streamer->batches, streamer->channels, streamer->produced_frames.load());
         streamer->produced_frames.fetch_add(frame_count, std::memory_order_release);
+        streamer->last_produced_millis.store(steady_now_millis(), std::memory_order_release);
         return;
     }
     if (streamer_ring_free(streamer) < frame_count) {
@@ -1805,12 +2221,14 @@ static void streamer_write_frames(
     if (streamer_ring_free(streamer) < frame_count) {
         streamer_enqueue_chunk(streamer, frames, frame_count, streamer->batches, streamer->channels, streamer->produced_frames.load());
         streamer->produced_frames.fetch_add(frame_count, std::memory_order_release);
+        streamer->last_produced_millis.store(steady_now_millis(), std::memory_order_release);
         return;
     }
     uint64_t start = streamer->write_index.load(std::memory_order_relaxed);
     streamer_copy_to_ring(streamer, start, frames, frame_count);
     streamer->write_index.store(start + frame_count, std::memory_order_release);
     streamer->produced_frames.fetch_add(frame_count, std::memory_order_release);
+    streamer->last_produced_millis.store(steady_now_millis(), std::memory_order_release);
 }
 
 /*** KPN production***
@@ -1826,10 +2244,17 @@ static int kpn_streamer_produce(
     if (runtime->sink_index >= runtime->nodes.size()) return -1;
     auto &sink_node = *runtime->nodes[runtime->sink_index];
 
-    if (!sink_node.output_edge) {
-        sink_node.output_edge = ensure_edge_ring(runtime, sink_node.name, sink_node.vector_policy);
+    OutputTap *primary = runtime_primary_output(sink_node);
+    if (!primary) return -1;
+
+    if (!primary->ring) {
+        std::string key = sink_node.name;
+        if (!primary->name.empty()) {
+            key.append("::").append(primary->name);
+        }
+        primary->ring = ensure_edge_ring(runtime, key, sink_node.vector_policy);
     }
-    auto sink_edge = sink_node.output_edge;
+    auto sink_edge = primary->ring;
     if (!sink_edge || sink_edge->capacity == 0U) return -1;
 
     if (streamer->ring_frames == 0U) {
@@ -1864,8 +2289,8 @@ static int kpn_streamer_produce(
             if (idx >= runtime->nodes.size()) continue;
             RuntimeNode &candidate = *runtime->nodes[idx];
             if (candidate.prefill_only) continue;
-            uint32_t frames = node_required_block_frames(runtime, candidate, streamer->block_frames);
-            if (!kpn_node_ready(runtime, candidate, idx, frames)) continue;
+            uint32_t frames = 0U;
+            if (!kpn_node_ready(runtime, candidate, idx, streamer->block_frames, frames)) continue;
             double priority = compute_scheduler_priority(runtime, idx);
             ReadyNodeEntry entry{idx, priority, candidate.vector_policy.archtypal_mode};
             ready_queue.push(entry);
@@ -1884,8 +2309,8 @@ static int kpn_streamer_produce(
                 if (idx >= runtime->nodes.size()) continue;
                 RuntimeNode &node = *runtime->nodes[idx];
                 if (node.prefill_only) continue;
-                uint32_t frames = node_required_block_frames(runtime, node, streamer->block_frames);
-                if (!kpn_node_ready(runtime, node, idx, frames)) continue;
+                uint32_t frames = 0U;
+                if (!kpn_node_ready(runtime, node, idx, streamer->block_frames, frames)) continue;
                 int status = kpn_execute_node_block(runtime, idx, frames, streamer->sample_rate, history);
                 if (status < 0) return status;
                 if (status == 0) {
@@ -1903,8 +2328,8 @@ static int kpn_streamer_produce(
             if (entry.node_index >= runtime->nodes.size()) continue;
             RuntimeNode &node = *runtime->nodes[entry.node_index];
             if (node.prefill_only) continue;
-            uint32_t frames = node_required_block_frames(runtime, node, streamer->block_frames);
-            if (!kpn_node_ready(runtime, node, entry.node_index, frames)) continue;
+            uint32_t frames = 0U;
+            if (!kpn_node_ready(runtime, node, entry.node_index, streamer->block_frames, frames)) continue;
             int status = kpn_execute_node_block(runtime, entry.node_index, frames, streamer->sample_rate, history);
             if (status < 0) return status;
             if (status == 0) {
@@ -2018,7 +2443,10 @@ static void clear_runtime(AmpGraphRuntime *runtime) {
         node->param_cache.clear();
         node->param_cache_index.clear();
         node->param_cache_dirty = true;
-        node->output_edge.reset();
+        for (auto &tap : node->outputs) {
+            tap.ring.reset();
+        }
+        node->outputs.clear();
         node->input_edges.clear();
         node->output.reset();
         node->audio_workspace.clear();
@@ -2258,14 +2686,31 @@ static int execute_runtime_with_history_impl(
         node.output_channels = node_output->shape.channels;
         node.output_frames   = node_output->shape.frames;
 
+        runtime_node_record_debug_frame(
+            node,
+            node_output->shape.batches,
+            node_output->shape.channels,
+            node_output->shape.frames
+        );
+
         auto channel_it = runtime->channels.find(node.name);
         if (channel_it != runtime->channels.end()) {
             auto &channel = *channel_it->second;
             channel.token = node_output;
             channel.ring.reset();
             channel.ring_frames = 0U;
-            channel.block_frames = node.vector_policy.block_frames > 0U
-                ? node.vector_policy.block_frames : node_output->shape.frames;
+            BlockFrameContract channel_contract = node_block_frame_contract(
+                runtime,
+                node,
+                runtime ? runtime->default_frames : node_output->shape.frames
+            );
+            uint32_t channel_block = channel_contract.preferred_frames > 0U
+                ? channel_contract.preferred_frames
+                : node_output->shape.frames;
+            if (channel_block == 0U) {
+                channel_block = node_output->shape.frames;
+            }
+            channel.block_frames = channel_block;
             channel.frame_stride = static_cast<size_t>(node_output->shape.batches) * static_cast<size_t>(node_output->shape.channels);
             channel.block_start = 0U;
         }
@@ -2550,9 +2995,13 @@ AMP_API int amp_graph_runtime_set_param(
     binding.full_shape   = incoming_shape;
     binding.frame_stride = static_cast<size_t>(incoming_shape.batches) * static_cast<size_t>(incoming_shape.channels);
     binding.window_frames = enable_ring ? target_frames : incoming_shape.frames;
-    if (node.vector_policy.block_frames > 0U) {
-        binding.window_frames = std::max(binding.window_frames, node.vector_policy.block_frames);
-    }
+    BlockFrameContract param_contract = node_block_frame_contract(
+        runtime,
+        node,
+        runtime ? runtime->default_frames : target_frames
+    );
+    binding.window_frames = std::max(binding.window_frames, param_contract.min_frames);
+    binding.window_frames = std::max(binding.window_frames, param_contract.preferred_frames);
     binding.use_ring    = enable_ring;
     binding.ring_frames = enable_ring ? incoming_shape.frames : binding.window_frames;
     binding.ring_head   = 0;
@@ -2722,6 +3171,16 @@ AMP_API AmpGraphStreamer *amp_graph_streamer_create(
     streamer->produced_frames.store(0, std::memory_order_relaxed);
     streamer->consumed_frames.store(0, std::memory_order_relaxed);
     streamer->stop_requested.store(false, std::memory_order_relaxed);
+    streamer->start_time_millis.store(0, std::memory_order_relaxed);
+    uint64_t now = steady_now_millis();
+    streamer->last_produced_millis.store(now, std::memory_order_relaxed);
+    streamer->last_consumed_millis.store(now, std::memory_order_relaxed);
+    streamer->last_dump_millis.store(now, std::memory_order_relaxed);
+    if (frames_hint > 0) {
+        streamer->expected_output_frames = static_cast<uint64_t>(frames_hint);
+    } else {
+        streamer->expected_output_frames = 0;
+    }
 
     uint32_t batches = runtime->default_batches > 0U ? runtime->default_batches : 1U;
     amp_graph_runtime_configure(runtime, batches, streamer->block_frames);
@@ -2738,6 +3197,11 @@ AMP_API int amp_graph_streamer_start(AmpGraphStreamer *streamer) {
     if (!streamer) return -1;
     if (streamer->running.load(std::memory_order_acquire)) return 0;
     streamer->stop_requested.store(false, std::memory_order_release);
+    uint64_t now = steady_now_millis();
+    streamer->start_time_millis.store(now, std::memory_order_release);
+    streamer->last_produced_millis.store(now, std::memory_order_release);
+    streamer->last_consumed_millis.store(now, std::memory_order_release);
+    streamer->last_dump_millis.store(now, std::memory_order_release);
     streamer->worker = std::thread(streamer_worker_main, streamer);
     return 0;
 }
@@ -2792,6 +3256,7 @@ AMP_API int amp_graph_streamer_read(
     streamer_copy_from_ring(streamer, start_index, to_copy, destination);
     streamer->read_index.store(start_index + to_copy, std::memory_order_release);
     streamer->consumed_frames.fetch_add(to_copy, std::memory_order_release);
+    streamer->last_consumed_millis.store(steady_now_millis(), std::memory_order_release);
 
     if (out_frames)   *out_frames = static_cast<uint32_t>(to_copy);
     if (out_channels) *out_channels = streamer->channels;
@@ -2829,6 +3294,7 @@ AMP_API int amp_graph_streamer_pop_dump(
     chunk = std::move(streamer->dump_queue.front());
     streamer->dump_queue.pop_front();
     lock.unlock();
+    streamer->last_dump_millis.store(steady_now_millis(), std::memory_order_release);
 
     size_t frames = chunk.frames;
     if (destination == nullptr || max_frames < frames) {
@@ -2843,6 +3309,7 @@ AMP_API int amp_graph_streamer_pop_dump(
 
     std::memcpy(destination, chunk.data.data(), frames * streamer->frame_stride * sizeof(double));
     streamer->consumed_frames.fetch_add(frames, std::memory_order_release);
+    streamer->last_consumed_millis.store(steady_now_millis(), std::memory_order_release);
 
     if (out_frames)   *out_frames   = static_cast<uint32_t>(frames);
     if (out_channels) *out_channels = chunk.channels;
@@ -2860,6 +3327,624 @@ AMP_API int amp_graph_streamer_status(
     if (out_produced_frames) *out_produced_frames = streamer->produced_frames.load(std::memory_order_acquire);
     if (out_consumed_frames) *out_consumed_frames = streamer->consumed_frames.load(std::memory_order_acquire);
     return streamer->last_status;
+}
+
+AMP_API int amp_graph_streamer_evaluate_completion(
+    AmpGraphStreamer *streamer,
+    const AmpGraphStreamerCompletionContract *contract,
+    AmpGraphStreamerCompletionState *out_state,
+    AmpGraphStreamerCompletionVerdict *out_verdict
+) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_evaluate_completion", (size_t)(streamer != nullptr), 0);
+    if (!streamer) return -1;
+
+    const uint64_t produced = streamer->produced_frames.load(std::memory_order_acquire);
+    const uint64_t consumed = streamer->consumed_frames.load(std::memory_order_acquire);
+    const uint32_t ring_size = static_cast<uint32_t>(streamer_ring_size(streamer));
+    const uint32_t ring_capacity = streamer->ring_frames;
+    uint32_t dump_depth = 0U;
+    {
+        std::lock_guard<std::mutex> lock(streamer->dump_mutex);
+        dump_depth = static_cast<uint32_t>(streamer->dump_queue.size());
+    }
+
+    const uint64_t now = steady_now_millis();
+    const uint64_t start = streamer->start_time_millis.load(std::memory_order_acquire);
+    const uint64_t elapsed = start > 0 ? elapsed_since(now, start) : 0;
+    const uint64_t since_produced = elapsed_since(now, streamer->last_produced_millis.load(std::memory_order_acquire));
+    const uint64_t since_consumed = elapsed_since(now, streamer->last_consumed_millis.load(std::memory_order_acquire));
+    const uint64_t since_dump = elapsed_since(now, streamer->last_dump_millis.load(std::memory_order_acquire));
+
+    if (out_state) {
+        out_state->produced_frames = produced;
+        out_state->consumed_frames = consumed;
+        out_state->ring_size = ring_size;
+        out_state->ring_capacity = ring_capacity;
+        out_state->dump_queue_depth = dump_depth;
+        out_state->elapsed_millis = elapsed;
+        out_state->since_producer_progress_millis = since_produced;
+        out_state->since_consumer_progress_millis = since_consumed;
+        out_state->since_dump_progress_millis = since_dump;
+        out_state->running = streamer->running.load(std::memory_order_acquire) ? 1 : 0;
+    }
+
+    if (out_verdict) {
+        out_verdict->contract_satisfied = 0;
+        out_verdict->producer_goal_met = 0;
+        out_verdict->consumer_goal_met = 0;
+        out_verdict->ring_drained = ring_size == 0 ? 1 : 0;
+        out_verdict->dump_drained = dump_depth == 0 ? 1 : 0;
+        out_verdict->timed_out = 0;
+        out_verdict->idle_timeout_triggered = 0;
+        out_verdict->total_timeout_triggered = 0;
+        out_verdict->inflight_limit_exceeded = 0;
+        out_verdict->dump_limit_exceeded = 0;
+
+        const bool has_contract = contract != nullptr;
+        const uint64_t target_produced = has_contract && contract->target_produced_frames > 0ULL
+            ? contract->target_produced_frames
+            : streamer->expected_output_frames;
+        const uint64_t target_consumed = has_contract && contract->target_consumed_frames > 0ULL
+            ? contract->target_consumed_frames
+            : streamer->expected_output_frames;
+        bool producer_goal_met = (target_produced == 0ULL) || (produced >= target_produced);
+        bool consumer_goal_met = (target_consumed == 0ULL) || (consumed >= target_consumed);
+        bool inflight_ok = true;
+        bool dump_ok = true;
+        bool require_ring_drain = has_contract ? (contract->require_ring_drain != 0)
+                                               : (target_produced > 0ULL || target_consumed > 0ULL);
+        bool require_dump_drain = has_contract ? (contract->require_dump_drain != 0)
+                                               : (target_produced > 0ULL || target_consumed > 0ULL);
+        bool idle_timeout_triggered = false;
+        bool total_timeout_triggered = false;
+
+        if (has_contract) {
+            if (contract->maximum_inflight_frames > 0U && ring_size > contract->maximum_inflight_frames) {
+                inflight_ok = false;
+                out_verdict->inflight_limit_exceeded = 1;
+            }
+            if (contract->maximum_dump_depth > 0U && dump_depth > contract->maximum_dump_depth) {
+                dump_ok = false;
+                out_verdict->dump_limit_exceeded = 1;
+            }
+            if (contract->idle_timeout_millis > 0U) {
+                const uint64_t idle_limit = contract->idle_timeout_millis;
+                const bool producer_idle = since_produced >= idle_limit;
+                const bool consumer_idle = since_consumed >= idle_limit;
+                const bool dump_idle = since_dump >= idle_limit;
+                idle_timeout_triggered = producer_idle && consumer_idle && dump_idle;
+            }
+            if (contract->total_timeout_millis > 0U && elapsed >= contract->total_timeout_millis) {
+                total_timeout_triggered = true;
+            }
+        }
+
+        const bool ring_drained = out_verdict->ring_drained == 1;
+        const bool dump_drained = out_verdict->dump_drained == 1;
+
+        bool contract_satisfied = producer_goal_met && consumer_goal_met && inflight_ok && dump_ok;
+        if (require_ring_drain) {
+            contract_satisfied = contract_satisfied && ring_drained;
+        }
+        if (require_dump_drain) {
+            contract_satisfied = contract_satisfied && dump_drained;
+        }
+
+        const bool timed_out = idle_timeout_triggered || total_timeout_triggered;
+        out_verdict->producer_goal_met = producer_goal_met ? 1 : 0;
+        out_verdict->consumer_goal_met = consumer_goal_met ? 1 : 0;
+        out_verdict->contract_satisfied = contract_satisfied ? 1 : 0;
+        out_verdict->timed_out = timed_out ? 1 : 0;
+        out_verdict->idle_timeout_triggered = idle_timeout_triggered ? 1 : 0;
+        out_verdict->total_timeout_triggered = total_timeout_triggered ? 1 : 0;
+    }
+
+    return streamer->last_status;
+}
+
+AMP_API int amp_graph_runtime_debug_snapshot(
+    AmpGraphRuntime *runtime,
+    AmpGraphStreamer *streamer,
+    AmpGraphNodeDebugEntry *node_entries,
+    uint32_t node_capacity,
+    AmpGraphDebugSnapshot *snapshot
+) {
+    if (!runtime || !snapshot) {
+        return -1;
+    }
+
+    const uint32_t node_count = static_cast<uint32_t>(runtime->nodes.size());
+    snapshot->version = 1U;
+    snapshot->node_count = node_count;
+    snapshot->sink_index = runtime->sink_index;
+    snapshot->sample_rate = runtime->dsp_sample_rate;
+    snapshot->scheduler_mode = static_cast<uint32_t>(runtime->scheduler_mode);
+    snapshot->produced_frames = 0U;
+    snapshot->consumed_frames = 0U;
+    snapshot->ring_capacity = 0U;
+    snapshot->ring_size = 0U;
+    snapshot->dump_queue_depth = 0U;
+
+    if (streamer != nullptr) {
+        snapshot->produced_frames = streamer->produced_frames.load(std::memory_order_acquire);
+        snapshot->consumed_frames = streamer->consumed_frames.load(std::memory_order_acquire);
+        snapshot->ring_capacity = streamer->ring_frames;
+        snapshot->ring_size = static_cast<uint32_t>(streamer_ring_size(streamer));
+        {
+            std::lock_guard<std::mutex> lock(streamer->dump_mutex);
+            snapshot->dump_queue_depth = static_cast<uint32_t>(streamer->dump_queue.size());
+        }
+    }
+
+    if (!node_entries || node_capacity < node_count) {
+        return static_cast<int>(node_count);
+    }
+
+    for (uint32_t i = 0; i < node_count; ++i) {
+        RuntimeNode &node = *runtime->nodes[i];
+        AmpGraphNodeDebugEntry &entry = node_entries[i];
+        std::memset(&entry, 0, sizeof(entry));
+        std::snprintf(entry.name, sizeof(entry.name), "%.63s", node.name.c_str());
+    entry.declared_delay_frames = node.declared_delay_frames;
+    entry.oversample_ratio = node.oversample_ratio;
+    entry.supports_v2 = node.supports_v2 ? 1U : 0U;
+    entry.prefill_only = node.prefill_only ? 1U : 0U;
+    entry.last_heat = node.has_latest_metrics ? node.latest_metrics.accumulated_heat : 0.0f;
+    entry.last_processing_time_seconds = node.has_latest_metrics ? node.latest_metrics.processing_time_seconds : 0.0;
+    entry.last_total_time_seconds = node.has_latest_metrics ? node.latest_metrics.total_time_seconds : 0.0;
+    entry.total_heat_accumulated = node.total_heat_accumulated;
+        const RuntimeNode::DebugFrameCache &cache = node.debug_frame_cache;
+        uint32_t block_frames_hint = 0U;
+        if (streamer && streamer->block_frames > 0U) {
+            block_frames_hint = streamer->block_frames;
+        } else if (runtime->default_frames > 0U) {
+            block_frames_hint = runtime->default_frames;
+        }
+        BlockFrameContract contract = node_block_frame_contract(runtime, node, block_frames_hint);
+        entry.debug_min_frames = contract.min_frames;
+        entry.debug_preferred_frames = contract.preferred_frames;
+        entry.debug_max_frames = contract.max_frames;
+        entry.debug_priority_weight = contract.priority_weight;
+        entry.debug_channel_expand = node.vector_policy.channel_expand;
+        entry.fifo_simultaneous_availability = node.output_contract.simultaneous_availability ? 1U : 0U;
+        entry.fifo_release_policy = static_cast<uint8_t>(node.output_contract.release_policy);
+        entry.fifo_primary_consumer = node.output_contract.primary_consumer;
+    entry.debug_sequence = cache.sequence;
+    entry.debug_sample_count = cache.sample_count;
+    entry.debug_total_frames = cache.total_frames;
+    entry.debug_total_batches = cache.total_batches;
+    entry.debug_total_channels = cache.total_channels;
+    entry.debug_metrics_samples = cache.metrics_samples;
+    entry.debug_last_timestamp_millis = cache.last_timestamp_millis;
+    entry.debug_sum_processing_seconds = cache.sum_processing_seconds;
+    entry.debug_sum_logging_seconds = cache.sum_logging_seconds;
+    entry.debug_sum_total_seconds = cache.sum_total_seconds;
+    entry.debug_sum_thread_cpu_seconds = cache.sum_thread_cpu_seconds;
+    entry.debug_last_frames = cache.last_frames;
+    entry.debug_last_batches = cache.last_batches;
+    entry.debug_last_channels = cache.last_channels;
+    entry.tap_count = 0U;
+
+        uint32_t ring_capacity = 0U;
+        uint32_t ring_size = 0U;
+        uint32_t reader_count = 0U;
+        const OutputTap *primary = runtime_primary_output(node);
+        if (primary && primary->ring) {
+            ring_capacity = primary->ring->capacity;
+            reader_count = static_cast<uint32_t>(primary->ring->reader_tails.size());
+            if (ring_capacity > 0U) {
+                uint32_t head = primary->ring->head % ring_capacity;
+                uint32_t tail = primary->ring->tail % ring_capacity;
+                ring_size = edge_ring_distance(head, tail, ring_capacity);
+            }
+        }
+        entry.ring_capacity = ring_capacity;
+        entry.ring_size = ring_size;
+        entry.reader_count = reader_count;
+
+        for (const OutputTap &tap : node.outputs) {
+            if (entry.tap_count >= AMP_GRAPH_NODE_MAX_TAPS) {
+                break;
+            }
+            AmpGraphNodeTapDebugEntry &tap_entry = entry.taps[entry.tap_count++];
+            std::string tap_name = tap.name.empty() ? std::string("default") : tap.name;
+            std::snprintf(tap_entry.name, sizeof(tap_entry.name), "%.31s", tap_name.c_str());
+            tap_entry.ring_capacity = 0U;
+            tap_entry.ring_size = 0U;
+            tap_entry.reader_count = 0U;
+            tap_entry.head_position = 0U;
+            tap_entry.tail_position = 0U;
+            tap_entry.produced_total = 0U;
+            if (!tap.ring) {
+                continue;
+            }
+            tap_entry.ring_capacity = tap.ring->capacity;
+            tap_entry.reader_count = static_cast<uint32_t>(tap.ring->reader_tails.size());
+            if (tap_entry.ring_capacity > 0U) {
+                uint32_t head = tap.ring->head % tap_entry.ring_capacity;
+                uint32_t tail = tap.ring->tail % tap_entry.ring_capacity;
+                tap_entry.head_position = head;
+                tap_entry.tail_position = tail;
+                tap_entry.ring_size = edge_ring_distance(head, tail, tap_entry.ring_capacity);
+            }
+            tap_entry.produced_total = tap.ring->produced_total;
+        }
+    }
+
+    return static_cast<int>(node_count);
+}
+
+struct AmpKpnOverlay {
+    AmpGraphStreamer *streamer{nullptr};
+    AmpKpnOverlayConfig config{100U, 1, 0, 0};
+    std::atomic<bool> running{false};
+    std::atomic<bool> stop_requested{false};
+    std::thread worker;
+    std::vector<AmpGraphNodeDebugEntry> buffer;
+    bool cursor_hidden{false};
+    double free_clock_hz{0.0};
+    bool free_clock_initialized{false};
+    uint64_t last_produced_frames{0ULL};
+    std::chrono::steady_clock::time_point last_rate_sample{};
+};
+
+#if defined(_WIN32)
+static void amp_kpn_overlay_enable_vt_mode() {
+    HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    DWORD mode = 0;
+    if (!GetConsoleMode(handle, &mode)) {
+        return;
+    }
+    if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) {
+        return;
+    }
+    SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+#else
+static void amp_kpn_overlay_enable_vt_mode() {}
+#endif
+
+static void amp_kpn_overlay_write(FILE *stream, const char *data, size_t length) {
+    if (!stream || !data || length == 0U) {
+        return;
+    }
+    std::fwrite(data, 1U, length, stream);
+}
+
+static void amp_kpn_overlay_render(
+    AmpKpnOverlay *overlay,
+    const AmpGraphDebugSnapshot &snapshot,
+    const AmpGraphNodeDebugEntry *entries
+) {
+    static constexpr double kDefaultEmaAlpha = 0.25; // smoothing factor for EMA; smaller = smoother
+    static constexpr double kDefaultWindowSeconds = 1.0; // fallback window for simple average if EMA disabled
+    static constexpr bool kUseEma = true;
+
+    if (!overlay) return;
+    FILE *out = stdout;
+    if (!out) return;
+
+    struct TapHistorySample {
+        uint64_t produced_total{0ULL};
+        std::chrono::steady_clock::time_point timestamp{};
+        double ema_flow{0.0};
+    };
+    static std::unordered_map<std::string, TapHistorySample> tap_history;
+
+    std::string buffer;
+    buffer.reserve(2048U + static_cast<size_t>(snapshot.node_count) * 160U);
+    buffer.append("\033[H\033[J");
+
+    char line[256];
+    double free_clock = 0.0;
+    if (overlay->config.enable_free_clock != 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!overlay->free_clock_initialized) {
+            overlay->last_rate_sample = now;
+            overlay->last_produced_frames = snapshot.produced_frames;
+            overlay->free_clock_hz = 0.0;
+            overlay->free_clock_initialized = true;
+        } else {
+            uint64_t produced_delta = 0ULL;
+            if (snapshot.produced_frames >= overlay->last_produced_frames) {
+                produced_delta = snapshot.produced_frames - overlay->last_produced_frames;
+            }
+            double elapsed = std::chrono::duration<double>(now - overlay->last_rate_sample).count();
+            if (elapsed > 0.0) {
+                double instantaneous = produced_delta / elapsed;
+                constexpr double alpha = 0.25;
+                if (!std::isfinite(overlay->free_clock_hz) || overlay->free_clock_hz <= 0.0) {
+                    overlay->free_clock_hz = instantaneous;
+                } else {
+                    overlay->free_clock_hz = alpha * instantaneous + (1.0 - alpha) * overlay->free_clock_hz;
+                }
+                overlay->last_rate_sample = now;
+                overlay->last_produced_frames = snapshot.produced_frames;
+            }
+        }
+        free_clock = overlay->free_clock_hz;
+    }
+
+    if (overlay->config.enable_free_clock != 0) {
+        std::snprintf(
+            line,
+            sizeof(line),
+            "AMP KPN Overlay | nodes:%u sink:%u | mode:%u | sr:%0.1f Hz | free:%0.2f Hz | ring:%u/%u | dumps:%u\n",
+            snapshot.node_count,
+            snapshot.sink_index,
+            snapshot.scheduler_mode,
+            snapshot.sample_rate,
+            free_clock,
+            snapshot.ring_size,
+            snapshot.ring_capacity,
+            snapshot.dump_queue_depth
+        );
+    } else {
+        std::snprintf(
+            line,
+            sizeof(line),
+            "AMP KPN Overlay | nodes:%u sink:%u | mode:%u | sr:%0.1f Hz | ring:%u/%u | dumps:%u\n",
+            snapshot.node_count,
+            snapshot.sink_index,
+            snapshot.scheduler_mode,
+            snapshot.sample_rate,
+            snapshot.ring_size,
+            snapshot.ring_capacity,
+            snapshot.dump_queue_depth
+        );
+    }
+    buffer.append(line);
+
+    std::snprintf(
+        line,
+        sizeof(line),
+        "Produced:%llu Consumed:%llu\n",
+        static_cast<unsigned long long>(snapshot.produced_frames),
+        static_cast<unsigned long long>(snapshot.consumed_frames)
+    );
+    buffer.append(line);
+    buffer.append("--------------------------------------------------------------------------------\n");
+    buffer.append("Node                             | Ring%  | Used/Cap | Delay | Heat  | AvgProc(ms) | AvgTotal(ms) | Min/Pref | Max  | Calls | Frames | LastF | LastB | LastC\n");
+
+    const auto now = std::chrono::steady_clock::now();
+    std::unordered_set<std::string> seen_taps;
+    seen_taps.reserve(static_cast<size_t>(snapshot.node_count) * 2U);
+
+    for (uint32_t i = 0; i < snapshot.node_count; ++i) {
+        const AmpGraphNodeDebugEntry &entry = entries[i];
+        double percent = 0.0;
+        if (entry.ring_capacity > 0U) {
+            percent = (100.0 * static_cast<double>(entry.ring_size)) / static_cast<double>(entry.ring_capacity);
+        }
+        double proc_ms = entry.last_processing_time_seconds * 1000.0;
+        double total_ms = entry.last_total_time_seconds * 1000.0;
+        if (entry.debug_metrics_samples > 0ULL) {
+            double sample_count = static_cast<double>(entry.debug_metrics_samples);
+            proc_ms = (entry.debug_sum_processing_seconds / sample_count) * 1000.0;
+            total_ms = (entry.debug_sum_total_seconds / sample_count) * 1000.0;
+        }
+        unsigned long long calls = static_cast<unsigned long long>(entry.debug_sample_count);
+        unsigned long long total_frames = static_cast<unsigned long long>(entry.debug_total_frames);
+        std::string node_name(entry.name);
+        if (node_name.empty()) {
+            node_name = "<unnamed>";
+        }
+        std::snprintf(
+            line,
+            sizeof(line),
+            "%-31.31s | %6.2f | %5u/%-5u | %5u | %5.2f | %11.3f | %12.3f | %3u/%-4u | %5u | %5llu | %6llu | %5u | %5u | %5u\n",
+            node_name.c_str(),
+            percent,
+            entry.ring_size,
+            entry.ring_capacity,
+            entry.declared_delay_frames,
+            static_cast<double>(entry.last_heat),
+            proc_ms,
+            total_ms,
+            entry.debug_min_frames,
+            entry.debug_preferred_frames,
+            entry.debug_max_frames,
+            calls,
+            total_frames,
+            entry.debug_last_frames,
+            entry.debug_last_batches,
+            entry.debug_last_channels
+        );
+        buffer.append(line);
+
+        if (entry.tap_count == 0U) {
+            continue;
+        }
+
+        buffer.append("        Tap                      | Ring%  | Used/Cap | Head/Tail | Readers | Flow(fr/s)\n");
+        for (uint32_t tap_idx = 0; tap_idx < entry.tap_count; ++tap_idx) {
+            const AmpGraphNodeTapDebugEntry &tap = entry.taps[tap_idx];
+            double tap_percent = 0.0;
+            if (tap.ring_capacity > 0U) {
+                tap_percent = (100.0 * static_cast<double>(tap.ring_size)) / static_cast<double>(tap.ring_capacity);
+            }
+
+            double flow_rate = 0.0;
+            std::string key = node_name;
+            key.append("::").append(tap.name);
+            auto it = tap_history.find(key);
+            if (it != tap_history.end()) {
+                double elapsed = std::chrono::duration<double>(now - it->second.timestamp).count();
+                if (elapsed > 0.0 && tap.produced_total >= it->second.produced_total) {
+                    uint64_t delta = tap.produced_total - it->second.produced_total;
+                    double instantaneous = static_cast<double>(delta) / elapsed;
+                    if (kUseEma) {
+                        double alpha = kDefaultEmaAlpha;
+                        double ema = (alpha * instantaneous) + ((1.0 - alpha) * it->second.ema_flow);
+                        flow_rate = ema;
+                    } else {
+                        double window = kDefaultWindowSeconds;
+                        if (window <= 0.0) window = elapsed;
+                        flow_rate = static_cast<double>(delta) / std::max(window, elapsed);
+                    }
+                }
+            }
+            TapHistorySample sample{};
+            sample.produced_total = tap.produced_total;
+            sample.timestamp = now;
+            if (kUseEma) {
+                if (it != tap_history.end()) {
+                    double ema_prev = it->second.ema_flow;
+                    double alpha = kDefaultEmaAlpha;
+                    double ema = (flow_rate > 0.0) ? flow_rate : ema_prev;
+                    sample.ema_flow = ema;
+                } else {
+                    sample.ema_flow = flow_rate;
+                }
+            } else {
+                sample.ema_flow = flow_rate;
+            }
+            tap_history[key] = sample;
+
+            seen_taps.insert(key);
+
+            std::snprintf(
+                line,
+                sizeof(line),
+                "        %-24.24s | %6.2f | %5u/%-5u | %4u/%-4u | %7u | %9.2f\n",
+                tap.name[0] != '\0' ? tap.name : "default",
+                tap_percent,
+                tap.ring_size,
+                tap.ring_capacity,
+                tap.head_position,
+                tap.tail_position,
+                tap.reader_count,
+                flow_rate
+            );
+            buffer.append(line);
+        }
+    }
+
+    if (!tap_history.empty()) {
+        for (auto it = tap_history.begin(); it != tap_history.end();) {
+            if (seen_taps.find(it->first) == seen_taps.end()) {
+                it = tap_history.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    amp_kpn_overlay_write(out, buffer.data(), buffer.size());
+    std::fflush(out);
+}
+
+static void amp_kpn_overlay_thread(AmpKpnOverlay *overlay) {
+    if (!overlay || !overlay->streamer) {
+        return;
+    }
+
+    amp_kpn_overlay_enable_vt_mode();
+
+    FILE *out = stdout;
+    if (out) {
+        std::fputs("\033[?25l", out);
+        std::fflush(out);
+        overlay->cursor_hidden = true;
+    }
+
+    overlay->running.store(true, std::memory_order_release);
+
+    const uint32_t sleep_ms = overlay->config.refresh_millis > 0U ? overlay->config.refresh_millis : 100U;
+
+    while (!overlay->stop_requested.load(std::memory_order_acquire)) {
+        AmpGraphDebugSnapshot snapshot{};
+        uint32_t capacity = static_cast<uint32_t>(overlay->buffer.size());
+        int rc = amp_graph_runtime_debug_snapshot(
+            overlay->streamer->runtime,
+            overlay->streamer,
+            overlay->buffer.data(),
+            capacity,
+            &snapshot
+        );
+        if (rc < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+            continue;
+        }
+        if (static_cast<uint32_t>(rc) > capacity) {
+            overlay->buffer.resize(static_cast<size_t>(rc));
+            continue;
+        }
+
+        amp_kpn_overlay_render(overlay, snapshot, overlay->buffer.data());
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    }
+
+    if (overlay->cursor_hidden && out) {
+        if (overlay->config.clear_on_exit != 0) {
+            std::fputs("\033[?25h\033[H\033[J", out);
+        } else {
+            std::fputs("\033[?25h", out);
+        }
+        std::fflush(out);
+        overlay->cursor_hidden = false;
+    }
+
+    overlay->running.store(false, std::memory_order_release);
+}
+
+AMP_API AmpKpnOverlay *amp_kpn_overlay_create(
+    AmpGraphStreamer *streamer,
+    const AmpKpnOverlayConfig *config
+) {
+    if (!streamer) {
+        return nullptr;
+    }
+    auto *overlay = new (std::nothrow) AmpKpnOverlay();
+    if (!overlay) {
+        return nullptr;
+    }
+    overlay->streamer = streamer;
+    if (config) {
+        overlay->config = *config;
+    }
+    if (overlay->config.refresh_millis == 0U) {
+        overlay->config.refresh_millis = 100U;
+    }
+    overlay->buffer.resize(32U);
+    return overlay;
+}
+
+AMP_API int amp_kpn_overlay_start(AmpKpnOverlay *overlay) {
+    if (!overlay) {
+        return -1;
+    }
+    if (overlay->running.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    if (overlay->worker.joinable()) {
+        overlay->worker.join();
+    }
+    overlay->stop_requested.store(false, std::memory_order_release);
+    overlay->worker = std::thread(amp_kpn_overlay_thread, overlay);
+    return 0;
+}
+
+AMP_API void amp_kpn_overlay_stop(AmpKpnOverlay *overlay) {
+    if (!overlay) {
+        return;
+    }
+    overlay->stop_requested.store(true, std::memory_order_release);
+    if (overlay->worker.joinable()) {
+        overlay->worker.join();
+    }
+    overlay->stop_requested.store(false, std::memory_order_release);
+}
+
+AMP_API void amp_kpn_overlay_destroy(AmpKpnOverlay *overlay) {
+    if (!overlay) {
+        return;
+    }
+    amp_kpn_overlay_stop(overlay);
+    delete overlay;
 }
 
 } // extern "C"

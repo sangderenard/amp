@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -296,6 +297,70 @@ typedef struct {
 
 #define AMP_E_UNSUPPORTED (-4)
 
+#define AMP_GRAPH_NODE_MAX_TAPS 8
+
+typedef struct {
+    char name[32];
+    uint32_t ring_capacity;
+    uint32_t ring_size;
+    uint32_t reader_count;
+    uint32_t head_position;
+    uint32_t tail_position;
+    uint64_t produced_total;
+} AmpGraphNodeTapDebugEntry;
+
+typedef struct {
+    char name[64];
+    uint32_t ring_capacity;
+    uint32_t ring_size;
+    uint32_t reader_count;
+    uint32_t declared_delay_frames;
+    uint32_t oversample_ratio;
+    uint8_t supports_v2;
+    uint8_t prefill_only;
+    float last_heat;
+    double last_processing_time_seconds;
+    double last_total_time_seconds;
+    double total_heat_accumulated;
+    uint64_t debug_sequence;
+    uint64_t debug_sample_count;
+    uint64_t debug_total_frames;
+    uint64_t debug_total_batches;
+    uint64_t debug_total_channels;
+    uint64_t debug_metrics_samples;
+    uint64_t debug_last_timestamp_millis;
+    double debug_sum_processing_seconds;
+    double debug_sum_logging_seconds;
+    double debug_sum_total_seconds;
+    double debug_sum_thread_cpu_seconds;
+    uint32_t debug_last_frames;
+    uint32_t debug_last_batches;
+    uint32_t debug_last_channels;
+    uint32_t debug_min_frames;
+    uint32_t debug_preferred_frames;
+    uint32_t debug_max_frames;
+    double debug_priority_weight;
+    uint32_t debug_channel_expand;
+    uint8_t fifo_simultaneous_availability;
+    uint8_t fifo_release_policy;
+    uint32_t fifo_primary_consumer;
+    uint32_t tap_count;
+    AmpGraphNodeTapDebugEntry taps[AMP_GRAPH_NODE_MAX_TAPS];
+} AmpGraphNodeDebugEntry;
+
+typedef struct {
+    uint32_t version;
+    uint32_t node_count;
+    uint32_t sink_index;
+    double sample_rate;
+    uint32_t scheduler_mode;
+    uint64_t produced_frames;
+    uint64_t consumed_frames;
+    uint32_t ring_capacity;
+    uint32_t ring_size;
+    uint32_t dump_queue_depth;
+} AmpGraphDebugSnapshot;
+
 AMP_CAPI int amp_run_node_v2(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
@@ -427,6 +492,75 @@ AMP_CAPI int amp_graph_streamer_status(
     uint64_t *out_produced_frames,
     uint64_t *out_consumed_frames
 );
+
+typedef struct {
+    uint64_t target_produced_frames;
+    uint64_t target_consumed_frames;
+    uint32_t maximum_inflight_frames;
+    uint32_t maximum_dump_depth;
+    uint32_t idle_timeout_millis;
+    uint32_t total_timeout_millis;
+    int require_ring_drain;
+    int require_dump_drain;
+} AmpGraphStreamerCompletionContract;
+
+typedef struct {
+    uint64_t produced_frames;
+    uint64_t consumed_frames;
+    uint32_t ring_size;
+    uint32_t ring_capacity;
+    uint32_t dump_queue_depth;
+    uint64_t elapsed_millis;
+    uint64_t since_producer_progress_millis;
+    uint64_t since_consumer_progress_millis;
+    uint64_t since_dump_progress_millis;
+    int running;
+} AmpGraphStreamerCompletionState;
+
+typedef struct {
+    int contract_satisfied;
+    int producer_goal_met;
+    int consumer_goal_met;
+    int ring_drained;
+    int dump_drained;
+    int timed_out;
+    int idle_timeout_triggered;
+    int total_timeout_triggered;
+    int inflight_limit_exceeded;
+    int dump_limit_exceeded;
+} AmpGraphStreamerCompletionVerdict;
+
+AMP_CAPI int amp_graph_streamer_evaluate_completion(
+    AmpGraphStreamer *streamer,
+    const AmpGraphStreamerCompletionContract *contract,
+    AmpGraphStreamerCompletionState *out_state,
+    AmpGraphStreamerCompletionVerdict *out_verdict
+);
+
+AMP_CAPI int amp_graph_runtime_debug_snapshot(
+    AmpGraphRuntime *runtime,
+    AmpGraphStreamer *streamer,
+    AmpGraphNodeDebugEntry *node_entries,
+    uint32_t node_capacity,
+    AmpGraphDebugSnapshot *snapshot
+);
+
+typedef struct {
+    uint32_t refresh_millis;
+    int ansi_only;
+    int clear_on_exit; /* 0 = leave final frame on screen, 1 = clear cursor+screen on shutdown */
+    int enable_free_clock; /* 1 = compute/display EMA free-running Hz, 0 = skip */
+} AmpKpnOverlayConfig;
+
+typedef struct AmpKpnOverlay AmpKpnOverlay;
+
+AMP_CAPI AmpKpnOverlay *amp_kpn_overlay_create(
+    AmpGraphStreamer *streamer,
+    const AmpKpnOverlayConfig *config
+);
+AMP_CAPI int amp_kpn_overlay_start(AmpKpnOverlay *overlay);
+AMP_CAPI void amp_kpn_overlay_stop(AmpKpnOverlay *overlay);
+AMP_CAPI void amp_kpn_overlay_destroy(AmpKpnOverlay *overlay);
 
 #ifdef __cplusplus
 }

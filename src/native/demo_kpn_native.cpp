@@ -578,11 +578,210 @@ static void amp_write_wav16(
     stream.write(reinterpret_cast<const char *>(pcm.data()), static_cast<std::streamsize>(pcm.size() * sizeof(int16_t)));
 }
 
-int main() {
+static void print_final_overlay_snapshot(
+    AmpGraphRuntime *runtime,
+    AmpGraphStreamer *streamer,
+    bool free_clock_mode,
+    double free_clock_hz
+) {
+    if (!runtime || !streamer) {
+        return;
+    }
+
+    std::vector<AmpGraphNodeDebugEntry> entries(32U);
+    AmpGraphDebugSnapshot snapshot{};
+
+    while (true) {
+        int rc = amp_graph_runtime_debug_snapshot(
+            runtime,
+            streamer,
+            entries.data(),
+            static_cast<uint32_t>(entries.size()),
+            &snapshot
+        );
+        if (rc < 0) {
+            std::fprintf(stderr, "[demo] failed to capture final snapshot (rc=%d)\n", rc);
+            return;
+        }
+        if (static_cast<uint32_t>(rc) > entries.size()) {
+            entries.resize(static_cast<size_t>(rc));
+            continue;
+        }
+        if (snapshot.node_count > entries.size()) {
+            entries.resize(snapshot.node_count);
+            continue;
+        }
+        entries.resize(snapshot.node_count);
+        break;
+    }
+
+    if (free_clock_mode) {
+        std::printf(
+            "AMP KPN Final Stats | nodes:%u sink:%u | mode:%u | sr:%0.1f Hz | free:%0.2f Hz | ring:%u/%u | dumps:%u\n",
+            snapshot.node_count,
+            snapshot.sink_index,
+            snapshot.scheduler_mode,
+            snapshot.sample_rate,
+            free_clock_hz,
+            snapshot.ring_size,
+            snapshot.ring_capacity,
+            snapshot.dump_queue_depth
+        );
+    } else {
+        std::printf(
+            "AMP KPN Final Stats | nodes:%u sink:%u | mode:%u | sr:%0.1f Hz | ring:%u/%u | dumps:%u\n",
+            snapshot.node_count,
+            snapshot.sink_index,
+            snapshot.scheduler_mode,
+            snapshot.sample_rate,
+            snapshot.ring_size,
+            snapshot.ring_capacity,
+            snapshot.dump_queue_depth
+        );
+    }
+
+    std::printf(
+        "Produced:%llu Consumed:%llu\n",
+        static_cast<unsigned long long>(snapshot.produced_frames),
+        static_cast<unsigned long long>(snapshot.consumed_frames)
+    );
+    std::printf("--------------------------------------------------------------------------------\n");
+    std::printf(
+        "Node                             | Ring%%  | Used/Cap | Delay | Heat  | AvgProc(ms) | AvgTotal(ms) | Min/Pref | Max  | Calls | Frames | LastF | LastB | LastC\n"
+    );
+
+    for (uint32_t i = 0; i < snapshot.node_count; ++i) {
+        const AmpGraphNodeDebugEntry &entry = entries[i];
+        double percent = 0.0;
+        if (entry.ring_capacity > 0U) {
+            percent = (100.0 * static_cast<double>(entry.ring_size)) / static_cast<double>(entry.ring_capacity);
+        }
+        double proc_ms = entry.last_processing_time_seconds * 1000.0;
+        double total_ms = entry.last_total_time_seconds * 1000.0;
+        if (entry.debug_metrics_samples > 0ULL) {
+            double sample_count = static_cast<double>(entry.debug_metrics_samples);
+            proc_ms = (entry.debug_sum_processing_seconds / sample_count) * 1000.0;
+            total_ms = (entry.debug_sum_total_seconds / sample_count) * 1000.0;
+        }
+        unsigned long long calls = static_cast<unsigned long long>(entry.debug_sample_count);
+        unsigned long long total_frames = static_cast<unsigned long long>(entry.debug_total_frames);
+        std::string node_name(entry.name);
+        if (node_name.empty()) {
+            node_name = "<unnamed>";
+        }
+        std::printf(
+            "%-31.31s | %6.2f | %5u/%-5u | %5u | %5.2f | %11.3f | %12.3f | %3u/%-4u | %5u | %5llu | %6llu | %5u | %5u | %5u\n",
+            node_name.c_str(),
+            percent,
+            entry.ring_size,
+            entry.ring_capacity,
+            entry.declared_delay_frames,
+            static_cast<double>(entry.last_heat),
+            proc_ms,
+            total_ms,
+            entry.debug_min_frames,
+            entry.debug_preferred_frames,
+            entry.debug_max_frames,
+            calls,
+            total_frames,
+            entry.debug_last_frames,
+            entry.debug_last_batches,
+            entry.debug_last_channels
+        );
+
+        if (entry.tap_count == 0U) {
+            continue;
+        }
+
+        std::printf("        Tap                      | Ring%%  | Used/Cap | Head/Tail | Readers | Flow(fr/s)\n");
+        for (uint32_t tap_idx = 0; tap_idx < entry.tap_count; ++tap_idx) {
+            const AmpGraphNodeTapDebugEntry &tap = entry.taps[tap_idx];
+            double tap_percent = 0.0;
+            if (tap.ring_capacity > 0U) {
+                tap_percent = (100.0 * static_cast<double>(tap.ring_size)) / static_cast<double>(tap.ring_capacity);
+            }
+            std::printf(
+                "        %-24.24s | %6.2f | %5u/%-5u | %4u/%-4u | %7u | %9.2f\n",
+                tap.name[0] != '\0' ? tap.name : "default",
+                tap_percent,
+                tap.ring_size,
+                tap.ring_capacity,
+                tap.head_position,
+                tap.tail_position,
+                tap.reader_count,
+                0.0
+            );
+        }
+    }
+}
+
+static void print_usage(const char *exe_name) {
+    std::fprintf(
+        stderr,
+        "Usage: %s [--overlay] [--overlay-refresh=<ms>] [--overlay-final] [--free-clock]\n",
+        exe_name ? exe_name : "demo_kpn_native"
+    );
+}
+
+int main(int argc, char **argv) {
+    bool overlay_requested = false;
+    uint32_t overlay_refresh_ms = 100U;
+    bool free_clock_mode = false;
+    bool overlay_final_only = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (std::strcmp(arg, "--overlay") == 0) {
+            overlay_requested = true;
+        } else if (std::strncmp(arg, "--overlay-refresh=", 19) == 0) {
+            const char *value = arg + 19;
+            char *endptr = nullptr;
+            long parsed = std::strtol(value, &endptr, 10);
+            if (endptr == value || parsed <= 0 || parsed > 10000) {
+                std::fprintf(stderr, "[demo] invalid --overlay-refresh value '%s'\n", value);
+                return 1;
+            }
+            overlay_refresh_ms = static_cast<uint32_t>(parsed);
+            overlay_requested = true;
+        } else if (std::strcmp(arg, "--overlay-refresh") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "[demo] --overlay-refresh expects a value\n");
+                return 1;
+            }
+            const char *value = argv[++i];
+            char *endptr = nullptr;
+            long parsed = std::strtol(value, &endptr, 10);
+            if (endptr == value || parsed <= 0 || parsed > 10000) {
+                std::fprintf(stderr, "[demo] invalid --overlay-refresh value '%s'\n", value);
+                return 1;
+            }
+            overlay_refresh_ms = static_cast<uint32_t>(parsed);
+            overlay_requested = true;
+        } else if (std::strcmp(arg, "--free-clock") == 0) {
+            free_clock_mode = true;
+            overlay_requested = true;
+        } else if (std::strcmp(arg, "--overlay-final") == 0) {
+            overlay_final_only = true;
+            overlay_requested = false;
+        } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            std::fprintf(stderr, "[demo] unknown argument '%s'\n", arg);
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+    if (overlay_final_only) {
+        overlay_requested = false;
+    }
     const uint32_t batches = 1U;
     const double sample_rate = 48000.0;
     const double duration_seconds = 2.0;
     const uint32_t frames = static_cast<uint32_t>(duration_seconds * sample_rate);
+    double free_clock_summary_rate = 0.0;
+    bool free_clock_summary_ready = false;
+    bool final_snapshot_printed = false;
 
     AmpDescriptorBuffer descriptor;
     amp_descriptor_buffer_init(&descriptor);
@@ -598,16 +797,19 @@ int main() {
     bool streamer_started = false;
     uint64_t produced_frames = 0U;
     uint64_t consumed_frames = 0U;
+    AmpKpnOverlay *overlay = nullptr;
 
     do {
-        const char *const *pitch_inputs = nullptr;
-        const char *const *driver_inputs = nullptr;
-        static const char *const osc_inputs[] = {"driver"};
-        static const char *const fft_inputs[] = {"mix"};
-        static const char *const mix_inputs[] = {"osc"};
+    const char *const *pitch_inputs = nullptr;
+    static const char *const driver_inputs[] = {"pitch"};
+    static const char *const osc_inputs[] = {"pitch", "driver"};
+    static const char *const fft_inputs[] = {"mix"};
+    static const char *const mix_inputs[] = {"osc"};
 
         static const char pitch_json[] =
-            "{\"declared_delay\":0,\"default_slew\":0.0,\"min_freq\":0.0,\"oversample_ratio\":1,\"supports_v2\":true}";
+            "{\"declared_delay\":0,\"default_slew\":0.0,\"min_freq\":0.0,"
+            "\"oversample_ratio\":1,\"supports_v2\":true,"
+            "\"fifo_simultaneous_output\":true,\"fifo_release_policy\":\"all\"}";
         static const char driver_json[] =
             "{\"declared_delay\":0,\"mode\":\"piezo\",\"oversample_ratio\":1,\"supports_v2\":true}";
         static const char osc_json[] =
@@ -638,7 +840,7 @@ int main() {
                 "driver",
                 "ParametricDriverNode",
                 driver_inputs,
-                0U,
+                1U,
                 driver_json,
                 nullptr,
                 0U
@@ -652,7 +854,7 @@ int main() {
                 "osc",
                 "OscNode",
                 osc_inputs,
-                1U,
+                2U,
                 osc_json,
                 nullptr,
                 0U
@@ -780,26 +982,102 @@ int main() {
         }
         streamer_started = true;
 
-        while (produced_frames < frames) {
-            int status = amp_graph_streamer_status(streamer, &produced_frames, &consumed_frames);
+        if (overlay_requested) {
+            AmpKpnOverlayConfig config{};
+            config.refresh_millis = overlay_refresh_ms;
+            config.ansi_only = 1;
+            config.clear_on_exit = 0;
+            config.enable_free_clock = free_clock_mode ? 1 : 0;
+            overlay = amp_kpn_overlay_create(streamer, &config);
+            if (overlay != nullptr) {
+                if (amp_kpn_overlay_start(overlay) != 0) {
+                    amp_kpn_overlay_destroy(overlay);
+                    overlay = nullptr;
+                }
+            }
+        }
+
+        AmpGraphStreamerCompletionContract completion_contract{};
+        completion_contract.target_produced_frames = frames;
+        completion_contract.target_consumed_frames = frames;
+        completion_contract.require_ring_drain = 1;
+        completion_contract.require_dump_drain = 1;
+        completion_contract.idle_timeout_millis = 500U;
+        completion_contract.total_timeout_millis = 10000U;
+
+        AmpGraphStreamerCompletionState completion_state{};
+        AmpGraphStreamerCompletionVerdict completion_verdict{};
+
+        for (;;) {
+            int status = amp_graph_streamer_evaluate_completion(
+                streamer,
+                &completion_contract,
+                &completion_state,
+                &completion_verdict
+            );
             if (status != 0) {
                 std::fprintf(stderr, "[demo] streamer reported error status %d\n", status);
                 exit_code = 9;
                 break;
             }
-            if (produced_frames >= frames) {
+            if (completion_verdict.timed_out) {
+                std::fprintf(
+                    stderr,
+                    "[demo] streamer timed out (produced=%llu consumed=%llu ring=%u dump=%u prod_idle=%llu ms cons_idle=%llu ms dump_idle=%llu ms total=%llu ms)\n",
+                    static_cast<unsigned long long>(completion_state.produced_frames),
+                    static_cast<unsigned long long>(completion_state.consumed_frames),
+                    completion_state.ring_size,
+                    completion_state.dump_queue_depth,
+                    static_cast<unsigned long long>(completion_state.since_producer_progress_millis),
+                    static_cast<unsigned long long>(completion_state.since_consumer_progress_millis),
+                    static_cast<unsigned long long>(completion_state.since_dump_progress_millis),
+                    static_cast<unsigned long long>(completion_state.elapsed_millis)
+                );
+                exit_code = 9;
+                break;
+            }
+            if (completion_verdict.contract_satisfied) {
+                produced_frames = completion_state.produced_frames;
+                consumed_frames = completion_state.consumed_frames;
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        produced_frames = completion_state.produced_frames;
+        consumed_frames = completion_state.consumed_frames;
         if (exit_code != 0) {
             break;
         }
 
         if (streamer_started) {
+            if (overlay) {
+                amp_kpn_overlay_destroy(overlay);
+                overlay = nullptr;
+            }
             amp_graph_streamer_stop(streamer);
             amp_graph_streamer_status(streamer, &produced_frames, &consumed_frames);
             streamer_started = false;
+        }
+
+        if (free_clock_mode) {
+            double elapsed_s = completion_state.elapsed_millis > 0ULL
+                ? static_cast<double>(completion_state.elapsed_millis) / 1000.0
+                : 0.0;
+            double rate = (elapsed_s > 0.0) ? static_cast<double>(produced_frames) / elapsed_s : 0.0;
+            free_clock_summary_rate = rate;
+            free_clock_summary_ready = true;
+            std::printf(
+                "[demo] free-clock throughput: %.2f Hz (produced %llu frames in %llums)\n",
+                rate,
+                static_cast<unsigned long long>(produced_frames),
+                static_cast<unsigned long long>(completion_state.elapsed_millis)
+            );
+        }
+
+        if (overlay_final_only) {
+            double rate = (free_clock_mode && free_clock_summary_ready) ? free_clock_summary_rate : 0.0;
+            print_final_overlay_snapshot(runtime, streamer, free_clock_mode, rate);
+            final_snapshot_printed = true;
         }
 
         TapCollection taps{};
@@ -860,8 +1138,26 @@ int main() {
     } while (false);
 
     if (streamer_started && streamer != nullptr) {
+        if (overlay) {
+            amp_kpn_overlay_destroy(overlay);
+            overlay = nullptr;
+        }
         amp_graph_streamer_stop(streamer);
         amp_graph_streamer_status(streamer, &produced_frames, &consumed_frames);
+        if (overlay_final_only && !final_snapshot_printed) {
+            double rate = (free_clock_mode && free_clock_summary_ready) ? free_clock_summary_rate : 0.0;
+            print_final_overlay_snapshot(runtime, streamer, free_clock_mode, rate);
+            final_snapshot_printed = true;
+        }
+    }
+    if (overlay) {
+        amp_kpn_overlay_destroy(overlay);
+        overlay = nullptr;
+    }
+    if (overlay_final_only && !final_snapshot_printed && streamer != nullptr) {
+        double rate = (free_clock_mode && free_clock_summary_ready) ? free_clock_summary_rate : 0.0;
+        print_final_overlay_snapshot(runtime, streamer, free_clock_mode, rate);
+        final_snapshot_printed = true;
     }
     if (streamer != nullptr) {
         amp_graph_streamer_destroy(streamer);
