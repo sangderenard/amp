@@ -22,7 +22,6 @@
 #include <deque>
 #include <condition_variable>
 #include <mutex>
-#include <mutex>
 
 #if defined(_WIN32)
 #  ifndef NOMINMAX
@@ -183,6 +182,10 @@ struct EdgeRingContract {
     bool simultaneous_availability{true};
     EdgeRingReleasePolicy release_policy{EdgeRingReleasePolicy::AllConsumers};
     uint32_t primary_consumer{std::numeric_limits<uint32_t>::max()};
+    double sample_rate_hz{0.0};
+    bool sample_rate_free{false};
+    double sample_rate_ema_alpha{0.0};
+    uint32_t sample_rate_window{0U};
 };
 
 struct EdgeRing {
@@ -196,14 +199,23 @@ struct EdgeRing {
     bool constant{false};
     EdgeRingContract contract{};
     uint64_t produced_total{0};
+    double nominal_sample_rate{0.0};
+    double effective_sample_rate{0.0};
+    bool sample_rate_free{false};
+    double sample_rate_ema_alpha{0.0};
+    uint32_t sample_rate_window{0U};
 };
 
 struct EdgeReader {
     std::shared_ptr<EdgeRing> ring;
     uint32_t consumer_index{0};
     std::string tap_name;
+    std::string input_name;
     uint32_t producer_node_index{std::numeric_limits<uint32_t>::max()};
     uint32_t producer_output_index{std::numeric_limits<uint32_t>::max()};
+    bool hold_if_absent{false};
+    bool has_optional_default{false};
+    double optional_default_value{0.0};
 };
 
 struct OutputTap {
@@ -317,6 +329,13 @@ struct RuntimeNode {
     std::vector<double> audio_workspace;
     TensorShape audio_workspace_shape{};
     bool prepass_done{false};
+    struct InputHoldState {
+        std::vector<double> values;
+        uint32_t batches{0};
+        uint32_t channels{0};
+        bool valid{false};
+    };
+    std::vector<InputHoldState> input_hold_cache;
 
     RuntimeNode() = default;
 
@@ -329,6 +348,39 @@ struct RuntimeNode {
         descriptor.params_len = params_json.size();
     }
 };
+
+static bool metadata_key_exists(const std::string &json, const char *key);
+static bool parse_bool_metadata(const std::string &json, const char *key, bool fallback);
+static double parse_double_metadata(const std::string &json, const char *key, double fallback);
+static std::string sanitize_metadata_key_component(const std::string &value);
+
+static void configure_input_reader_metadata(RuntimeNode &node, EdgeReader &reader, size_t slot) {
+    if (slot < node.audio_inputs.size()) {
+        reader.input_name = node.audio_inputs[slot];
+    } else {
+        reader.input_name.clear();
+    }
+    if (reader.input_name.empty()) {
+        reader.hold_if_absent = false;
+        reader.has_optional_default = false;
+        reader.optional_default_value = 0.0;
+        return;
+    }
+    std::string sanitized = sanitize_metadata_key_component(reader.input_name);
+    if (sanitized.empty()) {
+        sanitized = "input";
+    }
+    std::string hold_key = "input_" + sanitized + "_hold_if_absent";
+    reader.hold_if_absent = parse_bool_metadata(node.params_json, hold_key.c_str(), false);
+    std::string default_key = "input_" + sanitized + "_optional_default";
+    if (metadata_key_exists(node.params_json, default_key.c_str())) {
+        reader.optional_default_value = parse_double_metadata(node.params_json, default_key.c_str(), 0.0);
+        reader.has_optional_default = true;
+    } else {
+        reader.optional_default_value = 0.0;
+        reader.has_optional_default = false;
+    }
+}
 
 static OutputTap *runtime_primary_output(RuntimeNode &node) {
     for (auto &tap : node.outputs) {
@@ -515,6 +567,34 @@ static BlockFrameContract node_block_frame_contract(
         max_frames = preferred_frames;
     }
 
+    const OutputTap *primary = runtime_primary_output(node);
+    if (primary != nullptr && primary->ring != nullptr && runtime != nullptr && runtime->dsp_sample_rate > 0.0) {
+        const EdgeRing &ring = *primary->ring;
+        double target_rate = ring.effective_sample_rate > 0.0 ? ring.effective_sample_rate : ring.nominal_sample_rate;
+        if (target_rate <= 0.0) {
+            target_rate = ring.contract.sample_rate_hz;
+        }
+        if (target_rate > 0.0) {
+            double frames_per_update = runtime->dsp_sample_rate / target_rate;
+            if (frames_per_update < 1.0) {
+                frames_per_update = 1.0;
+            }
+            uint32_t adjusted = static_cast<uint32_t>(std::max<double>(1.0, std::round(frames_per_update)));
+            if (adjusted == 0U) {
+                adjusted = 1U;
+            }
+            if (ring.sample_rate_free || ring.nominal_sample_rate <= 0.0) {
+                min_frames = std::max(min_frames, adjusted);
+                preferred_frames = std::max(preferred_frames, adjusted);
+                max_frames = std::max(max_frames, adjusted);
+            } else {
+                min_frames = std::max(min_frames, adjusted);
+                preferred_frames = std::max(preferred_frames, adjusted);
+                max_frames = std::max(max_frames, adjusted);
+            }
+        }
+    }
+
     contract.min_frames = min_frames;
     contract.preferred_frames = preferred_frames;
     contract.max_frames = max_frames;
@@ -679,6 +759,33 @@ static std::string parse_string_metadata(const std::string &json, const char *ke
     }
     if (pos >= json.size()) return fallback;
     return json.substr(start, pos - start);
+}
+
+static bool metadata_key_exists(const std::string &json, const char *key) {
+    if (key == nullptr) return false;
+    std::string needle;
+    needle.reserve(std::strlen(key) + 4U);
+    needle.push_back('"');
+    needle.append(key);
+    needle.append("\":");
+    return json.find(needle) != std::string::npos;
+}
+
+static std::string sanitize_metadata_key_component(const std::string &value) {
+    if (value.empty()) {
+        return std::string("input");
+    }
+    std::string sanitized;
+    sanitized.reserve(value.size());
+    for (char ch : value) {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isalnum(uch) != 0) {
+            sanitized.push_back(static_cast<char>(std::tolower(uch)));
+        } else {
+            sanitized.push_back('_');
+        }
+    }
+    return sanitized;
 }
 
 /*** Error helpers ***/
@@ -873,6 +980,11 @@ static std::shared_ptr<EdgeRing> ensure_edge_ring(
     auto ring = std::make_shared<EdgeRing>();
     ring->policy = policy;
     ring->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
+    ring->nominal_sample_rate = 0.0;
+    ring->effective_sample_rate = 0.0;
+    ring->sample_rate_free = false;
+    ring->sample_rate_ema_alpha = 0.0;
+    ring->sample_rate_window = 0U;
     runtime->edge_rings.emplace(key, ring);
     return ring;
 }
@@ -962,6 +1074,11 @@ static void runtime_initialize_edge_rings(AmpGraphRuntime *runtime, uint32_t def
             tap.ring->policy = node.vector_policy;
             tap.ring->constant = node.constant_node;
             tap.ring->contract = tap.contract;
+            tap.ring->nominal_sample_rate = tap.contract.sample_rate_hz;
+            tap.ring->effective_sample_rate = tap.contract.sample_rate_hz;
+            tap.ring->sample_rate_free = tap.contract.sample_rate_free;
+            tap.ring->sample_rate_ema_alpha = tap.contract.sample_rate_ema_alpha;
+            tap.ring->sample_rate_window = tap.contract.sample_rate_window;
             tap.ring->produced_total = 0U;
             if (tap.ring->contract.primary_consumer == std::numeric_limits<uint32_t>::max()) {
                 tap.ring->contract.primary_consumer = EDGE_RING_HOST_CONSUMER;
@@ -1001,15 +1118,27 @@ static bool kpn_node_ready(
         feasible = primary->ring->capacity > 0U ? primary->ring->capacity : preferred_frames;
     }
 
-    for (const EdgeReader &reader : node.input_edges) {
-        if (!reader.ring) continue;
-        uint32_t ready = edge_ring_available_for_consumer(*reader.ring, reader.consumer_index);
+    for (size_t reader_index = 0; reader_index < node.input_edges.size(); ++reader_index) {
+        const EdgeReader &reader = node.input_edges[reader_index];
+        uint32_t ready = 0U;
+        if (reader.ring) {
+            ready = edge_ring_available_for_consumer(*reader.ring, reader.consumer_index);
+        }
+        bool have_hold_state = reader_index < node.input_hold_cache.size()
+            && node.input_hold_cache[reader_index].valid;
+        bool can_use_hold = reader.hold_if_absent && (have_hold_state || reader.has_optional_default);
         if (ready < min_frames) {
-            return false;
+            if (!can_use_hold) {
+                return false;
+            }
+            ready = min_frames;
         }
         ready = align_frames_down(ready, min_frames);
         if (ready < min_frames) {
-            return false;
+            if (!can_use_hold) {
+                return false;
+            }
+            ready = min_frames;
         }
         feasible = std::min(feasible, ready);
     }
@@ -1098,26 +1227,116 @@ static int kpn_execute_node_block(
     uint32_t total_channels = 0U;
 
     struct InputCache {
+        size_t reader_index{0};
         EdgeReader reader;
         std::vector<double> buffer;
         uint32_t batches{0};
         uint32_t channels{0};
         size_t stride{0};
+        bool consumed_from_ring{false};
     };
     std::vector<InputCache> caches;
     caches.reserve(node.input_edges.size());
+    if (node.input_hold_cache.size() < node.input_edges.size()) {
+        node.input_hold_cache.resize(node.input_edges.size());
+    }
 
-    for (const EdgeReader &reader : node.input_edges) {
-        if (!reader.ring || !reader.ring->storage) continue;
+    for (size_t reader_index = 0; reader_index < node.input_edges.size(); ++reader_index) {
+        const EdgeReader &reader = node.input_edges[reader_index];
         InputCache cache;
+        cache.reader_index = reader_index;
         cache.reader = reader;
-        cache.batches = std::max<uint32_t>(1U, reader.ring->storage->shape.batches);
-        cache.channels = std::max<uint32_t>(1U, reader.ring->storage->shape.channels);
-        cache.stride = cache.batches * cache.channels;
-        if (cache.batches > workspace_batches) workspace_batches = cache.batches;
-        cache.buffer.resize(static_cast<size_t>(frames) * cache.stride);
-        uint32_t tail = edge_ring_consumer_tail(*reader.ring, reader.consumer_index);
-        edge_ring_copy_out(*reader.ring, tail, frames, cache.buffer.data());
+
+    RuntimeNode::InputHoldState &hold_state = node.input_hold_cache[reader_index];
+
+        uint32_t ring_batches = 0U;
+        uint32_t ring_channels = 0U;
+        if (reader.ring && reader.ring->storage) {
+            ring_batches = std::max<uint32_t>(1U, reader.ring->storage->shape.batches);
+            ring_channels = std::max<uint32_t>(1U, reader.ring->storage->shape.channels);
+        }
+
+        uint32_t available = 0U;
+        if (reader.ring) {
+            available = edge_ring_available_for_consumer(*reader.ring, reader.consumer_index);
+        }
+
+        bool have_hold_state = hold_state.valid;
+        bool can_use_hold = reader.hold_if_absent && (have_hold_state || reader.has_optional_default);
+
+        bool use_ring_data = reader.ring && reader.ring->storage && available >= frames;
+        if (use_ring_data) {
+            cache.batches = ring_batches > 0U ? ring_batches : std::max<uint32_t>(1U, hold_state.batches);
+            cache.channels = ring_channels > 0U ? ring_channels : std::max<uint32_t>(1U, hold_state.channels);
+            cache.stride = cache.batches * cache.channels;
+            if (cache.batches == 0U || cache.channels == 0U) {
+                cache.batches = 1U;
+                cache.channels = 1U;
+                cache.stride = 1U;
+            }
+            if (cache.batches > workspace_batches) workspace_batches = cache.batches;
+            cache.buffer.resize(static_cast<size_t>(frames) * cache.stride);
+            uint32_t tail = edge_ring_consumer_tail(*reader.ring, reader.consumer_index);
+            edge_ring_copy_out(*reader.ring, tail, frames, cache.buffer.data());
+            cache.consumed_from_ring = true;
+
+            const double *last_frame = cache.buffer.data() + static_cast<size_t>(frames - 1U) * cache.stride;
+            hold_state.values.assign(last_frame, last_frame + cache.stride);
+            hold_state.batches = cache.batches;
+            hold_state.channels = cache.channels;
+            hold_state.valid = true;
+        } else {
+            cache.batches = ring_batches > 0U ? ring_batches : (hold_state.valid ? hold_state.batches : std::max<uint32_t>(1U, runtime->default_batches));
+            if (cache.batches == 0U) {
+                cache.batches = 1U;
+            }
+            cache.channels = ring_channels > 0U ? ring_channels : (hold_state.valid ? hold_state.channels : 1U);
+            if (cache.channels == 0U) {
+                cache.channels = 1U;
+            }
+            cache.stride = cache.batches * cache.channels;
+            if (cache.batches > workspace_batches) workspace_batches = cache.batches;
+            cache.buffer.resize(static_cast<size_t>(frames) * cache.stride);
+
+            std::vector<double> seed;
+            if (reader.ring && reader.ring->storage && reader.ring->capacity > 0U && available > 0U) {
+                uint32_t effective_batches = ring_batches > 0U ? ring_batches : cache.batches;
+                uint32_t effective_channels = ring_channels > 0U ? ring_channels : cache.channels;
+                size_t peek_stride = static_cast<size_t>(effective_batches) * static_cast<size_t>(effective_channels);
+                if (peek_stride == 0U) {
+                    peek_stride = 1U;
+                }
+                seed.resize(peek_stride);
+                uint32_t tail = edge_ring_consumer_tail(*reader.ring, reader.consumer_index);
+                uint32_t start = (tail + available - 1U) % reader.ring->capacity;
+                edge_ring_copy_out(*reader.ring, start, 1U, seed.data());
+                hold_state.values = seed;
+                hold_state.batches = effective_batches;
+                hold_state.channels = effective_channels;
+                hold_state.valid = true;
+            }
+            if (hold_state.valid && hold_state.values.size() == cache.stride) {
+                seed = hold_state.values;
+            } else if (hold_state.valid && hold_state.values.size() != cache.stride) {
+                seed.resize(cache.stride, hold_state.values.empty() ? 0.0 : hold_state.values.back());
+            } else if (reader.has_optional_default) {
+                seed.assign(cache.stride, reader.optional_default_value);
+            } else {
+                seed.assign(cache.stride, 0.0);
+            }
+
+            if (!seed.empty()) {
+                for (uint32_t f = 0; f < frames; ++f) {
+                    double *dst = cache.buffer.data() + static_cast<size_t>(f) * cache.stride;
+                    std::memcpy(dst, seed.data(), cache.stride * sizeof(double));
+                }
+            }
+            hold_state.values = seed;
+            hold_state.batches = cache.batches;
+            hold_state.channels = cache.channels;
+            hold_state.valid = !seed.empty() && (reader.has_optional_default || reader.hold_if_absent);
+        }
+
         caches.push_back(std::move(cache));
         total_channels += caches.back().channels;
     }
@@ -1285,6 +1504,17 @@ static int kpn_execute_node_block(
     node.output_ring_head = start_index;
     node.output_ring_capacity = output_edge->capacity;
 
+    if (!node.type_name.empty() && node.type_name == "ResamplerNode" && node.has_latest_metrics && primary != nullptr && primary->ring) {
+        double reported_rate = node.latest_metrics.reserved[0];
+        if (reported_rate > 0.0) {
+            if (primary->ring->sample_rate_free || primary->ring->nominal_sample_rate <= 0.0) {
+                primary->ring->effective_sample_rate = reported_rate;
+            } else {
+                primary->ring->effective_sample_rate = primary->ring->nominal_sample_rate;
+            }
+        }
+    }
+
     auto channel_it = runtime->channels.find(node.name);
     if (channel_it != runtime->channels.end()) {
         auto &channel = *channel_it->second;
@@ -1311,9 +1541,11 @@ static int kpn_execute_node_block(
     }
 
     node.state = state_arg;
-    for (const EdgeReader &reader : node.input_edges) {
-        if (!reader.ring) continue;
-        edge_ring_advance_consumer(*reader.ring, reader.consumer_index, frames);
+    for (const InputCache &cache : caches) {
+        if (!cache.consumed_from_ring || !cache.reader.ring) {
+            continue;
+        }
+        edge_ring_advance_consumer(*cache.reader.ring, cache.reader.consumer_index, frames);
     }
     if (output_edge) {
         edge_ring_recompute_tail(*output_edge);
@@ -1414,7 +1646,9 @@ static void runtime_update_scheduler_topology(AmpGraphRuntime *runtime) {
             }
         }
         node.input_edges.clear();
-        for (uint32_t source : node.audio_indices) {
+        node.input_hold_cache.clear();
+        for (size_t slot = 0; slot < node.audio_indices.size(); ++slot) {
+            uint32_t source = node.audio_indices[slot];
             if (source >= node_count) continue;
             runtime->dependents[source].push_back(static_cast<uint32_t>(idx));
             runtime->indegree[idx] += 1U;
@@ -1440,12 +1674,14 @@ static void runtime_update_scheduler_topology(AmpGraphRuntime *runtime) {
             reader.ring = edge;
             reader.consumer_index = static_cast<uint32_t>(idx);
             reader.tap_name = source_primary ? source_primary->name : std::string{};
+            configure_input_reader_metadata(node, reader, slot);
             reader.producer_node_index = static_cast<uint32_t>(source);
             reader.producer_output_index = 0U;
             if (edge) {
                 edge_ring_register_consumer(*edge, reader.consumer_index);
             }
             node.input_edges.push_back(reader);
+            node.input_hold_cache.emplace_back();
         }
     }
 }
@@ -1845,6 +2081,10 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         } else {
             node->output_contract.release_policy = EdgeRingReleasePolicy::AllConsumers;
         }
+        node->output_contract.sample_rate_hz = parse_double_metadata(node->params_json, "fifo_sample_rate_hz", 0.0);
+        node->output_contract.sample_rate_free = parse_bool_metadata(node->params_json, "fifo_sample_rate_free", false);
+        node->output_contract.sample_rate_ema_alpha = parse_double_metadata(node->params_json, "fifo_sample_rate_ema_alpha", 0.0);
+        node->output_contract.sample_rate_window = parse_uint_metadata(node->params_json, "fifo_sample_rate_window", 0U);
         uint32_t primary_consumer_index = parse_uint_metadata(
             node->params_json,
             "fifo_primary_consumer",
@@ -1893,7 +2133,9 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
     // Create input edges and register consumers
     for (auto &entry : runtime->nodes) {
         entry->input_edges.clear();
-        for (uint32_t idx : entry->audio_indices) {
+        entry->input_hold_cache.clear();
+        for (size_t slot = 0; slot < entry->audio_indices.size(); ++slot) {
+            uint32_t idx = entry->audio_indices[slot];
             if (idx >= runtime->nodes.size()) return false;
             auto &source = runtime->nodes[idx];
             OutputTap *source_primary = runtime_primary_output(*source);
@@ -1918,12 +2160,14 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             reader.ring = edge;
             reader.consumer_index = static_cast<uint32_t>(consumer_index);
             reader.tap_name = source_primary ? source_primary->name : std::string{};
+            configure_input_reader_metadata(*entry, reader, slot);
             reader.producer_node_index = static_cast<uint32_t>(idx);
             reader.producer_output_index = 0U;
             if (edge) {
                 edge_ring_register_consumer(*edge, reader.consumer_index);
             }
             entry->input_edges.push_back(reader);
+            entry->input_hold_cache.emplace_back();
         }
     }
 
@@ -2448,6 +2692,7 @@ static void clear_runtime(AmpGraphRuntime *runtime) {
         }
         node->outputs.clear();
         node->input_edges.clear();
+        node->input_hold_cache.clear();
         node->output.reset();
         node->audio_workspace.clear();
     }

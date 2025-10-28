@@ -1443,6 +1443,7 @@ typedef enum {
     NODE_KIND_OSC_PITCH,
     NODE_KIND_DRIVER,
     NODE_KIND_SUBHARM,
+    NODE_KIND_RESAMPLER,
     NODE_KIND_FFT_DIV,
     NODE_KIND_SPECTRAL_DRIVE,
 } node_kind_t;
@@ -1455,6 +1456,7 @@ typedef struct {
             int channels;
         } constant;
         struct {
+            double *last_freq;
             int out_channels;
         } mix;
         struct {
@@ -1462,6 +1464,7 @@ typedef struct {
             int batches;
             int channels;
             double alpha;
+            double *last_freq;
         } safety;
         struct {
             double *phase;
@@ -1585,6 +1588,20 @@ typedef struct {
         struct {
             int mode;
         } spectral_drive;
+        struct {
+            double *last_values;
+            double *rate_window;
+            uint32_t window_size;
+            uint32_t window_index;
+            uint32_t window_count;
+            double window_sum;
+            double ema_alpha;
+            double last_rate;
+            double fixed_sample_rate;
+            int free_rate;
+            uint32_t channels;
+            uint32_t batches;
+        } resampler;
     } u;
 } node_state_t;
 
@@ -1763,6 +1780,22 @@ static void release_node_state(node_state_t *state) {
         state->u.subharm.channels = 0;
         state->u.subharm.use_div4 = 0;
     }
+    if (state->kind == NODE_KIND_RESAMPLER) {
+        free(state->u.resampler.last_values);
+        free(state->u.resampler.rate_window);
+        state->u.resampler.last_values = NULL;
+        state->u.resampler.rate_window = NULL;
+        state->u.resampler.window_size = 0;
+        state->u.resampler.window_index = 0;
+        state->u.resampler.window_count = 0;
+        state->u.resampler.window_sum = 0.0;
+        state->u.resampler.ema_alpha = 0.0;
+        state->u.resampler.last_rate = 0.0;
+        state->u.resampler.fixed_sample_rate = 0.0;
+        state->u.resampler.free_rate = 0;
+        state->u.resampler.channels = 0;
+        state->u.resampler.batches = 0;
+    }
     if (state->kind == NODE_KIND_FFT_DIV) {
         fft_state_free_buffers(state);
         state->u.fftdiv.total_heat = 0.0;
@@ -1818,6 +1851,10 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "SubharmonicLowLifterNode") == 0) {
         return NODE_KIND_SUBHARM;
+    }
+    if (strcmp(descriptor->type_name, "ResamplerNode") == 0
+        || strcmp(descriptor->type_name, "resampler") == 0) {
+        return NODE_KIND_RESAMPLER;
     }
     if (strcmp(descriptor->type_name, "FFTDivisionNode") == 0) {
         return NODE_KIND_FFT_DIV;
@@ -3931,6 +3968,13 @@ static int run_osc_node(
     const EdgeRunnerParamView *frame_delay_view = find_param(inputs, "frame_delay");
     const EdgeRunnerParamView *slew_view = find_param(inputs, "slew");
 
+    const double *tap_data = NULL;
+    int tap_batches = 0;
+    int tap_frames = 0;
+    int tap_channels = 0;
+    size_t tap_batch_stride = 0;
+    size_t tap_channel_stride = 0;
+
     int B = batches > 0 ? batches : 1;
     int F = frames > 0 ? frames : 1;
     const EdgeRunnerParamView *shape_source = freq_view != NULL ? freq_view : amp_view;
@@ -3940,6 +3984,22 @@ static int run_osc_node(
         }
         if (shape_source->frames > 0) {
             F = (int)shape_source->frames;
+        }
+    }
+    if (inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
+        tap_data = inputs->audio.data;
+        tap_batches = inputs->audio.batches > 0 ? (int)inputs->audio.batches : B;
+        tap_frames = inputs->audio.frames > 0 ? (int)inputs->audio.frames : F;
+        tap_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 0;
+        if (tap_batches > 0) {
+            B = tap_batches;
+        }
+        if (tap_frames > 0) {
+            F = tap_frames;
+        }
+        if (tap_frames > 0) {
+            tap_channel_stride = (size_t)tap_frames;
+            tap_batch_stride = (size_t)tap_channels * (size_t)tap_frames;
         }
     }
     if (B <= 0) B = 1;
@@ -3960,6 +4020,8 @@ static int run_osc_node(
     const double *phase_offset = ensure_param_plane(phase_offset_view, B, F, 0.0, &owned_phase_offset);
     const double *frame_delay = ensure_param_plane(frame_delay_view, B, F, 0.0, &owned_frame_delay);
     const double *slew_curve = ensure_param_plane(slew_view, B, F, -1.0, &owned_slew);
+
+    bool has_tap_freq = tap_data != NULL && tap_channels > 0 && tap_frames > 0 && tap_batches > 0;
 
     if ((mode != OSC_MODE_OP_AMP && freq == NULL) || amp == NULL) {
         free(owned_freq);
@@ -4002,12 +4064,7 @@ static int run_osc_node(
         }
     }
 
-    const double *driver_data = NULL;
-    int driver_channels = 1;
-    if (mode == OSC_MODE_OP_AMP && inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
-        driver_data = inputs->audio.data;
-        driver_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 1;
-    }
+    int driver_channels = (has_tap_freq && tap_channels > 1) ? tap_channels - 1 : 0;
     if (mode == OSC_MODE_OP_AMP) {
         if (state->u.osc.op_amp_state == NULL || state->u.osc.batches != B || state->u.osc.driver_channels != driver_channels) {
             free(state->u.osc.op_amp_state);
@@ -4031,9 +4088,21 @@ static int run_osc_node(
     }
 
     for (int b = 0; b < B; ++b) {
+        size_t batch_base = (size_t)b * (size_t)F;
+        int tap_batch_index = has_tap_freq ? (b < tap_batches ? b : tap_batches - 1) : 0;
+        const double *tap_base = has_tap_freq ? tap_data + (size_t)tap_batch_index * tap_batch_stride : NULL;
         for (int f = 0; f < F; ++f) {
-            size_t idx = (size_t)b * (size_t)F + (size_t)f;
+            size_t idx = batch_base + (size_t)f;
             double hz = (freq != NULL) ? freq[idx] : 0.0;
+            if (tap_base != NULL) {
+                int tap_frame_index = f;
+                if (tap_frame_index >= tap_frames) {
+                    tap_frame_index = tap_frames - 1;
+                } else if (tap_frame_index < 0) {
+                    tap_frame_index = 0;
+                }
+                hz = tap_base[tap_frame_index];
+            }
             state->u.osc.dphi_buffer[idx] = hz / sample_rate;
         }
     }
@@ -4083,31 +4152,32 @@ static int run_osc_node(
         for (int b = 0; b < B; ++b) {
             double op_state = state->u.osc.op_amp_state != NULL ? state->u.osc.op_amp_state[b] : 0.0;
             size_t base_wave = (size_t)b * (size_t)F;
-            size_t base_driver = ((size_t)b * (size_t)driver_channels) * (size_t)F;
-            Eigen::ArrayXd target_row = Eigen::ArrayXd::Zero(F);
-            if (driver_data != NULL) {
-                if (driver_channels == 1) {
-                    Eigen::Map<const Eigen::Array<double, Eigen::Dynamic, 1>> driver_vec(
-                        driver_data + base_driver,
-                        F
-                    );
-                    target_row = driver_vec;
-                } else {
-                    using RowMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-                    Eigen::Map<const RowMatrixXd> driver_block(driver_data + base_driver, driver_channels, F);
-                    target_row = driver_block.colwise().mean().transpose().array();
-                }
-            }
-            Eigen::ArrayXd slew_row = Eigen::ArrayXd::Constant(F, per_sample_default);
-            if (slew_curve != NULL) {
-                Eigen::Map<const Eigen::Array<double, Eigen::Dynamic, 1>> slew_vec(slew_curve + base_wave, F);
-                slew_row = slew_vec.unaryExpr([per_sample_default, sample_rate](double candidate) {
-                    return candidate >= 0.0 ? candidate / sample_rate : per_sample_default;
-                });
-            }
+            int tap_batch_index = has_tap_freq ? (b < tap_batches ? b : tap_batches - 1) : 0;
+            const double *tap_base = has_tap_freq ? tap_data + (size_t)tap_batch_index * tap_batch_stride : NULL;
+            const double *driver_base = (tap_base != NULL && driver_channels > 0) ? tap_base + tap_channel_stride : NULL;
+            const double *slew_base = slew_curve != NULL ? slew_curve + base_wave : NULL;
             for (int f = 0; f < F; ++f) {
-                double target = target_row[f];
-                double per_sample_slew = slew_row[f];
+                double target = 0.0;
+                if (driver_base != NULL) {
+                    int tap_frame_index = f;
+                    if (tap_frame_index >= tap_frames) {
+                        tap_frame_index = tap_frames - 1;
+                    } else if (tap_frame_index < 0) {
+                        tap_frame_index = 0;
+                    }
+                    double sum = 0.0;
+                    for (int ch = 0; ch < driver_channels; ++ch) {
+                        sum += driver_base[(size_t)ch * tap_channel_stride + (size_t)tap_frame_index];
+                    }
+                    target = sum / (double)driver_channels;
+                }
+                double per_sample_slew = per_sample_default;
+                if (slew_base != NULL) {
+                    double candidate = slew_base[f];
+                    if (candidate >= 0.0) {
+                        per_sample_slew = candidate / sample_rate;
+                    }
+                }
                 double delta = target - op_state;
                 if (per_sample_slew > 0.0) {
                     if (delta > per_sample_slew) delta = per_sample_slew;
@@ -4189,6 +4259,209 @@ static int run_osc_node(
     return 0;
 }
 
+static int run_resampler_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state,
+    AmpNodeMetrics *metrics
+) {
+    if (descriptor == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+
+    if (sample_rate <= 0.0) {
+        sample_rate = 48000.0;
+    }
+
+    double ema_alpha = json_get_double(descriptor->params_json, descriptor->params_len, "sample_rate_ema_alpha", 0.0);
+    if (ema_alpha < 0.0) {
+        ema_alpha = 0.0;
+    } else if (ema_alpha > 1.0) {
+        ema_alpha = 1.0;
+    }
+    double fixed_sample_rate = json_get_double(descriptor->params_json, descriptor->params_len, "sample_rate_hz", 0.0);
+    int free_rate = json_get_bool(descriptor->params_json, descriptor->params_len, "sample_rate_free", 1) ? 1 : 0;
+    double window_val = json_get_double(descriptor->params_json, descriptor->params_len, "sample_rate_window", 0.0);
+    if (window_val < 0.0) {
+        window_val = 0.0;
+    }
+    uint32_t window_size = (uint32_t)(window_val + 0.5);
+    double init_value = json_get_double(descriptor->params_json, descriptor->params_len, "initial_value", 0.0);
+
+    int audio_batches = 0;
+    int audio_channels = 0;
+    int audio_frames = 0;
+    const double *input_data = NULL;
+    int has_audio = 0;
+
+    if (inputs != NULL) {
+        const EdgeRunnerAudioView *audio = &inputs->audio;
+        if (audio->has_audio && audio->data != NULL && audio->frames > 0 && audio->channels > 0) {
+            has_audio = 1;
+            input_data = audio->data;
+            audio_batches = (int)audio->batches;
+            audio_channels = (int)audio->channels;
+            audio_frames = (int)audio->frames;
+        }
+    }
+
+    if (frames <= 0) {
+        frames = (audio_frames > 0) ? audio_frames : 1;
+    }
+    if (has_audio && audio_frames > 0 && frames != audio_frames) {
+        frames = audio_frames;
+    }
+    if (batches <= 0) {
+        batches = has_audio && audio_batches > 0 ? audio_batches : 1;
+    }
+
+    int use_channels = has_audio && audio_channels > 0
+        ? audio_channels
+        : (state->u.resampler.channels > 0 ? (int)state->u.resampler.channels : 1);
+
+    uint32_t logical_batches = batches > 0 ? (uint32_t)batches : 1U;
+    uint32_t logical_channels = use_channels > 0 ? (uint32_t)use_channels : 1U;
+
+    size_t total = (size_t)logical_batches * (size_t)logical_channels * (size_t)frames;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        return -1;
+    }
+
+    size_t state_span = (size_t)logical_batches * (size_t)logical_channels;
+    if (state->u.resampler.last_values == NULL
+        || state->u.resampler.channels != logical_channels
+        || state->u.resampler.batches != logical_batches) {
+        free(state->u.resampler.last_values);
+        state->u.resampler.last_values = (double *)malloc(state_span * sizeof(double));
+        if (state->u.resampler.last_values == NULL) {
+            free(buffer);
+            return -1;
+        }
+        for (size_t i = 0; i < state_span; ++i) {
+            state->u.resampler.last_values[i] = init_value;
+        }
+        state->u.resampler.channels = logical_channels;
+        state->u.resampler.batches = logical_batches;
+    }
+
+    if (state->u.resampler.window_size != window_size) {
+        free(state->u.resampler.rate_window);
+        state->u.resampler.rate_window = NULL;
+        state->u.resampler.window_size = window_size;
+        state->u.resampler.window_index = 0;
+        state->u.resampler.window_count = 0;
+        state->u.resampler.window_sum = 0.0;
+        if (window_size > 0U) {
+            state->u.resampler.rate_window = (double *)calloc((size_t)window_size, sizeof(double));
+            if (state->u.resampler.rate_window == NULL) {
+                free(buffer);
+                return -1;
+            }
+        }
+    }
+
+    state->u.resampler.ema_alpha = ema_alpha;
+    state->u.resampler.fixed_sample_rate = fixed_sample_rate > 0.0 ? fixed_sample_rate : 0.0;
+    state->u.resampler.free_rate = free_rate;
+
+    size_t batch_stride = (size_t)logical_channels * (size_t)frames;
+    size_t channel_stride = (size_t)frames;
+
+    size_t input_batch_stride = 0;
+    size_t input_channel_stride = (size_t)frames;
+    uint32_t available_batches = has_audio ? (audio_batches > 0 ? (uint32_t)audio_batches : 1U) : 0U;
+    uint32_t available_channels = has_audio ? (audio_channels > 0 ? (uint32_t)audio_channels : 1U) : 0U;
+    if (has_audio) {
+        input_batch_stride = (size_t)available_channels * (size_t)frames;
+    }
+
+    for (uint32_t b = 0; b < logical_batches; ++b) {
+        size_t state_base = (size_t)b * (size_t)state->u.resampler.channels;
+        size_t out_batch_offset = (size_t)b * batch_stride;
+        uint32_t input_batch = (available_batches > 0U && b < available_batches)
+            ? b
+            : (available_batches > 0U ? (available_batches - 1U) : 0U);
+        for (uint32_t c = 0; c < logical_channels; ++c) {
+            double last = state->u.resampler.last_values[state_base + (size_t)c];
+            double *out_channel = buffer + out_batch_offset + (size_t)c * channel_stride;
+            if (has_audio) {
+                uint32_t input_channel = (available_channels > 0U && c < available_channels)
+                    ? c
+                    : (available_channels > 0U ? (available_channels - 1U) : 0U);
+                const double *in_channel = input_data
+                    + (size_t)input_batch * input_batch_stride
+                    + (size_t)input_channel * input_channel_stride;
+                for (int f = 0; f < frames; ++f) {
+                    double value = in_channel[f];
+                    double delta = value - last;
+                    out_channel[f] = delta;
+                    last = value;
+                }
+                state->u.resampler.last_values[state_base + (size_t)c] = last;
+            } else {
+                for (int f = 0; f < frames; ++f) {
+                    out_channel[f] = 0.0;
+                }
+            }
+        }
+    }
+
+    double instant_rate = frames > 0 ? sample_rate / (double)frames : sample_rate;
+    double reported_rate = instant_rate;
+
+    if (!free_rate && state->u.resampler.fixed_sample_rate > 0.0) {
+        reported_rate = state->u.resampler.fixed_sample_rate;
+        state->u.resampler.last_rate = reported_rate;
+    } else {
+        double smoothed = instant_rate;
+        if (state->u.resampler.window_size > 0U && state->u.resampler.rate_window != NULL) {
+            if (state->u.resampler.window_count == state->u.resampler.window_size) {
+                size_t idx = (size_t)state->u.resampler.window_index;
+                state->u.resampler.window_sum -= state->u.resampler.rate_window[idx];
+            } else if (state->u.resampler.window_count < state->u.resampler.window_size) {
+                state->u.resampler.window_count += 1U;
+            }
+            size_t write_index = (size_t)state->u.resampler.window_index;
+            state->u.resampler.rate_window[write_index] = smoothed;
+            state->u.resampler.window_sum += smoothed;
+            state->u.resampler.window_index = (state->u.resampler.window_index + 1U) % state->u.resampler.window_size;
+            if (state->u.resampler.window_count > 0U) {
+                smoothed = state->u.resampler.window_sum / (double)state->u.resampler.window_count;
+            }
+        } else if (ema_alpha > 0.0 && ema_alpha < 1.0) {
+            double previous = state->u.resampler.last_rate;
+            if (previous <= 0.0) {
+                previous = smoothed;
+            }
+            smoothed = ema_alpha * smoothed + (1.0 - ema_alpha) * previous;
+        }
+        if (smoothed <= 0.0) {
+            smoothed = instant_rate;
+        }
+        state->u.resampler.last_rate = smoothed;
+        reported_rate = smoothed;
+    }
+
+    if (metrics != NULL) {
+        metrics->reserved[0] = reported_rate;
+        metrics->reserved[1] = instant_rate;
+        metrics->reserved[2] = (double)frames;
+        metrics->reserved[3] = (double)state->u.resampler.free_rate;
+        metrics->reserved[4] = state->u.resampler.last_rate;
+        metrics->reserved[5] = state->u.resampler.fixed_sample_rate;
+    }
+
+    *out_buffer = buffer;
+    *out_channels = (int)logical_channels;
+    return 0;
+}
+
 static int run_parametric_driver_node(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
@@ -4243,10 +4516,6 @@ static int run_parametric_driver_node(
     }
     state->u.driver.mode = mode;
 
-    const EdgeRunnerParamView *freq_view = find_param(inputs, "frequency");
-    if (freq_view == NULL) {
-        freq_view = find_param(inputs, "freq");
-    }
     const EdgeRunnerParamView *amp_view = find_param(inputs, "amplitude");
     if (amp_view == NULL) {
         amp_view = find_param(inputs, "amp");
@@ -4259,7 +4528,7 @@ static int run_parametric_driver_node(
 
     int B = batches > 0 ? batches : 1;
     int F = frames > 0 ? frames : 1;
-    const EdgeRunnerParamView *shape_source = freq_view != NULL ? freq_view : amp_view;
+    const EdgeRunnerParamView *shape_source = amp_view != NULL ? amp_view : phase_view;
     if (shape_source != NULL) {
         if (shape_source->batches > 0) {
             B = (int)shape_source->batches;
@@ -4268,20 +4537,48 @@ static int run_parametric_driver_node(
             F = (int)shape_source->frames;
         }
     }
-    if (B <= 0) B = 1;
-    if (F <= 0) F = 1;
 
-    double *owned_freq = NULL;
+    const double *tap_data = NULL;
+    int tap_batches = 0;
+    int tap_frames = 0;
+    int tap_channels = 0;
+    size_t tap_batch_stride = 0;
+    size_t tap_channel_stride = 0;
+    if (inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
+        tap_data = inputs->audio.data;
+        tap_batches = inputs->audio.batches > 0 ? (int)inputs->audio.batches : B;
+        tap_frames = inputs->audio.frames > 0 ? (int)inputs->audio.frames : F;
+        tap_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 0;
+        if (tap_frames > 0) {
+            tap_channel_stride = (size_t)tap_frames;
+            tap_batch_stride = (size_t)tap_channels * (size_t)tap_frames;
+        }
+    }
+    bool has_tap_freq = tap_data != NULL && tap_channels > 0 && tap_frames > 0 && tap_batches > 0;
+    if (!has_tap_freq) {
+        return -1;
+    }
+    if (tap_batches > 0) {
+        B = tap_batches;
+    }
+    if (tap_frames > 0) {
+        F = tap_frames;
+    }
+    if (B <= 0) {
+        B = 1;
+    }
+    if (F <= 0) {
+        F = 1;
+    }
+
     double *owned_amp = NULL;
     double *owned_phase = NULL;
     double *owned_render = NULL;
 
-    const double *freq = ensure_param_plane(freq_view, B, F, 440.0, &owned_freq);
     const double *amp = ensure_param_plane(amp_view, B, F, 1.0, &owned_amp);
     const double *phase_offset = ensure_param_plane(phase_view, B, F, 0.0, &owned_phase);
     const double *render_mode = ensure_param_plane(render_view, B, F, 0.0, &owned_render);
-    if (freq == NULL || amp == NULL) {
-        free(owned_freq);
+    if (amp == NULL) {
         free(owned_amp);
         free(owned_phase);
         free(owned_render);
@@ -4294,52 +4591,39 @@ static int run_parametric_driver_node(
         state->u.driver.batches = B;
     }
     if (state->u.driver.phase == NULL || state->u.driver.harmonics == NULL) {
-        free(owned_freq);
-        free(owned_amp);
-        free(owned_phase);
-        return -1;
-    }
-
-    size_t total = (size_t)B * (size_t)F;
-    double *buffer = (double *)malloc(total * sizeof(double));
-    if (buffer == NULL) {
-        free(owned_freq);
         free(owned_amp);
         free(owned_phase);
         free(owned_render);
         return -1;
     }
 
-    const double *driver_input = NULL;
-    int driver_in_channels = 1;
-    int driver_in_batches = B;
-    int driver_in_frames = F;
-    if (inputs != NULL && inputs->audio.has_audio && inputs->audio.data != NULL) {
-        driver_input = inputs->audio.data;
-        driver_in_channels = inputs->audio.channels > 0 ? (int)inputs->audio.channels : 1;
-        if (inputs->audio.batches > 0) {
-            driver_in_batches = (int)inputs->audio.batches;
-        }
-        if (inputs->audio.frames > 0) {
-            driver_in_frames = (int)inputs->audio.frames;
-        }
+    size_t total = (size_t)B * (size_t)F;
+    double *buffer = (double *)malloc(total * sizeof(double));
+    if (buffer == NULL) {
+        free(owned_amp);
+        free(owned_phase);
+        free(owned_render);
+        return -1;
     }
-    if (driver_in_batches <= 0) {
-        driver_in_batches = B > 0 ? B : 1;
-    }
-    if (driver_in_frames <= 0) {
-        driver_in_frames = F > 0 ? F : 1;
-    }
-    if (driver_in_channels <= 0) {
-        driver_in_channels = 1;
-    }
+
+    int aux_channels = tap_channels > 1 ? tap_channels - 1 : 0;
+    size_t tap_aux_stride = aux_channels > 0 ? tap_channel_stride : 0;
 
     for (int b = 0; b < B; ++b) {
         double phase = state->u.driver.phase[b];
         size_t base = (size_t)b * (size_t)F;
+        int tap_batch_index = (b < tap_batches ? b : tap_batches - 1);
+        const double *tap_base = tap_data + (size_t)tap_batch_index * tap_batch_stride;
+        const double *tap_aux_base = aux_channels > 0 ? tap_base + tap_aux_stride : NULL;
         for (int f = 0; f < F; ++f) {
             size_t idx = base + (size_t)f;
-            double hz = freq[idx];
+            int tap_frame_index = f;
+            if (tap_frame_index >= tap_frames) {
+                tap_frame_index = tap_frames - 1;
+            } else if (tap_frame_index < 0) {
+                tap_frame_index = 0;
+            }
+            double hz = tap_base[tap_frame_index];
             if (hz < 0.0) hz = 0.0;
             double advance = hz / sample_rate;
             phase += advance;
@@ -4369,26 +4653,12 @@ static int run_parametric_driver_node(
                 blend = 1.0;
             }
             double stream_val = 0.0;
-            if (driver_input != NULL) {
-                int bb = b;
-                if (bb >= driver_in_batches) {
-                    bb = driver_in_batches - 1;
+            if (tap_aux_base != NULL) {
+                double sum = 0.0;
+                for (int ch = 0; ch < aux_channels; ++ch) {
+                    sum += tap_aux_base[(size_t)ch * tap_channel_stride + (size_t)tap_frame_index];
                 }
-                if (bb < 0) {
-                    bb = 0;
-                }
-                int ff = f;
-                if (ff >= driver_in_frames) {
-                    ff = driver_in_frames - 1;
-                }
-                if (ff < 0) {
-                    ff = 0;
-                }
-                size_t base_audio = ((size_t)bb * (size_t)driver_in_channels) * (size_t)driver_in_frames;
-                for (int c = 0; c < driver_in_channels; ++c) {
-                    stream_val += driver_input[base_audio + (size_t)c * (size_t)driver_in_frames + (size_t)ff];
-                }
-                stream_val /= (double)driver_in_channels;
+                stream_val = sum / (double)aux_channels;
             }
             double combined = (1.0 - blend) * sample + blend * stream_val;
             buffer[idx] = combined * amp[idx];
@@ -4396,7 +4666,6 @@ static int run_parametric_driver_node(
         state->u.driver.phase[b] = phase - floor(phase);
     }
 
-    free(owned_freq);
     free(owned_amp);
     free(owned_phase);
     free(owned_render);
@@ -6573,6 +6842,11 @@ static int amp_run_node_impl(
         case NODE_KIND_DRIVER:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
                 ? run_parametric_driver_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
+            break;
+        case NODE_KIND_RESAMPLER:
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_resampler_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state, metrics)
                 : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_SUBHARM:

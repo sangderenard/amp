@@ -70,8 +70,11 @@ Nodes publish a `tap_groups` array alongside the legacy `taps.inputs/outputs` fi
 - **unit_shape**: Defines the elemental tensor produced by each active tap instance. Shapes follow the runtime’s `(batches, channels, frames)` convention; omitted dimensions default to `1`.
 - **buffer.prealloc_units**: Maximum number of `unit_shape` elements the wheel may cache for this group. Allocation is deferred until at least one tap slot is active.
 - **delivery.mode**: `fifo_pc` for single producer→consumer semantics with primary-consumer release, or `multicast` to allow multiple readers. Delivery blocks include policy knobs that the wheel honours when sizing rings and handling acknowledgements.
+- **direction**: Identifies whether the group publishes (`"output"`) or consumes (`"input"`) data. Input groups may declare hold/default behaviour for control-style taps.
 - **indexing.major_order**: Specifies how the wheel flattens multi-dimensional indices into the preallocated buffer. The runtime iterates the listed keys in order (e.g., all active bands before moving to the next subchannel).
 - **channels[count]**: Describes the address space for each logical channel family. `active_indices` and `active_mask_b64` enable sparse activation without hard-coding contiguous ranges. Every enabled `(channel, band-index, subchannel)` combination becomes an individually addressable tap.
+  - `hold_if_absent`: Inputs may request that the runtime reuse the most recently observed frame when upstream edges momentarily run dry. Outputs ignore this flag.
+  - `optional_default`: Inputs can seed an initial value (scalar or tensor) before any frames arrive. The object may carry a `value` field and optional metadata such as `units` or a `unit_shape` override. When present, the runtime uses this default until real data arrives.
 - **subchannels**: Each subchannel represents a unique tap per channel element (for example, `mag`, `phase`, `power`). `stride_elems` describes how many scalar elements belong to the subchannel within the parent unit.
 
 ### Activation & Allocation

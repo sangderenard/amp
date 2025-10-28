@@ -1,10 +1,72 @@
 {
   "version": 1,
   "node": "ParametricDriverNode",
-  "description": "Default tap contract for the parametric driver. Produces a single control lane that may be multicasted to downstream modulators.",
+  "description": "Default tap contract for the parametric driver. Channel 0 carries instantaneous oscillator frequency in Hz; additional channels (if present) expose auxiliary control lanes for downstream consumers.",
   "tap_groups": [
     {
+      "name": "pitch_control",
+      "direction": "input",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 1,
+        "frames": 1
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 1,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "fifo_pc",
+        "full_percent_target": 100,
+        "low_watermark_percent": 0,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "absolute"
+      },
+      "channels": [
+        {
+          "name": "pitch_hz",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 1
+          },
+          "hold_if_absent": true,
+          "optional_default": {
+            "value": 440.0,
+            "units": "Hz"
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "control_bus",
+      "direction": "output",
       "unit_shape": {
         "batches": 1,
         "channels": 1,

@@ -14,6 +14,7 @@
 #include <limits>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -22,48 +23,58 @@ namespace fs = std::filesystem;
 #  define M_PI 3.14159265358979323846
 #endif
 
-static void amp_generate_driver_curves(
+static void amp_generate_pitch_curve(
     double *freq,
-    double *amp,
-    double *render,
     uint32_t frames,
     double sample_rate
 ) {
     const double base_freq = 220.0;
     const double sweep_hz = 1.0;
     const double sweep_depth = 110.0;
-    const double render_depth = 0.4;
     for (uint32_t i = 0; i < frames; ++i) {
         double t = static_cast<double>(i) / sample_rate;
         double slow = std::sin(2.0 * M_PI * sweep_hz * t);
-        freq[i] = base_freq + sweep_depth * slow;
-        if (freq[i] < 40.0) {
-            freq[i] = 40.0;
+        double value = base_freq + sweep_depth * slow;
+        if (value < 40.0) {
+            value = 40.0;
         }
-        amp[i] = 0.55 + 0.4 * slow;
-        if (amp[i] < 0.1) {
-            amp[i] = 0.1;
+        freq[i] = value;
+    }
+}
+
+static void amp_generate_driver_curves(
+    const double *pitch_freq,
+    double *amp,
+    double *render,
+    uint32_t frames,
+    double sample_rate
+) {
+    const double render_depth = 0.4;
+    for (uint32_t i = 0; i < frames; ++i) {
+        double t = static_cast<double>(i) / sample_rate;
+        double slow = std::sin(2.0 * M_PI * 1.0 * t);
+        double base_amp = 0.55 + 0.4 * slow;
+        if (base_amp < 0.1) {
+            base_amp = 0.1;
         }
-        render[i] = 0.5 + render_depth * slow;
-        if (render[i] < 0.0) {
-            render[i] = 0.0;
-        } else if (render[i] > 1.0) {
-            render[i] = 1.0;
+        amp[i] = base_amp;
+        double mix = 0.5 + render_depth * slow;
+        if (mix < 0.0) {
+            mix = 0.0;
+        } else if (mix > 1.0) {
+            mix = 1.0;
         }
+        render[i] = mix;
+        (void)pitch_freq;
     }
 }
 
 static void amp_generate_oscillator_curves(
-    double *freq,
     double *amp,
     double *slew,
-    uint32_t frames,
-    double sample_rate,
-    const double *driver_freq
+    uint32_t frames
 ) {
-    (void)sample_rate;
     for (uint32_t i = 0; i < frames; ++i) {
-        freq[i] = driver_freq != nullptr ? driver_freq[i] : 220.0;
         amp[i] = 0.4;
         slew[i] = 12000.0;
     }
@@ -137,6 +148,86 @@ static bool pop_all_dumps(AmpGraphStreamer *streamer, uint32_t max_frames, std::
     return true;
 }
 
+struct StreamAccumulator {
+    std::vector<StreamChunk> dump_chunks;
+    std::vector<StreamChunk> ring_chunks;
+};
+
+static bool accumulate_stream_chunks(
+    AmpGraphStreamer *streamer,
+    uint32_t max_frames,
+    StreamAccumulator &accumulator
+) {
+    std::vector<StreamChunk> dump_batch;
+    if (!pop_all_dumps(streamer, max_frames, dump_batch)) {
+        return false;
+    }
+    if (!dump_batch.empty()) {
+        accumulator.dump_chunks.reserve(accumulator.dump_chunks.size() + dump_batch.size());
+        for (StreamChunk &chunk : dump_batch) {
+            accumulator.dump_chunks.emplace_back(std::move(chunk));
+        }
+    }
+
+    while (true) {
+        uint64_t available = 0;
+        if (amp_graph_streamer_available(streamer, &available) != 0) {
+            return false;
+        }
+        if (available == 0U) {
+            break;
+        }
+
+        uint32_t request = static_cast<uint32_t>(std::min<uint64_t>(available, max_frames));
+        request = std::max<uint32_t>(request, 1U);
+
+        std::vector<double> buffer(static_cast<size_t>(request));
+        uint32_t out_frames = 0;
+        uint32_t out_channels = 0;
+        uint64_t sequence = 0;
+        int rc = amp_graph_streamer_read(
+            streamer,
+            buffer.data(),
+            request,
+            &out_frames,
+            &out_channels,
+            &sequence
+        );
+        if (rc == 1) {
+            const size_t needed = static_cast<size_t>(out_frames ? out_frames : request) *
+                static_cast<size_t>(std::max<uint32_t>(out_channels, 1U));
+            buffer.assign(needed, 0.0);
+            rc = amp_graph_streamer_read(
+                streamer,
+                buffer.data(),
+                static_cast<uint32_t>(out_frames),
+                &out_frames,
+                &out_channels,
+                &sequence
+            );
+        }
+        if (rc != 0) {
+            return false;
+        }
+        if (out_frames == 0U) {
+            continue;
+        }
+
+        const size_t stride = static_cast<size_t>(std::max<uint32_t>(out_channels, 1U));
+        buffer.resize(static_cast<size_t>(out_frames) * stride);
+
+        StreamChunk chunk{};
+        chunk.sequence = sequence;
+        chunk.frames = out_frames;
+        chunk.channels = out_channels ? out_channels : 1U;
+        chunk.source = StreamSource::Ring;
+        chunk.data = std::move(buffer);
+        accumulator.ring_chunks.emplace_back(std::move(chunk));
+    }
+
+    return true;
+}
+
 static bool read_ring_snapshot(AmpGraphStreamer *streamer, uint32_t max_frames, std::vector<StreamChunk> &chunks) {
     uint64_t available = 0;
     if (amp_graph_streamer_available(streamer, &available) != 0) {
@@ -185,16 +276,12 @@ struct TapCollection {
     uint32_t spectral_columns{0U};
 };
 
-static bool collect_tap_streams(
-    AmpGraphStreamer *streamer,
+static bool finalize_tap_streams(
+    std::vector<StreamChunk> dump_chunks,
+    std::vector<StreamChunk> ring_chunks,
     uint32_t total_frames,
     TapCollection &collection
 ) {
-    std::vector<StreamChunk> dump_chunks;
-    if (!pop_all_dumps(streamer, total_frames, dump_chunks)) {
-        return false;
-    }
-
     std::vector<StreamChunk> pcm_chunks;
     std::vector<StreamChunk> spectral_chunks;
     pcm_chunks.reserve(dump_chunks.size());
@@ -210,11 +297,6 @@ static bool collect_tap_streams(
         } else {
             spectral_chunks.emplace_back(std::move(chunk));
         }
-    }
-
-    std::vector<StreamChunk> ring_chunks;
-    if (!read_ring_snapshot(streamer, total_frames, ring_chunks)) {
-        return false;
     }
 
     const bool queue_provided_pcm = !pcm_chunks.empty();
@@ -300,6 +382,24 @@ static bool collect_tap_streams(
     }
 
     return true;
+}
+
+[[maybe_unused]] static bool collect_tap_streams(
+    AmpGraphStreamer *streamer,
+    uint32_t total_frames,
+    TapCollection &collection
+) {
+    std::vector<StreamChunk> dump_chunks;
+    if (!pop_all_dumps(streamer, total_frames, dump_chunks)) {
+        return false;
+    }
+
+    std::vector<StreamChunk> ring_chunks;
+    if (!read_ring_snapshot(streamer, total_frames, ring_chunks)) {
+        return false;
+    }
+
+    return finalize_tap_streams(std::move(dump_chunks), std::move(ring_chunks), total_frames, collection);
 }
 
 static std::vector<uint8_t> render_spectrogram_image(
@@ -798,6 +898,7 @@ int main(int argc, char **argv) {
     uint64_t produced_frames = 0U;
     uint64_t consumed_frames = 0U;
     AmpKpnOverlay *overlay = nullptr;
+    StreamAccumulator stream_accumulator{};
 
     do {
     const char *const *pitch_inputs = nullptr;
@@ -806,16 +907,22 @@ int main(int argc, char **argv) {
     static const char *const fft_inputs[] = {"mix"};
     static const char *const mix_inputs[] = {"osc"};
 
+        stream_accumulator.dump_chunks.clear();
+        stream_accumulator.ring_chunks.clear();
+
         static const char pitch_json[] =
             "{\"declared_delay\":0,\"default_slew\":0.0,\"min_freq\":0.0,"
             "\"oversample_ratio\":1,\"supports_v2\":true,"
             "\"fifo_simultaneous_output\":true,\"fifo_release_policy\":\"all\"}";
         static const char driver_json[] =
-            "{\"declared_delay\":0,\"mode\":\"piezo\",\"oversample_ratio\":1,\"supports_v2\":true}";
+            "{\"declared_delay\":0,\"mode\":\"piezo\",\"oversample_ratio\":1,\"supports_v2\":true,"
+            "\"input_pitch_hold_if_absent\":true,\"input_pitch_optional_default\":440.0}";
         static const char osc_json[] =
             "{\"accept_reset\":false,\"declared_delay\":0,\"integration_clamp\":1.2,"
             "\"integration_gain\":0.5,\"integration_leak\":0.997,\"mode\":\"op_amp\","\
-            "\"oversample_ratio\":1,\"slew_clamp\":1.2,\"slew_rate\":12000.0,\"supports_v2\":true,\"wave\":\"saw\"}";
+            "\"oversample_ratio\":1,\"slew_clamp\":1.2,\"slew_rate\":12000.0,\"supports_v2\":true,\"wave\":\"saw\","
+            "\"input_pitch_hold_if_absent\":true,\"input_pitch_optional_default\":330.0,"
+            "\"input_driver_hold_if_absent\":true,\"input_driver_optional_default\":0.0}";
         static const char fft_json[] =
             "{\"algorithm\":\"radix2\",\"declared_delay\":511,\"enable_remainder\":true,\"oversample_ratio\":1,\"supports_v2\":true,\"window_size\":512,\"hop_size\":256}";
         static const char mix_json[] =
@@ -921,37 +1028,23 @@ int main(int argc, char **argv) {
 
         const size_t param_count = static_cast<size_t>(batches) * static_cast<size_t>(frames);
         std::vector<double> pitch_freq(param_count, 0.0);
-        std::vector<double> driver_freq(param_count, 0.0);
         std::vector<double> driver_amp(param_count, 0.0);
         std::vector<double> driver_render(param_count, 0.0);
-        std::vector<double> osc_freq(param_count, 0.0);
         std::vector<double> osc_amp(param_count, 0.0);
         std::vector<double> osc_slew(param_count, 0.0);
 
-        amp_generate_driver_curves(driver_freq.data(), driver_amp.data(), driver_render.data(), frames, sample_rate);
-        amp_generate_oscillator_curves(
-            osc_freq.data(),
-            osc_amp.data(),
-            osc_slew.data(),
-            frames,
-            sample_rate,
-            driver_freq.data()
-        );
+        amp_generate_pitch_curve(pitch_freq.data(), frames, sample_rate);
+        amp_generate_driver_curves(pitch_freq.data(), driver_amp.data(), driver_render.data(), frames, sample_rate);
+        amp_generate_oscillator_curves(osc_amp.data(), osc_slew.data(), frames);
 
-        if (amp_graph_runtime_set_param(runtime, "pitch", "freq", pitch_freq.data(), batches, 1U, frames) != 0) {
-            std::fprintf(stderr, "[demo] failed to set pitch freq\n");
-        }
-        if (amp_graph_runtime_set_param(runtime, "driver", "frequency", driver_freq.data(), batches, 1U, frames) != 0) {
-            std::fprintf(stderr, "[demo] failed to set driver frequency\n");
+        if (amp_graph_runtime_set_param(runtime, "pitch", "pitch_hz", pitch_freq.data(), batches, 1U, frames) != 0) {
+            std::fprintf(stderr, "[demo] failed to set pitch frequency\n");
         }
         if (amp_graph_runtime_set_param(runtime, "driver", "amplitude", driver_amp.data(), batches, 1U, frames) != 0) {
             std::fprintf(stderr, "[demo] failed to set driver amplitude\n");
         }
         if (amp_graph_runtime_set_param(runtime, "driver", "render_mode", driver_render.data(), batches, 1U, frames) != 0) {
             std::fprintf(stderr, "[demo] failed to set driver render_mode\n");
-        }
-        if (amp_graph_runtime_set_param(runtime, "osc", "freq", osc_freq.data(), batches, 1U, frames) != 0) {
-            std::fprintf(stderr, "[demo] failed to set oscillator freq\n");
         }
         if (amp_graph_runtime_set_param(runtime, "osc", "amp", osc_amp.data(), batches, 1U, frames) != 0) {
             std::fprintf(stderr, "[demo] failed to set oscillator amp\n");
@@ -1009,6 +1102,11 @@ int main(int argc, char **argv) {
         AmpGraphStreamerCompletionVerdict completion_verdict{};
 
         for (;;) {
+            if (!accumulate_stream_chunks(streamer, 512U, stream_accumulator)) {
+                std::fprintf(stderr, "[demo] failed to drain streamer outputs\n");
+                exit_code = 9;
+                break;
+            }
             int status = amp_graph_streamer_evaluate_completion(
                 streamer,
                 &completion_contract,
@@ -1049,6 +1147,12 @@ int main(int argc, char **argv) {
             break;
         }
 
+        if (!accumulate_stream_chunks(streamer, frames, stream_accumulator)) {
+            std::fprintf(stderr, "[demo] failed to drain remaining streamer outputs\n");
+            exit_code = 10;
+            break;
+        }
+
         if (streamer_started) {
             if (overlay) {
                 amp_kpn_overlay_destroy(overlay);
@@ -1081,7 +1185,12 @@ int main(int argc, char **argv) {
         }
 
         TapCollection taps{};
-        if (!collect_tap_streams(streamer, frames, taps)) {
+        if (!finalize_tap_streams(
+                std::move(stream_accumulator.dump_chunks),
+                std::move(stream_accumulator.ring_chunks),
+                frames,
+                taps
+            )) {
             std::fprintf(stderr, "[demo] failed to collect tap streams\n");
             exit_code = 10;
             break;
