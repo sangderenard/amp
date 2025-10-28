@@ -1,0 +1,13 @@
+{
+  "name": "default",
+  "node": "ResamplerNode",
+  "description": "Derivative resampler preset that tracks rate freely with zero initial bias.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "sample_rate_ema_alpha": 0.0,
+    "sample_rate_hz": 0.0,
+    "sample_rate_free": true,
+    "sample_rate_window": 0,
+    "initial_value": 0.0
+  }
+}

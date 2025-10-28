@@ -1,0 +1,15 @@
+{
+  "name": "default",
+  "node": "EnvelopeModulatorNode",
+  "description": "ADSR envelope preset tuned for the demo modulation chain.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "attack_ms": 12.0,
+    "hold_ms": 8.0,
+    "decay_ms": 90.0,
+    "sustain_level": 0.7,
+    "sustain_ms": 0.0,
+    "release_ms": 220.0,
+    "send_resets": true
+  }
+}

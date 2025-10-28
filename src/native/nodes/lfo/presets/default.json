@@ -1,0 +1,13 @@
+{
+  "name": "default",
+  "node": "LFONode",
+  "description": "Classic sine LFO preset with depth modulation and optional input disabled.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "wave": "sine",
+    "rate_hz": 1.0,
+    "depth": 0.5,
+    "slew_ms": 0.0,
+    "use_input": false
+  }
+}

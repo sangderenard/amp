@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "node": "PitchQuantizerNode",
+  "description": "Tap contract for the pitch quantizer consuming control taps and emitting quantized pitch values.",
+  "tap_groups": [
+    {
+      "name": "quantizer_inputs",
+      "direction": "input",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 3,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 1024,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "fifo_pc",
+        "full_percent_target": 100,
+        "low_watermark_percent": 0,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "absolute"
+      },
+      "channels": [
+        {
+          "name": "input",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "hold_if_absent": true,
+          "optional_default": {
+            "value": 0.0,
+            "units": "octaves"
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        },
+        {
+          "name": "root_midi",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "hold_if_absent": true,
+          "optional_default": {
+            "value": 60.0,
+            "units": "MIDI"
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        },
+        {
+          "name": "span_oct",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "hold_if_absent": true,
+          "optional_default": {
+            "value": 2.0,
+            "units": "octaves"
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "quantized_pitch",
+      "direction": "output",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 1,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 4096,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "multicast",
+        "full_percent_target": 85,
+        "low_watermark_percent": 25,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "absolute"
+      },
+      "channels": [
+        {
+          "name": "pitch_hz",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "default",
+  "node": "SineOscillatorNode",
+  "description": "Monophonic sine oscillator preset with unity amplitude.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "channels": 1,
+    "frequency": 440.0,
+    "amplitude": 0.5,
+    "phase": 0.0
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "default",
+  "node": "PitchShiftNode",
+  "description": "Windowed pitch shifter preset with unity ratio for neutral processing.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "window_size": 1024,
+    "hop_size": 256,
+    "resynthesis_hop": 256,
+    "ratio": 1.0,
+    "semitones": 0.0
+  }
+}

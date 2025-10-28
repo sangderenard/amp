@@ -1,0 +1,10 @@
+{
+  "name": "default",
+  "node": "SafetyNode",
+  "description": "Stereo safety filter preset for host output protection.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "channels": 2,
+    "dc_alpha": 0.995
+  }
+}

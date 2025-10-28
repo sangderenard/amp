@@ -1,0 +1,14 @@
+{
+  "name": "default",
+  "node": "SubharmonicLowLifterNode",
+  "description": "Default low-lifter preset tuned for the demo bass chain.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "band_lo": 70.0,
+    "band_hi": 160.0,
+    "mix": 0.5,
+    "drive": 1.0,
+    "out_hp": 25.0,
+    "use_div4": false
+  }
+}
