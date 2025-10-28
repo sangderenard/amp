@@ -1714,14 +1714,29 @@ static double compute_scheduler_priority(const AmpGraphRuntime *runtime, uint32_
             activity += node.latest_metrics.total_time_seconds;
         }
         activity += node.total_heat_accumulated;
+
+        double backlog_penalty = 0.0;
+        const OutputTap *primary = runtime_primary_output(node);
+        if (primary != nullptr && primary->ring && primary->ring->capacity > 0U) {
+            uint32_t capacity = primary->ring->capacity;
+            uint32_t head = primary->ring->head % capacity;
+            uint32_t tail = primary->ring->tail % capacity;
+            uint32_t used = edge_ring_distance(head, tail, capacity);
+            if (capacity > 0U) {
+                backlog_penalty = static_cast<double>(used) / static_cast<double>(capacity);
+            }
+        }
+
         auto channel_it = runtime->channels.find(node.name);
         if (channel_it != runtime->channels.end()) {
             const auto &channel = *channel_it->second;
             if (channel.ring_frames > 0U && channel.block_frames > 0U) {
-                double fill_ratio = static_cast<double>(channel.block_frames) / static_cast<double>(channel.ring_frames);
-                activity += fill_ratio;
+                double block_fill = static_cast<double>(channel.block_frames) / static_cast<double>(channel.ring_frames);
+                activity += block_fill;
             }
         }
+
+        activity -= backlog_penalty;
         saturation_component = activity * params.saturation_bias;
     }
 
