@@ -1,0 +1,1600 @@
+diff --git a/src/native/amp_kernels.c b/src/native/amp_kernels.c
+index 139a286..5c7c4cc 100644
+--- a/src/native/amp_kernels.c
++++ b/src/native/amp_kernels.c
+@@ -9,6 +9,7 @@
+ #define _USE_MATH_DEFINES
+ #endif
+ #include <math.h>
++#include <limits.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -31,650 +32,6 @@
+ #include "amp_fft_backend.h"
+ #include "amp_debug_alloc.h"
+ 
+-#ifndef M_LN2
+-#define M_LN2 0.693147180559945309417232121458176568
+-#endif
+-
+-typedef struct {
+-    int *boundaries;
+-    int *trig_indices;
+-    int8_t *gate_bool;
+-    int8_t *drone_bool;
+-    size_t boundary_cap;
+-    size_t trig_cap;
+-    size_t bool_cap;
+-} envelope_scratch_t;
+-
+-static envelope_scratch_t envelope_scratch = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+-/* Debug: track last allocation element count for diagnostics. */
+-static size_t amp_last_alloc_count = 0;
+-
+-AMP_CAPI size_t amp_last_alloc_count_get(void) {
+-    return amp_last_alloc_count;
+-}
+-
+-/*
+- * Edge runner contract (mirrors `_EDGE_RUNNER_CDEF` in Python).
+- *
+- * The runtime passes node descriptors/inputs to `amp_run_node`, which may
+- * allocate per-node state (returned via `state`) and a heap-owned audio buffer
+- * (`out_buffer`).
+- *
+- * Return codes:
+- *   0   -> success
+- *  -1   -> allocation failure / invalid contract usage
+- *  -3   -> unsupported node kind (caller should fall back to Python)
+- */
+-/* Persistent log file handles and allocator wrappers now reside in amp_debug_alloc.c. */
+-
+-static void destroy_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+-    if (plan == NULL) {
+-        return;
+-    }
+-    if (plan->nodes != NULL) {
+-        for (uint32_t i = 0; i < plan->node_count; ++i) {
+-            EdgeRunnerCompiledNode *node = &plan->nodes[i];
+-            if (node->params != NULL) {
+-                for (uint32_t j = 0; j < node->param_count; ++j) {
+-                    EdgeRunnerCompiledParam *param = &node->params[j];
+-                    if (param->name != NULL) {
+-                        free(param->name);
+-                        param->name = NULL;
+-                    }
+-                }
+-                free(node->params);
+-                node->params = NULL;
+-            }
+-            if (node->name != NULL) {
+-                free(node->name);
+-                node->name = NULL;
+-            }
+-        }
+-        free(plan->nodes);
+-        plan->nodes = NULL;
+-    }
+-    free(plan);
+-}
+-
+-static int read_u32_le(const uint8_t **cursor, size_t *remaining, uint32_t *out_value) {
+-    if (cursor == NULL || remaining == NULL || out_value == NULL) {
+-        return 0;
+-    }
+-    if (*remaining < 4) {
+-        return 0;
+-    }
+-    const uint8_t *ptr = *cursor;
+-    *out_value = (uint32_t)ptr[0]
+-        | ((uint32_t)ptr[1] << 8)
+-        | ((uint32_t)ptr[2] << 16)
+-        | ((uint32_t)ptr[3] << 24);
+-    *cursor += 4;
+-    *remaining -= 4;
+-    return 1;
+-}
+-
+-AMP_CAPI EdgeRunnerCompiledPlan *amp_load_compiled_plan(
+-    const uint8_t *descriptor_blob,
+-    size_t descriptor_len,
+-    const uint8_t *plan_blob,
+-    size_t plan_len
+-) {
+-    AMP_LOG_NATIVE_CALL("amp_load_compiled_plan", descriptor_len, plan_len);
+-    AMP_LOG_GENERATED("amp_load_compiled_plan", (size_t)descriptor_blob, (size_t)plan_blob);
+-    if (descriptor_blob == NULL || plan_blob == NULL) {
+-        return NULL;
+-    }
+-    if (descriptor_len < 4 || plan_len < 12) {
+-        return NULL;
+-    }
+-
+-    const uint8_t *descriptor_cursor = descriptor_blob;
+-    size_t descriptor_remaining = descriptor_len;
+-    uint32_t descriptor_count = 0;
+-    if (!read_u32_le(&descriptor_cursor, &descriptor_remaining, &descriptor_count)) {
+-        return NULL;
+-    }
+-
+-    const uint8_t *cursor = plan_blob;
+-    size_t remaining = plan_len;
+-    if (remaining < 4) {
+-        return NULL;
+-    }
+-    if (cursor[0] != 'A' || cursor[1] != 'M' || cursor[2] != 'P' || cursor[3] != 'L') {
+-        return NULL;
+-    }
+-    cursor += 4;
+-    remaining -= 4;
+-
+-    uint32_t version = 0;
+-    uint32_t node_count = 0;
+-    if (!read_u32_le(&cursor, &remaining, &version) || !read_u32_le(&cursor, &remaining, &node_count)) {
+-        return NULL;
+-    }
+-    if (descriptor_count != node_count) {
+-        return NULL;
+-    }
+-
+-    EdgeRunnerCompiledPlan *plan = (EdgeRunnerCompiledPlan *)calloc(1, sizeof(EdgeRunnerCompiledPlan));
+-    if (plan == NULL) {
+-        return NULL;
+-    }
+-    plan->version = version;
+-    plan->node_count = node_count;
+-
+-    if (node_count == 0) {
+-        if (remaining != 0) {
+-            destroy_compiled_plan(plan);
+-            return NULL;
+-        }
+-        return plan;
+-    }
+-
+-    plan->nodes = (EdgeRunnerCompiledNode *)calloc(node_count, sizeof(EdgeRunnerCompiledNode));
+-    if (plan->nodes == NULL) {
+-        destroy_compiled_plan(plan);
+-        return NULL;
+-    }
+-
+-    for (uint32_t idx = 0; idx < node_count; ++idx) {
+-        EdgeRunnerCompiledNode *node = &plan->nodes[idx];
+-        uint32_t function_id = 0;
+-        uint32_t name_len = 0;
+-        uint32_t audio_offset = 0;
+-        uint32_t audio_span = 0;
+-        uint32_t param_count = 0;
+-        if (!read_u32_le(&cursor, &remaining, &function_id)
+-            || !read_u32_le(&cursor, &remaining, &name_len)
+-            || !read_u32_le(&cursor, &remaining, &audio_offset)
+-            || !read_u32_le(&cursor, &remaining, &audio_span)
+-            || !read_u32_le(&cursor, &remaining, &param_count)) {
+-            destroy_compiled_plan(plan);
+-            return NULL;
+-        }
+-        if (remaining < name_len) {
+-            destroy_compiled_plan(plan);
+-            return NULL;
+-        }
+-        node->name = (char *)malloc((size_t)name_len + 1);
+-        if (node->name == NULL) {
+-            destroy_compiled_plan(plan);
+-            return NULL;
+-        }
+-        memcpy(node->name, cursor, name_len);
+-        node->name[name_len] = '\0';
+-        node->name_len = name_len;
+-        cursor += name_len;
+-        remaining -= name_len;
+-        node->function_id = function_id;
+-        node->audio_offset = audio_offset;
+-        node->audio_span = audio_span;
+-        node->param_count = param_count;
+-        if (param_count > 0) {
+-            node->params = (EdgeRunnerCompiledParam *)calloc(param_count, sizeof(EdgeRunnerCompiledParam));
+-            if (node->params == NULL) {
+-                destroy_compiled_plan(plan);
+-                return NULL;
+-            }
+-        }
+-        for (uint32_t param_idx = 0; param_idx < param_count; ++param_idx) {
+-            EdgeRunnerCompiledParam *param = &node->params[param_idx];
+-            uint32_t param_name_len = 0;
+-            uint32_t param_offset = 0;
+-            uint32_t param_span = 0;
+-            if (!read_u32_le(&cursor, &remaining, &param_name_len)
+-                || !read_u32_le(&cursor, &remaining, &param_offset)
+-                || !read_u32_le(&cursor, &remaining, &param_span)) {
+-                destroy_compiled_plan(plan);
+-                return NULL;
+-            }
+-            if (remaining < param_name_len) {
+-                destroy_compiled_plan(plan);
+-                return NULL;
+-            }
+-            param->name = (char *)malloc((size_t)param_name_len + 1);
+-            if (param->name == NULL) {
+-                destroy_compiled_plan(plan);
+-                return NULL;
+-            }
+-            memcpy(param->name, cursor, param_name_len);
+-            param->name[param_name_len] = '\0';
+-            param->name_len = param_name_len;
+-            param->offset = param_offset;
+-            param->span = param_span;
+-            cursor += param_name_len;
+-            remaining -= param_name_len;
+-        }
+-    }
+-
+-    if (remaining != 0) {
+-        destroy_compiled_plan(plan);
+-        return NULL;
+-    }
+-
+-    return plan;
+-}
+-
+-AMP_CAPI void amp_release_compiled_plan(EdgeRunnerCompiledPlan *plan) {
+-    AMP_LOG_NATIVE_CALL("amp_release_compiled_plan", (size_t)(plan != NULL), 0);
+-    AMP_LOG_GENERATED("amp_release_compiled_plan", (size_t)plan, 0);
+-    destroy_compiled_plan(plan);
+-}
+-
+-static void destroy_control_history(EdgeRunnerControlHistory *history) {
+-    if (history == NULL) {
+-        return;
+-    }
+-    if (history->curves != NULL) {
+-        for (uint32_t i = 0; i < history->curve_count; ++i) {
+-            EdgeRunnerControlCurve *curve = &history->curves[i];
+-            if (curve->name != NULL) {
+-                free(curve->name);
+-                curve->name = NULL;
+-            }
+-            if (curve->values != NULL) {
+-                free(curve->values);
+-                curve->values = NULL;
+-            }
+-            curve->value_count = 0;
+-        }
+-        free(history->curves);
+-        history->curves = NULL;
+-    }
+-    free(history);
+-}
+-
+-static const EdgeRunnerControlCurve *find_history_curve(
+-    const EdgeRunnerControlHistory *history,
+-    const char *name,
+-    size_t name_len
+-) {
+-    if (history == NULL || name == NULL || name_len == 0) {
+-        return NULL;
+-    }
+-    for (uint32_t i = 0; i < history->curve_count; ++i) {
+-        const EdgeRunnerControlCurve *curve = &history->curves[i];
+-        if (curve->name_len == name_len && curve->name != NULL && strncmp(curve->name, name, name_len) == 0) {
+-            return curve;
+-        }
+-    }
+-    return NULL;
+-}
+-
+-static void apply_history_curve(
+-    double *dest,
+-    int batches,
+-    int frames,
+-    const EdgeRunnerControlCurve *curve
+-) {
+-    if (dest == NULL || curve == NULL || curve->values == NULL || curve->value_count == 0) {
+-        return;
+-    }
+-    int count = (int)curve->value_count;
+-    if (batches <= 0) {
+-        batches = 1;
+-    }
+-    if (frames <= 0) {
+-        frames = 1;
+-    }
+-    for (int b = 0; b < batches; ++b) {
+-        for (int f = 0; f < frames; ++f) {
+-            double value = 0.0;
+-            if (count >= frames) {
+-                if (f < count) {
+-                    value = curve->values[f];
+-                } else {
+-                    value = curve->values[count - 1];
+-                }
+-            } else if (count == 1) {
+-                value = curve->values[0];
+-            } else {
+-                if (f < count) {
+-                    value = curve->values[f];
+-                } else {
+-                    value = curve->values[count - 1];
+-                }
+-            }
+-            dest[((size_t)b * (size_t)frames) + (size_t)f] = value;
+-        }
+-    }
+-}
+-
+-AMP_CAPI EdgeRunnerControlHistory *amp_load_control_history(
+-    const uint8_t *blob,
+-    size_t blob_len,
+-    int frames_hint
+-) {
+-    AMP_LOG_NATIVE_CALL("amp_load_control_history", blob_len, (size_t)frames_hint);
+-    AMP_LOG_GENERATED("amp_load_control_history", (size_t)blob, (size_t)frames_hint);
+-    if (blob == NULL || blob_len < 8) {
+-        return NULL;
+-    }
+-    const uint8_t *cursor = blob;
+-    size_t remaining = blob_len;
+-    uint32_t event_count = 0;
+-    uint32_t key_count = 0;
+-    if (!read_u32_le(&cursor, &remaining, &event_count) || !read_u32_le(&cursor, &remaining, &key_count)) {
+-        return NULL;
+-    }
+-    EdgeRunnerControlHistory *history = (EdgeRunnerControlHistory *)calloc(1, sizeof(EdgeRunnerControlHistory));
+-    if (history == NULL) {
+-        return NULL;
+-    }
+-    history->frames_hint = frames_hint > 0 ? (uint32_t)frames_hint : 0U;
+-    history->curve_count = key_count;
+-    if (key_count > 0) {
+-        history->curves = (EdgeRunnerControlCurve *)calloc(key_count, sizeof(EdgeRunnerControlCurve));
+-        if (history->curves == NULL) {
+-            destroy_control_history(history);
+-            return NULL;
+-        }
+-    }
+-    if (key_count == 0) {
+-        return history;
+-    }
+-    uint32_t *name_lengths = (uint32_t *)calloc(key_count, sizeof(uint32_t));
+-    if (name_lengths == NULL) {
+-        destroy_control_history(history);
+-        return NULL;
+-    }
+-    for (uint32_t i = 0; i < key_count; ++i) {
+-        if (!read_u32_le(&cursor, &remaining, &name_lengths[i])) {
+-            free(name_lengths);
+-            destroy_control_history(history);
+-            return NULL;
+-        }
+-    }
+-    for (uint32_t i = 0; i < key_count; ++i) {
+-        uint32_t name_len = name_lengths[i];
+-        if (remaining < name_len) {
+-            free(name_lengths);
+-            destroy_control_history(history);
+-            return NULL;
+-        }
+-        EdgeRunnerControlCurve *curve = &history->curves[i];
+-        curve->name = (char *)malloc((size_t)name_len + 1);
+-        if (curve->name == NULL) {
+-            free(name_lengths);
+-            destroy_control_history(history);
+-            return NULL;
+-        }
+-        memcpy(curve->name, cursor, name_len);
+-        curve->name[name_len] = '\0';
+-        curve->name_len = name_len;
+-        curve->value_count = 0;
+-        curve->values = NULL;
+-        curve->timestamp = -DBL_MAX;
+-        cursor += name_len;
+-        remaining -= name_len;
+-    }
+-    free(name_lengths);
+-    for (uint32_t event_idx = 0; event_idx < event_count; ++event_idx) {
+-        if (remaining < sizeof(double)) {
+-            destroy_control_history(history);
+-            return NULL;
+-        }
+-        double timestamp = 0.0;
+-        memcpy(&timestamp, cursor, sizeof(double));
+-        cursor += sizeof(double);
+-        remaining -= sizeof(double);
+-        for (uint32_t key_idx = 0; key_idx < key_count; ++key_idx) {
+-            uint32_t value_count = 0;
+-            if (!read_u32_le(&cursor, &remaining, &value_count)) {
+-                destroy_control_history(history);
+-                return NULL;
+-            }
+-            double *values_copy = NULL;
+-            if (value_count > 0) {
+-                size_t bytes = (size_t)value_count * sizeof(double);
+-                if (remaining < bytes) {
+-                    destroy_control_history(history);
+-                    return NULL;
+-                }
+-                values_copy = (double *)malloc(bytes);
+-                if (values_copy == NULL) {
+-                    destroy_control_history(history);
+-                    return NULL;
+-                }
+-                memcpy(values_copy, cursor, bytes);
+-                cursor += bytes;
+-                remaining -= bytes;
+-            }
+-            EdgeRunnerControlCurve *curve = &history->curves[key_idx];
+-            if (value_count > 0 && (curve->values == NULL || timestamp >= curve->timestamp)) {
+-                if (curve->values != NULL) {
+-                    free(curve->values);
+-                }
+-                curve->values = values_copy;
+-                curve->value_count = value_count;
+-                curve->timestamp = timestamp;
+-                values_copy = NULL;
+-            }
+-            if (values_copy != NULL) {
+-                free(values_copy);
+-            }
+-        }
+-    }
+-    return history;
+-}
+-
+-AMP_CAPI void amp_release_control_history(EdgeRunnerControlHistory *history) {
+-    AMP_LOG_NATIVE_CALL("amp_release_control_history", (size_t)(history != NULL), 0);
+-    AMP_LOG_GENERATED("amp_release_control_history", (size_t)history, 0);
+-    destroy_control_history(history);
+-}
+-
+-static int envelope_reserve_scratch(int F) {
+-    size_t needed_boundaries = (size_t)(4 * F + 4);
+-    size_t needed_trig = (size_t)(F > 0 ? F : 1);
+-    size_t needed_bool = (size_t)(F > 0 ? F : 1);
+-
+-    if (envelope_scratch.boundary_cap < needed_boundaries) {
+-        int *new_boundaries = (int *)realloc(envelope_scratch.boundaries, needed_boundaries * sizeof(int));
+-        if (new_boundaries == NULL) {
+-            return 0;
+-        }
+-        envelope_scratch.boundaries = new_boundaries;
+-        envelope_scratch.boundary_cap = needed_boundaries;
+-    }
+-
+-    if (envelope_scratch.trig_cap < needed_trig) {
+-        int *new_trig = (int *)realloc(envelope_scratch.trig_indices, needed_trig * sizeof(int));
+-        if (new_trig == NULL) {
+-            return 0;
+-        }
+-        envelope_scratch.trig_indices = new_trig;
+-        envelope_scratch.trig_cap = needed_trig;
+-    }
+-
+-    if (envelope_scratch.bool_cap < needed_bool) {
+-        int8_t *gate_ptr = envelope_scratch.gate_bool;
+-        int8_t *drone_ptr = envelope_scratch.drone_bool;
+-        int8_t *new_gate = (int8_t *)realloc(gate_ptr, needed_bool * sizeof(int8_t));
+-        int8_t *new_drone = (int8_t *)realloc(drone_ptr, needed_bool * sizeof(int8_t));
+-        if (new_gate == NULL || new_drone == NULL) {
+-            if (new_gate != NULL) {
+-                envelope_scratch.gate_bool = new_gate;
+-            }
+-            if (new_drone != NULL) {
+-                envelope_scratch.drone_bool = new_drone;
+-            }
+-            return 0;
+-        }
+-        envelope_scratch.gate_bool = new_gate;
+-        envelope_scratch.drone_bool = new_drone;
+-        envelope_scratch.bool_cap = needed_bool;
+-    }
+-
+-    return 1;
+-}
+-
+-void lfo_slew(const double* x, double* out, int B, int F, double r, double alpha, double* z0) {
+-    for (int b = 0; b < B; ++b) {
+-        double state = 0.0;
+-        if (z0 != NULL) state = z0[b];
+-        int base = b * F;
+-        for (int i = 0; i < F; ++i) {
+-            double xi = x[base + i];
+-            state = r * state + alpha * xi;
+-            out[base + i] = state;
+-        }
+-        if (z0 != NULL) z0[b] = state;
+-    }
+-}
+-
+-void safety_filter(const double* x, double* y, int B, int C, int F, double a, double* prev_in, double* prev_dc) {
+-    for (int b = 0; b < B; ++b) {
+-        for (int c = 0; c < C; ++c) {
+-            int chan = b * C + c;
+-            double pi = 0.0;
+-            double pd = 0.0;
+-            if (prev_in != NULL) pi = prev_in[chan];
+-            if (prev_dc != NULL) pd = prev_dc[chan];
+-            int base = chan * F;
+-            for (int i = 0; i < F; ++i) {
+-                double xin = x[base + i];
+-                double diff;
+-                if (i == 0) diff = xin - pi;
+-                else diff = xin - x[base + i - 1];
+-                pd = a * pd + diff;
+-                y[base + i] = pd;
+-            }
+-            if (prev_in != NULL) prev_in[chan] = x[base + F - 1];
+-            if (prev_dc != NULL) prev_dc[chan] = y[base + F - 1];
+-        }
+-    }
+-}
+-
+-void dc_block(const double* x, double* out, int B, int C, int F, double a, double* state) {
+-    for (int b = 0; b < B; ++b) {
+-        for (int c = 0; c < C; ++c) {
+-            int chan = b * C + c;
+-            double dc = 0.0;
+-            if (state != NULL) dc = state[chan];
+-            int base = chan * F;
+-            for (int i = 0; i < F; ++i) {
+-                double xin = x[base + i];
+-                dc = a * dc + (1.0 - a) * xin;
+-                out[base + i] = xin - dc;
+-            }
+-            if (state != NULL) state[chan] = dc;
+-        }
+-    }
+-}
+-
+-void subharmonic_process(
+-    const double* x,
+-    double* y,
+-    int B,
+-    int C,
+-    int F,
+-    double a_hp_in,
+-    double a_lp_in,
+-    double a_sub2,
+-    int use_div4,
+-    double a_sub4,
+-    double a_env_attack,
+-    double a_env_release,
+-    double a_hp_out,
+-    double drive,
+-    double mix,
+-    double* hp_y,
+-    double* lp_y,
+-    double* prev,
+-    int8_t* sign,
+-    int8_t* ff2,
+-    int8_t* ff4,
+-    int32_t* ff4_count,
+-    double* sub2_lp,
+-    double* sub4_lp,
+-    double* env,
+-    double* hp_out_y,
+-    double* hp_out_x
+-) {
+-    // Layout: arrays are flattened per-channel: index = (b*C + c) * F + t
+-    for (int t = 0; t < F; ++t) {
+-        for (int b = 0; b < B; ++b) {
+-            for (int c = 0; c < C; ++c) {
+-                int chan = b * C + c;
+-                int base = chan * F;
+-                double xt = x[base + t];
+-
+-                // Bandpass driver: simple HP then LP
+-                double hp_y_val = hp_y[chan];
+-                double prev_val = prev[chan];
+-                double lp_y_val = lp_y[chan];
+-                double hp_in = a_hp_in * (hp_y_val + xt - prev_val);
+-                hp_y[chan] = hp_in;
+-                prev[chan] = xt;
+-                double bp = lp_y_val + a_lp_in * (hp_in - lp_y_val);
+-                lp_y[chan] = bp;
+-
+-                // env
+-                double abs_bp = fabs(bp);
+-                double env_val = env[chan];
+-                if (abs_bp > env_val) env_val = env_val + a_env_attack * (abs_bp - env_val);
+-                else env_val = env_val + a_env_release * (abs_bp - env_val);
+-                env[chan] = env_val;
+-
+-                // sign and flip-flops
+-                int8_t prev_sign = sign[chan];
+-                int8_t sign_now = (bp > 0.0) ? 1 : -1;
+-                int pos_zc = (prev_sign < 0) && (sign_now > 0);
+-                sign[chan] = sign_now;
+-
+-                if (pos_zc) ff2[chan] = -ff2[chan];
+-
+-                if (use_div4) {
+-                    if (pos_zc) ff4_count[chan] = ff4_count[chan] + 1;
+-                    int toggle4 = (pos_zc && (ff4_count[chan] >= 2));
+-                    if (toggle4) ff4[chan] = -ff4[chan];
+-                    if (toggle4) ff4_count[chan] = 0;
+-                }
+-
+-                double sq2 = (double) ff2[chan];
+-                double sub2_lp_val = sub2_lp[chan];
+-                sub2_lp_val = sub2_lp_val + a_sub2 * (sq2 - sub2_lp_val);
+-                sub2_lp[chan] = sub2_lp_val;
+-                double sub_val = sub2_lp_val;
+-
+-                if (use_div4) {
+-                    double sq4 = (double) ff4[chan];
+-                    double sub4_lp_val = sub4_lp[chan];
+-                    sub4_lp_val = sub4_lp_val + a_sub4 * (sq4 - sub4_lp_val);
+-                    sub4_lp[chan] = sub4_lp_val;
+-                    sub_val = sub_val + 0.6 * sub4_lp_val;
+-                }
+-
+-                double sub = tanh(drive * sub_val) * (env_val + 1e-6);
+-
+-                double dry = xt;
+-                double wet = sub;
+-                double out_t = (1.0 - mix) * dry + mix * wet;
+-
+-                double y_prev = hp_out_y[chan];
+-                double x_prev = hp_out_x[chan];
+-                double hp = a_hp_out * (y_prev + out_t - x_prev);
+-                hp_out_y[chan] = hp;
+-                hp_out_x[chan] = out_t;
+-                y[base + t] = hp;
+-            }
+-        }
+-    }
+-}
+-
+-static void envelope_start_attack(
+-    int index,
+-    const double* velocity,
+-    int send_resets,
+-    double* reset_line,
+-    int* stage,
+-    double* timer,
+-    double* value,
+-    double* vel_state,
+-    double* release_start,
+-    int64_t* activations
+-) {
+-    double vel = velocity[index];
+     if (vel < 0.0) vel = 0.0;
+     *stage = 1;
+     *timer = 0.0;
+@@ -1543,38 +900,50 @@ typedef struct {
+             int use_div4;
+         } subharm;
+         struct {
+-            double *input_buffer;
+-            double *divisor_buffer;
+-            double *divisor_imag_buffer;
+-            double *phase_buffer;
+-            double *lower_buffer;
+-            double *upper_buffer;
+-            double *filter_buffer;
++            double *history_signal;
++            double *history_phase;
++            double *history_lower;
++            double *history_upper;
++            double *history_filter;
++            double *history_epsilon;
++            int *history_algorithm;
++            double *output_history;
++            uint8_t *output_ready;
+             double *window;
+             double *work_real;
+             double *work_imag;
+-            double *div_real;
+-            double *div_imag;
+             double *ifft_real;
+             double *ifft_imag;
+-            double *result_buffer;
+-            double *div_fft_real;
+-            double *div_fft_imag;
+-            double *recomb_buffer;
++            double *batch_input_real;
++            double *batch_input_imag;
++            int *batch_slot_map;
++            int64_t *batch_center_index;
++            int *batch_algorithm_kind;
++            double *batch_phase;
++            double *batch_lower;
++            double *batch_upper;
++            double *batch_filter;
++            double *batch_epsilon;
++            int *history_start;
++            int *history_count;
++            int *history_write;
++            int64_t *history_sample_count;
++            int64_t *history_next_center;
+             int window_size;
+-            int algorithm;
+             int window_kind;
+-            int filled;
+-            int position;
+-            double epsilon;
++            int slots;
+             int batches;
+             int channels;
+-            int slots;
+-            int recomb_filled;
++            int algorithm;
++            int window_left;
++            int window_right;
++            int window_hop;
++            int history_capacity;
+             double last_phase;
+             double last_lower;
+             double last_upper;
+             double last_filter;
++            double epsilon;
+             double total_heat;
+             int dynamic_carrier_band_count;
+             double dynamic_carrier_last_sum;
+@@ -1584,6 +953,9 @@ typedef struct {
+             int dynamic_k_active;
+             int enable_remainder;
+             double remainder_energy;
++            int max_batch_windows;
++            int batch_capacity;
++            int64_t frames_processed;
+         } fftdiv;
+         struct {
+             int mode;
+@@ -2181,7 +1553,6 @@ static const double *ensure_param_plane(
+     }
+     double *buf = (double *)malloc(total * sizeof(double));
+     amp_last_alloc_count = total;
+-    amp_last_alloc_count = total;
+     if (buf == NULL) {
+         return NULL;
+     }
+@@ -2792,6 +2163,305 @@ static const fft_algorithm_class_t *select_fft_algorithm(int kind) {
+     return NULL;
+ }
+ 
++static void fft_algorithm_batched_forward(
++    const fft_algorithm_class_t *cls,
++    double *in_real,
++    double *in_imag,
++    int n,
++    int slots
++) {
++    if (cls == NULL || cls->forward == NULL || n <= 0 || slots <= 0) {
++        return;
++    }
++    for (int s = 0; s < slots; ++s) {
++        double *r = in_real + (size_t)s * (size_t)n;
++        double *i = in_imag + (size_t)s * (size_t)n;
++        cls->forward(r, i, r, i, n);
++    }
++}
++
++static void fft_algorithm_batched_inverse(
++    const fft_algorithm_class_t *cls,
++    double *in_real,
++    double *in_imag,
++    int n,
++    int slots
++) {
++    if (cls == NULL || cls->inverse == NULL || n <= 0 || slots <= 0) {
++        return;
++    }
++    for (int s = 0; s < slots; ++s) {
++        double *r = in_real + (size_t)s * (size_t)n;
++        double *i = in_imag + (size_t)s * (size_t)n;
++        cls->inverse(r, i, r, i, n);
++    }
++}
++
++static size_t fftdiv_history_base(const node_state_t *state, int slot) {
++    if (state == NULL || slot < 0 || state->u.fftdiv.history_capacity <= 0) {
++        return 0;
++    }
++    return (size_t)slot * (size_t)state->u.fftdiv.history_capacity;
++}
++
++static int fftdiv_store_output(node_state_t *state, int slot, int64_t center_index, double value) {
++    if (state == NULL || slot < 0 || slot >= state->u.fftdiv.slots) {
++        return -1;
++    }
++    int history_capacity = state->u.fftdiv.history_capacity;
++    if (history_capacity <= 0) {
++        return -1;
++    }
++    int history_count = state->u.fftdiv.history_count[slot];
++    int history_start = state->u.fftdiv.history_start[slot];
++    int64_t sample_count = state->u.fftdiv.history_sample_count[slot];
++    int64_t history_base_index = sample_count - (int64_t)history_count;
++    if (center_index < history_base_index) {
++        return -1;
++    }
++    int64_t relative = center_index - history_base_index;
++    if (relative < 0 || relative >= history_count) {
++        return -1;
++    }
++    int ring_index = (history_start + (int)relative) % history_capacity;
++    size_t base = fftdiv_history_base(state, slot);
++    state->u.fftdiv.output_history[base + (size_t)ring_index] = value;
++    state->u.fftdiv.output_ready[base + (size_t)ring_index] = 1;
++    return 0;
++}
++
++static void fftdiv_align_next_center(node_state_t *state, int slot) {
++    if (state == NULL || slot < 0 || slot >= state->u.fftdiv.slots) {
++        return;
++    }
++    int history_count = state->u.fftdiv.history_count[slot];
++    int window_left = state->u.fftdiv.window_left;
++    int64_t sample_count = state->u.fftdiv.history_sample_count[slot];
++    int64_t base_index = sample_count - (int64_t)history_count;
++    int64_t minimum_center = base_index + (int64_t)window_left;
++    if (state->u.fftdiv.history_next_center[slot] < minimum_center) {
++        state->u.fftdiv.history_next_center[slot] = minimum_center;
++    }
++}
++
++static void fftdiv_history_push_sample(
++    node_state_t *state,
++    int slot,
++    double signal,
++    double phase,
++    double lower,
++    double upper,
++    double filter,
++    double epsilon,
++    int algorithm_kind
++) {
++    if (state == NULL || slot < 0 || slot >= state->u.fftdiv.slots) {
++        return;
++    }
++    int capacity = state->u.fftdiv.history_capacity;
++    if (capacity <= 0) {
++        return;
++    }
++    size_t base = fftdiv_history_base(state, slot);
++    int write_index = state->u.fftdiv.history_write[slot];
++    state->u.fftdiv.history_signal[base + (size_t)write_index] = signal;
++    state->u.fftdiv.history_phase[base + (size_t)write_index] = phase;
++    state->u.fftdiv.history_lower[base + (size_t)write_index] = lower;
++    state->u.fftdiv.history_upper[base + (size_t)write_index] = upper;
++    state->u.fftdiv.history_filter[base + (size_t)write_index] = filter;
++    state->u.fftdiv.history_epsilon[base + (size_t)write_index] = epsilon;
++    state->u.fftdiv.history_algorithm[base + (size_t)write_index] = algorithm_kind;
++    state->u.fftdiv.output_ready[base + (size_t)write_index] = 0;
++    write_index += 1;
++    if (write_index >= capacity) {
++        write_index = 0;
++    }
++    int count = state->u.fftdiv.history_count[slot];
++    if (count < capacity) {
++        count += 1;
++    } else {
++        int start = state->u.fftdiv.history_start[slot];
++        start += 1;
++        if (start >= capacity) {
++            start = 0;
++        }
++        state->u.fftdiv.history_start[slot] = start;
++    }
++    state->u.fftdiv.history_count[slot] = count;
++    state->u.fftdiv.history_write[slot] = write_index;
++    state->u.fftdiv.history_sample_count[slot] += 1;
++    fftdiv_align_next_center(state, slot);
++}
++
++static int fftdiv_history_resolve_index(
++    const node_state_t *state,
++    int slot,
++    int64_t absolute_index,
++    int *out_ring_index
++) {
++    if (state == NULL || slot < 0 || slot >= state->u.fftdiv.slots || out_ring_index == NULL) {
++        return -1;
++    }
++    int history_count = state->u.fftdiv.history_count[slot];
++    if (history_count <= 0) {
++        return -1;
++    }
++    int capacity = state->u.fftdiv.history_capacity;
++    if (capacity <= 0) {
++        return -1;
++    }
++    int64_t sample_count = state->u.fftdiv.history_sample_count[slot];
++    int64_t base_index = sample_count - (int64_t)history_count;
++    if (absolute_index < base_index) {
++        return -1;
++    }
++    int64_t relative = absolute_index - base_index;
++    if (relative < 0 || relative >= history_count) {
++        return -1;
++    }
++    int start = state->u.fftdiv.history_start[slot];
++    int ring_index = (start + (int)relative) % capacity;
++    *out_ring_index = ring_index;
++    return 0;
++}
++
++static int fftdiv_copy_window_from_history(
++    node_state_t *state,
++    int slot,
++    int64_t start_index,
++    int window_size,
++    double *dest_real,
++    double *dest_imag
++) {
++    if (state == NULL || dest_real == NULL || dest_imag == NULL || window_size <= 0) {
++        return -1;
++    }
++    int capacity = state->u.fftdiv.history_capacity;
++    if (capacity <= 0) {
++        return -1;
++    }
++    size_t base = fftdiv_history_base(state, slot);
++    for (int i = 0; i < window_size; ++i) {
++        int ring_index = 0;
++        if (fftdiv_history_resolve_index(state, slot, start_index + (int64_t)i, &ring_index) != 0) {
++            return -1;
++        }
++        double sample = state->u.fftdiv.history_signal[base + (size_t)ring_index];
++        double window_coeff = state->u.fftdiv.window[i];
++        dest_real[i] = sample * window_coeff;
++        dest_imag[i] = 0.0;
++    }
++    return 0;
++}
++
++static int fftdiv_history_window_ready(const node_state_t *state, int slot) {
++    if (state == NULL || slot < 0 || slot >= state->u.fftdiv.slots) {
++        return 0;
++    }
++    int history_count = state->u.fftdiv.history_count[slot];
++    if (history_count <= 0) {
++        return 0;
++    }
++    int64_t sample_count = state->u.fftdiv.history_sample_count[slot];
++    if (sample_count <= 0) {
++        return 0;
++    }
++    int window_left = state->u.fftdiv.window_left;
++    int window_right = state->u.fftdiv.window_right;
++    int64_t next_center = state->u.fftdiv.history_next_center[slot];
++    int64_t base_index = sample_count - (int64_t)history_count;
++    if (next_center < base_index + (int64_t)window_left) {
++        return 0;
++    }
++    int64_t latest_index = sample_count - 1;
++    if (latest_index < next_center + (int64_t)window_right - 1) {
++        return 0;
++    }
++    return 1;
++}
++
++static void fftdiv_flush_batch(
++    node_state_t *state,
++    const fft_algorithm_class_t *algorithm_class,
++    int window_size,
++    int batch_count
++) {
++    if (state == NULL || algorithm_class == NULL || batch_count <= 0 || window_size <= 0) {
++        return;
++    }
++    double *sig_real = state->u.fftdiv.batch_input_real;
++    double *sig_imag = state->u.fftdiv.batch_input_imag;
++    int *slot_map = state->u.fftdiv.batch_slot_map;
++    int64_t *center_index_map = state->u.fftdiv.batch_center_index;
++    int *algorithm_kind_map = state->u.fftdiv.batch_algorithm_kind;
++    double *phase_map = state->u.fftdiv.batch_phase;
++    double *lower_map = state->u.fftdiv.batch_lower;
++    double *upper_map = state->u.fftdiv.batch_upper;
++    double *filter_map = state->u.fftdiv.batch_filter;
++    double *epsilon_map = state->u.fftdiv.batch_epsilon;
++    if (
++        sig_real == NULL || sig_imag == NULL
++        || slot_map == NULL || center_index_map == NULL
++        || algorithm_kind_map == NULL
++        || phase_map == NULL || lower_map == NULL || upper_map == NULL
++        || filter_map == NULL || epsilon_map == NULL
++    ) {
++        return;
++    }
++
++    fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count);
++
++    for (int b = 0; b < batch_count; ++b) {
++        size_t batch_offset = (size_t)b * (size_t)window_size;
++        double *sig_real_base = sig_real + batch_offset;
++        double *sig_imag_base = sig_imag + batch_offset;
++        double phase_mod = phase_map[b];
++        double lower_mod = lower_map[b];
++        double upper_mod = upper_map[b];
++        double filter_mod = filter_map[b];
++        double epsilon_frame = epsilon_map[b];
++        double lower_clamped = clamp_unit_double(lower_mod);
++        double upper_clamped = clamp_unit_double(upper_mod);
++        if (upper_clamped < lower_clamped) {
++            double tmp_bounds = lower_clamped;
++            lower_clamped = upper_clamped;
++            upper_clamped = tmp_bounds;
++        }
++        double intensity_clamped = clamp_unit_double(filter_mod);
++        double cos_phase = cos(phase_mod);
++        double sin_phase = sin(phase_mod);
++        for (int i = 0; i < window_size; ++i) {
++            double real = sig_real_base[i];
++            double imag = sig_imag_base[i];
++            double ratio = window_size > 1 ? (double)i / (double)(window_size - 1) : 0.0;
++            double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
++            if (gain < 1e-6) {
++                gain = 1e-6;
++            }
++            double gated_real = real * gain;
++            double gated_imag = imag * gain;
++            double rotated_real = gated_real * cos_phase - gated_imag * sin_phase;
++            double rotated_imag = gated_real * sin_phase + gated_imag * cos_phase;
++            sig_real_base[i] = rotated_real;
++            sig_imag_base[i] = rotated_imag;
++        }
++        (void)epsilon_frame;
++        (void)algorithm_kind_map;
++    }
++
++    fft_algorithm_batched_inverse(algorithm_class, sig_real, sig_imag, window_size, batch_count);
++
++    for (int b = 0; b < batch_count; ++b) {
++        size_t batch_offset = (size_t)b * (size_t)window_size;
++        double *sig_real_base = sig_real + batch_offset;
++        int slot = slot_map[b];
++        int64_t center_index = center_index_map[b];
++        double center_value = sig_real_base[state->u.fftdiv.window_left < window_size ? state->u.fftdiv.window_left : window_size - 1];
++        fftdiv_store_output(state, slot, center_index, center_value);
++        state->u.fftdiv.batch_slot_map[b] = slot_map[b];
++    }
++}
++
+ static void fill_window_weights(double *window, int window_size, int window_kind) {
+     if (window == NULL || window_size <= 0) {
+         return;
+@@ -2825,70 +2495,104 @@ static void fft_state_free_buffers(node_state_t *state) {
+     if (state == NULL) {
+         return;
+     }
+-    free(state->u.fftdiv.input_buffer);
+-    free(state->u.fftdiv.divisor_buffer);
+-    free(state->u.fftdiv.divisor_imag_buffer);
+-    free(state->u.fftdiv.phase_buffer);
+-    free(state->u.fftdiv.lower_buffer);
+-    free(state->u.fftdiv.upper_buffer);
+-    free(state->u.fftdiv.filter_buffer);
++    free(state->u.fftdiv.history_signal);
++    free(state->u.fftdiv.history_phase);
++    free(state->u.fftdiv.history_lower);
++    free(state->u.fftdiv.history_upper);
++    free(state->u.fftdiv.history_filter);
++    free(state->u.fftdiv.history_epsilon);
++    free(state->u.fftdiv.history_algorithm);
++    free(state->u.fftdiv.output_history);
++    free(state->u.fftdiv.output_ready);
+     free(state->u.fftdiv.window);
+     free(state->u.fftdiv.work_real);
+     free(state->u.fftdiv.work_imag);
+-    free(state->u.fftdiv.div_real);
+-    free(state->u.fftdiv.div_imag);
+     free(state->u.fftdiv.ifft_real);
+     free(state->u.fftdiv.ifft_imag);
+-    free(state->u.fftdiv.result_buffer);
+-    free(state->u.fftdiv.div_fft_real);
+-    free(state->u.fftdiv.div_fft_imag);
+-    free(state->u.fftdiv.recomb_buffer);
++    free(state->u.fftdiv.batch_input_real);
++    free(state->u.fftdiv.batch_input_imag);
++    free(state->u.fftdiv.batch_slot_map);
++    free(state->u.fftdiv.batch_center_index);
++    free(state->u.fftdiv.batch_algorithm_kind);
++    free(state->u.fftdiv.batch_phase);
++    free(state->u.fftdiv.batch_lower);
++    free(state->u.fftdiv.batch_upper);
++    free(state->u.fftdiv.batch_filter);
++    free(state->u.fftdiv.batch_epsilon);
+     free(state->u.fftdiv.dynamic_phase);
+     free(state->u.fftdiv.dynamic_step_re);
+     free(state->u.fftdiv.dynamic_step_im);
+-    state->u.fftdiv.input_buffer = NULL;
+-    state->u.fftdiv.divisor_buffer = NULL;
+-    state->u.fftdiv.divisor_imag_buffer = NULL;
+-    state->u.fftdiv.phase_buffer = NULL;
+-    state->u.fftdiv.lower_buffer = NULL;
+-    state->u.fftdiv.upper_buffer = NULL;
+-    state->u.fftdiv.filter_buffer = NULL;
++    free(state->u.fftdiv.history_start);
++    free(state->u.fftdiv.history_count);
++    free(state->u.fftdiv.history_write);
++    free(state->u.fftdiv.history_sample_count);
++    free(state->u.fftdiv.history_next_center);
++    state->u.fftdiv.history_signal = NULL;
++    state->u.fftdiv.history_phase = NULL;
++    state->u.fftdiv.history_lower = NULL;
++    state->u.fftdiv.history_upper = NULL;
++    state->u.fftdiv.history_filter = NULL;
++    state->u.fftdiv.history_epsilon = NULL;
++    state->u.fftdiv.history_algorithm = NULL;
++    state->u.fftdiv.output_history = NULL;
++    state->u.fftdiv.output_ready = NULL;
+     state->u.fftdiv.window = NULL;
+     state->u.fftdiv.work_real = NULL;
+     state->u.fftdiv.work_imag = NULL;
+-    state->u.fftdiv.div_real = NULL;
+-    state->u.fftdiv.div_imag = NULL;
+     state->u.fftdiv.ifft_real = NULL;
+     state->u.fftdiv.ifft_imag = NULL;
+-    state->u.fftdiv.result_buffer = NULL;
+-    state->u.fftdiv.div_fft_real = NULL;
+-    state->u.fftdiv.div_fft_imag = NULL;
+-    state->u.fftdiv.recomb_buffer = NULL;
++    state->u.fftdiv.batch_input_real = NULL;
++    state->u.fftdiv.batch_input_imag = NULL;
++    state->u.fftdiv.batch_slot_map = NULL;
++    state->u.fftdiv.batch_center_index = NULL;
++    state->u.fftdiv.batch_algorithm_kind = NULL;
++    state->u.fftdiv.batch_phase = NULL;
++    state->u.fftdiv.batch_lower = NULL;
++    state->u.fftdiv.batch_upper = NULL;
++    state->u.fftdiv.batch_filter = NULL;
++    state->u.fftdiv.batch_epsilon = NULL;
+     state->u.fftdiv.dynamic_phase = NULL;
+     state->u.fftdiv.dynamic_step_re = NULL;
+     state->u.fftdiv.dynamic_step_im = NULL;
++    state->u.fftdiv.history_start = NULL;
++    state->u.fftdiv.history_count = NULL;
++    state->u.fftdiv.history_write = NULL;
++    state->u.fftdiv.history_sample_count = NULL;
++    state->u.fftdiv.history_next_center = NULL;
+     state->u.fftdiv.window_size = 0;
+-    state->u.fftdiv.algorithm = FFT_ALGORITHM_EIGEN;
+     state->u.fftdiv.window_kind = -1;
+-    state->u.fftdiv.filled = 0;
+-    state->u.fftdiv.position = 0;
++    state->u.fftdiv.slots = 0;
+     state->u.fftdiv.batches = 0;
+     state->u.fftdiv.channels = 0;
+-    state->u.fftdiv.slots = 0;
+-    state->u.fftdiv.epsilon = 0.0;
+-    state->u.fftdiv.recomb_filled = 0;
++    state->u.fftdiv.algorithm = FFT_ALGORITHM_EIGEN;
++    state->u.fftdiv.window_left = 0;
++    state->u.fftdiv.window_right = 0;
++    state->u.fftdiv.window_hop = 1;
++    state->u.fftdiv.history_capacity = 0;
+     state->u.fftdiv.last_phase = 0.0;
+     state->u.fftdiv.last_lower = 0.0;
+     state->u.fftdiv.last_upper = 1.0;
+     state->u.fftdiv.last_filter = 1.0;
++    state->u.fftdiv.epsilon = 0.0;
+     state->u.fftdiv.dynamic_carrier_band_count = 0;
+     state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
+     state->u.fftdiv.dynamic_k_active = 0;
+     state->u.fftdiv.enable_remainder = 1;
+     state->u.fftdiv.remainder_energy = 0.0;
++    state->u.fftdiv.max_batch_windows = 0;
++    state->u.fftdiv.batch_capacity = 0;
++    state->u.fftdiv.frames_processed = 0;
+ }
+ 
+-static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_size) {
++static int ensure_fft_state_buffers(
++    node_state_t *state,
++    int slots,
++    int window_size,
++    int max_batch_windows,
++    int window_left,
++    int window_right,
++    int window_hop
++) {
+     if (state == NULL) {
+         return -1;
+     }
+@@ -2898,58 +2602,149 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
+     if (window_size <= 0) {
+         window_size = 1;
+     }
+-    if (state->u.fftdiv.input_buffer != NULL && state->u.fftdiv.window_size == window_size && state->u.fftdiv.slots == slots) {
++    if (max_batch_windows <= 0) {
++        max_batch_windows = 1;
++    }
++    if (window_hop <= 0) {
++        window_hop = 1;
++    }
++    if (window_left < 0) {
++        window_left = 0;
++    }
++    if (window_right <= 0) {
++        window_right = window_size;
++    }
++    int prev_window_size = state->u.fftdiv.window_size;
++    int prev_slots = state->u.fftdiv.slots;
++    int prev_batch = state->u.fftdiv.max_batch_windows;
++    int prev_history_capacity = state->u.fftdiv.history_capacity;
++    int prev_window_left = state->u.fftdiv.window_left;
++    int prev_window_right = state->u.fftdiv.window_right;
++    int prev_window_hop = state->u.fftdiv.window_hop;
++    size_t history_capacity_required_size_t = 0;
++    if (max_batch_windows > 0) {
++        history_capacity_required_size_t = (size_t)window_size
++            + (size_t)window_left
++            + (size_t)window_right
++            + ((size_t)window_hop * (size_t)(max_batch_windows - 1));
++    }
++    if (history_capacity_required_size_t == 0) {
++        history_capacity_required_size_t = (size_t)window_size + (size_t)window_left + (size_t)window_right;
++    }
++    if (history_capacity_required_size_t < (size_t)window_size) {
++        history_capacity_required_size_t = (size_t)window_size;
++    }
++    if (history_capacity_required_size_t > (size_t)INT_MAX) {
++        return -1;
++    }
++    int history_capacity = (int)history_capacity_required_size_t;
++    if (
++        state->u.fftdiv.history_signal != NULL
++        && prev_window_size == window_size
++        && prev_slots == slots
++        && prev_batch == max_batch_windows
++        && prev_history_capacity == history_capacity
++        && prev_window_left == window_left
++        && prev_window_right == window_right
++        && prev_window_hop == window_hop
++    ) {
+         return 0;
+     }
+     double preserved_heat = state->u.fftdiv.total_heat;
+     fft_state_free_buffers(state);
+-    size_t total = (size_t)window_size * (size_t)slots;
+-    if (total == 0) {
++    size_t slot_count = (size_t)slots;
++    size_t batch_capacity = (size_t)max_batch_windows;
++    size_t window_samples = (size_t)window_size;
++    size_t history_total = slot_count * (size_t)history_capacity;
++    if (window_samples == 0 || history_total == 0 || batch_capacity == 0) {
+         state->u.fftdiv.total_heat = preserved_heat;
+         return -1;
+     }
+-    state->u.fftdiv.input_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.divisor_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.divisor_imag_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.phase_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.lower_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.upper_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.filter_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.window = (double *)calloc((size_t)window_size, sizeof(double));
+-    state->u.fftdiv.work_real = (double *)calloc((size_t)window_size, sizeof(double));
+-    state->u.fftdiv.work_imag = (double *)calloc((size_t)window_size, sizeof(double));
+-    state->u.fftdiv.div_real = (double *)calloc((size_t)window_size, sizeof(double));
+-    state->u.fftdiv.div_imag = (double *)calloc((size_t)window_size, sizeof(double));
+-    state->u.fftdiv.ifft_real = (double *)calloc((size_t)window_size, sizeof(double));
+-    state->u.fftdiv.ifft_imag = (double *)calloc((size_t)window_size, sizeof(double));
+-    state->u.fftdiv.result_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.div_fft_real = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.div_fft_imag = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.recomb_buffer = (double *)calloc(total, sizeof(double));
+-    state->u.fftdiv.dynamic_phase = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
+-    state->u.fftdiv.dynamic_step_re = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
+-    state->u.fftdiv.dynamic_step_im = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
+-    if (state->u.fftdiv.input_buffer == NULL || state->u.fftdiv.divisor_buffer == NULL || state->u.fftdiv.divisor_imag_buffer == NULL
+-        || state->u.fftdiv.phase_buffer == NULL || state->u.fftdiv.lower_buffer == NULL || state->u.fftdiv.upper_buffer == NULL
+-        || state->u.fftdiv.filter_buffer == NULL || state->u.fftdiv.window == NULL || state->u.fftdiv.work_real == NULL
+-        || state->u.fftdiv.work_imag == NULL || state->u.fftdiv.div_real == NULL || state->u.fftdiv.div_imag == NULL
+-        || state->u.fftdiv.ifft_real == NULL || state->u.fftdiv.ifft_imag == NULL || state->u.fftdiv.result_buffer == NULL
+-        || state->u.fftdiv.div_fft_real == NULL || state->u.fftdiv.div_fft_imag == NULL || state->u.fftdiv.recomb_buffer == NULL
+-        || state->u.fftdiv.dynamic_phase == NULL || state->u.fftdiv.dynamic_step_re == NULL || state->u.fftdiv.dynamic_step_im == NULL) {
++    size_t batch_total = window_samples * batch_capacity;
++    state->u.fftdiv.history_signal = (double *)calloc(history_total, sizeof(double));
++    state->u.fftdiv.history_phase = (double *)calloc(history_total, sizeof(double));
++    state->u.fftdiv.history_lower = (double *)calloc(history_total, sizeof(double));
++    state->u.fftdiv.history_upper = (double *)calloc(history_total, sizeof(double));
++    state->u.fftdiv.history_filter = (double *)calloc(history_total, sizeof(double));
++    state->u.fftdiv.history_epsilon = (double *)calloc(history_total, sizeof(double));
++    state->u.fftdiv.history_algorithm = (int *)calloc(history_total, sizeof(int));
++    state->u.fftdiv.output_history = (double *)calloc(history_total, sizeof(double));
++    state->u.fftdiv.output_ready = (uint8_t *)calloc(history_total, sizeof(uint8_t));
++    state->u.fftdiv.window = (double *)calloc(window_samples, sizeof(double));
++    state->u.fftdiv.work_real = (double *)calloc(window_samples, sizeof(double));
++    state->u.fftdiv.work_imag = (double *)calloc(window_samples, sizeof(double));
++    state->u.fftdiv.ifft_real = (double *)calloc(window_samples, sizeof(double));
++    state->u.fftdiv.ifft_imag = (double *)calloc(window_samples, sizeof(double));
++    state->u.fftdiv.batch_input_real = (double *)calloc(batch_total, sizeof(double));
++    state->u.fftdiv.batch_input_imag = (double *)calloc(batch_total, sizeof(double));
++    state->u.fftdiv.batch_slot_map = (int *)calloc(batch_capacity, sizeof(int));
++    state->u.fftdiv.batch_center_index = (int64_t *)calloc(batch_capacity, sizeof(int64_t));
++    state->u.fftdiv.batch_algorithm_kind = (int *)calloc(batch_capacity, sizeof(int));
++    state->u.fftdiv.batch_phase = (double *)calloc(batch_capacity, sizeof(double));
++    state->u.fftdiv.batch_lower = (double *)calloc(batch_capacity, sizeof(double));
++    state->u.fftdiv.batch_upper = (double *)calloc(batch_capacity, sizeof(double));
++    state->u.fftdiv.batch_filter = (double *)calloc(batch_capacity, sizeof(double));
++    state->u.fftdiv.batch_epsilon = (double *)calloc(batch_capacity, sizeof(double));
++    state->u.fftdiv.history_start = (int *)calloc(slot_count, sizeof(int));
++    state->u.fftdiv.history_count = (int *)calloc(slot_count, sizeof(int));
++    state->u.fftdiv.history_write = (int *)calloc(slot_count, sizeof(int));
++    state->u.fftdiv.history_sample_count = (int64_t *)calloc(slot_count, sizeof(int64_t));
++    state->u.fftdiv.history_next_center = (int64_t *)calloc(slot_count, sizeof(int64_t));
++    state->u.fftdiv.dynamic_phase = (double *)calloc(slot_count * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
++    state->u.fftdiv.dynamic_step_re = (double *)calloc(slot_count * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
++    state->u.fftdiv.dynamic_step_im = (double *)calloc(slot_count * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
++    if (
++        state->u.fftdiv.history_signal == NULL
++        || state->u.fftdiv.history_phase == NULL
++        || state->u.fftdiv.history_lower == NULL
++        || state->u.fftdiv.history_upper == NULL
++        || state->u.fftdiv.history_filter == NULL
++        || state->u.fftdiv.history_epsilon == NULL
++        || state->u.fftdiv.history_algorithm == NULL
++        || state->u.fftdiv.output_history == NULL
++        || state->u.fftdiv.output_ready == NULL
++        || state->u.fftdiv.window == NULL
++        || state->u.fftdiv.work_real == NULL
++        || state->u.fftdiv.work_imag == NULL
++        || state->u.fftdiv.ifft_real == NULL
++        || state->u.fftdiv.ifft_imag == NULL
++        || state->u.fftdiv.batch_input_real == NULL
++        || state->u.fftdiv.batch_input_imag == NULL
++        || state->u.fftdiv.batch_slot_map == NULL
++        || state->u.fftdiv.batch_center_index == NULL
++        || state->u.fftdiv.batch_algorithm_kind == NULL
++        || state->u.fftdiv.batch_phase == NULL
++        || state->u.fftdiv.batch_lower == NULL
++        || state->u.fftdiv.batch_upper == NULL
++        || state->u.fftdiv.batch_filter == NULL
++        || state->u.fftdiv.batch_epsilon == NULL
++        || state->u.fftdiv.history_start == NULL
++        || state->u.fftdiv.history_count == NULL
++        || state->u.fftdiv.history_write == NULL
++        || state->u.fftdiv.history_sample_count == NULL
++        || state->u.fftdiv.history_next_center == NULL
++        || state->u.fftdiv.dynamic_phase == NULL
++        || state->u.fftdiv.dynamic_step_re == NULL
++        || state->u.fftdiv.dynamic_step_im == NULL
++    ) {
+         fft_state_free_buffers(state);
+         state->u.fftdiv.total_heat = preserved_heat;
+         return -1;
+     }
+     state->u.fftdiv.window_size = window_size;
+     state->u.fftdiv.slots = slots;
+-    state->u.fftdiv.filled = 0;
+-    state->u.fftdiv.position = window_size > 0 ? window_size - 1 : 0;
+-    state->u.fftdiv.algorithm = FFT_ALGORITHM_EIGEN;
++    state->u.fftdiv.max_batch_windows = max_batch_windows;
++    state->u.fftdiv.batch_capacity = (int)batch_capacity;
+     state->u.fftdiv.window_kind = -1;
+     state->u.fftdiv.batches = 0;
+     state->u.fftdiv.channels = 0;
++    state->u.fftdiv.algorithm = FFT_ALGORITHM_EIGEN;
++    state->u.fftdiv.window_left = window_left;
++    state->u.fftdiv.window_right = window_right;
++    state->u.fftdiv.window_hop = window_hop;
++    state->u.fftdiv.history_capacity = history_capacity;
+     state->u.fftdiv.epsilon = 1e-9;
+-    state->u.fftdiv.recomb_filled = 0;
++    state->u.fftdiv.frames_processed = 0;
+     state->u.fftdiv.last_phase = 0.0;
+     state->u.fftdiv.last_lower = 0.0;
+     state->u.fftdiv.last_upper = 1.0;
+@@ -2960,6 +2755,9 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
+     state->u.fftdiv.dynamic_k_active = 0;
+     state->u.fftdiv.enable_remainder = 1;
+     state->u.fftdiv.remainder_energy = 0.0;
++    for (int slot = 0; slot < slots; ++slot) {
++        state->u.fftdiv.history_next_center[slot] = (int64_t)window_left;
++    }
+     return 0;
+ }
+ 
+@@ -5144,6 +4942,15 @@ static int run_fft_division_node(
+     if (epsilon_json <= 0.0) {
+         epsilon_json = 1e-9;
+     }
++    int max_batch_windows = json_get_int(
++        descriptor->params_json,
++        descriptor->params_len,
++        "max_batch_windows",
++        32
++    );
++    if (max_batch_windows <= 0) {
++        max_batch_windows = 1;
++    }
+     int enable_remainder = json_get_bool(
+         descriptor->params_json,
+         descriptor->params_len,
+@@ -5156,7 +4963,7 @@ static int run_fft_division_node(
+     int default_window_kind = parse_window_string(descriptor->params_json, descriptor->params_len, FFT_WINDOW_HANN);
+     default_window_kind = clamp_window_kind(default_window_kind);
+ 
+-    if (ensure_fft_state_buffers(state, slot_count, window_size) != 0) {
++    if (ensure_fft_state_buffers(state, slot_count, window_size, max_batch_windows) != 0) {
+         return -1;
+     }
+     state->u.fftdiv.batches = batches;
+@@ -5164,6 +4971,7 @@ static int run_fft_division_node(
+     state->u.fftdiv.algorithm = default_algorithm;
+     state->u.fftdiv.epsilon = epsilon_json;
+     state->u.fftdiv.enable_remainder = enable_remainder ? 1 : 0;
++    state->u.fftdiv.max_batch_windows = max_batch_windows;
+     if (state->u.fftdiv.window_kind != default_window_kind) {
+         fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
+         state->u.fftdiv.window_kind = default_window_kind;
+@@ -5200,6 +5008,15 @@ static int run_fft_division_node(
+     size_t filter_total = param_total_count(filter_view);
+ 
+     fft_dynamic_carrier_summary_t carrier_summary = summarize_dynamic_carriers(inputs);
++    double *window_weights = state->u.fftdiv.window;
++    int max_batch_capacity = state->u.fftdiv.batch_capacity > 0 ? state->u.fftdiv.batch_capacity : 1;
++    int max_batch_runtime = state->u.fftdiv.max_batch_windows;
++    if (max_batch_runtime <= 0 || max_batch_runtime > max_batch_capacity) {
++        max_batch_runtime = max_batch_capacity;
++    }
++    int batch_count = 0;
++    int batch_algorithm_kind = -1;
++    const fft_algorithm_class_t *batch_algorithm_class = NULL;
+ 
+     for (int frame_index = 0; frame_index < frames; ++frame_index) {
+         size_t base_index = (size_t)frame_index * (size_t)slot_count;
+@@ -5263,6 +5080,15 @@ static int run_fft_division_node(
+             state->u.fftdiv.dynamic_k_active = 0;
+         }
+ 
++        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
++            if (batch_count > 0 && batch_algorithm_class != NULL) {
++                fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
++                batch_count = 0;
++                batch_algorithm_kind = -1;
++                batch_algorithm_class = NULL;
++            }
++        }
++
+         int filled = state->u.fftdiv.filled;
+         double phase_last = state->u.fftdiv.last_phase;
+         double lower_last = state->u.fftdiv.last_lower;
+@@ -5328,6 +5154,12 @@ static int run_fft_division_node(
+             state->u.fftdiv.filled = filled;
+         }
+         if (state->u.fftdiv.filled < window_size) {
++            if (batch_count > 0 && batch_algorithm_class != NULL) {
++                fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
++                batch_count = 0;
++                batch_algorithm_kind = -1;
++                batch_algorithm_class = NULL;
++            }
+             for (int slot = 0; slot < slot_count; ++slot) {
+                 double divisor_sample = divisor_total > 0U ? read_param_value(divisor_view, base_index + (size_t)slot, 1.0) : 1.0;
+                 double safe_div = fabs(divisor_sample) < epsilon_frame ? (divisor_sample >= 0.0 ? epsilon_frame : -epsilon_frame) : divisor_sample;
+@@ -5336,13 +5168,6 @@ static int run_fft_division_node(
+             }
+             continue;
+         }
+-        double *work_real = state->u.fftdiv.work_real;
+-        double *work_imag = state->u.fftdiv.work_imag;
+-        double *div_real = state->u.fftdiv.div_real;
+-        double *div_imag = state->u.fftdiv.div_imag;
+-        double *ifft_real = state->u.fftdiv.ifft_real;
+-        double *ifft_imag = state->u.fftdiv.ifft_imag;
+-        double *window_weights = state->u.fftdiv.window;
+         int dynamic_active_frame = 0;
+         double dynamic_sum_frame = 0.0;
+         state->u.fftdiv.dynamic_k_active = 0;
+@@ -5634,42 +5459,59 @@ static int run_fft_division_node(
+                 continue;
+             }
+ 
+-            for (int i = 0; i < window_size; ++i) {
+-                double w = window_weights != NULL ? window_weights[i] : 1.0;
+-                work_real[i] = input_ring[i] * w;
+-                work_imag[i] = 0.0;
+-                div_real[i] = divisor_ring[i] * w;
+-                div_imag[i] = divisor_imag_ring[i] * w;
++            if (batch_count > 0 && algorithm_kind != batch_algorithm_kind) {
++                if (batch_algorithm_class != NULL) {
++                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
++                }
++                batch_count = 0;
++                batch_algorithm_kind = -1;
++                batch_algorithm_class = NULL;
+             }
+-            algorithm_class->forward(work_real, work_imag, work_real, work_imag, window_size);
+-            algorithm_class->forward(div_real, div_imag, div_real, div_imag, window_size);
+-            for (int i = 0; i < window_size; ++i) {
+-                double a = work_real[i];
+-                double b = work_imag[i];
+-                double c = div_real[i];
+-                double d = div_imag[i];
+-                state->u.fftdiv.div_fft_real[offset + (size_t)i] = c;
+-                state->u.fftdiv.div_fft_imag[offset + (size_t)i] = d;
+-                double denom = c * c + d * d;
+-                if (denom < epsilon_frame) {
+-                    denom = epsilon_frame;
++            if (batch_count == 0) {
++                batch_algorithm_kind = algorithm_kind;
++                batch_algorithm_class = algorithm_class;
++            }
++            if (batch_count >= max_batch_runtime) {
++                if (batch_algorithm_class != NULL) {
++                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
+                 }
+-                double real = (a * c + b * d) / denom;
+-                double imag = (b * c - a * d) / denom;
+-                double ratio = window_size > 1 ? (double)i / (double)(window_size - 1) : 0.0;
+-                double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
+-                double gated_real = real * gain;
+-                double gated_imag = imag * gain;
+-                double rotated_real = gated_real * cos_phase - gated_imag * sin_phase;
+-                double rotated_imag = gated_real * sin_phase + gated_imag * cos_phase;
+-                work_real[i] = rotated_real;
+-                work_imag[i] = rotated_imag;
++                batch_count = 0;
++                batch_algorithm_kind = -1;
++                batch_algorithm_class = NULL;
+             }
+-            algorithm_class->inverse(work_real, work_imag, ifft_real, ifft_imag, window_size);
++
++            size_t batch_offset = (size_t)batch_count * (size_t)window_size;
++            double *batched_real = state->u.fftdiv.batch_input_real + batch_offset;
++            double *batched_imag = state->u.fftdiv.batch_input_imag + batch_offset;
++            double *batched_div_real = state->u.fftdiv.batch_div_real + batch_offset;
++            double *batched_div_imag = state->u.fftdiv.batch_div_imag + batch_offset;
++
+             for (int i = 0; i < window_size; ++i) {
+-                state->u.fftdiv.result_buffer[offset + (size_t)i] = ifft_real[i];
++                double w = window_weights != NULL ? window_weights[i] : 1.0;
++                batched_real[i] = input_ring[i] * w;
++                batched_imag[i] = 0.0;
++                batched_div_real[i] = divisor_ring[i] * w;
++                batched_div_imag[i] = divisor_imag_ring[i] * w;
++            }
++
++            state->u.fftdiv.batch_slot_map[batch_count] = slot;
++            state->u.fftdiv.batch_slot_offset[batch_count] = offset;
++            state->u.fftdiv.batch_output_index[batch_count] = base_index + (size_t)slot;
++            state->u.fftdiv.batch_phase[batch_count] = phase_mod;
++            state->u.fftdiv.batch_lower[batch_count] = lower_mod;
++            state->u.fftdiv.batch_upper[batch_count] = upper_mod;
++            state->u.fftdiv.batch_filter[batch_count] = filter_mod;
++            state->u.fftdiv.batch_epsilon[batch_count] = epsilon_frame;
++
++            batch_count += 1;
++            if (batch_count >= max_batch_runtime) {
++                if (batch_algorithm_class != NULL) {
++                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
++                }
++                batch_count = 0;
++                batch_algorithm_kind = -1;
++                batch_algorithm_class = NULL;
+             }
+-            buffer[base_index + (size_t)slot] = ifft_real[window_size - 1];
+         }
+         if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
+             state->u.fftdiv.dynamic_carrier_band_count = dynamic_active_frame;
+@@ -5757,15 +5599,25 @@ static int run_fft_division_node_backward(
+     if (epsilon_json <= 0.0) {
+         epsilon_json = 1e-9;
+     }
++    int max_batch_windows = json_get_int(
++        descriptor->params_json,
++        descriptor->params_len,
++        "max_batch_windows",
++        32
++    );
++    if (max_batch_windows <= 0) {
++        max_batch_windows = 1;
++    }
+ 
+     int default_algorithm = parse_algorithm_string(descriptor->params_json, descriptor->params_len, FFT_ALGORITHM_EIGEN);
+     default_algorithm = clamp_algorithm_kind(default_algorithm);
+     int default_window_kind = parse_window_string(descriptor->params_json, descriptor->params_len, FFT_WINDOW_HANN);
+     default_window_kind = clamp_window_kind(default_window_kind);
+ 
+-    if (ensure_fft_state_buffers(state, slot_count, window_size) != 0) {
++    if (ensure_fft_state_buffers(state, slot_count, window_size, max_batch_windows) != 0) {
+         return -1;
+     }
++    state->u.fftdiv.max_batch_windows = max_batch_windows;
+     if (state->u.fftdiv.window_kind != default_window_kind) {
+         fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
+         state->u.fftdiv.window_kind = default_window_kind;
