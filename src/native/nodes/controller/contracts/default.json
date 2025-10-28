@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "node": "ControllerNode",
+  "description": "Default tap contract for the native controller node. Publishes a multicast control bus with up to 32 lanes.",
+  "tap_groups": [
+    {
+      "name": "controller_bus",
+      "direction": "output",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 32,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 4096,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "multicast",
+        "full_percent_target": 90,
+        "low_watermark_percent": 30,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "dense_active"
+      },
+      "channels": [
+        {
+          "name": "control",
+          "enabled": true,
+          "count": 32,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

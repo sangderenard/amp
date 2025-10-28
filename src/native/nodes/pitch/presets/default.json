@@ -1,0 +1,13 @@
+{
+  "name": "default",
+  "node": "PitchQuantizerNode",
+  "description": "12-TET quantizer preset with slew enabled for smooth transitions.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "grid_cents": "0,100,200,300,400,500,600,700,800,900,1000,1100",
+    "is_free_mode": false,
+    "free_variant": "continuous",
+    "span_default": 2.0,
+    "slew": true
+  }
+}

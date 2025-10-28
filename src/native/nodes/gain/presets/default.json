@@ -1,0 +1,9 @@
+{
+  "name": "default",
+  "node": "GainNode",
+  "description": "Unity gain preset for the KPN demo mixer chain.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "gain": 1.0
+  }
+}

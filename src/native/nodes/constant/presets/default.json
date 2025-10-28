@@ -1,0 +1,10 @@
+{
+  "name": "default",
+  "node": "ConstantNode",
+  "description": "Unity constant control source used by the native demo graphs.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "channels": 1,
+    "value": 0.0
+  }
+}

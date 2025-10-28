@@ -1,6 +1,7 @@
 # Native Node Packages
 
-This tree groups node-specific assets so contracts, presets, and source code travel together. Every native node should eventually live in a folder with the following shape:
+This tree groups node-specific assets so contracts, presets, and source code travel together. Every native node now ships with a
+package shaped like:
 
 ```text
 <node>/
@@ -10,11 +11,25 @@ This tree groups node-specific assets so contracts, presets, and source code tra
   src/                   # native implementation files (.c/.cpp/.h)
 ```
 
-The KPN demo currently uses these nodes and each now has a package directory:
+All runtime nodes participating in the modern KPN wheel publish contracts here:
 
-- `parametric_driver/`
-- `oscillator/`
-- `mix/`
+- `constant/`
+- `controller/`
+- `envelope/`
 - `fft_division/`
+- `gain/`
+- `lfo/`
+- `mix/`
+- `oscillator/`
+- `oscillator_pitch/`
+- `parametric_driver/`
+- `pitch/`
+- `pitch_shift/`
+- `resampler/`
+- `safety/`
+- `sine_osc/`
+- `subharmonic/`
 
-At the moment the implementations still sit in `amp_kernels.c`; we keep the `src/.keep` markers so the directories exist ahead of the extraction work. Tooling and the build system copy the entire `nodes/` tree next to the compiled binaries, which makes presets and contracts available for future hot-loading without a rebuild.
+The native implementations still live inside `amp_kernels.c`; the `src/.keep` markers reserve space for their eventual extraction.
+Build tooling copies the entire `nodes/` tree next to the compiled binaries so presets and tap contracts stay discoverable for
+demos, tooling, and hot-loaded graphs.

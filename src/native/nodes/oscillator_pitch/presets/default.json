@@ -1,0 +1,10 @@
+{
+  "name": "default",
+  "node": "OscillatorPitchNode",
+  "description": "Default frequency slewing helper for the native oscillator.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "min_freq": 0.0,
+    "default_slew": 0.0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "default",
+  "node": "ControllerNode",
+  "description": "Single-lane controller preset that forwards the 'mod' control into the multicast bus.",
+  "tap_contract": "../contracts/default.json",
+  "params": {
+    "__controller_outputs__": "mod",
+    "__controller_sources__": "mod=mod"
+  }
+}

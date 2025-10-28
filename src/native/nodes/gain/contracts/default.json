@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "node": "GainNode",
+  "description": "Tap contract for the native gain stage with matched audio input/output FIFOs.",
+  "tap_groups": [
+    {
+      "name": "audio_in",
+      "direction": "input",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 2,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 4096,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "fifo_pc",
+        "full_percent_target": 95,
+        "low_watermark_percent": 20,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "dense_active"
+      },
+      "channels": [
+        {
+          "name": "signal",
+          "enabled": true,
+          "count": 2,
+          "active_indices": [
+            0,
+            1
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "hold_if_absent": false,
+          "subchannels": [
+            {
+              "name": "pcm",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "audio_out",
+      "direction": "output",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 2,
+        "frames": 256
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 4096,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "fifo_pc",
+        "full_percent_target": 90,
+        "low_watermark_percent": 35,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "dense_active"
+      },
+      "channels": [
+        {
+          "name": "signal",
+          "enabled": true,
+          "count": 2,
+          "active_indices": [
+            0,
+            1
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 256
+          },
+          "subchannels": [
+            {
+              "name": "pcm",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

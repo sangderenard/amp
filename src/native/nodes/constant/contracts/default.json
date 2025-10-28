@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "node": "ConstantNode",
+  "description": "Tap contract for the native constant source: emits a single control lane that may be multicast to any downstream consumer.",
+  "tap_groups": [
+    {
+      "name": "constant_bus",
+      "direction": "output",
+      "unit_shape": {
+        "batches": 1,
+        "channels": 1,
+        "frames": 1
+      },
+      "dtype": "f64",
+      "buffer": {
+        "prealloc_units": 256,
+        "layout": "row-major"
+      },
+      "delivery": {
+        "mode": "multicast",
+        "full_percent_target": 100,
+        "low_watermark_percent": 0,
+        "multicast": {
+          "ack_policy": "all",
+          "quorum_k": 1
+        },
+        "fifo_pc": {
+          "release_policy": "on_consume"
+        }
+      },
+      "indexing": {
+        "major_order": [
+          "channel",
+          "unit"
+        ],
+        "band_indexing": "absolute"
+      },
+      "channels": [
+        {
+          "name": "constant",
+          "enabled": true,
+          "count": 1,
+          "active_indices": [
+            0
+          ],
+          "active_mask_b64": null,
+          "unit_shape": {
+            "batches": 1,
+            "channels": 1,
+            "frames": 1
+          },
+          "subchannels": [
+            {
+              "name": "value",
+              "enabled": true,
+              "stride_elems": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
