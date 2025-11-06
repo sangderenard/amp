@@ -33,6 +33,20 @@ set(FFTFREE_BUILD_TESTS OFF CACHE BOOL "Build fftfree test executables" FORCE)
 set(FFTFREE_OPENMP OFF CACHE BOOL "Enable OpenMP in fftfree" FORCE)
 add_subdirectory(fftfree)
 
+# Ensure consistent output directories for multi-config generators (Visual Studio)
+if(CMAKE_CONFIGURATION_TYPES)
+    foreach(_cfg IN LISTS CMAKE_CONFIGURATION_TYPES)
+        string(TOUPPER ${_cfg} _ucfg)
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_ucfg} "${CMAKE_BINARY_DIR}/${_cfg}" CACHE PATH "" FORCE)
+        set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_ucfg} "${CMAKE_BINARY_DIR}/${_cfg}" CACHE PATH "" FORCE)
+        set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_ucfg} "${CMAKE_BINARY_DIR}/${_cfg}" CACHE PATH "" FORCE)
+    endforeach()
+else()
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}" CACHE PATH "" FORCE)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}" CACHE PATH "" FORCE)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}" CACHE PATH "" FORCE)
+endif()
+
 set_source_files_properties(amp_kernels.c PROPERTIES LANGUAGE CXX)
 set_source_files_properties(amp_debug_alloc.c PROPERTIES LANGUAGE CXX)
 
@@ -118,9 +132,9 @@ endif()
 
 set_target_properties(amp_native PROPERTIES
     OUTPUT_NAME "amp_native"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
 )
 
 # Optional: build native-only unit tests for the graph runtime (KPN)
@@ -214,3 +228,12 @@ if (AMP_NATIVE_BUILD_TESTS)
         endif()
     endforeach()
 endif()
+
+# Ensure that the demo and native test executables are built by a simple
+# "cmake --build <builddir> --config <cfg>" invocation (add an ALL target).
+set(_AMP_NATIVE_DEFAULT_BINARIES demo_kpn_native)
+if(AMP_NATIVE_BUILD_TESTS)
+    list(APPEND _AMP_NATIVE_DEFAULT_BINARIES ${_AMP_NATIVE_TEST_TARGETS})
+endif()
+# Create an aggregate ALL target that depends on the demo and all test binaries.
+add_custom_target(build_native_binaries ALL DEPENDS ${_AMP_NATIVE_DEFAULT_BINARIES})

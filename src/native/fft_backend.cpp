@@ -175,28 +175,81 @@ int run_fftfree_many(
     const std::size_t frames = static_cast<std::size_t>(batch);
     const std::size_t total = frame_len * frames;
 
-    std::vector<float> buffer_real(total, 0.0f);
-    std::vector<float> buffer_imag;
-    if (in_imag != nullptr) {
-        buffer_imag.resize(total, 0.0f);
-    }
-    for (std::size_t idx = 0; idx < total; ++idx) {
-        buffer_real[idx] = static_cast<float>(in_real ? in_real[idx] : 0.0);
-        if (!buffer_imag.empty()) {
-            buffer_imag[idx] = static_cast<float>(in_imag[idx]);
+    if (!inverse) {
+        if (in_real == nullptr) {
+            fallback_transform_many(in_real, in_imag, out_real, out_imag, n, batch, inverse);
+            return 1;
         }
+
+        std::vector<float> pcm(total, 0.0f);
+        std::vector<float> spec_real(total, 0.0f);
+        std::vector<float> spec_imag(total, 0.0f);
+        std::vector<float> spec_mag(total, 0.0f);
+
+        auto run_forward = [&](const double *src) -> bool {
+            if (src == nullptr) {
+                return false;
+            }
+            for (std::size_t i = 0; i < total; ++i) {
+                pcm[i] = static_cast<float>(src[i]);
+            }
+            const std::size_t produced = fft_execute_batched(
+                ctx->handle.get(),
+                pcm.data(),
+                total,
+                spec_real.data(),
+                spec_imag.data(),
+                spec_mag.data(),
+                2,   /* pad_mode = never */
+                0,   /* enable_backup */
+                frames);
+            return produced == frames;
+        };
+
+        if (!run_forward(in_real)) {
+            fallback_transform_many(in_real, in_imag, out_real, out_imag, n, batch, inverse);
+            return 1;
+        }
+
+        for (std::size_t idx = 0; idx < total; ++idx) {
+            out_real[idx] = static_cast<double>(spec_real[idx]);
+            out_imag[idx] = static_cast<double>(spec_imag[idx]);
+        }
+
+        if (in_imag != nullptr) {
+            if (!run_forward(in_imag)) {
+                fallback_transform_many(in_real, in_imag, out_real, out_imag, n, batch, inverse);
+                return 1;
+            }
+            for (std::size_t idx = 0; idx < total; ++idx) {
+                const double a_real = out_real[idx];
+                const double a_imag = out_imag[idx];
+                const double b_real = static_cast<double>(spec_real[idx]);
+                const double b_imag = static_cast<double>(spec_imag[idx]);
+                out_real[idx] = a_real - b_imag;
+                out_imag[idx] = a_imag + b_real;
+            }
+        }
+
+        return 1;
     }
 
-    std::vector<float> out_real_f(total, 0.0f);
-    std::vector<float> out_imag_f(total, 0.0f);
+    std::vector<float> input_real(total, 0.0f);
+    std::vector<float> input_imag(total, 0.0f);
+    for (std::size_t idx = 0; idx < total; ++idx) {
+        input_real[idx] = static_cast<float>(in_real ? in_real[idx] : 0.0);
+        input_imag[idx] = static_cast<float>(in_imag ? in_imag[idx] : 0.0);
+    }
 
-    const float *imag_in_ptr = buffer_imag.empty() ? nullptr : buffer_imag.data();
-    const std::size_t produced = fft_execute_c2c_batched(
+    std::vector<float> pcm_out(total, 0.0f);
+    const std::size_t produced = fft_execute_complex_batched(
         ctx->handle.get(),
-        buffer_real.data(),
-        imag_in_ptr,
-        out_real_f.data(),
-        out_imag_f.data(),
+        input_real.data(),
+        input_imag.data(),
+        frames,
+        pcm_out.data(),
+        2,   /* pad_mode = never */
+        0,   /* enable_backup */
         frames);
 
     if (produced != frames) {
@@ -205,10 +258,8 @@ int run_fftfree_many(
     }
 
     for (std::size_t idx = 0; idx < total; ++idx) {
-        out_real[idx] = static_cast<double>(out_real_f[idx]);
-        if (out_imag != nullptr) {
-            out_imag[idx] = static_cast<double>(out_imag_f[idx]);
-        }
+        out_real[idx] = static_cast<double>(pcm_out[idx]);
+        out_imag[idx] = 0.0;
     }
 
     return 1;
