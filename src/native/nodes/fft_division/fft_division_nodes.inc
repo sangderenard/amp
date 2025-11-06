@@ -585,12 +585,22 @@ static int run_fft_division_node(
             double *batched_div_real = state->u.fftdiv.batch_div_real + batch_offset;
             double *batched_div_imag = state->u.fftdiv.batch_div_imag + batch_offset;
 
+            const int use_backend = (batch_algorithm_class != NULL && batch_algorithm_class->forward == fft_algorithm_backend_forward) ? 1 : 0;
+            const int apply_window_weights = use_backend ? 0 : 1;
             for (int i = 0; i < window_size; ++i) {
-                double w = window_weights != NULL ? window_weights[i] : 1.0;
-                batched_real[i] = input_ring[i] * w;
-                batched_imag[i] = 0.0;
-                batched_div_real[i] = divisor_ring[i] * w;
-                batched_div_imag[i] = divisor_imag_ring[i] * w;
+                const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
+                if (use_backend) {
+                    /* Backend applies analysis windows/OLA itself; pass raw PCM. */
+                    batched_real[i] = input_ring[i];
+                    batched_imag[i] = 0.0;
+                    batched_div_real[i] = divisor_ring[i];
+                    batched_div_imag[i] = divisor_imag_ring[i];
+                } else {
+                    batched_real[i] = input_ring[i] * w;
+                    batched_imag[i] = 0.0;
+                    batched_div_real[i] = divisor_ring[i] * w;
+                    batched_div_imag[i] = divisor_imag_ring[i] * w;
+                }
             }
 
             state->u.fftdiv.batch_slot_map[batch_count] = slot;
@@ -618,6 +628,14 @@ static int run_fft_division_node(
             state->u.fftdiv.dynamic_k_active = dynamic_active_frame;
         }
         state->u.fftdiv.position = window_size - 1;
+    }
+
+    /* Flush any remaining batched windows that were not processed inside the loop. */
+    if (batch_count > 0 && batch_algorithm_class != NULL) {
+        fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
+        batch_count = 0;
+        batch_algorithm_kind = -1;
+        batch_algorithm_class = NULL;
     }
 
     *out_buffer = buffer;
@@ -1070,13 +1088,18 @@ static int run_fft_division_node_backward(
             continue;
         }
 
-        double *work_real = state->u.fftdiv.work_real;
-        double *work_imag = state->u.fftdiv.work_imag;
-        double *div_real = state->u.fftdiv.div_real;
-        double *div_imag = state->u.fftdiv.div_imag;
-        double *ifft_real = state->u.fftdiv.ifft_real;
-        double *ifft_imag = state->u.fftdiv.ifft_imag;
+        /* Use the batched FFT path for all STFT work (push each slot into the batch
+           buffers and call fftdiv_flush_batch). This removes the non-batched/inline
+           FFT path and ensures the backend algorithm is used uniformly. */
         double *window_weights = state->u.fftdiv.window;
+        int max_batch_capacity = state->u.fftdiv.batch_capacity > 0 ? state->u.fftdiv.batch_capacity : 1;
+        int max_batch_runtime = state->u.fftdiv.max_batch_windows;
+        if (max_batch_runtime <= 0 || max_batch_runtime > max_batch_capacity) {
+            max_batch_runtime = max_batch_capacity;
+        }
+        int batch_count = 0;
+        int batch_algorithm_kind = -1;
+        const fft_algorithm_class_t *batch_algorithm_class = NULL;
 
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t offset = (size_t)slot * (size_t)window_size;
@@ -1097,50 +1120,78 @@ static int run_fft_division_node_backward(
                 upper_clamped = tmp_bounds;
             }
             double intensity_clamped = clamp_unit_double(filter_mod);
-            double cos_phase = cos(phase_mod);
-            double sin_phase = sin(phase_mod);
 
-            for (int i = 0; i < window_size; ++i) {
-                double w = window_weights != NULL ? window_weights[i] : 1.0;
-                div_real[i] = state->u.fftdiv.divisor_buffer[offset + (size_t)i] * w;
-                div_imag[i] = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i] * w;
-            }
-            algorithm_class->forward(div_real, div_imag, div_real, div_imag, window_size);
-            for (int i = 0; i < window_size; ++i) {
-                state->u.fftdiv.div_fft_real[offset + (size_t)i] = div_real[i];
-                state->u.fftdiv.div_fft_imag[offset + (size_t)i] = div_imag[i];
-            }
-
-            for (int i = 0; i < window_size; ++i) {
-                double w = window_weights != NULL ? window_weights[i] : 1.0;
-                work_real[i] = recomb_ring[i] * w;
-                work_imag[i] = 0.0;
-            }
-            algorithm_class->forward(work_real, work_imag, work_real, work_imag, window_size);
-            for (int i = 0; i < window_size; ++i) {
-                double ratio = window_size > 1 ? (double)i / (double)(window_size - 1) : 0.0;
-                double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
-                if (gain < 1e-6) {
-                    gain = 1e-6;
+            if (batch_count > 0 && algorithm_kind != batch_algorithm_kind) {
+                if (batch_algorithm_class != NULL) {
+                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
                 }
-                double rotated_real = work_real[i];
-                double rotated_imag = work_imag[i];
-                double inv_real = rotated_real * cos_phase + rotated_imag * sin_phase;
-                double inv_imag = -rotated_real * sin_phase + rotated_imag * cos_phase;
-                inv_real /= gain;
-                inv_imag /= gain;
-                double c = state->u.fftdiv.div_fft_real[offset + (size_t)i];
-                double d = state->u.fftdiv.div_fft_imag[offset + (size_t)i];
-                double out_real_freq = inv_real * c - inv_imag * d;
-                double out_imag_freq = inv_real * d + inv_imag * c;
-                work_real[i] = out_real_freq;
-                work_imag[i] = out_imag_freq;
+                batch_count = 0;
+                batch_algorithm_kind = -1;
+                batch_algorithm_class = NULL;
             }
-            algorithm_class->inverse(work_real, work_imag, ifft_real, ifft_imag, window_size);
-            buffer[base_index + (size_t)slot] = ifft_real[window_size - 1];
+            if (batch_count == 0) {
+                batch_algorithm_kind = algorithm_kind;
+                batch_algorithm_class = algorithm_class;
+            }
+            if (batch_count >= max_batch_runtime) {
+                if (batch_algorithm_class != NULL) {
+                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
+                }
+                batch_count = 0;
+                batch_algorithm_kind = -1;
+                batch_algorithm_class = NULL;
+            }
+
+            size_t batch_offset = (size_t)batch_count * (size_t)window_size;
+            double *batched_real = state->u.fftdiv.batch_input_real + batch_offset;
+            double *batched_imag = state->u.fftdiv.batch_input_imag + batch_offset;
+            double *batched_div_real = state->u.fftdiv.batch_div_real + batch_offset;
+            double *batched_div_imag = state->u.fftdiv.batch_div_imag + batch_offset;
+
+            const int use_backend = (batch_algorithm_class != NULL && batch_algorithm_class->forward == fft_algorithm_backend_forward) ? 1 : 0;
+            const int apply_window_weights = use_backend ? 0 : 1;
+            for (int i = 0; i < window_size; ++i) {
+                const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
+                if (use_backend) {
+                    /* Pass raw PCM segment for backend STFT; backend owns window/OLA. */
+                    batched_real[i] = recomb_ring[i];
+                    batched_imag[i] = 0.0;
+                    batched_div_real[i] = state->u.fftdiv.divisor_buffer[offset + (size_t)i];
+                    batched_div_imag[i] = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i];
+                } else {
+                    batched_real[i] = recomb_ring[i] * w;
+                    batched_imag[i] = 0.0;
+                    batched_div_real[i] = state->u.fftdiv.divisor_buffer[offset + (size_t)i] * w;
+                    batched_div_imag[i] = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i] * w;
+                }
+            }
+
+            state->u.fftdiv.batch_slot_map[batch_count] = slot;
+            state->u.fftdiv.batch_slot_offset[batch_count] = offset;
+            state->u.fftdiv.batch_output_index[batch_count] = base_index + (size_t)slot;
+            state->u.fftdiv.batch_phase[batch_count] = phase_mod;
+            state->u.fftdiv.batch_lower[batch_count] = lower_mod;
+            state->u.fftdiv.batch_upper[batch_count] = upper_mod;
+            state->u.fftdiv.batch_filter[batch_count] = filter_mod;
+            state->u.fftdiv.batch_epsilon[batch_count] = epsilon_frame;
+
+            batch_count += 1;
+            if (batch_count >= max_batch_runtime) {
+                if (batch_algorithm_class != NULL) {
+                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
+                }
+                batch_count = 0;
+                batch_algorithm_kind = -1;
+                batch_algorithm_class = NULL;
+            }
+        }
+        if (batch_count > 0 && batch_algorithm_class != NULL) {
+            fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
+            batch_count = 0;
+            batch_algorithm_kind = -1;
+            batch_algorithm_class = NULL;
         }
     }
-
     state->u.fftdiv.recomb_filled = recomb_filled;
     *out_buffer = buffer;
     *out_channels = input_channels;

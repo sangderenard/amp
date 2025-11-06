@@ -806,6 +806,15 @@ int main() {
                     expected[i],
                     diff
                 );
+                /* Print full context arrays to help diagnose the source of the mismatch. */
+                std::fprintf(stderr, "--- full actual ---\n");
+                for (int j = 0; j < kFrames; ++j) {
+                    std::fprintf(stderr, "[%d] %.18g\n", j, actual[j]);
+                }
+                std::fprintf(stderr, "--- full expected ---\n");
+                for (int j = 0; j < kFrames; ++j) {
+                    std::fprintf(stderr, "[%d] %.18g\n", j, expected[j]);
+                }
                 assert(false && "FFT division output mismatch");
             }
         }
@@ -921,7 +930,7 @@ int main() {
         fft_params,
         sizeof(fft_params),
         "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\","
-        "\"supports_v2\":true,\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9}",
+        "\"supports_v2\":true,\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1}",
         kWindowSize,
         kWindowSize - 1
     );

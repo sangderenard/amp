@@ -2815,6 +2815,33 @@ static void fft_algorithm_batched_forward(
     if (cls == NULL || cls->forward == NULL || n <= 0 || slots <= 0) {
         return;
     }
+    /* If the selected algorithm is the backend (fftfree), prefer the
+       batched backend transform which can accept STFT framing hints. This
+       lets the runtime provide window/hop instructions to the backend
+       without changing the per-frame algebra.
+       Fall back to per-slot calls if the extended batched call fails. */
+    if (cls->forward == fft_algorithm_backend_forward) {
+        /* Request STFT framing from the backend: window = n, hop = 1 (sliding)
+           so the backend will assemble overlapping frames the same way AMP
+           previously did when it applied the analysis window itself. */
+        int ok = amp_fft_backend_transform_many_ex(
+            in_real,
+            in_imag,
+            in_real,
+            in_imag,
+            n,
+            slots,
+            0, /* forward */
+            n, /* window */
+            1, /* hop */
+            1  /* stft_mode: enable */
+        );
+        if (ok) {
+            return;
+        }
+        /* fall through to per-slot if backend batched helper failed */
+    }
+
     for (int s = 0; s < slots; ++s) {
         double *r = in_real + (size_t)s * (size_t)n;
         double *i = in_imag + (size_t)s * (size_t)n;
@@ -2872,6 +2899,53 @@ static void fftdiv_flush_batch(
 
     fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count);
     fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count);
+    /* Diagnostic dump for batches: print mapping and batched arrays when window_size is small
+       This helps compare batched inputs/divisors against the simulator. */
+    if (window_size > 0 && window_size <= 16) {
+        fprintf(stderr, "[diag] fftdiv_flush_batch: window_size=%d batch_count=%d\n", window_size, batch_count);
+        for (int b = 0; b < batch_count; ++b) {
+            size_t batch_offset = (size_t)b * (size_t)window_size;
+            fprintf(stderr, "[diag] batch %d: slot_map=%d slot_offset=%zu output_index=%zu phase=% .9g lower=% .9g upper=% .9g filter=% .9g epsilon=% .9g\n",
+                b, slot_map[b], slot_offset_map[b], output_index_map[b], phase_map[b], lower_map[b], upper_map[b], filter_map[b], epsilon_map[b]);
+            fprintf(stderr, "[diag]  time sig_real: ");
+            for (int i = 0; i < window_size; ++i) {
+                fprintf(stderr, " % .9g", sig_real[batch_offset + (size_t)i]);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[diag]  time sig_imag: ");
+            for (int i = 0; i < window_size; ++i) {
+                fprintf(stderr, " % .9g", sig_imag[batch_offset + (size_t)i]);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[diag]  time div_real: ");
+            for (int i = 0; i < window_size; ++i) {
+                fprintf(stderr, " % .9g", div_real[batch_offset + (size_t)i]);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[diag]  time div_imag: ");
+            for (int i = 0; i < window_size; ++i) {
+                fprintf(stderr, " % .9g", div_imag[batch_offset + (size_t)i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
+    /* After forward transforms, print the frequency-domain bins for sig and divisor. */
+    if (window_size > 0 && window_size <= 16) {
+        for (int b = 0; b < batch_count; ++b) {
+            size_t batch_offset = (size_t)b * (size_t)window_size;
+            fprintf(stderr, "[diag] freq sig (batch %d): ", b);
+            for (int i = 0; i < window_size; ++i) {
+                fprintf(stderr, " % .9g+% .9gi", sig_real[batch_offset + (size_t)i], sig_imag[batch_offset + (size_t)i]);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[diag] freq div (batch %d): ", b);
+            for (int i = 0; i < window_size; ++i) {
+                fprintf(stderr, " % .9g+% .9gi", div_real[batch_offset + (size_t)i], div_imag[batch_offset + (size_t)i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
 
     for (int b = 0; b < batch_count; ++b) {
         size_t batch_offset = (size_t)b * (size_t)window_size;

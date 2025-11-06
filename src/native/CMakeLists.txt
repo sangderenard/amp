@@ -197,6 +197,18 @@ if (AMP_NATIVE_BUILD_TESTS)
     target_link_libraries(test_fft_division_node PRIVATE amp_native)
     add_test(NAME test_fft_division_node COMMAND test_fft_division_node)
 
+    # Diagnostic: compare Eigen FFT vs backend (fftfree) outputs
+    add_executable(test_fft_backend_compare
+        tests/fft_backend_compare.cpp
+    )
+    target_include_directories(test_fft_backend_compare PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(test_fft_backend_compare PRIVATE amp_native fft_cffi)
+    add_test(NAME test_fft_backend_compare COMMAND test_fft_backend_compare)
+
     add_executable(test_pitch_shift_node
         tests/test_pitch_shift_node.cpp
     )
@@ -214,6 +226,7 @@ if (AMP_NATIVE_BUILD_TESTS)
         test_amp_run_node_v2
         test_fft_noise_gradient
         test_fft_division_node
+        test_fft_backend_compare
         test_pitch_shift_node
     )
 

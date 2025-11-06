@@ -269,7 +269,7 @@ int run_fftfree_many(
 
 extern "C" {
 
-int amp_fft_backend_transform_many(
+AMP_CAPI int amp_fft_backend_transform_many(
     const double *in_real,
     const double *in_imag,
     double *out_real,
@@ -284,7 +284,167 @@ int amp_fft_backend_transform_many(
     return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
 }
 
-void amp_fft_backend_transform(
+AMP_CAPI int amp_fft_backend_transform_many_ex(
+    const double *in_real,
+    const double *in_imag,
+    double *out_real,
+    double *out_imag,
+    int n,
+    int batch,
+    int inverse,
+    int window,
+    int hop,
+    int stft_mode
+) {
+    if (n <= 0 || batch <= 0 || out_real == nullptr || out_imag == nullptr || in_real == nullptr) {
+        return 0;
+    }
+
+    // If caller requests default behaviour (no STFT framing) and window==n/hop==n,
+    // delegate to the cached/path-optimized implementation.
+    if (stft_mode == 0 && window == n && hop == n) {
+        return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
+    }
+
+    // Create a temporary fftfree context configured with STFT/window params.
+    void *handle = fft_init_full_v2(
+        static_cast<std::size_t>(n),
+        0,   /* threads: auto */
+        1,   /* lanes */
+        inverse ? 1 : 0,
+        FFT_KERNEL_COOLEYTUKEY,
+        0,   /* radix */
+        nullptr,
+        0,
+        2,   /* pad_mode = never */
+        window,
+        hop,
+        stft_mode,
+        FFT_TRANSFORM_C2C,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,   /* silent_crash_reports */
+        0,   /* apply_windows: leave to caller/backend default (0) */
+        0,   /* apply_ola */
+        FFT_WINDOW_RECT,
+        0.0f,
+        0.0f,
+        FFT_WINDOW_RECT,
+        0.0f,
+        0.0f,
+        FFT_WINDOW_NORM_NONE,
+        FFT_COLA_OFF);
+
+    if (handle == nullptr) {
+        // Fallback to safe implementation
+        return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
+    }
+
+    const std::size_t frame_len = static_cast<std::size_t>(n);
+    const std::size_t frames = static_cast<std::size_t>(batch);
+    const std::size_t total = frame_len * frames;
+
+    if (!inverse) {
+        // Forward: caller supplies PCM-like concatenation of frames.
+        std::vector<float> pcm(total, 0.0f);
+        std::vector<float> spec_real(total, 0.0f);
+        std::vector<float> spec_imag(total, 0.0f);
+        std::vector<float> spec_mag(total, 0.0f);
+        for (std::size_t i = 0; i < total; ++i) {
+            pcm[i] = static_cast<float>(in_real[i]);
+        }
+        std::fprintf(stderr, "[diag] transform_many_ex: n=%zu frames=%zu total=%zu\n",
+                      frame_len, frames, total);
+        const std::size_t produced = fft_execute_batched(
+            handle,
+            pcm.data(),
+            total,
+            spec_real.data(),
+            spec_imag.data(),
+            spec_mag.data(),
+            2,   /* pad_mode = never */
+            0,   /* enable_backup */
+            frames);
+        std::fprintf(stderr, "[diag] transform_many_ex: produced=%zu\n", produced);
+        if (produced != frames) {
+            fft_free(handle);
+            return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
+        }
+        for (std::size_t idx = 0; idx < total; ++idx) {
+            out_real[idx] = static_cast<double>(spec_real[idx]);
+            out_imag[idx] = static_cast<double>(spec_imag[idx]);
+        }
+        if (in_imag != nullptr) {
+            // If a separate imaginary input is provided, run it too and combine
+            std::vector<float> pcm_b(total, 0.0f);
+            for (std::size_t i = 0; i < total; ++i) {
+                pcm_b[i] = static_cast<float>(in_imag[i]);
+            }
+            const std::size_t produced_b = fft_execute_batched(
+                handle,
+                pcm_b.data(),
+                total,
+                spec_real.data(),
+                spec_imag.data(),
+                spec_mag.data(),
+                2,
+                0,
+                frames);
+            if (produced_b != frames) {
+                fft_free(handle);
+                return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
+            }
+            for (std::size_t idx = 0; idx < total; ++idx) {
+                const double a_real = out_real[idx];
+                const double a_imag = out_imag[idx];
+                const double b_real = static_cast<double>(spec_real[idx]);
+                const double b_imag = static_cast<double>(spec_imag[idx]);
+                out_real[idx] = a_real - b_imag;
+                out_imag[idx] = a_imag + b_real;
+            }
+        }
+        fft_free(handle);
+        return 1;
+    }
+
+    // Inverse: accept complex frames and produce PCM
+    std::vector<float> input_real(total, 0.0f);
+    std::vector<float> input_imag(total, 0.0f);
+    for (std::size_t idx = 0; idx < total; ++idx) {
+        input_real[idx] = static_cast<float>(in_real ? in_real[idx] : 0.0);
+        input_imag[idx] = static_cast<float>(in_imag ? in_imag[idx] : 0.0);
+    }
+
+    std::vector<float> pcm_out(total, 0.0f);
+    const std::size_t produced = fft_execute_complex_batched(
+        handle,
+        input_real.data(),
+        input_imag.data(),
+        frames,
+        pcm_out.data(),
+        2,   /* pad_mode = never */
+        0,   /* enable_backup */
+        frames);
+
+    if (produced != frames) {
+        fft_free(handle);
+        return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
+    }
+
+    for (std::size_t idx = 0; idx < total; ++idx) {
+        out_real[idx] = static_cast<double>(pcm_out[idx]);
+        out_imag[idx] = 0.0;
+    }
+    fft_free(handle);
+    return 1;
+}
+
+AMP_CAPI void amp_fft_backend_transform(
     const double *in_real,
     const double *in_imag,
     double *out_real,
@@ -295,7 +455,7 @@ void amp_fft_backend_transform(
     (void)amp_fft_backend_transform_many(in_real, in_imag, out_real, out_imag, n, 1, inverse);
 }
 
-int amp_fft_backend_has_hook(void) {
+AMP_CAPI int amp_fft_backend_has_hook(void) {
     return 0;
 }
 

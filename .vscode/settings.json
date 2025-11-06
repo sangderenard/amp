@@ -1,6 +1,7 @@
 {
     "cmake.sourceDirectory": "C:/dev/Powershell/amp/src/native",
     "files.associations": {
-        "utility": "cpp"
+        "utility": "cpp",
+        "vector": "cpp"
     }
 }

@@ -15,6 +15,7 @@ import shlex
 import shutil
 import sys
 from typing import Iterable, Mapping
+from pathlib import Path
 
 _LOGGING_ENV = "AMP_NATIVE_DIAGNOSTICS_BUILD"
 _EXTRA_COMPILE_ENV = "AMP_NATIVE_EXTRA_COMPILE_ARGS"
@@ -79,6 +80,15 @@ def get_build_config() -> NativeBuildConfig:
     else:
         compile_args.extend(["-std=c++17", "-pthread"])
 
+    # Convenience: allow defining AMP_NATIVE_USE_FFTFREE via environment
+    # so users can simply `set AMP_NATIVE_USE_FFTFREE=1` (or export on POSIX)
+    # and get the corresponding compiler define injected for cffi builds.
+    if os.environ.get("AMP_NATIVE_USE_FFTFREE", "").strip():
+        if sys.platform == "win32":
+            compile_args.append("/DAMP_NATIVE_USE_FFTFREE")
+        else:
+            compile_args.append("-DAMP_NATIVE_USE_FFTFREE")
+
     extra_compile = list(_parse_extra_args(_EXTRA_COMPILE_ENV))
     compile_args.extend(extra_compile)
 
@@ -86,6 +96,24 @@ def get_build_config() -> NativeBuildConfig:
     if sys.platform != "win32":
         link_args.append("-pthread")
     link_args.extend(_parse_extra_args(_EXTRA_LINK_ENV))
+
+    # If fftfree static library is available locally and the user asked for
+    # AMP_NATIVE_USE_FFTFREE, add the .lib to link args and mark the static
+    # define so symbols are resolved for static linking on MSVC.
+    if os.environ.get("AMP_NATIVE_USE_FFTFREE", "").strip():
+        try:
+            repo_root = Path(__file__).resolve().parents[2]
+            # Windows static lib path used by CMake build
+            fft_lib = repo_root / "src" / "native" / "build" / "fftfree" / "Release" / "fft_cffi.lib"
+            if sys.platform == "win32" and fft_lib.exists():
+                # Linker expects the .lib path on MSVC
+                link_args.append(str(fft_lib))
+                # Ensure compile-time static macro matches lib type
+                extra_compile_static = "/DFFT_CFFI_STATIC" if sys.platform == "win32" else "-DFFT_CFFI_STATIC"
+                compile_args.append(extra_compile_static)
+        except Exception:
+            # best-effort only; fall back to user-supplied AMP_NATIVE_EXTRA_LINK_ARGS
+            pass
 
     c_candidates, cxx_candidates = _candidate_compilers()
     c_compiler = _select_compiler("CC", _CC_OVERRIDE_ENV, c_candidates)

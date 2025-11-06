@@ -254,15 +254,32 @@ try:
         kernels_cxx = _stage_cffi_source(kernels_source, "amp_kernels_cffi.cc")
         debug_alloc_source = native_dir / "amp_debug_alloc.c"
         debug_alloc_cxx = _stage_cffi_source(debug_alloc_source, "amp_debug_alloc_cffi.cc")
+        # Build the sources list explicitly to avoid inserting `None` into
+        # the list when AMP_NATIVE_USE_FFTFREE is not set. cffi does not
+        # accept None entries and that causes confusing build failures.
+        sources = [
+            str(kernels_cxx),
+            str(debug_alloc_cxx),
+            str(native_dir / "fft_backend.cpp"),
+        ]
+        if os.environ.get("AMP_NATIVE_USE_FFTFREE", "").strip():
+            sources.append(str(native_dir / "fftfree" / "fft_cffi.cpp"))
+            # When compiling the fft_cffi implementation into this module we
+            # must ensure the header's export macro resolves to an export (or
+            # at least not dllimport). The upstream CMake build defines
+            # FFT_CFFI_EXPORTS for the fft_cffi target; replicate that here
+            # so the translation unit defines symbols correctly instead of
+            # being declared as __declspec(dllimport) which causes C2491.
+            if sys.platform == "win32":
+                _EXTRA_COMPILE_ARGS.append("/DFFT_CFFI_EXPORTS")
+            else:
+                _EXTRA_COMPILE_ARGS.append("-DFFT_CFFI_EXPORTS")
+
         ffi.set_source(
             "_amp_ckernels_cffi",
             '#include "amp_native.h"\n',
-            sources=[
-                str(kernels_cxx),
-                str(debug_alloc_cxx),
-                str(native_dir / "fft_backend.cpp"),
-            ],
-            include_dirs=[str(include_dir), str(eigen_dir)],
+            sources=sources,
+            include_dirs=[str(include_dir), str(eigen_dir), str(native_dir)],
             extra_compile_args=_EXTRA_COMPILE_ARGS,
             extra_link_args=_EXTRA_LINK_ARGS,
             source_extension=".cc",
