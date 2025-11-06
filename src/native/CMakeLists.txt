@@ -27,6 +27,12 @@ if (NOT EXISTS "${EIGEN3_INCLUDE_DIR}/Eigen/Core")
     endif()
 endif()
 
+set(FFTFREE_BUILD_SHARED OFF CACHE BOOL "Build fft_cffi as a shared library" FORCE)
+set(FFTFREE_BUILD_APPS OFF CACHE BOOL "Build fftfree standalone demos and tools" FORCE)
+set(FFTFREE_BUILD_TESTS OFF CACHE BOOL "Build fftfree test executables" FORCE)
+set(FFTFREE_OPENMP OFF CACHE BOOL "Enable OpenMP in fftfree" FORCE)
+add_subdirectory(fftfree)
+
 set_source_files_properties(amp_kernels.c PROPERTIES LANGUAGE CXX)
 set_source_files_properties(amp_debug_alloc.c PROPERTIES LANGUAGE CXX)
 
@@ -45,11 +51,13 @@ find_package(Threads REQUIRED)
 target_include_directories(amp_native
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${EIGEN3_INCLUDE_DIR}
+        ${EIGEN3_INCLUDE_DIR}
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/fftfree
 )
 
-target_compile_definitions(amp_native PRIVATE AMP_NATIVE_BUILD)
-target_link_libraries(amp_native PRIVATE Threads::Threads)
+target_compile_definitions(amp_native PRIVATE AMP_NATIVE_BUILD AMP_NATIVE_USE_FFTFREE)
+target_link_libraries(amp_native PRIVATE Threads::Threads fft_cffi)
 
 add_executable(demo_kpn_native
     demo_kpn_native.cpp

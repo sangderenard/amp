@@ -1,0 +1,3 @@
+[submodule "src/native/fftfree"]
+	path = src/native/fftfree
+	url = https://github.com/sangderenard/fftfree

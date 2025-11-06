@@ -38,3 +38,5 @@ _amp_ckernels_cffi.*
 output/test_fft.wav
 third_party/*
 third_party
+**/.vs/*
+**/.vs/
