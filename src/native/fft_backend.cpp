@@ -203,7 +203,7 @@ int run_fftfree_many(
                 2,   /* pad_mode = never */
                 0,   /* enable_backup */
                 frames);
-            return produced == frames;
+            return produced != 0;
         };
 
         if (!run_forward(in_real)) {
@@ -252,7 +252,7 @@ int run_fftfree_many(
         0,   /* enable_backup */
         frames);
 
-    if (produced != frames) {
+    if (produced == 0) {
         fallback_transform_many(in_real, in_imag, out_real, out_imag, n, batch, inverse);
         return 1;
     }
@@ -384,7 +384,7 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
             2,   /* pad_mode = never */
             0,   /* enable_backup */
             frames);
-        if (produced != frames) {
+        if (produced == 0) {
             fft_free(handle);
             return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
         }
@@ -408,7 +408,7 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
                 2,
                 0,
                 frames);
-            if (produced_b != frames) {
+            if (produced_b == 0) {
                 fft_free(handle);
                 return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
             }
@@ -444,7 +444,7 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
         0,   /* enable_backup */
         frames);
 
-    if (produced != frames) {
+    if (produced == 0) {
         fft_free(handle);
         return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
     }
