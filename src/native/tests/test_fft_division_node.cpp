@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -20,6 +21,21 @@ extern "C" {
 }
 
 namespace {
+
+bool g_test_failed = false;
+
+void record_failure(const char *fmt, ...) {
+    g_test_failed = true;
+    std::fprintf(stderr, "FAIL: ");
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    std::fprintf(stderr, "\n");
+}
+
+#undef assert
+#define assert(expr) ((expr) ? (void)0 : record_failure("Assertion failed: %s (%s:%d)", #expr, __FILE__, __LINE__))
 
 constexpr int FFT_ALGORITHM_EIGEN = 0;
 constexpr int FFT_ALGORITHM_DFT = 1;
@@ -819,7 +835,8 @@ int main() {
                 for (int j = 0; j < kFrames; ++j) {
                     std::fprintf(stderr, "[%d] %.18g\n", j, expected[j]);
                 }
-                assert(false && "FFT division output mismatch");
+                record_failure("FFT division output mismatch for %s", label);
+                return;
             }
         }
     };
@@ -979,9 +996,18 @@ int main() {
     );
 
     auto run_backend_case = [&](const std::vector<uint8_t> &desc, const char *label) {
+        AmpGraphNodeSummary summary_local{};
         AmpGraphRuntime *runtime_local = amp_graph_runtime_create(desc.data(), desc.size(), nullptr, 0U);
-        assert(runtime_local != nullptr);
-        assert(amp_graph_runtime_configure(runtime_local, 1U, static_cast<uint32_t>(kFrames)) == 0);
+        if (runtime_local == nullptr) {
+            record_failure("runtime create failed for %s", label);
+            return summary_local;
+        }
+        int configure_rc = amp_graph_runtime_configure(runtime_local, 1U, static_cast<uint32_t>(kFrames));
+        if (configure_rc != 0) {
+            record_failure("runtime configure failed for %s rc=%d", label, configure_rc);
+            amp_graph_runtime_destroy(runtime_local);
+            return summary_local;
+        }
 
         double *case_out_buffer = nullptr;
         uint32_t case_batches = 0;
@@ -998,20 +1024,49 @@ int main() {
             &case_channels,
             &case_frames
         );
-        assert(exec_rc == 0);
-        assert(case_out_buffer != nullptr);
-        assert(case_batches == 1U);
-        assert(case_channels == 1U);
-        assert(case_frames == static_cast<uint32_t>(kFrames));
+        if (exec_rc != 0 || case_out_buffer == nullptr) {
+            record_failure("runtime execute failed for %s rc=%d buffer=%p", label, exec_rc, static_cast<void*>(case_out_buffer));
+            if (case_out_buffer != nullptr) {
+                amp_graph_runtime_buffer_free(case_out_buffer);
+                case_out_buffer = nullptr;
+            }
+            amp_graph_runtime_destroy(runtime_local);
+            return summary_local;
+        }
+        if (case_batches != 1U || case_channels != 1U || case_frames != static_cast<uint32_t>(kFrames)) {
+            record_failure(
+                "%s produced unexpected shape batches=%u channels=%u frames=%u",
+                label,
+                case_batches,
+                case_channels,
+                case_frames
+            );
+        }
         verify_frames(case_out_buffer, expected, label);
 
-        AmpGraphNodeSummary summary_local{};
         int describe_rc_local = amp_graph_runtime_describe_node(runtime_local, "fft_divider", &summary_local);
-        assert(describe_rc_local == 0);
+        if (describe_rc_local != 0) {
+            record_failure("describe node failed for %s rc=%d", label, describe_rc_local);
+        }
 
         amp_graph_runtime_buffer_free(case_out_buffer);
         amp_graph_runtime_destroy(runtime_local);
         return summary_local;
+    };
+
+    auto create_configured_runtime = [&](const std::vector<uint8_t> &desc, const char *label) -> AmpGraphRuntime * {
+        AmpGraphRuntime *rt = amp_graph_runtime_create(desc.data(), desc.size(), nullptr, 0U);
+        if (rt == nullptr) {
+            record_failure("runtime create failed for %s", label);
+            return nullptr;
+        }
+        int cfg_rc = amp_graph_runtime_configure(rt, 1U, static_cast<uint32_t>(kFrames));
+        if (cfg_rc != 0) {
+            record_failure("runtime configure failed for %s rc=%d", label, cfg_rc);
+            amp_graph_runtime_destroy(rt);
+            return nullptr;
+        }
+        return rt;
     };
 
     auto verify_summary_metadata = [&](const AmpGraphNodeSummary &summary) {
@@ -1025,6 +1080,31 @@ int main() {
         assert(std::fabs(summary.metrics.reserved[1] - static_cast<float>(lower_metadata.back())) < 1e-6f);
         assert(std::fabs(summary.metrics.reserved[2] - static_cast<float>(upper_metadata.back())) < 1e-6f);
         assert(std::fabs(summary.metrics.reserved[3] - static_cast<float>(filter_metadata.back())) < 1e-6f);
+    };
+
+    auto compare_summary_to_reference = [&](
+        const AmpGraphNodeSummary &reference,
+        const AmpGraphNodeSummary &candidate
+    ) {
+        assert(candidate.supports_v2 == reference.supports_v2);
+        assert(candidate.declared_delay_frames == reference.declared_delay_frames);
+        assert(candidate.oversample_ratio == reference.oversample_ratio);
+        assert(candidate.has_metrics == reference.has_metrics);
+
+        const float heat_ref = reference.metrics.accumulated_heat;
+        const float heat_candidate = candidate.metrics.accumulated_heat;
+        assert(std::fabs(static_cast<double>(heat_candidate) - static_cast<double>(heat_ref)) < 1e-6);
+
+        assert(std::fabs(candidate.metrics.processing_time_seconds - reference.metrics.processing_time_seconds) < 1e-9);
+        assert(std::fabs(candidate.metrics.logging_time_seconds - reference.metrics.logging_time_seconds) < 1e-9);
+        assert(std::fabs(candidate.metrics.total_time_seconds - reference.metrics.total_time_seconds) < 1e-9);
+        assert(std::fabs(candidate.metrics.thread_cpu_time_seconds - reference.metrics.thread_cpu_time_seconds) < 1e-9);
+
+        for (int i = 0; i < 6; ++i) {
+            assert(std::fabs(candidate.metrics.reserved[i] - reference.metrics.reserved[i]) < 1e-6);
+        }
+
+        assert(std::fabs(candidate.total_heat_accumulated - reference.total_heat_accumulated) < 1e-6);
     };
 
     AmpGraphNodeSummary summary_fft = run_backend_case(descriptor, "backend_mode_amp_window");
@@ -1045,6 +1125,9 @@ int main() {
     verify_summary_metadata(summary_fftfree_batched);
     verify_summary_metadata(summary_fftfree_stream);
 
+    compare_summary_to_reference(summary_fft, summary_fftfree_batched);
+    compare_summary_to_reference(summary_fft, summary_fftfree_stream);
+
     double *out_buffer = nullptr;
     uint32_t out_batches = 0;
     uint32_t out_channels = 0;
@@ -1054,13 +1137,10 @@ int main() {
     AmpGraphRuntime *runtime = nullptr;
 
     // Override algorithm selector to use the DFT pathway on a fresh runtime instance and verify updates.
-    runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
-    assert(runtime != nullptr);
-    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
-
-    std::vector<double> algorithm_selector_param_dft(kFrames, static_cast<double>(FFT_ALGORITHM_DFT));
-    assert(
-        amp_graph_runtime_set_param(
+    runtime = create_configured_runtime(descriptor, "backend_mode_amp_window_dft");
+    if (runtime != nullptr) {
+        std::vector<double> algorithm_selector_param_dft(kFrames, static_cast<double>(FFT_ALGORITHM_DFT));
+        int set_param_rc = amp_graph_runtime_set_param(
             runtime,
             "fft_divider",
             "algorithm_selector",
@@ -1068,67 +1148,89 @@ int main() {
             1U,
             1U,
             static_cast<uint32_t>(kFrames)
-        ) == 0
-    );
-
-    exec_rc = amp_graph_runtime_execute(
-        runtime,
-        nullptr,
-        0U,
-        kFrames,
-        48000.0,
-        &out_buffer,
-        &out_batches,
-        &out_channels,
-        &out_frames
-    );
-    assert(exec_rc == 0);
-    assert(out_buffer != nullptr);
-    assert(out_batches == 1U);
-    assert(out_channels == 1U);
-    assert(out_frames == static_cast<uint32_t>(kFrames));
-    bool diverged_from_fft = false;
-    for (int i = kWindowSize - 1; i < kFrames; ++i) {
-        double diff = std::fabs(out_buffer[i] - expected[i]);
-        if (diff > 1e-6) {
-            diverged_from_fft = true;
-            break;
+        );
+        if (set_param_rc != 0) {
+            record_failure("set_param algorithm_selector dft failed rc=%d", set_param_rc);
         }
-    }
-    assert(diverged_from_fft);
-    for (int i = 0; i < kFrames; ++i) {
-        assert(std::isfinite(out_buffer[i]));
-    }
 
-    AmpGraphNodeSummary summary_dft{};
-    describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dft);
-    assert(describe_rc == 0);
-    assert(summary_dft.has_metrics == 1);
-    assert(summary_dft.metrics.accumulated_heat > 0.0f);
-    assert(summary_dft.metrics.accumulated_heat < summary_fft.metrics.accumulated_heat);
+        if (set_param_rc == 0) {
+            exec_rc = amp_graph_runtime_execute(
+                runtime,
+                nullptr,
+                0U,
+                kFrames,
+                48000.0,
+                &out_buffer,
+                &out_batches,
+                &out_channels,
+                &out_frames
+            );
+            if (exec_rc != 0 || out_buffer == nullptr) {
+                record_failure("dft execute failed rc=%d buffer=%p", exec_rc, static_cast<void*>(out_buffer));
+            } else {
+                if (out_batches != 1U || out_channels != 1U || out_frames != static_cast<uint32_t>(kFrames)) {
+                    record_failure(
+                        "dft execute unexpected shape batches=%u channels=%u frames=%u",
+                        out_batches,
+                        out_channels,
+                        out_frames
+                    );
+                }
+                bool diverged_from_fft = false;
+                for (int i = kWindowSize - 1; i < kFrames; ++i) {
+                    double diff = std::fabs(out_buffer[i] - expected[i]);
+                    if (diff > 1e-6) {
+                        diverged_from_fft = true;
+                        break;
+                    }
+                }
+                if (!diverged_from_fft) {
+                    record_failure("dft run did not diverge from fft" );
+                }
+                for (int i = 0; i < kFrames; ++i) {
+                    if (!std::isfinite(out_buffer[i])) {
+                        record_failure("dft output not finite at %d", i);
+                        break;
+                    }
+                }
 
-    amp_graph_runtime_buffer_free(out_buffer);
-    out_buffer = nullptr;
-    amp_graph_runtime_destroy(runtime);
-    runtime = nullptr;
+                AmpGraphNodeSummary summary_dft{};
+                describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dft);
+                if (describe_rc != 0) {
+                    record_failure("describe node failed for dft rc=%d", describe_rc);
+                } else {
+                    if (summary_dft.has_metrics != 1) {
+                        record_failure("dft summary missing metrics");
+                    }
+                    if (summary_dft.metrics.accumulated_heat <= 0.0f) {
+                        record_failure("dft summary accumulated_heat <= 0");
+                    }
+                    if (!(summary_dft.metrics.accumulated_heat < summary_fft.metrics.accumulated_heat)) {
+                        record_failure("dft summary accumulated_heat not less than fft");
+                    }
+                }
+                amp_graph_runtime_buffer_free(out_buffer);
+                out_buffer = nullptr;
+            }
+        }
+        amp_graph_runtime_destroy(runtime);
+        runtime = nullptr;
+    }
 
     // Override algorithm selector to dynamic oscillator stub and verify the skeleton path behaves like the DFT fallback.
-    runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
-    assert(runtime != nullptr);
-    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
+    runtime = create_configured_runtime(descriptor, "backend_mode_amp_window_dynamic_stub");
+    if (runtime != nullptr) {
+        std::vector<int> algorithm_selector_dynamic(kFrames, FFT_ALGORITHM_DYNAMIC_OSCILLATORS);
+        std::vector<double> algorithm_selector_param_dynamic(
+            kFrames,
+            static_cast<double>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)
+        );
+        std::vector<double> carrier_override(kFrames, 0.25);
+        for (int i = 0; i < kFrames; ++i) {
+            carrier_override[i] = 0.1 + 0.05 * static_cast<double>(i);
+        }
 
-    std::vector<int> algorithm_selector_dynamic(kFrames, FFT_ALGORITHM_DYNAMIC_OSCILLATORS);
-    std::vector<double> algorithm_selector_param_dynamic(
-        kFrames,
-        static_cast<double>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)
-    );
-    std::vector<double> carrier_override(kFrames, 0.25);
-    for (int i = 0; i < kFrames; ++i) {
-        carrier_override[i] = 0.1 + 0.05 * static_cast<double>(i);
-    }
-
-    assert(
-        amp_graph_runtime_set_param(
+        int set_algo_dynamic_rc = amp_graph_runtime_set_param(
             runtime,
             "fft_divider",
             "algorithm_selector",
@@ -1136,10 +1238,11 @@ int main() {
             1U,
             1U,
             static_cast<uint32_t>(kFrames)
-        ) == 0
-    );
-    assert(
-        amp_graph_runtime_set_param(
+        );
+        if (set_algo_dynamic_rc != 0) {
+            record_failure("set_param algorithm_selector dynamic failed rc=%d", set_algo_dynamic_rc);
+        }
+        int set_carrier_override_rc = amp_graph_runtime_set_param(
             runtime,
             "fft_divider",
             "carrier_band_0",
@@ -1147,68 +1250,90 @@ int main() {
             1U,
             1U,
             static_cast<uint32_t>(kFrames)
-        ) == 0
-    );
+        );
+        if (set_carrier_override_rc != 0) {
+            record_failure("set_param carrier_band_0 dynamic failed rc=%d", set_carrier_override_rc);
+        }
 
-    std::vector<std::vector<double>> dynamic_override_carriers{carrier_override};
+        if (set_algo_dynamic_rc == 0 && set_carrier_override_rc == 0) {
+            std::vector<std::vector<double>> dynamic_override_carriers{carrier_override};
 
-    std::vector<double> expected_dynamic = simulate_fft_division(
-        signal,
-        divisor_real,
-        divisor_imag,
-        algorithm_selector_dynamic,
-        window_selector,
-        stabilizer,
-        phase_metadata,
-        lower_metadata,
-        upper_metadata,
-        filter_metadata,
-        dynamic_override_carriers,
-        kWindowSize,
-        1e-9,
-        FFT_ALGORITHM_EIGEN,
-        FFT_WINDOW_HANN
-    );
+            std::vector<double> expected_dynamic = simulate_fft_division(
+                signal,
+                divisor_real,
+                divisor_imag,
+                algorithm_selector_dynamic,
+                window_selector,
+                stabilizer,
+                phase_metadata,
+                lower_metadata,
+                upper_metadata,
+                filter_metadata,
+                dynamic_override_carriers,
+                kWindowSize,
+                1e-9,
+                FFT_ALGORITHM_EIGEN,
+                FFT_WINDOW_HANN
+            );
 
-    exec_rc = amp_graph_runtime_execute(
-        runtime,
-        nullptr,
-        0U,
-        kFrames,
-        48000.0,
-        &out_buffer,
-        &out_batches,
-        &out_channels,
-        &out_frames
-    );
-    assert(exec_rc == 0);
-    assert(out_buffer != nullptr);
-    assert(out_batches == 1U);
-    assert(out_channels == 1U);
-    assert(out_frames == static_cast<uint32_t>(kFrames));
-    verify_frames(out_buffer, expected_dynamic, "fft_dynamic_stub");
+            exec_rc = amp_graph_runtime_execute(
+                runtime,
+                nullptr,
+                0U,
+                kFrames,
+                48000.0,
+                &out_buffer,
+                &out_batches,
+                &out_channels,
+                &out_frames
+            );
+            if (exec_rc != 0 || out_buffer == nullptr) {
+                record_failure("dynamic stub execute failed rc=%d buffer=%p", exec_rc, static_cast<void*>(out_buffer));
+                if (out_buffer != nullptr) {
+                    amp_graph_runtime_buffer_free(out_buffer);
+                    out_buffer = nullptr;
+                }
+            } else {
+                if (out_batches != 1U || out_channels != 1U || out_frames != static_cast<uint32_t>(kFrames)) {
+                    record_failure(
+                        "dynamic stub unexpected shape batches=%u channels=%u frames=%u",
+                        out_batches,
+                        out_channels,
+                        out_frames
+                    );
+                }
+                verify_frames(out_buffer, expected_dynamic, "fft_dynamic_stub");
 
-    AmpGraphNodeSummary summary_dynamic{};
-    describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dynamic);
-    assert(describe_rc == 0);
-    assert(summary_dynamic.has_metrics == 1);
-    assert(summary_dynamic.metrics.accumulated_heat > 0.0f);
-    assert(std::fabs(summary_dynamic.metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
+                AmpGraphNodeSummary summary_dynamic{};
+                describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dynamic);
+                if (describe_rc != 0) {
+                    record_failure("describe node failed for dynamic stub rc=%d", describe_rc);
+                } else {
+                    if (summary_dynamic.has_metrics != 1) {
+                        record_failure("dynamic stub summary missing metrics");
+                    }
+                    if (summary_dynamic.metrics.accumulated_heat <= 0.0f) {
+                        record_failure("dynamic stub accumulated_heat <= 0");
+                    }
+                    if (std::fabs(summary_dynamic.metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) >= 1e-6f) {
+                        record_failure("dynamic stub reserved[5] mismatch");
+                    }
+                }
 
-    amp_graph_runtime_buffer_free(out_buffer);
-    out_buffer = nullptr;
-    amp_graph_runtime_destroy(runtime);
-    runtime = nullptr;
+                amp_graph_runtime_buffer_free(out_buffer);
+                out_buffer = nullptr;
+            }
+        }
+        amp_graph_runtime_destroy(runtime);
+        runtime = nullptr;
+    }
 
     // Override window selector to rectangular while restoring FFT algorithm on another fresh runtime.
-    runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
-    assert(runtime != nullptr);
-    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
-
-    std::vector<double> algorithm_selector_param_fft(kFrames, 0.0);
-    std::vector<double> window_selector_param_rect(kFrames, 0.0);
-    assert(
-        amp_graph_runtime_set_param(
+    runtime = create_configured_runtime(descriptor, "backend_mode_amp_window_rect");
+    if (runtime != nullptr) {
+        std::vector<double> algorithm_selector_param_fft(kFrames, 0.0);
+        std::vector<double> window_selector_param_rect(kFrames, 0.0);
+        int set_algo_fft_rc = amp_graph_runtime_set_param(
             runtime,
             "fft_divider",
             "algorithm_selector",
@@ -1216,10 +1341,11 @@ int main() {
             1U,
             1U,
             static_cast<uint32_t>(kFrames)
-        ) == 0
-    );
-    assert(
-        amp_graph_runtime_set_param(
+        );
+        if (set_algo_fft_rc != 0) {
+            record_failure("set_param algorithm_selector fft failed rc=%d", set_algo_fft_rc);
+        }
+        int set_window_rect_rc = amp_graph_runtime_set_param(
             runtime,
             "fft_divider",
             "window_selector",
@@ -1227,55 +1353,81 @@ int main() {
             1U,
             1U,
             static_cast<uint32_t>(kFrames)
-        ) == 0
-    );
+        );
+        if (set_window_rect_rc != 0) {
+            record_failure("set_param window_selector rect failed rc=%d", set_window_rect_rc);
+        }
 
-    std::vector<int> window_selector_rect(kFrames, 0);
-    std::vector<double> expected_rect = simulate_fft_division(
-        signal,
-        divisor_real,
-        divisor_imag,
-        algorithm_selector,
-        window_selector_rect,
-        stabilizer,
-        phase_metadata,
-        lower_metadata,
-        upper_metadata,
-        filter_metadata,
-        dynamic_carriers,
-        kWindowSize,
-        1e-9,
-        FFT_ALGORITHM_EIGEN,
-        FFT_WINDOW_HANN
-    );
+        if (set_algo_fft_rc == 0 && set_window_rect_rc == 0) {
+            std::vector<int> window_selector_rect(kFrames, 0);
+            std::vector<double> expected_rect = simulate_fft_division(
+                signal,
+                divisor_real,
+                divisor_imag,
+                algorithm_selector,
+                window_selector_rect,
+                stabilizer,
+                phase_metadata,
+                lower_metadata,
+                upper_metadata,
+                filter_metadata,
+                dynamic_carriers,
+                kWindowSize,
+                1e-9,
+                FFT_ALGORITHM_EIGEN,
+                FFT_WINDOW_HANN
+            );
 
-    exec_rc = amp_graph_runtime_execute(
-        runtime,
-        nullptr,
-        0U,
-        kFrames,
-        48000.0,
-        &out_buffer,
-        &out_batches,
-        &out_channels,
-        &out_frames
-    );
-    assert(exec_rc == 0);
-    assert(out_buffer != nullptr);
-    assert(out_batches == 1U);
-    assert(out_channels == 1U);
-    assert(out_frames == static_cast<uint32_t>(kFrames));
-    verify_frames(out_buffer, expected_rect, "rectangular_window");
+            exec_rc = amp_graph_runtime_execute(
+                runtime,
+                nullptr,
+                0U,
+                kFrames,
+                48000.0,
+                &out_buffer,
+                &out_batches,
+                &out_channels,
+                &out_frames
+            );
+            if (exec_rc != 0 || out_buffer == nullptr) {
+                record_failure("rect window execute failed rc=%d buffer=%p", exec_rc, static_cast<void*>(out_buffer));
+                if (out_buffer != nullptr) {
+                    amp_graph_runtime_buffer_free(out_buffer);
+                    out_buffer = nullptr;
+                }
+            } else {
+                if (out_batches != 1U || out_channels != 1U || out_frames != static_cast<uint32_t>(kFrames)) {
+                    record_failure(
+                        "rect window unexpected shape batches=%u channels=%u frames=%u",
+                        out_batches,
+                        out_channels,
+                        out_frames
+                    );
+                }
+                verify_frames(out_buffer, expected_rect, "rectangular_window");
 
-    AmpGraphNodeSummary summary_rect{};
-    describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_rect);
-    assert(describe_rc == 0);
-    assert(summary_rect.has_metrics == 1);
-    assert(std::fabs(summary_rect.metrics.accumulated_heat - summary_fft.metrics.accumulated_heat) < 1e-6f);
+                AmpGraphNodeSummary summary_rect{};
+                describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_rect);
+                if (describe_rc != 0) {
+                    record_failure("describe node failed for rect rc=%d", describe_rc);
+                } else {
+                    if (summary_rect.has_metrics != 1) {
+                        record_failure("rect summary missing metrics");
+                    }
+                    if (std::fabs(summary_rect.metrics.accumulated_heat - summary_fft.metrics.accumulated_heat) >= 1e-6f) {
+                        record_failure("rect summary accumulated_heat mismatch");
+                    }
+                }
 
-    amp_graph_runtime_buffer_free(out_buffer);
-    amp_graph_runtime_clear_params(runtime);
-    amp_graph_runtime_destroy(runtime);
+                amp_graph_runtime_buffer_free(out_buffer);
+                out_buffer = nullptr;
+            }
+        }
+
+        amp_graph_runtime_clear_params(runtime);
+        amp_graph_runtime_destroy(runtime);
+    }
+    runtime = nullptr;
 
     // Directly exercise amp_run_node_v2 forward/backward metadata handling.
     std::string direct_node_name = "fft_divider_direct";
@@ -1615,6 +1767,11 @@ int main() {
 
     amp_free(dynamic_fresh_out);
     amp_release_state(dynamic_fresh_state);
+
+    if (g_test_failed) {
+        std::printf("test_fft_division_node: FAIL CODE=FFT_DIVISION\n");
+        return 1;
+    }
 
     std::printf(
         "test_fft_division_node: PASS (FFT division node streaming, dynamic oscillators, and window overrides validated)\n"
