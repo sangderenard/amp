@@ -56,6 +56,27 @@ static int run_fft_division_node(
         "enable_remainder",
         1
     );
+    int backend_mode_param = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "backend_mode",
+        0
+    );
+    if (backend_mode_param < 0) {
+        backend_mode_param = 0;
+    }
+    if (backend_mode_param > 2) {
+        backend_mode_param = 2;
+    }
+    int backend_hop_param = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "backend_hop",
+        1
+    );
+    if (backend_hop_param <= 0) {
+        backend_hop_param = 1;
+    }
 
     int default_algorithm = parse_algorithm_string(descriptor->params_json, descriptor->params_len, FFT_ALGORITHM_EIGEN);
     default_algorithm = clamp_algorithm_kind(default_algorithm);
@@ -71,9 +92,34 @@ static int run_fft_division_node(
     state->u.fftdiv.epsilon = epsilon_json;
     state->u.fftdiv.enable_remainder = enable_remainder ? 1 : 0;
     state->u.fftdiv.max_batch_windows = max_batch_windows;
+    state->u.fftdiv.backend_mode = backend_mode_param;
+    state->u.fftdiv.backend_hop = backend_hop_param;
     if (state->u.fftdiv.window_kind != default_window_kind) {
         fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
         state->u.fftdiv.window_kind = default_window_kind;
+    }
+    if (state->u.fftdiv.backend_mode == 2) {
+        if (
+            state->u.fftdiv.backend_stream_window_size != window_size
+            || state->u.fftdiv.backend_stream_window_kind != state->u.fftdiv.window_kind
+            || state->u.fftdiv.backend_stream_hop != state->u.fftdiv.backend_hop
+        ) {
+            fftdiv_destroy_stream_handles(state);
+            state->u.fftdiv.backend_stream_window_size = window_size;
+            state->u.fftdiv.backend_stream_window_kind = state->u.fftdiv.window_kind;
+            state->u.fftdiv.backend_stream_hop = state->u.fftdiv.backend_hop;
+        }
+    } else {
+        if (
+            state->u.fftdiv.backend_stream_signal != NULL
+            || state->u.fftdiv.backend_stream_div_real != NULL
+            || state->u.fftdiv.backend_stream_div_imag != NULL
+        ) {
+            fftdiv_destroy_stream_handles(state);
+        }
+        state->u.fftdiv.backend_stream_window_size = window_size;
+        state->u.fftdiv.backend_stream_window_kind = state->u.fftdiv.window_kind;
+        state->u.fftdiv.backend_stream_hop = state->u.fftdiv.backend_hop;
     }
 
     const EdgeRunnerParamView *divisor_view = find_param(inputs, "divisor");
@@ -586,20 +632,105 @@ static int run_fft_division_node(
             double *batched_div_imag = state->u.fftdiv.batch_div_imag + batch_offset;
 
             const int use_backend = (batch_algorithm_class != NULL && batch_algorithm_class->forward == fft_algorithm_backend_forward) ? 1 : 0;
-            const int apply_window_weights = use_backend ? 0 : 1;
-            for (int i = 0; i < window_size; ++i) {
-                const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
+            int include_in_batch = 1;
+            if (use_backend && state->u.fftdiv.backend_mode == 2) {
+                include_in_batch = 0;
+                void *signal_ctx = fftdiv_ensure_stream_handle(
+                    state,
+                    state->u.fftdiv.backend_stream_signal,
+                    slot,
+                    window_size,
+                    state->u.fftdiv.backend_hop,
+                    state->u.fftdiv.window_kind
+                );
+                void *div_real_ctx = fftdiv_ensure_stream_handle(
+                    state,
+                    state->u.fftdiv.backend_stream_div_real,
+                    slot,
+                    window_size,
+                    state->u.fftdiv.backend_hop,
+                    state->u.fftdiv.window_kind
+                );
+                void *div_imag_ctx = fftdiv_ensure_stream_handle(
+                    state,
+                    state->u.fftdiv.backend_stream_div_imag,
+                    slot,
+                    window_size,
+                    state->u.fftdiv.backend_hop,
+                    state->u.fftdiv.window_kind
+                );
+                if (signal_ctx != NULL && div_real_ctx != NULL && div_imag_ctx != NULL) {
+                    int tail_index = window_size > 0 ? window_size - 1 : 0;
+                    double signal_sample = input_ring[tail_index];
+                    double divisor_sample_real = divisor_ring[tail_index];
+                    double divisor_sample_imag = divisor_imag_ring[tail_index];
+                    size_t frames_signal = amp_fft_backend_stream_push(
+                        signal_ctx,
+                        &signal_sample,
+                        1,
+                        window_size,
+                        batched_real,
+                        batched_imag,
+                        1,
+                        AMP_FFT_STREAM_FLUSH_NONE
+                    );
+                    double *tmp_div_real_re = state->u.fftdiv.work_real;
+                    double *tmp_div_real_im = state->u.fftdiv.work_imag;
+                    double *tmp_div_imag_re = state->u.fftdiv.div_real;
+                    double *tmp_div_imag_im = state->u.fftdiv.div_imag;
+                    size_t frames_div_real = amp_fft_backend_stream_push(
+                        div_real_ctx,
+                        &divisor_sample_real,
+                        1,
+                        window_size,
+                        tmp_div_real_re,
+                        tmp_div_real_im,
+                        1,
+                        AMP_FFT_STREAM_FLUSH_NONE
+                    );
+                    size_t frames_div_imag = amp_fft_backend_stream_push(
+                        div_imag_ctx,
+                        &divisor_sample_imag,
+                        1,
+                        window_size,
+                        tmp_div_imag_re,
+                        tmp_div_imag_im,
+                        1,
+                        AMP_FFT_STREAM_FLUSH_NONE
+                    );
+                    if (frames_signal > 0 && frames_div_real > 0 && frames_div_imag > 0) {
+                        for (int i = 0; i < window_size; ++i) {
+                            const double a_real = tmp_div_real_re[i];
+                            const double a_imag = tmp_div_real_im[i];
+                            const double b_real = tmp_div_imag_re[i];
+                            const double b_imag = tmp_div_imag_im[i];
+                            batched_div_real[i] = a_real - b_imag;
+                            batched_div_imag[i] = a_imag + b_real;
+                        }
+                        include_in_batch = 1;
+                    }
+                }
+                if (!include_in_batch) {
+                    continue;
+                }
+            } else {
+                int apply_window_weights = 1;
                 if (use_backend) {
-                    /* Backend applies analysis windows/OLA itself; pass raw PCM. */
-                    batched_real[i] = input_ring[i];
-                    batched_imag[i] = 0.0;
-                    batched_div_real[i] = divisor_ring[i];
-                    batched_div_imag[i] = divisor_imag_ring[i];
-                } else {
-                    batched_real[i] = input_ring[i] * w;
-                    batched_imag[i] = 0.0;
-                    batched_div_real[i] = divisor_ring[i] * w;
-                    batched_div_imag[i] = divisor_imag_ring[i] * w;
+                    apply_window_weights = (state->u.fftdiv.backend_mode == 0) ? 1 : 0;
+                }
+                for (int i = 0; i < window_size; ++i) {
+                    const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
+                    if (use_backend) {
+                        batched_real[i] = input_ring[i];
+                        batched_imag[i] = 0.0;
+                        batched_div_real[i] = divisor_ring[i];
+                        batched_div_imag[i] = divisor_imag_ring[i];
+                    } else {
+                        batched_real[i] = input_ring[i] * w;
+                        batched_imag[i] = 0.0;
+                        batched_div_real[i] = divisor_ring[i] * w;
+                        batched_div_imag[i] = divisor_imag_ring[i] * w;
+                    }
                 }
             }
 

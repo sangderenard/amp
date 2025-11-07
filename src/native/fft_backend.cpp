@@ -294,7 +294,10 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
     int inverse,
     int window,
     int hop,
-    int stft_mode
+    int stft_mode,
+    int apply_windows,
+    int analysis_window_kind,
+    int synthesis_window_kind
 ) {
     if (n <= 0 || batch <= 0 || out_real == nullptr || out_imag == nullptr || in_real == nullptr) {
         return 0;
@@ -302,8 +305,21 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
 
     // If caller requests default behaviour (no STFT framing) and window==n/hop==n,
     // delegate to the cached/path-optimized implementation.
-    if (stft_mode == 0 && window == n && hop == n) {
+    if (stft_mode == 0 && window == n && hop == n && apply_windows == 0) {
         return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
+    }
+
+    if (window <= 0) {
+        window = n;
+    }
+    if (hop <= 0) {
+        hop = window;
+    }
+    if (analysis_window_kind < 0) {
+        analysis_window_kind = FFT_WINDOW_RECT;
+    }
+    if (synthesis_window_kind < 0) {
+        synthesis_window_kind = analysis_window_kind;
     }
 
     // Create a temporary fftfree context configured with STFT/window params.
@@ -329,12 +345,12 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
         0,
         0,
         1,   /* silent_crash_reports */
-        0,   /* apply_windows: leave to caller/backend default (0) */
+        apply_windows ? 1 : 0,
         0,   /* apply_ola */
-        FFT_WINDOW_RECT,
+        analysis_window_kind,
         0.0f,
         0.0f,
-        FFT_WINDOW_RECT,
+        synthesis_window_kind,
         0.0f,
         0.0f,
         FFT_WINDOW_NORM_NONE,
@@ -358,8 +374,6 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
         for (std::size_t i = 0; i < total; ++i) {
             pcm[i] = static_cast<float>(in_real[i]);
         }
-        std::fprintf(stderr, "[diag] transform_many_ex: n=%zu frames=%zu total=%zu\n",
-                      frame_len, frames, total);
         const std::size_t produced = fft_execute_batched(
             handle,
             pcm.data(),
@@ -370,7 +384,6 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
             2,   /* pad_mode = never */
             0,   /* enable_backup */
             frames);
-        std::fprintf(stderr, "[diag] transform_many_ex: produced=%zu\n", produced);
         if (produced != frames) {
             fft_free(handle);
             return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
@@ -442,6 +455,115 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
     }
     fft_free(handle);
     return 1;
+}
+
+AMP_CAPI void *amp_fft_backend_stream_create(
+    int n,
+    int window,
+    int hop,
+    int analysis_window_kind
+) {
+    if (n <= 0) {
+        return nullptr;
+    }
+    if (window <= 0) {
+        window = n;
+    }
+    if (hop <= 0) {
+        hop = 1;
+    }
+    if (analysis_window_kind < 0) {
+        analysis_window_kind = FFT_WINDOW_RECT;
+    }
+    return fft_init_full_v2(
+        static_cast<std::size_t>(n),
+        0,
+        1,
+        0,
+        FFT_KERNEL_COOLEYTUKEY,
+        0,
+        nullptr,
+        0,
+        2,
+        window,
+        hop,
+        2, /* streaming mode */
+        FFT_TRANSFORM_C2C,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+    1, /* apply_windows */
+    0, /* apply_ola */
+        analysis_window_kind,
+        0.0f,
+        0.0f,
+        analysis_window_kind,
+        0.0f,
+        0.0f,
+        FFT_WINDOW_NORM_NONE,
+        FFT_COLA_OFF);
+}
+
+AMP_CAPI void amp_fft_backend_stream_destroy(void *handle) {
+    if (handle != nullptr) {
+        fft_free(handle);
+    }
+}
+
+AMP_CAPI size_t amp_fft_backend_stream_push(
+    void *handle,
+    const double *pcm,
+    size_t samples,
+    int n,
+    double *out_real,
+    double *out_imag,
+    size_t max_frames,
+    int flush_mode
+) {
+    if (handle == nullptr || pcm == nullptr || samples == 0 || n <= 0) {
+        return 0;
+    }
+    std::vector<float> pcm_f(samples, 0.0f);
+    for (size_t i = 0; i < samples; ++i) {
+        pcm_f[i] = static_cast<float>(pcm[i]);
+    }
+    std::vector<float> out_real_f;
+    std::vector<float> out_imag_f;
+    std::vector<float> out_mag_f;
+    if (out_real != nullptr || out_imag != nullptr) {
+        const size_t capacity = max_frames * static_cast<size_t>(n);
+        out_real_f.resize(capacity, 0.0f);
+        out_imag_f.resize(capacity, 0.0f);
+        out_mag_f.resize(capacity, 0.0f);
+    }
+    const size_t frames = fft_stream_push_pcm(
+        handle,
+        pcm_f.data(),
+        samples,
+        out_real_f.empty() ? nullptr : out_real_f.data(),
+        out_imag_f.empty() ? nullptr : out_imag_f.data(),
+        out_mag_f.empty() ? nullptr : out_mag_f.data(),
+        max_frames,
+        flush_mode);
+    if (frames == 0 || out_real_f.empty()) {
+        return frames;
+    }
+    const size_t frame_len = static_cast<size_t>(n);
+    const size_t copy_len = frames * frame_len;
+    for (size_t i = 0; i < copy_len; ++i) {
+        if (out_real != nullptr) {
+            out_real[i] = static_cast<double>(out_real_f[i]);
+        }
+        if (out_imag != nullptr) {
+            out_imag[i] = static_cast<double>(out_imag_f[i]);
+        }
+    }
+    return frames;
 }
 
 AMP_CAPI void amp_fft_backend_transform(

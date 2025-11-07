@@ -1,3 +1,7 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -820,19 +824,6 @@ int main() {
         }
     };
 
-    std::vector<uint8_t> descriptor;
-    descriptor.reserve(2048);
-    append_u32(descriptor, 3U);
-
-    append_node(
-        descriptor,
-        "carrier",
-        "ConstantNode",
-        {},
-        "{\"value\":1.0,\"channels\":1}",
-        {}
-    );
-
     ParamDescriptor signal_param{
         "gain",
         1U,
@@ -840,14 +831,6 @@ int main() {
         static_cast<uint32_t>(kFrames),
         signal
     };
-    append_node(
-        descriptor,
-        "signal",
-        "GainNode",
-        {"carrier"},
-        "{}",
-        {signal_param}
-    );
 
     std::vector<double> algorithm_selector_d(algorithm_selector.begin(), algorithm_selector.end());
     std::vector<double> window_selector_d(window_selector.begin(), window_selector.end());
@@ -925,28 +908,57 @@ int main() {
 
     std::vector<std::vector<double>> dynamic_carriers{carrier_band0};
 
-    char fft_params[256];
-    std::snprintf(
-        fft_params,
-        sizeof(fft_params),
-        "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\","
-        "\"supports_v2\":true,\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1}",
-        kWindowSize,
-        kWindowSize - 1
-    );
+    auto make_fft_params_json = [&](int backend_mode, int backend_hop) -> std::string {
+        char fft_params_local[256];
+        std::snprintf(
+            fft_params_local,
+            sizeof(fft_params_local),
+            "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\"," \
+            "\"supports_v2\":true,\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1,\"backend_mode\":%d,\"backend_hop\":%d}",
+            kWindowSize,
+            kWindowSize - 1,
+            backend_mode,
+            backend_hop
+        );
+        return std::string(fft_params_local);
+    };
 
-    append_node(
-        descriptor,
-        "fft_divider",
-        "FFTDivisionNode",
-        {"signal"},
-        fft_params,
-        {divisor_param, divisor_imag_param, algorithm_param, window_param, stabilizer_param, phase_param, lower_param, upper_param, filter_param, carrier_band_param}
-    );
+    auto build_descriptor = [&](int backend_mode, int backend_hop) {
+        std::vector<uint8_t> result;
+        result.reserve(2048);
+        append_u32(result, 3U);
 
-    AmpGraphRuntime *runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
-    assert(runtime != nullptr);
-    assert(amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) == 0);
+        append_node(
+            result,
+            "carrier",
+            "ConstantNode",
+            {},
+            "{\"value\":1.0,\"channels\":1}",
+            {}
+        );
+
+        append_node(
+            result,
+            "signal",
+            "GainNode",
+            {"carrier"},
+            "{}",
+            {signal_param}
+        );
+
+        std::string fft_params_json = make_fft_params_json(backend_mode, backend_hop);
+        append_node(
+            result,
+            "fft_divider",
+            "FFTDivisionNode",
+            {"signal"},
+            fft_params_json,
+            {divisor_param, divisor_imag_param, algorithm_param, window_param, stabilizer_param, phase_param, lower_param, upper_param, filter_param, carrier_band_param}
+        );
+        return result;
+    };
+
+    std::vector<uint8_t> descriptor = build_descriptor(0, 1);
 
     std::vector<double> expected = simulate_fft_division(
         signal,
@@ -966,46 +978,80 @@ int main() {
         FFT_WINDOW_HANN
     );
 
+    auto run_backend_case = [&](const std::vector<uint8_t> &desc, const char *label) {
+        AmpGraphRuntime *runtime_local = amp_graph_runtime_create(desc.data(), desc.size(), nullptr, 0U);
+        assert(runtime_local != nullptr);
+        assert(amp_graph_runtime_configure(runtime_local, 1U, static_cast<uint32_t>(kFrames)) == 0);
+
+        double *case_out_buffer = nullptr;
+        uint32_t case_batches = 0;
+        uint32_t case_channels = 0;
+        uint32_t case_frames = 0;
+        int exec_rc = amp_graph_runtime_execute(
+            runtime_local,
+            nullptr,
+            0U,
+            kFrames,
+            48000.0,
+            &case_out_buffer,
+            &case_batches,
+            &case_channels,
+            &case_frames
+        );
+        assert(exec_rc == 0);
+        assert(case_out_buffer != nullptr);
+        assert(case_batches == 1U);
+        assert(case_channels == 1U);
+        assert(case_frames == static_cast<uint32_t>(kFrames));
+        verify_frames(case_out_buffer, expected, label);
+
+        AmpGraphNodeSummary summary_local{};
+        int describe_rc_local = amp_graph_runtime_describe_node(runtime_local, "fft_divider", &summary_local);
+        assert(describe_rc_local == 0);
+
+        amp_graph_runtime_buffer_free(case_out_buffer);
+        amp_graph_runtime_destroy(runtime_local);
+        return summary_local;
+    };
+
+    auto verify_summary_metadata = [&](const AmpGraphNodeSummary &summary) {
+        assert(summary.supports_v2 == 1);
+        assert(summary.declared_delay_frames == static_cast<uint32_t>(kWindowSize - 1));
+        assert(summary.has_metrics == 1);
+        assert(summary.metrics.accumulated_heat > 0.0f);
+        assert(summary.total_heat_accumulated >= static_cast<double>(summary.metrics.accumulated_heat));
+        assert(summary.total_heat_accumulated > 0.0);
+        assert(std::fabs(summary.metrics.reserved[0] - static_cast<float>(phase_metadata.back())) < 1e-6f);
+        assert(std::fabs(summary.metrics.reserved[1] - static_cast<float>(lower_metadata.back())) < 1e-6f);
+        assert(std::fabs(summary.metrics.reserved[2] - static_cast<float>(upper_metadata.back())) < 1e-6f);
+        assert(std::fabs(summary.metrics.reserved[3] - static_cast<float>(filter_metadata.back())) < 1e-6f);
+    };
+
+    AmpGraphNodeSummary summary_fft = run_backend_case(descriptor, "backend_mode_amp_window");
+
+    std::vector<uint8_t> descriptor_backend_fftfree_batched = build_descriptor(1, 1);
+    AmpGraphNodeSummary summary_fftfree_batched = run_backend_case(
+        descriptor_backend_fftfree_batched,
+        "backend_mode_fftfree_batched"
+    );
+
+    std::vector<uint8_t> descriptor_backend_fftfree_stream = build_descriptor(2, 1);
+    AmpGraphNodeSummary summary_fftfree_stream = run_backend_case(
+        descriptor_backend_fftfree_stream,
+        "backend_mode_fftfree_stream"
+    );
+
+    verify_summary_metadata(summary_fft);
+    verify_summary_metadata(summary_fftfree_batched);
+    verify_summary_metadata(summary_fftfree_stream);
+
     double *out_buffer = nullptr;
     uint32_t out_batches = 0;
     uint32_t out_channels = 0;
     uint32_t out_frames = 0;
-    int exec_rc = amp_graph_runtime_execute(
-        runtime,
-        nullptr,
-        0U,
-        kFrames,
-        48000.0,
-        &out_buffer,
-        &out_batches,
-        &out_channels,
-        &out_frames
-    );
-    assert(exec_rc == 0);
-    assert(out_buffer != nullptr);
-    assert(out_batches == 1U);
-    assert(out_channels == 1U);
-    assert(out_frames == static_cast<uint32_t>(kFrames));
-    verify_frames(out_buffer, expected, "fft_baseline");
-
-    AmpGraphNodeSummary summary_fft{};
-    int describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_fft);
-    assert(describe_rc == 0);
-    assert(summary_fft.supports_v2 == 1);
-    assert(summary_fft.declared_delay_frames == static_cast<uint32_t>(kWindowSize - 1));
-    assert(summary_fft.has_metrics == 1);
-    assert(summary_fft.metrics.accumulated_heat > 0.0f);
-    assert(summary_fft.total_heat_accumulated >= static_cast<double>(summary_fft.metrics.accumulated_heat));
-    assert(summary_fft.total_heat_accumulated > 0.0);
-    assert(std::fabs(summary_fft.metrics.reserved[0] - static_cast<float>(phase_metadata.back())) < 1e-6f);
-    assert(std::fabs(summary_fft.metrics.reserved[1] - static_cast<float>(lower_metadata.back())) < 1e-6f);
-    assert(std::fabs(summary_fft.metrics.reserved[2] - static_cast<float>(upper_metadata.back())) < 1e-6f);
-    assert(std::fabs(summary_fft.metrics.reserved[3] - static_cast<float>(filter_metadata.back())) < 1e-6f);
-
-    amp_graph_runtime_buffer_free(out_buffer);
-    out_buffer = nullptr;
-    amp_graph_runtime_destroy(runtime);
-    runtime = nullptr;
+    int exec_rc = 0;
+    int describe_rc = 0;
+    AmpGraphRuntime *runtime = nullptr;
 
     // Override algorithm selector to use the DFT pathway on a fresh runtime instance and verify updates.
     runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
@@ -1234,7 +1280,7 @@ int main() {
     // Directly exercise amp_run_node_v2 forward/backward metadata handling.
     std::string direct_node_name = "fft_divider_direct";
     std::string direct_type_name = "FFTDivisionNode";
-    std::string direct_params_json = fft_params;
+    std::string direct_params_json = make_fft_params_json(0, 1);
 
     EdgeRunnerNodeDescriptor direct_descriptor{};
     direct_descriptor.name = direct_node_name.c_str();
