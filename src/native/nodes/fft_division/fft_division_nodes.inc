@@ -715,22 +715,18 @@ static int run_fft_division_node(
                 }
             } else {
                 int apply_window_weights = 1;
-                if (use_backend) {
-                    apply_window_weights = (state->u.fftdiv.backend_mode == 0) ? 1 : 0;
+                if (use_backend && state->u.fftdiv.backend_mode != 0) {
+                    apply_window_weights = 0;
                 }
                 for (int i = 0; i < window_size; ++i) {
                     const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
-                    if (use_backend) {
-                        batched_real[i] = input_ring[i];
-                        batched_imag[i] = 0.0;
-                        batched_div_real[i] = divisor_ring[i];
-                        batched_div_imag[i] = divisor_imag_ring[i];
-                    } else {
-                        batched_real[i] = input_ring[i] * w;
-                        batched_imag[i] = 0.0;
-                        batched_div_real[i] = divisor_ring[i] * w;
-                        batched_div_imag[i] = divisor_imag_ring[i] * w;
-                    }
+                    double sample = input_ring[i] * w;
+                    double div_re_sample = divisor_ring[i] * w;
+                    double div_im_sample = divisor_imag_ring[i] * w;
+                    batched_real[i] = sample;
+                    batched_imag[i] = 0.0;
+                    batched_div_real[i] = div_re_sample;
+                    batched_div_imag[i] = div_im_sample;
                 }
             }
 
@@ -1280,21 +1276,19 @@ static int run_fft_division_node_backward(
             double *batched_div_imag = state->u.fftdiv.batch_div_imag + batch_offset;
 
             const int use_backend = (batch_algorithm_class != NULL && batch_algorithm_class->forward == fft_algorithm_backend_forward) ? 1 : 0;
-            const int apply_window_weights = use_backend ? 0 : 1;
+            int apply_window_weights = use_backend ? 0 : 1;
+            if (use_backend && state->u.fftdiv.backend_mode == 0) {
+                apply_window_weights = 1;
+            }
             for (int i = 0; i < window_size; ++i) {
                 const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
-                if (use_backend) {
-                    /* Pass raw PCM segment for backend STFT; backend owns window/OLA. */
-                    batched_real[i] = recomb_ring[i];
-                    batched_imag[i] = 0.0;
-                    batched_div_real[i] = state->u.fftdiv.divisor_buffer[offset + (size_t)i];
-                    batched_div_imag[i] = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i];
-                } else {
-                    batched_real[i] = recomb_ring[i] * w;
-                    batched_imag[i] = 0.0;
-                    batched_div_real[i] = state->u.fftdiv.divisor_buffer[offset + (size_t)i] * w;
-                    batched_div_imag[i] = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i] * w;
-                }
+                double sample = recomb_ring[i] * w;
+                double div_re_sample = state->u.fftdiv.divisor_buffer[offset + (size_t)i] * w;
+                double div_im_sample = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i] * w;
+                batched_real[i] = sample;
+                batched_imag[i] = 0.0;
+                batched_div_real[i] = div_re_sample;
+                batched_div_imag[i] = div_im_sample;
             }
 
             state->u.fftdiv.batch_slot_map[batch_count] = slot;

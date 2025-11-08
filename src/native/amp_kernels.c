@@ -2818,7 +2818,8 @@ static void fft_algorithm_batched_forward(
     double *in_real,
     double *in_imag,
     int n,
-    int slots
+    int slots,
+    int allow_backend_stft
 ) {
     if (cls == NULL || cls->forward == NULL || n <= 0 || slots <= 0) {
         return;
@@ -2828,7 +2829,7 @@ static void fft_algorithm_batched_forward(
        lets the runtime provide window/hop instructions to the backend
        without changing the per-frame algebra.
        Fall back to per-slot calls if the extended batched call fails. */
-    if (cls->forward == fft_algorithm_backend_forward) {
+    if (allow_backend_stft && cls->forward == fft_algorithm_backend_forward) {
         /* Request STFT framing from the backend: window = n, hop = 1 (sliding)
            so the backend will assemble overlapping frames the same way AMP
            previously did when it applied the analysis window itself. */
@@ -2910,8 +2911,8 @@ static void fftdiv_flush_batch(
 
     if (algorithm_class->forward == fft_algorithm_backend_forward) {
         if (state->u.fftdiv.backend_mode == 0) {
-            fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count);
-            fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count);
+            fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count, 0);
+            fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count, 0);
         } else if (state->u.fftdiv.backend_mode == 1) {
             int ok_sig = amp_fft_backend_transform_many_ex(
                 sig_real,
@@ -2929,7 +2930,7 @@ static void fftdiv_flush_batch(
                 state->u.fftdiv.window_kind
             );
             if (!ok_sig) {
-                fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count);
+                fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count, 1);
             }
             int ok_div = amp_fft_backend_transform_many_ex(
                 div_real,
@@ -2947,14 +2948,14 @@ static void fftdiv_flush_batch(
                 state->u.fftdiv.window_kind
             );
             if (!ok_div) {
-                fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count);
+                fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count, 1);
             }
         } else {
             /* Streaming mode already wrote spectra into the batch buffers. */
         }
     } else {
-        fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count);
-        fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count);
+        fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count, 1);
+        fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count, 1);
     }
     /* Diagnostic dump for batches: print mapping and batched arrays when window_size is small
        This helps compare batched inputs/divisors against the simulator. */

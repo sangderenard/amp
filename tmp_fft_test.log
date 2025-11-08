@@ -1,0 +1,492 @@
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=3 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.1875  0.562499911  0.5625 -0.937499911
+[diag]  time sig_imag:   0  0.374999905  0 -0.374999905
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.1875+ 0i  0.562499911+ 0.374999905i  0.5625+ 0i -0.937499911+-0.374999905i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=4 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.09375 -0.281249955 -0.28125  0.468749955
+[diag]  time sig_imag:   0 -0.187499952  0  0.187499952
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.09375+ 0i -0.281249955+-0.187499952i -0.28125+ 0i  0.468749955+ 0.187499952i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=5 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.046875  0.140624978  0.140625 -0.234374978
+[diag]  time sig_imag:   0  0.0937499762  0 -0.0937499762
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.046875+ 0i  0.140624978+ 0.0937499762i  0.140625+ 0i -0.234374978+-0.0937499762i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.0234375 -0.0703124888 -0.0703125  0.117187489
+[diag]  time sig_imag:   0 -0.0468749881  0  0.0468749881
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.0234375+ 0i -0.0703124888+-0.0468749881i -0.0703125+ 0i  0.117187489+ 0.0468749881i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.01171875  0.0351562444  0.03515625 -0.0585937444
+[diag]  time sig_imag:   0  0.023437494  0 -0.023437494
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.01171875+ 0i  0.0351562444+ 0.023437494i  0.03515625+ 0i -0.0585937444+-0.023437494i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+backend_mode_amp_window mismatch at frame 3: got -0.095833338797 expected -0.145833427008 diff 0.050000088211
+--- full actual ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] -0.0958333387970924377
+[4] 0.0479166693985462189
+[5] -0.0239583346992731094
+[6] 0.0119791673496365547
+[7] -0.00598958367481827736
+--- full expected ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] -0.14583342700840099
+[4] 0.0729167135042004949
+[5] -0.0364583567521002475
+[6] 0.0182291783760501237
+[7] -0.00911458918802506186
+FAIL: FFT division output mismatch for backend_mode_amp_window
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=3 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.1875  0.0937499702  0.5625 -0.46874997
+[diag]  time sig_imag:   0.28124997  0.374999946 -0.28124997 -0.374999946
+[diag]  time div_real:   2.25 -1.96874994  0 -0.28125006
+[diag]  time div_imag:  -0.843749881 -1.12499981  0.843749881  1.12499981
+[diag] freq sig (batch 0):  -0.1875+ 0.28124997i  0.0937499702+ 0.374999946i  0.5625+-0.28124997i -0.46874997+-0.374999946i
+[diag] freq div (batch 0):   2.25+-0.843749881i -1.96874994+-1.12499981i  0+ 0.843749881i -0.28125006+ 1.12499981i
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=4 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.09375 -0.0468749851 -0.28125  0.234374985
+[diag]  time sig_imag:  -0.140624985 -0.187499973  0.140624985  0.187499973
+[diag]  time div_real:   2.25 -1.96874994  0 -0.28125006
+[diag]  time div_imag:  -0.843749881 -1.12499981  0.843749881  1.12499981
+[diag] freq sig (batch 0):   0.09375+-0.140624985i -0.0468749851+-0.187499973i -0.28125+ 0.140624985i  0.234374985+ 0.187499973i
+[diag] freq div (batch 0):   2.25+-0.843749881i -1.96874994+-1.12499981i  0+ 0.843749881i -0.28125006+ 1.12499981i
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=5 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.046875  0.0234374925  0.140625 -0.117187493
+[diag]  time sig_imag:   0.0703124925  0.0937499864 -0.0703124925 -0.0937499864
+[diag]  time div_real:   2.25 -1.96874994  0 -0.28125006
+[diag]  time div_imag:  -0.843749881 -1.12499981  0.843749881  1.12499981
+[diag] freq sig (batch 0):  -0.046875+ 0.0703124925i  0.0234374925+ 0.0937499864i  0.140625+-0.0703124925i -0.117187493+-0.0937499864i
+[diag] freq div (batch 0):   2.25+-0.843749881i -1.96874994+-1.12499981i  0+ 0.843749881i -0.28125006+ 1.12499981i
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.0234375 -0.0117187463 -0.0703125  0.0585937463
+[diag]  time sig_imag:  -0.0351562463 -0.0468749932  0.0351562463  0.0468749932
+[diag]  time div_real:   2.25 -1.96874994  0 -0.28125006
+[diag]  time div_imag:  -0.843749881 -1.12499981  0.843749881  1.12499981
+[diag] freq sig (batch 0):   0.0234375+-0.0351562463i -0.0117187463+-0.0468749932i -0.0703125+ 0.0351562463i  0.0585937463+ 0.0468749932i
+[diag] freq div (batch 0):   2.25+-0.843749881i -1.96874994+-1.12499981i  0+ 0.843749881i -0.28125006+ 1.12499981i
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fft_execute_batched: chunked=1 frames=1 pcm_len=4 W=4 H=1
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.01171875  0.00585937314  0.03515625 -0.0292968731
+[diag]  time sig_imag:   0.0175781231  0.0234374966 -0.0175781231 -0.0234374966
+[diag]  time div_real:   2.25 -1.96874994  0 -0.28125006
+[diag]  time div_imag:  -0.843749881 -1.12499981  0.843749881  1.12499981
+[diag] freq sig (batch 0):  -0.01171875+ 0.0175781231i  0.00585937314+ 0.0234374966i  0.03515625+-0.0175781231i -0.0292968731+-0.0234374966i
+[diag] freq div (batch 0):   2.25+-0.843749881i -1.96874994+-1.12499981i  0+ 0.843749881i -0.28125006+ 1.12499981i
+backend_mode_fftfree_batched mismatch at frame 3: got -0.093621775508 expected -0.145833427008 diff 0.052211651500
+--- full actual ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] -0.0936217755079269409
+[4] 0.0468108877539634705
+[5] -0.0234054438769817352
+[6] 0.0117027219384908676
+[7] -0.00585136096924543381
+--- full expected ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] -0.14583342700840099
+[4] 0.0729167135042004949
+[5] -0.0364583567521002475
+[6] 0.0182291783760501237
+[7] -0.00911458918802506186
+FAIL: FFT division output mismatch for backend_mode_fftfree_batched
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.0234375  0.0234374963 -0.0703125  0.0234375037
+[diag]  time sig_imag:   0 -0.0468749963  0  0.0468749963
+[diag]  time div_real:   2.25 -1.12500012  0 -1.12499988
+[diag]  time div_imag:   0 -1.12499988  0  1.12499988
+[diag] freq sig (batch 0):   0.0234375+ 0i  0.0234374963+-0.0468749963i -0.0703125+ 0i  0.0234375037+ 0.0468749963i
+[diag] freq div (batch 0):   2.25+ 0i -1.12500012+-1.12499988i  0+ 0i -1.12499988+ 1.12499988i
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.01171875 -0.0117187481  0.03515625 -0.0117187519
+[diag]  time sig_imag:   0  0.0234374981  0 -0.0234374981
+[diag]  time div_real:   2.25 -1.12500012  0 -1.12499988
+[diag]  time div_imag:   0 -1.12499988  0  1.12499988
+[diag] freq sig (batch 0):  -0.01171875+ 0i -0.0117187481+ 0.0234374981i  0.03515625+ 0i -0.0117187519+-0.0234374981i
+[diag] freq div (batch 0):   2.25+ 0i -1.12500012+-1.12499988i  0+ 0i -1.12499988+ 1.12499988i
+backend_mode_fftfree_stream mismatch at frame 3: got 1.000000000000 expected -0.145833427008 diff 1.145833427008
+--- full actual ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] 1
+[4] 1
+[5] 1
+[6] 0.0182291660457849503
+[7] -0.00911458302289247513
+--- full expected ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] -0.14583342700840099
+[4] 0.0729167135042004949
+[5] -0.0364583567521002475
+[6] 0.0182291783760501237
+[7] -0.00911458918802506186
+FAIL: FFT division output mismatch for backend_mode_fftfree_stream
+FAIL: Assertion failed: std::fabs(candidate.metrics.processing_time_seconds - reference.metrics.processing_time_seconds) < 1e-9 (C:\dev\Powershell\amp\src\native\tests\test_fft_division_node.cpp:1098)
+FAIL: Assertion failed: std::fabs(candidate.metrics.total_time_seconds - reference.metrics.total_time_seconds) < 1e-9 (C:\dev\Powershell\amp\src\native\tests\test_fft_division_node.cpp:1100)
+FAIL: Assertion failed: std::fabs(candidate.metrics.processing_time_seconds - reference.metrics.processing_time_seconds) < 1e-9 (C:\dev\Powershell\amp\src\native\tests\test_fft_division_node.cpp:1098)
+FAIL: Assertion failed: std::fabs(candidate.metrics.total_time_seconds - reference.metrics.total_time_seconds) < 1e-9 (C:\dev\Powershell\amp\src\native\tests\test_fft_division_node.cpp:1100)
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=3 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.1875 -0.375  0.375 -0.9375
+[diag]  time sig_imag:   0  0.375 -0.375 -3.33066907e-16
+[diag]  time div_real:   2.25  1.125  2.25  1.125
+[diag]  time div_imag:   0 -1.125  1.125 -1.11022302e-15
+[diag] freq sig (batch 0):  -0.1875+ 0i -0.375+ 0.375i  0.375+-0.375i -0.9375+-3.33066907e-16i
+[diag] freq div (batch 0):   2.25+ 0i  1.125+-1.125i  2.25+ 1.125i  1.125+-1.11022302e-15i
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=4 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.09375  0.1875 -0.1875  0.46875
+[diag]  time sig_imag:   0 -0.1875  0.1875  1.66533454e-16
+[diag]  time div_real:   2.25  1.125  2.25  1.125
+[diag]  time div_imag:   0 -1.125  1.125 -1.11022302e-15
+[diag] freq sig (batch 0):   0.09375+ 0i  0.1875+-0.1875i -0.1875+ 0.1875i  0.46875+ 1.66533454e-16i
+[diag] freq div (batch 0):   2.25+ 0i  1.125+-1.125i  2.25+ 1.125i  1.125+-1.11022302e-15i
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=5 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.046875 -0.09375  0.09375 -0.234375
+[diag]  time sig_imag:   0  0.09375 -0.09375 -8.32667268e-17
+[diag]  time div_real:   2.25  1.125  2.25  1.125
+[diag]  time div_imag:   0 -1.125  1.125 -1.11022302e-15
+[diag] freq sig (batch 0):  -0.046875+ 0i -0.09375+ 0.09375i  0.09375+-0.09375i -0.234375+-8.32667268e-17i
+[diag] freq div (batch 0):   2.25+ 0i  1.125+-1.125i  2.25+ 1.125i  1.125+-1.11022302e-15i
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.0234375  0.046875 -0.046875  0.1171875
+[diag]  time sig_imag:   0 -0.046875  0.046875  4.16333634e-17
+[diag]  time div_real:   2.25  1.125  2.25  1.125
+[diag]  time div_imag:   0 -1.125  1.125 -1.11022302e-15
+[diag] freq sig (batch 0):   0.0234375+ 0i  0.046875+-0.046875i -0.046875+ 0.046875i  0.1171875+ 4.16333634e-17i
+[diag] freq div (batch 0):   2.25+ 0i  1.125+-1.125i  2.25+ 1.125i  1.125+-1.11022302e-15i
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.01171875 -0.0234375  0.0234375 -0.05859375
+[diag]  time sig_imag:   0  0.0234375 -0.0234375 -2.08166817e-17
+[diag]  time div_real:   2.25  1.125  2.25  1.125
+[diag]  time div_imag:   0 -1.125  1.125 -1.11022302e-15
+[diag] freq sig (batch 0):  -0.01171875+ 0i -0.0234375+ 0.0234375i  0.0234375+-0.0234375i -0.05859375+-2.08166817e-17i
+[diag] freq div (batch 0):   2.25+ 0i  1.125+-1.125i  2.25+ 1.125i  1.125+-1.11022302e-15i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=3 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.625  1.49999994  1.875  5.96046448e-08
+[diag]  time sig_imag:   0  0.374999905  0 -0.374999905
+[diag]  time div_real:   6  0  0  0
+[diag]  time div_imag:   0  0  0  0
+[diag] freq sig (batch 0):   0.625+ 0i  1.49999994+ 0.374999905i  1.875+ 0i  5.96046448e-08+-0.374999905i
+[diag] freq div (batch 0):   6+ 0i  0+ 0i  0+ 0i  0+ 0i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=4 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.3125 -0.74999997 -0.9375 -2.98023224e-08
+[diag]  time sig_imag:   0 -0.187499952  0  0.187499952
+[diag]  time div_real:   6  0  0  0
+[diag]  time div_imag:   0  0  0  0
+[diag] freq sig (batch 0):  -0.3125+ 0i -0.74999997+-0.187499952i -0.9375+ 0i -2.98023224e-08+ 0.187499952i
+[diag] freq div (batch 0):   6+ 0i  0+ 0i  0+ 0i  0+ 0i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=5 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.15625  0.374999985  0.46875  1.49011612e-08
+[diag]  time sig_imag:   0  0.0937499762  0 -0.0937499762
+[diag]  time div_real:   6  0  0  0
+[diag]  time div_imag:   0  0  0  0
+[diag] freq sig (batch 0):   0.15625+ 0i  0.374999985+ 0.0937499762i  0.46875+ 0i  1.49011612e-08+-0.0937499762i
+[diag] freq div (batch 0):   6+ 0i  0+ 0i  0+ 0i  0+ 0i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:  -0.078125 -0.187499993 -0.234375 -7.4505806e-09
+[diag]  time sig_imag:   0 -0.0468749881  0  0.0468749881
+[diag]  time div_real:   6  0  0  0
+[diag]  time div_imag:   0  0  0  0
+[diag] freq sig (batch 0):  -0.078125+ 0i -0.187499993+-0.0468749881i -0.234375+ 0i -7.4505806e-09+ 0.0468749881i
+[diag] freq div (batch 0):   6+ 0i  0+ 0i  0+ 0i  0+ 0i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0 lower= 0 upper= 1 filter= 1 epsilon= 1e-09
+[diag]  time sig_real:   0.0390625  0.0937499963  0.1171875  3.7252903e-09
+[diag]  time sig_imag:   0  0.023437494  0 -0.023437494
+[diag]  time div_real:   6  0  0  0
+[diag]  time div_imag:   0  0  0  0
+[diag] freq sig (batch 0):   0.0390625+ 0i  0.0937499963+ 0.023437494i  0.1171875+ 0i  3.7252903e-09+-0.023437494i
+[diag] freq div (batch 0):   6+ 0i  0+ 0i  0+ 0i  0+ 0i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=3 phase= 0.24 lower= 0 upper= 1 filter= 0.96 epsilon= 1e-09
+[diag]  time sig_real:  -0.1875  0.562499911  0.5625 -0.937499911
+[diag]  time sig_imag:   0  0.374999905  0 -0.374999905
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.1875+ 0i  0.562499911+ 0.374999905i  0.5625+ 0i -0.937499911+-0.374999905i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=4 phase=-0.3 lower= 0 upper= 1 filter= 0.94 epsilon= 1e-09
+[diag]  time sig_real:   0.09375 -0.281249955 -0.28125  0.468749955
+[diag]  time sig_imag:   0 -0.187499952  0  0.187499952
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.09375+ 0i -0.281249955+-0.187499952i -0.28125+ 0i  0.468749955+ 0.187499952i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=5 phase= 0.36 lower= 0 upper= 1 filter= 0.98 epsilon= 1e-09
+[diag]  time sig_real:  -0.046875  0.140624978  0.140625 -0.234374978
+[diag]  time sig_imag:   0  0.0937499762  0 -0.0937499762
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.046875+ 0i  0.140624978+ 0.0937499762i  0.140625+ 0i -0.234374978+-0.0937499762i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase=-0.12 lower= 0 upper= 1 filter= 0.93 epsilon= 1e-09
+[diag]  time sig_real:   0.0234375 -0.0703124888 -0.0703125  0.117187489
+[diag]  time sig_imag:   0 -0.0468749881  0  0.0468749881
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.0234375+ 0i -0.0703124888+-0.0468749881i -0.0703125+ 0i  0.117187489+ 0.0468749881i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0.18 lower= 0 upper= 1 filter= 0.97 epsilon= 1e-09
+[diag]  time sig_real:  -0.01171875  0.0351562444  0.03515625 -0.0585937444
+[diag]  time sig_imag:   0  0.023437494  0 -0.023437494
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.01171875+ 0i  0.0351562444+ 0.023437494i  0.03515625+ 0i -0.0585937444+-0.023437494i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+direct_forward mismatch at frame 3: got -0.066543638706 expected -0.135987403830 diff 0.069443765124
+--- full actual ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] -0.0665436387062072754
+[4] 0.0569194033741950989
+[5] -0.0133433584123849869
+[6] 0.0124521646648645401
+[7] -0.00463066250085830688
+--- full expected ---
+[0] 0.66666666666666663
+[1] -0.333333333333333315
+[2] 0.166666666666666657
+[3] -0.135987403829828629
+[4] 0.0654803972530197259
+[5] -0.0334388350751914643
+[6] 0.0168312197161247026
+[7] -0.00869831115244346434
+FAIL: FFT division output mismatch for direct_forward
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=4 phase=-0.3 lower= 0 upper= 1 filter= 0.94 epsilon= 1e-09
+[diag]  time sig_real:   0.075092271 -0.200092252 -0.174907729  0.29990771
+[diag]  time sig_imag:   0 -0.124999971  0  0.124999971
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.075092271+ 0i -0.200092252+-0.124999971i -0.174907729+ 0i  0.29990771+ 0.124999971i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=5 phase= 0.36 lower= 0 upper= 1 filter= 0.98 epsilon= 1e-09
+[diag]  time sig_real:  -0.00721817464  0.0571258925  0.0925972834 -0.142505001
+[diag]  time sig_imag:   0  0.0499077166  0 -0.0499077166
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.00721817464+ 0i  0.0571258925+ 0.0499077166i  0.0925972834+ 0i -0.142505001+-0.0499077166i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase=-0.12 lower= 0 upper= 1 filter= 0.93 epsilon= 1e-09
+[diag]  time sig_real:   0.0326820314 -0.0753715709 -0.0526970699  0.0953866094
+[diag]  time sig_imag:   0 -0.0426895395  0  0.0426895395
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.0326820314+ 0i -0.0753715709+-0.0426895395i -0.0526970699+ 0i  0.0953866094+ 0.0426895395i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0.18 lower= 0 upper= 1 filter= 0.97 epsilon= 1e-09
+[diag]  time sig_real:  -0.000668394379  0.0106759099  0.0193466432 -0.0293541579
+[diag]  time sig_imag:   0  0.0100075157  0 -0.0100075157
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.000668394379+ 0i  0.0106759099+ 0.0100075157i  0.0193466432+ 0i -0.0293541579+-0.0100075157i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=4 phase=-0.3 lower= 0 upper= 1 filter= 0.94 epsilon= 1e-09
+[diag]  time sig_real:   0.075092271 -0.200092252 -0.174907729  0.29990771
+[diag]  time sig_imag:   0 -0.124999971  0  0.124999971
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.075092271+ 0i -0.200092252+-0.124999971i -0.174907729+ 0i  0.29990771+ 0.124999971i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=5 phase= 0.36 lower= 0 upper= 1 filter= 0.98 epsilon= 1e-09
+[diag]  time sig_real:  -0.00721817464  0.0571258925  0.0925972834 -0.142505001
+[diag]  time sig_imag:   0  0.0499077166  0 -0.0499077166
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.00721817464+ 0i  0.0571258925+ 0.0499077166i  0.0925972834+ 0i -0.142505001+-0.0499077166i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=6 phase=-0.12 lower= 0 upper= 1 filter= 0.93 epsilon= 1e-09
+[diag]  time sig_real:   0.0326820314 -0.0753715709 -0.0526970699  0.0953866094
+[diag]  time sig_imag:   0 -0.0426895395  0  0.0426895395
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):   0.0326820314+ 0i -0.0753715709+-0.0426895395i -0.0526970699+ 0i  0.0953866094+ 0.0426895395i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fft_execute_batched: chunked=0 frames=1 pcm_len=4 W=4 H=4
+[diag] fftdiv_flush_batch: window_size=4 batch_count=1
+[diag] batch 0: slot_map=0 slot_offset=0 output_index=7 phase= 0.18 lower= 0 upper= 1 filter= 0.97 epsilon= 1e-09
+[diag]  time sig_real:  -0.000668394379  0.0106759099  0.0193466432 -0.0293541579
+[diag]  time sig_imag:   0  0.0100075157  0 -0.0100075157
+[diag]  time div_real:   2.25 -3.37499964  0  1.12499964
+[diag]  time div_imag:   0 -1.12499968  0  1.12499968
+[diag] freq sig (batch 0):  -0.000668394379+ 0i  0.0106759099+ 0.0100075157i  0.0193466432+ 0i -0.0293541579+-0.0100075157i
+[diag] freq div (batch 0):   2.25+ 0i -3.37499964+-1.12499968i  0+ 0i  1.12499964+ 1.12499968i
+test_fft_division_node: FAIL CODE=FFT_DIVISION
