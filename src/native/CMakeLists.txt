@@ -209,6 +209,30 @@ if (AMP_NATIVE_BUILD_TESTS)
     target_link_libraries(test_fft_backend_compare PRIVATE amp_native fft_cffi)
     add_test(NAME test_fft_backend_compare COMMAND test_fft_backend_compare)
 
+    add_executable(test_fft_backend_transform
+        tests/test_fft_backend_transform.cpp
+        tests/mock_fftfree.cpp
+    )
+    target_include_directories(test_fft_backend_transform PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    add_test(NAME test_fft_backend_transform COMMAND test_fft_backend_transform)
+
+    add_executable(test_fft_backend_stream
+        tests/test_fft_backend_stream.cpp
+        tests/mock_fftfree.cpp
+    )
+    target_include_directories(test_fft_backend_stream PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    add_test(NAME test_fft_backend_stream COMMAND test_fft_backend_stream)
+
     add_executable(test_pitch_shift_node
         tests/test_pitch_shift_node.cpp
     )
@@ -227,6 +251,8 @@ if (AMP_NATIVE_BUILD_TESTS)
         test_fft_noise_gradient
         test_fft_division_node
         test_fft_backend_compare
+        test_fft_backend_transform
+        test_fft_backend_stream
         test_pitch_shift_node
     )
 
