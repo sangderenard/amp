@@ -2,6 +2,7 @@
 #if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS 1
 #endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <float.h>
@@ -14,18 +15,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#if defined(__cplusplus)
-#include <Eigen/Dense>
-#endif
+
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #endif
+
 #if defined(__GNUC__) && !defined(_WIN32) && !defined(_WIN64)
 #include <execinfo.h>
 #endif
-/* POSIX mkdir() */
-#include <sys/stat.h>
-#include <sys/types.h>
+
+#if defined(__cplusplus)
+#include <complex>
+#include <deque>
+#include <memory>
+#include <new>
+#include <vector>
+#include <Eigen/Core>
+#include <unsupported/Eigen/CXX11/Tensor>
+using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>;
+#endif
 
 #include "amp_native.h"
 #include "amp_fft_backend.h"
@@ -46,7 +54,7 @@ typedef struct {
 } envelope_scratch_t;
 
 static envelope_scratch_t envelope_scratch = { NULL, NULL, NULL, NULL, 0, 0, 0 };
-/* Debug: track last allocation element count for diagnostics. */
+
 static size_t amp_last_alloc_count = 0;
 
 AMP_CAPI size_t amp_last_alloc_count_get(void) {
@@ -1438,7 +1446,6 @@ typedef enum {
     NODE_KIND_LFO,
     NODE_KIND_ENVELOPE,
     NODE_KIND_PITCH,
-    NODE_KIND_PITCH_SHIFT,
     NODE_KIND_OSC,
     NODE_KIND_OSC_PITCH,
     NODE_KIND_DRIVER,
@@ -1447,6 +1454,19 @@ typedef enum {
     NODE_KIND_FFT_DIV,
     NODE_KIND_SPECTRAL_DRIVE,
 } node_kind_t;
+
+#if defined(__cplusplus)
+struct FftDivSpectralScratch {
+    int cache_pages;
+    int lanes;
+    int freq_bins;
+    int time_slices;
+    int cache_cursor;
+    int time_cursor;
+    std::vector<double> real;
+    std::vector<double> imag;
+};
+#endif
 
 typedef struct {
     node_kind_t kind;
@@ -1495,15 +1515,6 @@ typedef struct {
             int mode;
         } driver;
         struct {
-            double *analysis_window;
-            double *synthesis_window;
-            double *prev_phase;
-            double *phase_accum;
-            int window_size;
-            int hop_size;
-            int resynthesis_hop;
-        } pitch_shift;
-        struct {
             double *slew_state;
             int batches;
             double phase;
@@ -1543,69 +1554,65 @@ typedef struct {
             int use_div4;
         } subharm;
         struct {
-            double *input_buffer;
-            double *divisor_buffer;
-            double *divisor_imag_buffer;
-            double *phase_buffer;
-            double *lower_buffer;
-            double *upper_buffer;
-            double *filter_buffer;
-            double *window;
-            double *work_real;
-            double *work_imag;
-            double *div_real;
-            double *div_imag;
-            double *ifft_real;
-            double *ifft_imag;
-            double *result_buffer;
-            double *div_fft_real;
-            double *div_fft_imag;
-            double *recomb_buffer;
-            double *batch_input_real;
-            double *batch_input_imag;
-            double *batch_div_real;
-            double *batch_div_imag;
-            int *batch_slot_map;
-            size_t *batch_slot_offset;
-            size_t *batch_output_index;
-            double *batch_phase;
-            double *batch_lower;
-            double *batch_upper;
-            double *batch_filter;
-            double *batch_epsilon;
             int window_size;
-            int algorithm;
             int window_kind;
-            int filled;
-            int position;
-            double epsilon;
-            int batches;
-            int channels;
-            int slots;
-            int recomb_filled;
-            double last_phase;
-            double last_lower;
-            double last_upper;
-            double last_filter;
-            double total_heat;
-            int dynamic_carrier_band_count;
-            double dynamic_carrier_last_sum;
-            double *dynamic_phase;
-            double *dynamic_step_re;
-            double *dynamic_step_im;
-            int dynamic_k_active;
-            int enable_remainder;
-            double remainder_energy;
-            int max_batch_windows;
-            int batch_capacity;
-            int backend_mode;
-            int backend_hop;
-            void **backend_stream_signal;
-            void **backend_stream_div_real;
-            void **backend_stream_div_imag;
-            int backend_stream_window_size;
-            int backend_stream_window_kind;
-            int backend_stream_hop;
+#if defined(__cplusplus)
+            FftWorkingTensor *working_tensor;
+            int working_tensor_lanes;
+            int working_tensor_freq_bins;
+            int working_tensor_time_slices;
+            int working_tensor_time_cursor;
+            int working_tensor_cache_pages;
+            int working_tensor_cache_cursor;
+            int default_lane_count;
+            struct StreamSlot {
+                void *forward_handle{nullptr};
+                void *inverse_handle{nullptr};
+                std::vector<double> forward_real;
+                std::vector<double> forward_imag;
+                std::vector<double> inverse_scratch;
+                std::deque<double> inverse_queue;
+                bool warmup_complete{false};
+            };
+            std::vector<StreamSlot> stream_slots;
+            struct LaneBinding {
+                int slot_index{-1};
+                int tensor_lane{-1};
+                bool enable_pcm_in{false};
+                bool enable_pcm_out{false};
+                bool enable_spectral_in{false};
+                bool enable_spectral_out{false};
+                bool active{false};
+                bool frame_ready{false};
+                double staged_pcm_value{0.0};
+                bool staged_pcm_valid{false};
+            };
+            std::vector<LaneBinding> lane_plan;
+            FftDivSpectralScratch spectral_scratch;
+            struct OperatorTensorSpec {
+                int identifier{-1};
+                int cache_pages{1};
+                int lanes{1};
+                int freq_bins{0};
+                int time_slices{0};
+                bool persistent{true};
+                bool expose_as_lane{false};
+                int exposed_lane{-1};
+            };
+            struct OperatorTensorEntry {
+                OperatorTensorSpec spec;
+                std::unique_ptr<FftWorkingTensor> tensor;
+            };
+            struct OperatorStep {
+                int opcode{0};
+                std::vector<int> input_tensor_indices;
+                std::vector<int> output_tensor_indices;
+                std::vector<int> lane_bindings;
+            };
+            std::vector<OperatorTensorEntry> operator_arena;
+            std::vector<OperatorStep> operator_steps;
+#endif
+            int preserve_tensor_on_ingest;
         } fftdiv;
         struct {
             int mode;
@@ -1755,19 +1762,6 @@ static void release_node_state(node_state_t *state) {
         state->u.pitch.last_freq = NULL;
         state->u.pitch.batches = 0;
     }
-    if (state->kind == NODE_KIND_PITCH_SHIFT) {
-        free(state->u.pitch_shift.analysis_window);
-        free(state->u.pitch_shift.synthesis_window);
-        free(state->u.pitch_shift.prev_phase);
-        free(state->u.pitch_shift.phase_accum);
-        state->u.pitch_shift.analysis_window = NULL;
-        state->u.pitch_shift.synthesis_window = NULL;
-        state->u.pitch_shift.prev_phase = NULL;
-        state->u.pitch_shift.phase_accum = NULL;
-        state->u.pitch_shift.window_size = 0;
-        state->u.pitch_shift.hop_size = 0;
-        state->u.pitch_shift.resynthesis_hop = 0;
-    }
     if (state->kind == NODE_KIND_OSC_PITCH) {
         free(state->u.osc_pitch.last_value);
         state->u.osc_pitch.last_value = NULL;
@@ -1820,7 +1814,6 @@ static void release_node_state(node_state_t *state) {
     }
     if (state->kind == NODE_KIND_FFT_DIV) {
         fft_state_free_buffers(state);
-        state->u.fftdiv.total_heat = 0.0;
     }
     free(state);
 }
@@ -1855,10 +1848,6 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     }
     if (strcmp(descriptor->type_name, "PitchQuantizerNode") == 0) {
         return NODE_KIND_PITCH;
-    }
-    if (strcmp(descriptor->type_name, "PitchShiftNode") == 0
-        || strcmp(descriptor->type_name, "pitch_shift") == 0) {
-        return NODE_KIND_PITCH_SHIFT;
     }
     if (strcmp(descriptor->type_name, "OscillatorPitchNode") == 0
         || strcmp(descriptor->type_name, "oscillator_pitch") == 0) {
@@ -2321,10 +2310,6 @@ static double grid_warp_inverse_value(double u, const double *grid, const double
 #define FFT_ALGORITHM_DFT 1
 #define FFT_ALGORITHM_DYNAMIC_OSCILLATORS 2
 #define FFT_ALGORITHM_HOOK 3
-
-#define PITCH_SHIFT_DEFAULT_WINDOW 1024
-#define PITCH_SHIFT_DEFAULT_HOP 256
-#define PITCH_SHIFT_DEFAULT_RESYNTH_HOP 256
 
 #define FFT_WINDOW_RECTANGULAR 0
 #define FFT_WINDOW_HANN 1
@@ -2813,447 +2798,32 @@ static const fft_algorithm_class_t *select_fft_algorithm(int kind) {
     return NULL;
 }
 
-static void fft_algorithm_batched_forward(
-    const fft_algorithm_class_t *cls,
-    double *in_real,
-    double *in_imag,
-    int n,
-    int slots,
-    int allow_backend_stft
-) {
-    if (cls == NULL || cls->forward == NULL || n <= 0 || slots <= 0) {
-        return;
-    }
-    /* If the selected algorithm is the backend (fftfree), prefer the
-       batched backend transform which can accept STFT framing hints. This
-       lets the runtime provide window/hop instructions to the backend
-       without changing the per-frame algebra.
-       Fall back to per-slot calls if the extended batched call fails. */
-    if (allow_backend_stft && cls->forward == fft_algorithm_backend_forward) {
-        /* Request STFT framing from the backend: window = n, hop = 1 (sliding)
-           so the backend will assemble overlapping frames the same way AMP
-           previously did when it applied the analysis window itself. */
-        int ok = amp_fft_backend_transform_many_ex(
-            in_real,
-            in_imag,
-            in_real,
-            in_imag,
-            n,
-            slots,
-            0, /* forward */
-            n, /* window */
-            1, /* hop */
-            1, /* stft_mode: enable */
-            0, /* apply_windows */
-            AMP_FFT_WINDOW_RECT,
-            AMP_FFT_WINDOW_RECT
-        );
-        if (ok) {
-            return;
-        }
-        /* fall through to per-slot if backend batched helper failed */
-    }
-
-    for (int s = 0; s < slots; ++s) {
-        double *r = in_real + (size_t)s * (size_t)n;
-        double *i = in_imag + (size_t)s * (size_t)n;
-        cls->forward(r, i, r, i, n);
-    }
-}
-
-static void fft_algorithm_batched_inverse(
-    const fft_algorithm_class_t *cls,
-    double *in_real,
-    double *in_imag,
-    int n,
-    int slots
-) {
-    if (cls == NULL || cls->inverse == NULL || n <= 0 || slots <= 0) {
-        return;
-    }
-    for (int s = 0; s < slots; ++s) {
-        double *r = in_real + (size_t)s * (size_t)n;
-        double *i = in_imag + (size_t)s * (size_t)n;
-        cls->inverse(r, i, r, i, n);
-    }
-}
-
-static void fftdiv_flush_batch(
-    node_state_t *state,
-    const fft_algorithm_class_t *algorithm_class,
-    int window_size,
-    int batch_count,
-    double *output_buffer
-) {
-    if (state == NULL || algorithm_class == NULL || batch_count <= 0 || window_size <= 0 || output_buffer == NULL) {
-        return;
-    }
-    double *sig_real = state->u.fftdiv.batch_input_real;
-    double *sig_imag = state->u.fftdiv.batch_input_imag;
-    double *div_real = state->u.fftdiv.batch_div_real;
-    double *div_imag = state->u.fftdiv.batch_div_imag;
-    int *slot_map = state->u.fftdiv.batch_slot_map;
-    size_t *slot_offset_map = state->u.fftdiv.batch_slot_offset;
-    size_t *output_index_map = state->u.fftdiv.batch_output_index;
-    double *phase_map = state->u.fftdiv.batch_phase;
-    double *lower_map = state->u.fftdiv.batch_lower;
-    double *upper_map = state->u.fftdiv.batch_upper;
-    double *filter_map = state->u.fftdiv.batch_filter;
-    double *epsilon_map = state->u.fftdiv.batch_epsilon;
-    if (
-        sig_real == NULL || sig_imag == NULL || div_real == NULL || div_imag == NULL
-        || slot_map == NULL || slot_offset_map == NULL || output_index_map == NULL
-        || phase_map == NULL || lower_map == NULL || upper_map == NULL
-        || filter_map == NULL || epsilon_map == NULL
-    ) {
-        return;
-    }
-
-    if (algorithm_class->forward == fft_algorithm_backend_forward) {
-        if (state->u.fftdiv.backend_mode == 0) {
-            fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count, 0);
-            fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count, 0);
-        } else if (state->u.fftdiv.backend_mode == 1) {
-            int ok_sig = amp_fft_backend_transform_many_ex(
-                sig_real,
-                sig_imag,
-                sig_real,
-                sig_imag,
-                window_size,
-                batch_count,
-                0,
-                window_size,
-                state->u.fftdiv.backend_hop,
-                1,
-                1,
-                state->u.fftdiv.window_kind,
-                state->u.fftdiv.window_kind
-            );
-            if (!ok_sig) {
-                fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count, 1);
-            }
-            int ok_div = amp_fft_backend_transform_many_ex(
-                div_real,
-                div_imag,
-                div_real,
-                div_imag,
-                window_size,
-                batch_count,
-                0,
-                window_size,
-                state->u.fftdiv.backend_hop,
-                1,
-                1,
-                state->u.fftdiv.window_kind,
-                state->u.fftdiv.window_kind
-            );
-            if (!ok_div) {
-                fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count, 1);
-            }
-        } else {
-            /* Streaming mode already wrote spectra into the batch buffers. */
-        }
-    } else {
-        fft_algorithm_batched_forward(algorithm_class, sig_real, sig_imag, window_size, batch_count, 1);
-        fft_algorithm_batched_forward(algorithm_class, div_real, div_imag, window_size, batch_count, 1);
-    }
-    /* Diagnostic dump for batches: print mapping and batched arrays when window_size is small
-       This helps compare batched inputs/divisors against the simulator. */
-    if (window_size > 0 && window_size <= 16) {
-        fprintf(stderr, "[diag] fftdiv_flush_batch: window_size=%d batch_count=%d\n", window_size, batch_count);
-        for (int b = 0; b < batch_count; ++b) {
-            size_t batch_offset = (size_t)b * (size_t)window_size;
-            fprintf(stderr, "[diag] batch %d: slot_map=%d slot_offset=%zu output_index=%zu phase=% .9g lower=% .9g upper=% .9g filter=% .9g epsilon=% .9g\n",
-                b, slot_map[b], slot_offset_map[b], output_index_map[b], phase_map[b], lower_map[b], upper_map[b], filter_map[b], epsilon_map[b]);
-            fprintf(stderr, "[diag]  time sig_real: ");
-            for (int i = 0; i < window_size; ++i) {
-                fprintf(stderr, " % .9g", sig_real[batch_offset + (size_t)i]);
-            }
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[diag]  time sig_imag: ");
-            for (int i = 0; i < window_size; ++i) {
-                fprintf(stderr, " % .9g", sig_imag[batch_offset + (size_t)i]);
-            }
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[diag]  time div_real: ");
-            for (int i = 0; i < window_size; ++i) {
-                fprintf(stderr, " % .9g", div_real[batch_offset + (size_t)i]);
-            }
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[diag]  time div_imag: ");
-            for (int i = 0; i < window_size; ++i) {
-                fprintf(stderr, " % .9g", div_imag[batch_offset + (size_t)i]);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
-
-    /* After forward transforms, print the frequency-domain bins for sig and divisor. */
-    if (window_size > 0 && window_size <= 16) {
-        for (int b = 0; b < batch_count; ++b) {
-            size_t batch_offset = (size_t)b * (size_t)window_size;
-            fprintf(stderr, "[diag] freq sig (batch %d): ", b);
-            for (int i = 0; i < window_size; ++i) {
-                fprintf(stderr, " % .9g+% .9gi", sig_real[batch_offset + (size_t)i], sig_imag[batch_offset + (size_t)i]);
-            }
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[diag] freq div (batch %d): ", b);
-            for (int i = 0; i < window_size; ++i) {
-                fprintf(stderr, " % .9g+% .9gi", div_real[batch_offset + (size_t)i], div_imag[batch_offset + (size_t)i]);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
-
-    for (int b = 0; b < batch_count; ++b) {
-        size_t batch_offset = (size_t)b * (size_t)window_size;
-        double *sig_real_base = sig_real + batch_offset;
-        double *sig_imag_base = sig_imag + batch_offset;
-        double *div_real_base = div_real + batch_offset;
-        double *div_imag_base = div_imag + batch_offset;
-        size_t slot_offset = slot_offset_map[b];
-        double phase_mod = phase_map[b];
-        double lower_mod = lower_map[b];
-        double upper_mod = upper_map[b];
-        double filter_mod = filter_map[b];
-        double epsilon_frame = epsilon_map[b];
-        double lower_clamped = clamp_unit_double(lower_mod);
-        double upper_clamped = clamp_unit_double(upper_mod);
-        if (upper_clamped < lower_clamped) {
-            double tmp_bounds = lower_clamped;
-            lower_clamped = upper_clamped;
-            upper_clamped = tmp_bounds;
-        }
-        double intensity_clamped = clamp_unit_double(filter_mod);
-        double cos_phase = cos(phase_mod);
-        double sin_phase = sin(phase_mod);
-        for (int i = 0; i < window_size; ++i) {
-            double a = sig_real_base[i];
-            double b_im = sig_imag_base[i];
-            double c = div_real_base[i];
-            double d = div_imag_base[i];
-            state->u.fftdiv.div_fft_real[slot_offset + (size_t)i] = c;
-            state->u.fftdiv.div_fft_imag[slot_offset + (size_t)i] = d;
-            double denom = c * c + d * d;
-            if (denom < epsilon_frame) {
-                denom = epsilon_frame;
-            }
-            double real = (a * c + b_im * d) / denom;
-            double imag = (b_im * c - a * d) / denom;
-            double ratio = window_size > 1 ? (double)i / (double)(window_size - 1) : 0.0;
-            double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
-            double gated_real = real * gain;
-            double gated_imag = imag * gain;
-            double rotated_real = gated_real * cos_phase - gated_imag * sin_phase;
-            double rotated_imag = gated_real * sin_phase + gated_imag * cos_phase;
-            sig_real_base[i] = rotated_real;
-            sig_imag_base[i] = rotated_imag;
-        }
-    }
-
-    fft_algorithm_batched_inverse(algorithm_class, sig_real, sig_imag, window_size, batch_count);
-
-    for (int b = 0; b < batch_count; ++b) {
-        size_t slot_offset = slot_offset_map[b];
-        size_t batch_offset = (size_t)b * (size_t)window_size;
-        double *sig_real_base = sig_real + batch_offset;
-        for (int i = 0; i < window_size; ++i) {
-            state->u.fftdiv.result_buffer[slot_offset + (size_t)i] = sig_real_base[i];
-        }
-        size_t output_index = output_index_map[b];
-        output_buffer[output_index] = sig_real_base[window_size > 0 ? window_size - 1 : 0];
-        state->u.fftdiv.batch_slot_map[b] = slot_map[b];
-    }
-}
-
-static void fill_window_weights(double *window, int window_size, int window_kind) {
-    if (window == NULL || window_size <= 0) {
-        return;
-    }
-    if (window_size == 1) {
-        window[0] = 1.0;
-        return;
-    }
-    for (int i = 0; i < window_size; ++i) {
-        double value = 1.0;
-        double phase = (double)i / (double)(window_size - 1);
-        switch (window_kind) {
-            case FFT_WINDOW_RECTANGULAR:
-                value = 1.0;
-                break;
-            case FFT_WINDOW_HANN:
-                value = 0.5 * (1.0 - cos(2.0 * M_PI * phase));
-                break;
-            case FFT_WINDOW_HAMMING:
-                value = 0.54 - 0.46 * cos(2.0 * M_PI * phase);
-                break;
-            default:
-                value = 1.0;
-                break;
-        }
-        window[i] = value;
-    }
-}
-
-static void fftdiv_destroy_stream_handles(node_state_t *state) {
+#if defined(__cplusplus)
+static void fftdiv_reset_stream_slots(node_state_t *state) {
     if (state == NULL) {
         return;
     }
-    const int slot_count = state->u.fftdiv.slots > 0 ? state->u.fftdiv.slots : state->u.fftdiv.batch_capacity;
-    if (state->u.fftdiv.backend_stream_signal != NULL) {
-        for (int i = 0; i < slot_count; ++i) {
-            if (state->u.fftdiv.backend_stream_signal[i] != NULL) {
-                amp_fft_backend_stream_destroy(state->u.fftdiv.backend_stream_signal[i]);
-                state->u.fftdiv.backend_stream_signal[i] = NULL;
-            }
+    for (auto &slot : state->u.fftdiv.stream_slots) {
+        if (slot.forward_handle != nullptr) {
+            amp_fft_backend_stream_destroy(slot.forward_handle);
+            slot.forward_handle = nullptr;
         }
-    }
-    if (state->u.fftdiv.backend_stream_div_real != NULL) {
-        for (int i = 0; i < slot_count; ++i) {
-            if (state->u.fftdiv.backend_stream_div_real[i] != NULL) {
-                amp_fft_backend_stream_destroy(state->u.fftdiv.backend_stream_div_real[i]);
-                state->u.fftdiv.backend_stream_div_real[i] = NULL;
-            }
+        if (slot.inverse_handle != nullptr) {
+            amp_fft_backend_stream_destroy(slot.inverse_handle);
+            slot.inverse_handle = nullptr;
         }
+        slot.forward_real.clear();
+        slot.forward_imag.clear();
+        slot.inverse_scratch.clear();
+        slot.inverse_queue.clear();
+        slot.warmup_complete = false;
     }
-    if (state->u.fftdiv.backend_stream_div_imag != NULL) {
-        for (int i = 0; i < slot_count; ++i) {
-            if (state->u.fftdiv.backend_stream_div_imag[i] != NULL) {
-                amp_fft_backend_stream_destroy(state->u.fftdiv.backend_stream_div_imag[i]);
-                state->u.fftdiv.backend_stream_div_imag[i] = NULL;
-            }
-        }
-    }
+    state->u.fftdiv.stream_slots.clear();
 }
+#endif
 
-static void *fftdiv_ensure_stream_handle(
-    node_state_t *state,
-    void **table,
-    int slot,
-    int window_size,
-    int hop,
-    int window_kind
-) {
-    if (state == NULL || table == NULL || slot < 0) {
-        return NULL;
-    }
-    if (slot >= state->u.fftdiv.slots) {
-        return NULL;
-    }
-    if (table[slot] != NULL) {
-        return table[slot];
-    }
-    void *handle = amp_fft_backend_stream_create(window_size, window_size, hop, window_kind);
-    table[slot] = handle;
-    return handle;
-}
-
-static void fft_state_free_buffers(node_state_t *state) {
-    if (state == NULL) {
-        return;
-    }
-    fftdiv_destroy_stream_handles(state);
-    free(state->u.fftdiv.input_buffer);
-    free(state->u.fftdiv.divisor_buffer);
-    free(state->u.fftdiv.divisor_imag_buffer);
-    free(state->u.fftdiv.phase_buffer);
-    free(state->u.fftdiv.lower_buffer);
-    free(state->u.fftdiv.upper_buffer);
-    free(state->u.fftdiv.filter_buffer);
-    free(state->u.fftdiv.window);
-    free(state->u.fftdiv.work_real);
-    free(state->u.fftdiv.work_imag);
-    free(state->u.fftdiv.div_real);
-    free(state->u.fftdiv.div_imag);
-    free(state->u.fftdiv.ifft_real);
-    free(state->u.fftdiv.ifft_imag);
-    free(state->u.fftdiv.result_buffer);
-    free(state->u.fftdiv.div_fft_real);
-    free(state->u.fftdiv.div_fft_imag);
-    free(state->u.fftdiv.recomb_buffer);
-    free(state->u.fftdiv.batch_input_real);
-    free(state->u.fftdiv.batch_input_imag);
-    free(state->u.fftdiv.batch_div_real);
-    free(state->u.fftdiv.batch_div_imag);
-    free(state->u.fftdiv.batch_slot_map);
-    free(state->u.fftdiv.batch_slot_offset);
-    free(state->u.fftdiv.batch_output_index);
-    free(state->u.fftdiv.batch_phase);
-    free(state->u.fftdiv.batch_lower);
-    free(state->u.fftdiv.batch_upper);
-    free(state->u.fftdiv.batch_filter);
-    free(state->u.fftdiv.batch_epsilon);
-    free(state->u.fftdiv.dynamic_phase);
-    free(state->u.fftdiv.dynamic_step_re);
-    free(state->u.fftdiv.dynamic_step_im);
-    free(state->u.fftdiv.backend_stream_signal);
-    free(state->u.fftdiv.backend_stream_div_real);
-    free(state->u.fftdiv.backend_stream_div_imag);
-    state->u.fftdiv.input_buffer = NULL;
-    state->u.fftdiv.divisor_buffer = NULL;
-    state->u.fftdiv.divisor_imag_buffer = NULL;
-    state->u.fftdiv.phase_buffer = NULL;
-    state->u.fftdiv.lower_buffer = NULL;
-    state->u.fftdiv.upper_buffer = NULL;
-    state->u.fftdiv.filter_buffer = NULL;
-    state->u.fftdiv.window = NULL;
-    state->u.fftdiv.work_real = NULL;
-    state->u.fftdiv.work_imag = NULL;
-    state->u.fftdiv.div_real = NULL;
-    state->u.fftdiv.div_imag = NULL;
-    state->u.fftdiv.ifft_real = NULL;
-    state->u.fftdiv.ifft_imag = NULL;
-    state->u.fftdiv.result_buffer = NULL;
-    state->u.fftdiv.div_fft_real = NULL;
-    state->u.fftdiv.div_fft_imag = NULL;
-    state->u.fftdiv.recomb_buffer = NULL;
-    state->u.fftdiv.batch_input_real = NULL;
-    state->u.fftdiv.batch_input_imag = NULL;
-    state->u.fftdiv.batch_div_real = NULL;
-    state->u.fftdiv.batch_div_imag = NULL;
-    state->u.fftdiv.batch_slot_map = NULL;
-    state->u.fftdiv.batch_slot_offset = NULL;
-    state->u.fftdiv.batch_output_index = NULL;
-    state->u.fftdiv.batch_phase = NULL;
-    state->u.fftdiv.batch_lower = NULL;
-    state->u.fftdiv.batch_upper = NULL;
-    state->u.fftdiv.batch_filter = NULL;
-    state->u.fftdiv.batch_epsilon = NULL;
-    state->u.fftdiv.dynamic_phase = NULL;
-    state->u.fftdiv.dynamic_step_re = NULL;
-    state->u.fftdiv.dynamic_step_im = NULL;
-    state->u.fftdiv.backend_stream_signal = NULL;
-    state->u.fftdiv.backend_stream_div_real = NULL;
-    state->u.fftdiv.backend_stream_div_imag = NULL;
-    state->u.fftdiv.window_size = 0;
-    state->u.fftdiv.algorithm = FFT_ALGORITHM_EIGEN;
-    state->u.fftdiv.window_kind = -1;
-    state->u.fftdiv.filled = 0;
-    state->u.fftdiv.position = 0;
-    state->u.fftdiv.batches = 0;
-    state->u.fftdiv.channels = 0;
-    state->u.fftdiv.slots = 0;
-    state->u.fftdiv.epsilon = 0.0;
-    state->u.fftdiv.recomb_filled = 0;
-    state->u.fftdiv.last_phase = 0.0;
-    state->u.fftdiv.last_lower = 0.0;
-    state->u.fftdiv.last_upper = 1.0;
-    state->u.fftdiv.last_filter = 1.0;
-    state->u.fftdiv.dynamic_carrier_band_count = 0;
-    state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
-    state->u.fftdiv.dynamic_k_active = 0;
-    state->u.fftdiv.enable_remainder = 1;
-    state->u.fftdiv.remainder_energy = 0.0;
-    state->u.fftdiv.max_batch_windows = 0;
-    state->u.fftdiv.batch_capacity = 0;
-    state->u.fftdiv.backend_mode = 0;
-    state->u.fftdiv.backend_hop = 1;
-    state->u.fftdiv.backend_stream_window_size = 0;
-    state->u.fftdiv.backend_stream_window_kind = -1;
-    state->u.fftdiv.backend_stream_hop = 1;
-}
-
-static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_size, int max_batch_windows) {
+#if defined(__cplusplus)
+static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_size, int window_kind) {
     if (state == NULL) {
         return -1;
     }
@@ -3263,110 +2833,244 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
     if (window_size <= 0) {
         window_size = 1;
     }
-    if (max_batch_windows <= 0) {
-        max_batch_windows = 1;
+    if (window_kind < 0) {
+        window_kind = FFT_WINDOW_RECTANGULAR;
+    }
+
+    bool rebuild = false;
+    if (state->u.fftdiv.stream_slots.size() != static_cast<std::size_t>(slots)) {
+        rebuild = true;
+    }
+    if (state->u.fftdiv.window_size != window_size || state->u.fftdiv.window_kind != window_kind) {
+        rebuild = true;
+    }
+
+    if (!rebuild) {
+        for (auto &slot : state->u.fftdiv.stream_slots) {
+            if (slot.forward_real.size() != static_cast<std::size_t>(window_size)) {
+                slot.forward_real.assign(static_cast<std::size_t>(window_size), 0.0);
+            }
+            if (slot.forward_imag.size() != static_cast<std::size_t>(window_size)) {
+                slot.forward_imag.assign(static_cast<std::size_t>(window_size), 0.0);
+            }
+            if (slot.inverse_scratch.size() != static_cast<std::size_t>(window_size)) {
+                slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
+            }
+        }
+        return 0;
+    }
+
+    fftdiv_reset_stream_slots(state);
+    try {
+        state->u.fftdiv.stream_slots.resize(static_cast<std::size_t>(slots));
+        for (auto &slot : state->u.fftdiv.stream_slots) {
+            slot.forward_handle = amp_fft_backend_stream_create(window_size, window_size, 1, window_kind);
+            if (slot.forward_handle == nullptr) {
+                throw std::bad_alloc();
+            }
+            slot.inverse_handle = amp_fft_backend_stream_create_inverse(window_size, window_size, 1, window_kind);
+            if (slot.inverse_handle == nullptr) {
+                throw std::bad_alloc();
+            }
+            slot.forward_real.assign(static_cast<std::size_t>(window_size), 0.0);
+            slot.forward_imag.assign(static_cast<std::size_t>(window_size), 0.0);
+            slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
+            slot.inverse_queue.clear();
+            slot.warmup_complete = false;
+        }
+    } catch (...) {
+        fftdiv_reset_stream_slots(state);
+        return -1;
+    }
+
+    state->u.fftdiv.window_size = window_size;
+    state->u.fftdiv.window_kind = window_kind;
+    return 0;
+}
+#else
+static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_size, int window_kind) {
+    (void)state;
+    (void)slots;
+    (void)window_size;
+    (void)window_kind;
+    return 0;
+}
+#endif
+
+static void fft_state_free_buffers(node_state_t *state) {
+    if (state == NULL) {
+        return;
+    }
+    state->u.fftdiv.window_size = 0;
+    state->u.fftdiv.window_kind = -1;
+    state->u.fftdiv.preserve_tensor_on_ingest = 0;
+#if defined(__cplusplus)
+    delete state->u.fftdiv.working_tensor;
+    state->u.fftdiv.working_tensor = NULL;
+    state->u.fftdiv.working_tensor_lanes = 0;
+    state->u.fftdiv.working_tensor_freq_bins = 0;
+    state->u.fftdiv.working_tensor_time_slices = 0;
+    state->u.fftdiv.working_tensor_time_cursor = 0;
+    state->u.fftdiv.working_tensor_cache_pages = 0;
+    state->u.fftdiv.working_tensor_cache_cursor = 0;
+    state->u.fftdiv.default_lane_count = 0;
+    fftdiv_reset_stream_slots(state);
+    state->u.fftdiv.lane_plan.clear();
+    state->u.fftdiv.spectral_scratch.real.clear();
+    state->u.fftdiv.spectral_scratch.imag.clear();
+    state->u.fftdiv.spectral_scratch.cache_pages = 0;
+    state->u.fftdiv.spectral_scratch.lanes = 0;
+    state->u.fftdiv.spectral_scratch.freq_bins = 0;
+    state->u.fftdiv.spectral_scratch.time_slices = 0;
+    state->u.fftdiv.spectral_scratch.cache_cursor = 0;
+    state->u.fftdiv.spectral_scratch.time_cursor = 0;
+#endif
+}
+
+static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_size, int max_batch_windows) {
+    (void)slots;
+    (void)max_batch_windows;
+    if (state == NULL) {
+        return -1;
+    }
+    if (window_size <= 0) {
+        window_size = 1;
+    }
+    state->u.fftdiv.window_size = window_size;
+    return 0;
+}
+
+static int ensure_fft_working_tensor(
+    node_state_t *state,
+    int cache_pages,
+    int lanes,
+    int frequency_bins,
+    int time_slices
+) {
+    if (state == NULL) {
+        return -1;
+    }
+    if (cache_pages <= 0) {
+        cache_pages = 1;
+    }
+    if (lanes <= 0) {
+        lanes = 1;
+    }
+    if (frequency_bins <= 0) {
+        frequency_bins = 1;
+    }
+    if (time_slices <= 0) {
+        time_slices = 1;
     }
     if (
-        state->u.fftdiv.input_buffer != NULL
-        && state->u.fftdiv.window_size == window_size
-        && state->u.fftdiv.slots == slots
-        && state->u.fftdiv.max_batch_windows == max_batch_windows
+        state->u.fftdiv.working_tensor != NULL &&
+        state->u.fftdiv.working_tensor_cache_pages == cache_pages &&
+        state->u.fftdiv.working_tensor_lanes == lanes &&
+        state->u.fftdiv.working_tensor_freq_bins == frequency_bins &&
+        state->u.fftdiv.working_tensor_time_slices == time_slices
     ) {
         return 0;
     }
-    double preserved_heat = state->u.fftdiv.total_heat;
-    fft_state_free_buffers(state);
-    size_t total = (size_t)window_size * (size_t)slots;
-    if (total == 0) {
-        state->u.fftdiv.total_heat = preserved_heat;
+    delete state->u.fftdiv.working_tensor;
+    state->u.fftdiv.working_tensor = NULL;
+    state->u.fftdiv.working_tensor_cache_pages = 0;
+    state->u.fftdiv.working_tensor_lanes = 0;
+    state->u.fftdiv.working_tensor_freq_bins = 0;
+    state->u.fftdiv.working_tensor_time_slices = 0;
+    state->u.fftdiv.working_tensor_time_cursor = 0;
+    state->u.fftdiv.working_tensor_cache_cursor = 0;
+
+    FftWorkingTensor *tensor = new (std::nothrow) FftWorkingTensor(cache_pages, lanes, frequency_bins, time_slices);
+    if (tensor == NULL) {
         return -1;
     }
-    size_t batch_capacity = (size_t)max_batch_windows;
-    size_t batch_total = (size_t)window_size * batch_capacity;
-    state->u.fftdiv.input_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.divisor_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.divisor_imag_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.phase_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.lower_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.upper_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.filter_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.window = (double *)calloc((size_t)window_size, sizeof(double));
-    state->u.fftdiv.work_real = (double *)calloc((size_t)window_size, sizeof(double));
-    state->u.fftdiv.work_imag = (double *)calloc((size_t)window_size, sizeof(double));
-    state->u.fftdiv.div_real = (double *)calloc((size_t)window_size, sizeof(double));
-    state->u.fftdiv.div_imag = (double *)calloc((size_t)window_size, sizeof(double));
-    state->u.fftdiv.ifft_real = (double *)calloc((size_t)window_size, sizeof(double));
-    state->u.fftdiv.ifft_imag = (double *)calloc((size_t)window_size, sizeof(double));
-    state->u.fftdiv.result_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.div_fft_real = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.div_fft_imag = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.recomb_buffer = (double *)calloc(total, sizeof(double));
-    state->u.fftdiv.batch_input_real = (double *)calloc(batch_total, sizeof(double));
-    state->u.fftdiv.batch_input_imag = (double *)calloc(batch_total, sizeof(double));
-    state->u.fftdiv.batch_div_real = (double *)calloc(batch_total, sizeof(double));
-    state->u.fftdiv.batch_div_imag = (double *)calloc(batch_total, sizeof(double));
-    state->u.fftdiv.batch_slot_map = (int *)calloc(batch_capacity, sizeof(int));
-    state->u.fftdiv.batch_slot_offset = (size_t *)calloc(batch_capacity, sizeof(size_t));
-    state->u.fftdiv.batch_output_index = (size_t *)calloc(batch_capacity, sizeof(size_t));
-    state->u.fftdiv.batch_phase = (double *)calloc(batch_capacity, sizeof(double));
-    state->u.fftdiv.batch_lower = (double *)calloc(batch_capacity, sizeof(double));
-    state->u.fftdiv.batch_upper = (double *)calloc(batch_capacity, sizeof(double));
-    state->u.fftdiv.batch_filter = (double *)calloc(batch_capacity, sizeof(double));
-    state->u.fftdiv.batch_epsilon = (double *)calloc(batch_capacity, sizeof(double));
-    state->u.fftdiv.dynamic_phase = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
-    state->u.fftdiv.dynamic_step_re = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
-    state->u.fftdiv.dynamic_step_im = (double *)calloc((size_t)slots * FFT_DYNAMIC_CARRIER_LIMIT, sizeof(double));
-    state->u.fftdiv.backend_stream_signal = (void **)calloc((size_t)slots, sizeof(void *));
-    state->u.fftdiv.backend_stream_div_real = (void **)calloc((size_t)slots, sizeof(void *));
-    state->u.fftdiv.backend_stream_div_imag = (void **)calloc((size_t)slots, sizeof(void *));
-    if (state->u.fftdiv.input_buffer == NULL || state->u.fftdiv.divisor_buffer == NULL || state->u.fftdiv.divisor_imag_buffer == NULL
-        || state->u.fftdiv.phase_buffer == NULL || state->u.fftdiv.lower_buffer == NULL || state->u.fftdiv.upper_buffer == NULL
-        || state->u.fftdiv.filter_buffer == NULL || state->u.fftdiv.window == NULL || state->u.fftdiv.work_real == NULL
-        || state->u.fftdiv.work_imag == NULL || state->u.fftdiv.div_real == NULL || state->u.fftdiv.div_imag == NULL
-        || state->u.fftdiv.ifft_real == NULL || state->u.fftdiv.ifft_imag == NULL || state->u.fftdiv.result_buffer == NULL
-        || state->u.fftdiv.div_fft_real == NULL || state->u.fftdiv.div_fft_imag == NULL || state->u.fftdiv.recomb_buffer == NULL
-        || state->u.fftdiv.batch_input_real == NULL || state->u.fftdiv.batch_input_imag == NULL
-        || state->u.fftdiv.batch_div_real == NULL || state->u.fftdiv.batch_div_imag == NULL
-        || state->u.fftdiv.batch_slot_map == NULL || state->u.fftdiv.batch_slot_offset == NULL
-        || state->u.fftdiv.batch_output_index == NULL || state->u.fftdiv.batch_phase == NULL
-        || state->u.fftdiv.batch_lower == NULL || state->u.fftdiv.batch_upper == NULL
-        || state->u.fftdiv.batch_filter == NULL || state->u.fftdiv.batch_epsilon == NULL
-        || state->u.fftdiv.dynamic_phase == NULL || state->u.fftdiv.dynamic_step_re == NULL || state->u.fftdiv.dynamic_step_im == NULL
-        || state->u.fftdiv.backend_stream_signal == NULL || state->u.fftdiv.backend_stream_div_real == NULL
-        || state->u.fftdiv.backend_stream_div_imag == NULL) {
-        fft_state_free_buffers(state);
-        state->u.fftdiv.total_heat = preserved_heat;
-        return -1;
+    tensor->setZero();
+    state->u.fftdiv.working_tensor = tensor;
+    state->u.fftdiv.working_tensor_cache_pages = cache_pages;
+    state->u.fftdiv.working_tensor_lanes = lanes;
+    state->u.fftdiv.working_tensor_freq_bins = frequency_bins;
+    state->u.fftdiv.working_tensor_time_slices = time_slices;
+    state->u.fftdiv.working_tensor_time_cursor = 0;
+    state->u.fftdiv.working_tensor_cache_cursor = 0;
+    if (state->u.fftdiv.default_lane_count > lanes) {
+        state->u.fftdiv.default_lane_count = lanes;
     }
-    state->u.fftdiv.window_size = window_size;
-    state->u.fftdiv.slots = slots;
-    state->u.fftdiv.max_batch_windows = max_batch_windows;
-    state->u.fftdiv.batch_capacity = (int)batch_capacity;
-    state->u.fftdiv.filled = 0;
-    state->u.fftdiv.position = window_size > 0 ? window_size - 1 : 0;
-    state->u.fftdiv.algorithm = FFT_ALGORITHM_EIGEN;
-    state->u.fftdiv.window_kind = -1;
-    state->u.fftdiv.batches = 0;
-    state->u.fftdiv.channels = 0;
-    state->u.fftdiv.epsilon = 1e-9;
-    state->u.fftdiv.recomb_filled = 0;
-    state->u.fftdiv.last_phase = 0.0;
-    state->u.fftdiv.last_lower = 0.0;
-    state->u.fftdiv.last_upper = 1.0;
-    state->u.fftdiv.last_filter = 1.0;
-    state->u.fftdiv.total_heat = preserved_heat;
-    state->u.fftdiv.dynamic_carrier_band_count = 0;
-    state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
-    state->u.fftdiv.dynamic_k_active = 0;
-    state->u.fftdiv.enable_remainder = 1;
-    state->u.fftdiv.remainder_energy = 0.0;
-    state->u.fftdiv.backend_mode = 0;
-    state->u.fftdiv.backend_hop = 1;
-    state->u.fftdiv.backend_stream_window_size = window_size;
-    state->u.fftdiv.backend_stream_window_kind = -1;
-    state->u.fftdiv.backend_stream_hop = 1;
     return 0;
 }
+
+#if defined(__cplusplus)
+static int ensure_fft_spectral_scratch(
+    node_state_t *state,
+    int cache_pages,
+    int lanes,
+    int frequency_bins,
+    int time_slices
+) {
+    if (state == NULL) {
+        return -1;
+    }
+    if (cache_pages <= 0) {
+        cache_pages = 1;
+    }
+    if (lanes <= 0) {
+        lanes = 1;
+    }
+    if (frequency_bins <= 0) {
+        frequency_bins = 1;
+    }
+    if (time_slices <= 0) {
+        time_slices = 1;
+    }
+    auto &scratch = state->u.fftdiv.spectral_scratch;
+    const size_t required = static_cast<size_t>(cache_pages) * static_cast<size_t>(lanes) * static_cast<size_t>(frequency_bins) * static_cast<size_t>(time_slices);
+    if (
+        scratch.cache_pages == cache_pages &&
+        scratch.lanes == lanes &&
+        scratch.freq_bins == frequency_bins &&
+        scratch.time_slices == time_slices &&
+        scratch.real.size() == required &&
+        scratch.imag.size() == required
+    ) {
+        return 0;
+    }
+    try {
+        scratch.real.resize(required);
+        scratch.imag.resize(required);
+    } catch (...) {
+        scratch.real.clear();
+        scratch.imag.clear();
+        scratch.cache_pages = 0;
+        scratch.lanes = 0;
+        scratch.freq_bins = 0;
+        scratch.time_slices = 0;
+        scratch.cache_cursor = 0;
+        scratch.time_cursor = 0;
+        return -1;
+    }
+    scratch.cache_pages = cache_pages;
+    scratch.lanes = lanes;
+    scratch.freq_bins = frequency_bins;
+    scratch.time_slices = time_slices;
+    scratch.cache_cursor = 0;
+    scratch.time_cursor = 0;
+    return 0;
+}
+#else
+static int ensure_fft_spectral_scratch(
+    node_state_t *state,
+    int cache_pages,
+    int lanes,
+    int frequency_bins,
+    int time_slices
+) {
+    (void)state;
+    (void)cache_pages;
+    (void)lanes;
+    (void)frequency_bins;
+    (void)time_slices;
+    return 0;
+}
+#endif
 
 #include "nodes/constant/constant_node.inc"
 #include "nodes/controller/controller_node.inc"
@@ -3378,7 +3082,6 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
 #include "nodes/oscillator/oscillator_node.inc"
 #include "nodes/resampler/resampler_node.inc"
 #include "nodes/parametric_driver/parametric_driver_node.inc"
-#include "nodes/pitch_shift/pitch_shift_node.inc"
 #include "nodes/gain/gain_node.inc"
 #include "nodes/fft_division/fft_division_nodes.inc"
 #include "nodes/mix/mix_node.inc"
@@ -3774,11 +3477,6 @@ static int amp_run_node_impl(
         case NODE_KIND_PITCH:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
                 ? run_pitch_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
-                : AMP_E_UNSUPPORTED;
-            break;
-        case NODE_KIND_PITCH_SHIFT:
-            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
-                ? run_pitch_shift_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
                 : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_OSC_PITCH:

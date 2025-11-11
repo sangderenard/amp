@@ -1,13 +1,44 @@
 # FFTDivisionNode Implementation Audit
 
 ## Scope and intent
-This note captures the observable behaviour of the native `FFTDivisionNode` as currently
-implemented in `src/native/amp_kernels.c`. It focuses on the forward and backward execution
-paths, the state that is persisted between firings, and the specific mechanism used to realise
-arbitrary bin selection within a finite FFT window. All findings below come from the native C
-runtime; no Python fallbacks are provided or allowed under project policy.
+This audit now references the spectral workstation plan (`docs/spectral_workstation_plan.md`) and
+the spectral tensor packing ABI (`docs/spectral_packing_standard.md`). It captures the observable
+behaviour of the native `FFTDivisionNode` and documents the ongoing aggregation rewrite that
+introduces explicit cache staging. All observations come from the C/C++ runtime—Python fallbacks
+remain disallowed by policy.
+
+## Window taxonomy
+
+Three distinct “windowed” constructs coexist inside the node:
+
+1. **Analysis window** – The FFT/DFT/NUFFT transform length (`window_size`). It governs warm-up,
+   frequency-bin count, and the stride with which PCM is consumed per slot.
+2. **Time-slice ring** – A per-slot circular buffer with length `working_ft_duration_frames`.
+   Each entry stores one spectrum produced by the analysis window.
+3. **Cache layer** – A higher-level circular buffer with depth `cache_slices` (default `1`). Each
+   cache slice holds an entire time-slice ring. Increasing the depth enables smearing/aggregation
+   policies while retaining fixed memory bounds.
+
+The internal working tensor now has shape `(lanes, cache_slice, frequency_bin, time_slice)`. When
+`cache_slices == 1` the structure collapses back to `(lanes, frequency_bin, time_slice)`, matching
+legacy behaviour byte-for-byte.
+
+## Aggregation stages
+
+Two explicit aggregation hooks mediate how data flows through the cache:
+
+* **Lane aggregation (pre-cache)** – Optionally collapses all lanes into lane zero before writing
+  into the cache. Disabled by default.
+* **Window aggregation (post-cache)** – Reduces along the cache axis when emitting spectra or
+  resynthesising PCM. Policies include `latest` (default), `sum`, `mean`, and future bespoke
+  reducers. Each lane is reduced independently.
+
+Together these hooks describe when `cache_slices` needs to exceed one: either to smear multiple
+time slices within a slot or to hold pre-aggregated results for downstream operators that prefer a
+combined view.
 
 ## Node surface and state
+
 * **Window and stabiliser configuration** – Each dispatch resolves a JSON-declared
   `window_size`, per-frame `epsilon` stabiliser, and default FFT/window algorithms before
   touching the work buffers. Non-positive window sizes are clamped to one frame, epsilon values
@@ -34,6 +65,7 @@ runtime; no Python fallbacks are provided or allowed under project policy.
   what the synthesis path actually used.【F:src/native/amp_kernels.c†L2147-L2194】【F:src/native/amp_kernels.c†L3444-L3519】
 
 ## Forward execution behaviour
+
 1. **Warm-up and safe division** – Until the window is filled, each slot outputs the input sample
    divided by a stabilised divisor (real input plus floor on magnitude). This prevents runaway
    gain during startup while waiting for enough history.【F:src/native/amp_kernels.c†L4297-L4308】
@@ -48,10 +80,11 @@ runtime; no Python fallbacks are provided or allowed under project policy.
    accumulating `Σ x_w[n] · e^{-iθ_k[n]}` and (optionally) dividing by the windowed divisor
    projection, then reweighted by the band gate and phase offset before emitting
    `(1/N)·Re{c_k · e^{iθ_k[N-1]}}`. Per-carrier phases are integrated sample-by-sample so the next
-   frame resumes from the exact phasor endpoint, and the fallback inverse transform is invoked only
-   if no carriers are provided.【F:src/native/amp_kernels.c†L4690-L4808】【F:src/native/tests/test_fft_division_node.cpp†L476-L555】
+  frame resumes from the exact phasor endpoint, and the fallback inverse transform is invoked only
+  if no carriers are provided.【F:src/native/amp_kernels.c†L4690-L4808】【F:src/native/tests/test_fft_division_node.cpp†L476-L555】
 
 ## Arbitrary binning mechanism
+
 * **Transform core (FFT or DFT)** – Arbitrary bin control always begins from a uniform spectrum.
   Power-of-two windows feed the radix-2 FFT; non power-of-two sizes fall back to the exact direct
   DFT. The NUFFT/CZT/dynamic modes currently route to the DFT scaffolding until their dedicated
@@ -81,7 +114,9 @@ but the magnitude response always flips per discrete FFT bin. Arbitrary bin “c
 therefore quantised to the underlying transform grid, not resynthesised at new frequencies.
 
 ## Backward execution behaviour
+
 The adjoint closely mirrors the forward pass:
+
 1. **Metadata replay** – The recombination buffer stores the emitted time-domain samples, while
    the divisor and metadata rings are rewound through the same memmove pipeline used in the
    forward path. This guarantees alignment between gradients and the history that produced the
@@ -91,13 +126,14 @@ The adjoint closely mirrors the forward pass:
    before the FFT path is live.【F:src/native/amp_kernels.c†L4631-L4649】
 3. **FFT/DFT replay** – After warm-up, the divisor history is windowed, transformed, and cached in
    the same spectral buffers, followed by a windowed transform of the recombination buffer (the
-   accumulated forward outputs).【F:src/native/amp_kernels.c†L4653-L4705】
+  accumulated forward outputs).【F:src/native/amp_kernels.c†L4653-L4705】
 4. **Dynamic adjoint guard** – The backward implementation now refuses to run when the dynamic
-   oscillator algorithm is selected, returning `-1` so callers cannot silently reuse the FFT adjoint
-   against the non-linear oscillator bank. FFT/DFT paths continue to undo the gain and phase mask
-   before multiplying by the cached divisor spectrum.【F:src/native/amp_kernels.c†L4557-L4559】【F:src/native/amp_kernels.c†L5154-L5191】
+  oscillator algorithm is selected, returning `-1` so callers cannot silently reuse the FFT adjoint
+  against the non-linear oscillator bank. FFT/DFT paths continue to undo the gain and phase mask
+  before multiplying by the cached divisor spectrum.【F:src/native/amp_kernels.c†L4557-L4559】【F:src/native/amp_kernels.c†L5154-L5191】
 
 ## Metrics and observability
+
 * Runtime metrics surface the measured delay, a coarse “heat” estimate derived from algorithmic
   complexity, and the last phase/band/filter scalars for inspection. Total heat is accumulated in
   the node state and grows monotonically across firings.【F:src/native/amp_kernels.c†L4389-L4409】
@@ -115,6 +151,7 @@ editing JSON descriptors. The flag simply injects the chosen label into the node
 invoking the native renderer.【F:scripts/fft_noise_gradient.py†L63-L86】【F:src/native/tests/test_fft_noise_gradient.cpp†L300-L363】
 
 ## Audit observations
+
 * The arbitrary bin control is purely algebraic—no lookup tables or Python fallbacks are involved
   in the gating, satisfying the runtime-only requirement.
 * Because gain floors at `1e-6`, extremely narrow bands will still leak a minimum amount of energy;
@@ -122,4 +159,9 @@ invoking the native renderer.【F:scripts/fft_noise_gradient.py†L63-L86】【F
 * The per-slot memmove operations scale with `window_size` for each frame. Large windows and many
   channels will therefore skew towards the direct DFT cost profile and should be profiled if
   deployment scenarios approach that limit.
+* NUFFT and CZT backends must emit spectra that honour the analysis-window bin count before data
+  enters the cache; oversampled grids collapse along the time-slice axis so aggregation policies
+  remain well defined.
+
+
 

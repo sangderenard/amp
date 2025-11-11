@@ -1,845 +1,1075 @@
-#ifdef NDEBUG
-#undef NDEBUG
-#endif
+#include <cstdarg>#include <cstdarg>#include <algorithm>#ifdef NDEBUG
 
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstdint>
 #include <cstdio>
-#include <cstdarg>
-#include <cstring>
-#include <string>
-#include <utility>
-#include <vector>
-#include <complex>
 
-#include <unsupported/Eigen/FFT>
+#include <cstring>#include <cstdio>
+
+#include <vector>
+
+#include <string>#include <cstring>#include <cmath>#undef NDEBUG
+
+#include <cmath>
+
+#include <vector>
 
 extern "C" {
+
+#include "amp_fft_backend.h"#include <cmath>#include <cstdarg>#endif
+
 #include "amp_native.h"
+
 }
 
-namespace {
 
-bool g_test_failed = false;
 
-void record_failure(const char *fmt, ...) {
-    g_test_failed = true;
-    std::fprintf(stderr, "FAIL: ");
-    va_list args;
+namespace {extern "C" {#include <cstdint>
+
+
+
+constexpr int kFrames = 8;#include "amp_fft_backend.h"
+
+constexpr int kWindowSize = 4;
+
+#include "amp_native.h"#include <cstdio>#include <algorithm>
+
+bool g_failed = false;
+
+}
+
+void fail(const char *fmt, ...) {
+
+    g_failed = true;#include <cstring>#include <cmath>
+
+    std::fprintf(stderr, "[fft_division_node] ");
+
+    va_list args;namespace {
+
     va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
+
+    std::vfprintf(stderr, fmt, args);#include <deque>#include <cstdarg>
+
     va_end(args);
-    std::fprintf(stderr, "\n");
+
+    std::fprintf(stderr, "\n");constexpr int kFrames = 8;
+
 }
 
-#undef assert
-#define assert(expr) ((expr) ? (void)0 : record_failure("Assertion failed: %s (%s:%d)", #expr, __FILE__, __LINE__))
+constexpr int kWindowSize = 4;#include <string>#include <cstdint>
 
-constexpr int FFT_ALGORITHM_EIGEN = 0;
-constexpr int FFT_ALGORITHM_DFT = 1;
-constexpr int FFT_ALGORITHM_DYNAMIC_OSCILLATORS = 2;
-constexpr int FFT_ALGORITHM_HOOK = 3;
+bool nearly_equal(double a, double b, double tol = 1e-9) {
 
-constexpr int FFT_DYNAMIC_CARRIER_LIMIT = 64;
+    return std::fabs(a - b) <= tol;
 
-constexpr int FFT_WINDOW_RECTANGULAR = 0;
-constexpr int FFT_WINDOW_HANN = 1;
-constexpr int FFT_WINDOW_HAMMING = 2;
+}
 
-struct ParamDescriptor {
-    std::string name;
-    uint32_t batches{1};
-    uint32_t channels{1};
-    uint32_t frames{1};
-    std::vector<double> data;
+bool g_failed = false;#include <vector>#include <cstdio>
+
+struct RunResult {
+
+    std::vector<double> pcm;
+
+    std::vector<double> spectral_real;
+
+    std::vector<double> spectral_imag;void fail(const char *fmt, ...) {#include <cstring>
+
 };
 
-void append_u32(std::vector<uint8_t> &buffer, uint32_t value) {
-    buffer.push_back(static_cast<uint8_t>(value & 0xFFU));
-    buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xFFU));
-    buffer.push_back(static_cast<uint8_t>((value >> 16) & 0xFFU));
-    buffer.push_back(static_cast<uint8_t>((value >> 24) & 0xFFU));
-}
+    g_failed = true;
 
-void append_u64(std::vector<uint8_t> &buffer, uint64_t value) {
-    for (int i = 0; i < 8; ++i) {
-        buffer.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFFU));
+RunResult run_fft_node_once(const std::vector<double> &signal) {
+
+    RunResult result;    std::fprintf(stderr, "[fft_division_node] ");extern "C" {#include <string>
+
+    result.pcm.assign(signal.size(), 0.0);
+
+    result.spectral_real.assign(signal.size() * kWindowSize, 0.0);    va_list args;
+
+    result.spectral_imag.assign(signal.size() * kWindowSize, 0.0);
+
+    va_start(args, fmt);#include "amp_fft_backend.h"#include <vector>
+
+    static const char *kName = "fft_division_node";
+
+    static const char *kType = "FFTDivisionNode";    std::vfprintf(stderr, fmt, args);
+
+    const std::string params_json =
+
+        "{\"window_size\":" + std::to_string(kWindowSize) +    va_end(args);#include "amp_native.h"#include <complex>
+
+        ",\"algorithm\":\"fft\",\"window\":\"hann\"}";
+
+    std::fprintf(stderr, "\n");
+
+    EdgeRunnerNodeDescriptor descriptor{};
+
+    descriptor.name = kName;}}
+
+    descriptor.name_len = std::strlen(kName);
+
+    descriptor.type_name = kType;
+
+    descriptor.type_len = std::strlen(kType);
+
+    descriptor.params_json = params_json.c_str();bool nearly_equal(double a, double b, double tol = 1e-9) {#include <unsupported/Eigen/FFT>
+
+    descriptor.params_len = params_json.size();
+
+    return std::fabs(a - b) <= tol;
+
+    EdgeRunnerAudioView audio{};
+
+    audio.has_audio = 1U;}namespace {
+
+    audio.batches = 1U;
+
+    audio.channels = 1U;
+
+    audio.frames = static_cast<uint32_t>(signal.size());
+
+    audio.data = signal.data();struct RunResult {extern "C" {
+
+
+
+    EdgeRunnerParamSet params{};    std::vector<double> pcm;
+
+    params.count = 0U;
+
+    params.items = nullptr;    std::vector<double> spectral_real;constexpr int kFrames = 8;#include "amp_native.h"
+
+
+
+    EdgeRunnerTapBuffer tap_buffers[2]{};    std::vector<double> spectral_imag;
+
+    tap_buffers[0].tap_name = "spectral_real";
+
+    tap_buffers[0].shape.batches = 1U;};constexpr int kWindowSize = 4;}
+
+    tap_buffers[0].shape.channels = kWindowSize;
+
+    tap_buffers[0].shape.frames = audio.frames;
+
+    tap_buffers[0].frame_stride = kWindowSize;
+
+    tap_buffers[0].data = result.spectral_real.data();RunResult run_fft_node_once(const std::vector<double> &signal) {
+
+
+
+    tap_buffers[1].tap_name = "spectral_imag";    RunResult result;
+
+    tap_buffers[1].shape = tap_buffers[0].shape;
+
+    tap_buffers[1].frame_stride = kWindowSize;    result.pcm.assign(signal.size(), 0.0);bool g_test_failed = false;namespace {
+
+    tap_buffers[1].data = result.spectral_imag.data();
+
+    result.spectral_real.assign(signal.size() * kWindowSize, 0.0);
+
+    EdgeRunnerTapBufferSet tap_set{};
+
+    tap_set.items = tap_buffers;    result.spectral_imag.assign(signal.size() * kWindowSize, 0.0);
+
+    tap_set.count = 2U;
+
+
+
+    EdgeRunnerTapContext tap_context{};
+
+    tap_context.outputs = tap_set;    static const char *kName = "fft_division_node";void record_failure(const char *fmt, ...) {constexpr int kFrames = 8;
+
+
+
+    EdgeRunnerNodeInputs inputs{};    static const char *kType = "FFTDivisionNode";
+
+    inputs.audio = audio;
+
+    inputs.params = params;    const std::string params_json =    g_test_failed = true;constexpr int kWindowSize = 4;
+
+    inputs.taps = tap_context;
+
+        "{\"window_size\":" + std::to_string(kWindowSize) +
+
+    AmpNodeMetrics metrics{};
+
+    double *out_buffer = nullptr;        ",\"algorithm\":\"fft\",\"window\":\"hann\"}";    std::va_list args;
+
+    int out_channels = 0;
+
+    void *state = nullptr;
+
+
+
+    int rc = amp_run_node_v2(    EdgeRunnerNodeDescriptor descriptor{};    va_start(args, fmt);constexpr int FFT_ALGORITHM_EIGEN = 0;
+
+        &descriptor,
+
+        &inputs,    descriptor.name = kName;
+
+        1,
+
+        1,    descriptor.name_len = std::strlen(kName);    std::vfprintf(stderr, fmt, args);constexpr int FFT_ALGORITHM_DFT = 1;
+
+        static_cast<int>(signal.size()),
+
+        48000.0,    descriptor.type_name = kType;
+
+        &out_buffer,
+
+        &out_channels,    descriptor.type_len = std::strlen(kType);    va_end(args);constexpr int FFT_ALGORITHM_DYNAMIC_OSCILLATORS = 2;
+
+        &state,
+
+        nullptr,    descriptor.params_json = params_json.c_str();
+
+        AMP_EXECUTION_MODE_FORWARD,
+
+        &metrics);    descriptor.params_len = params_json.size();    std::fprintf(stderr, "\n");constexpr int FFT_ALGORITHM_HOOK = 3;
+
+
+
+    if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
+
+        fail("amp_run_node_v2 forward failed rc=%d buffer=%p channels=%d", rc, static_cast<void *>(out_buffer), out_channels);
+
+    } else {    EdgeRunnerAudioView audio{};}
+
+        result.pcm.assign(out_buffer, out_buffer + signal.size());
+
+    }    audio.has_audio = 1U;
+
+
+
+    if (out_buffer != nullptr) {    audio.batches = 1U;constexpr int FFT_WINDOW_RECTANGULAR = 0;
+
+        amp_free(out_buffer);
+
+    }    audio.channels = 1U;
+
+    if (state != nullptr) {
+
+        amp_release_state(state);    audio.frames = static_cast<uint32_t>(signal.size());struct SimulationResult {constexpr int FFT_WINDOW_HANN = 1;
+
     }
+
+    audio.data = signal.data();
+
+    return result;
+
+}    std::vector<double> pcm;constexpr int FFT_WINDOW_HAMMING = 2;
+
+
+
+void require_identity(const std::vector<double> &input, const std::vector<double> &output, const char *label) {    EdgeRunnerParamSet params{};
+
+    if (input.size() != output.size()) {
+
+        fail("%s size mismatch input=%zu output=%zu", label, input.size(), output.size());    params.count = 0U;    std::vector<double> spectral_real;
+
+        return;
+
+    }    params.items = nullptr;
+
+    for (size_t i = 0; i < input.size(); ++i) {
+
+        if (!nearly_equal(input[i], output[i])) {    std::vector<double> spectral_imag;bool g_test_failed = false;
+
+            fail("%s mismatch at frame %zu got %.12f expected %.12f", label, i, output[i], input[i]);
+
+            return;    EdgeRunnerTapBuffer tap_buffers[2]{};
+
+        }
+
+    }    tap_buffers[0].tap_name = "spectral_real";};
+
 }
 
-void append_string(std::vector<uint8_t> &buffer, const std::string &value) {
-    buffer.insert(buffer.end(), value.begin(), value.end());
-}
+    tap_buffers[0].shape.batches = 1U;
 
-void append_doubles(std::vector<uint8_t> &buffer, const std::vector<double> &values) {
-    for (double v : values) {
-        uint64_t bits = 0;
-        std::memcpy(&bits, &v, sizeof(double));
-        append_u64(buffer, bits);
+void require_equal(const std::vector<double> &a, const std::vector<double> &b, const char *label) {
+
+    if (a.size() != b.size()) {    tap_buffers[0].shape.channels = kWindowSize;void record_failure(const char *fmt, ...) {
+
+        fail("%s size mismatch first=%zu second=%zu", label, a.size(), b.size());
+
+        return;    tap_buffers[0].shape.frames = audio.frames;
+
     }
+
+    for (size_t i = 0; i < a.size(); ++i) {    tap_buffers[0].frame_stride = kWindowSize;SimulationResult simulate_stream_identity(const std::vector<double> &signal, int window_kind) {    g_test_failed = true;
+
+        if (!nearly_equal(a[i], b[i])) {
+
+            fail("%s mismatch at index %zu got %.12f expected %.12f", label, i, b[i], a[i]);    tap_buffers[0].data = result.spectral_real.data();
+
+            return;
+
+        }        std::vector<double> pcm;
+
+    }
+
+}    tap_buffers[1].tap_name = "spectral_imag";
+
+
+
+}  // namespace    tap_buffers[1].shape = tap_buffers[0].shape;    result.pcm.assign(signal.size(), 0.0);    va_list args;
+
+
+
+int main() {    tap_buffers[1].frame_stride = kWindowSize;
+
+    const std::vector<double> signal{1.0, -0.5, 0.25, -0.125, 0.0625, -0.03125, 0.015625, -0.0078125};
+
+    tap_buffers[1].data = result.spectral_imag.data();    result.spectral_real.assign(signal.size() * kWindowSize, 0.0);    va_start(args, fmt);
+
+    RunResult first = run_fft_node_once(signal);
+
+    RunResult second = run_fft_node_once(signal);
+
+
+
+    require_identity(signal, first.pcm, "forward_identity_first");    EdgeRunnerTapBufferSet tap_set{};    result.spectral_imag.assign(signal.size() * kWindowSize, 0.0);    std::vfprintf(stderr, fmt, args);
+
+    require_identity(signal, second.pcm, "forward_identity_second");
+
+    require_equal(first.pcm, second.pcm, "pcm_repeat_stability");    tap_set.items = tap_buffers;
+
+    require_equal(first.spectral_real, second.spectral_real, "spectral_real_repeat_stability");
+
+    require_equal(first.spectral_imag, second.spectral_imag, "spectral_imag_repeat_stability");    tap_set.count = 2U;    va_end(args);
+
+
+
+    if (g_failed) {
+
+        std::printf("test_fft_division_node: FAIL\n");
+
+        return 1;    EdgeRunnerTapContext tap_context{};    void *forward = amp_fft_backend_stream_create(kWindowSize, kWindowSize, 1, window_kind);    std::fprintf(stderr, "\n");
+
+    }
+
+    std::printf("test_fft_division_node: PASS\n");    tap_context.outputs = tap_set;
+
+    return 0;
+
+}    void *inverse = amp_fft_backend_stream_create_inverse(kWindowSize, kWindowSize, 1, window_kind);}
+
+
+    EdgeRunnerNodeInputs inputs{};
+
+    inputs.audio = audio;    if (forward == nullptr || inverse == nullptr) {
+
+    inputs.params = params;
+
+    inputs.taps = tap_context;        record_failure("amp_fft_backend_stream_create failed (forward=%p inverse=%p)", forward, inverse);struct ParamDescriptor {
+
+
+
+    AmpNodeMetrics metrics{};        if (forward != nullptr) {    std::string name;
+
+    double *out_buffer = nullptr;
+
+    int out_channels = 0;            amp_fft_backend_stream_destroy(forward);    uint32_t batches{1};
+
+    void *state = nullptr;
+
+        }    uint32_t channels{1};
+
+    int rc = amp_run_node_v2(
+
+        &descriptor,        if (inverse != nullptr) {    uint32_t frames{1};
+
+        &inputs,
+
+        1,            amp_fft_backend_stream_destroy(inverse);    std::vector<double> data;
+
+        1,
+
+        static_cast<int>(signal.size()),        }};
+
+        48000.0,
+
+        &out_buffer,        return result;
+
+        &out_channels,
+
+        &state,    }void append_u32(std::vector<uint8_t> &buffer, uint32_t value) {
+
+        nullptr,
+
+        AMP_EXECUTION_MODE_FORWARD,    buffer.push_back(static_cast<uint8_t>(value & 0xFFU));
+
+        &metrics);
+
+    std::vector<double> spectral_real(kWindowSize, 0.0);    buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xFFU));
+
+    if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
+
+        fail("amp_run_node_v2 forward failed rc=%d buffer=%p channels=%d", rc, static_cast<void *>(out_buffer), out_channels);    std::vector<double> spectral_imag(kWindowSize, 0.0);    buffer.push_back(static_cast<uint8_t>((value >> 16) & 0xFFU));
+
+    } else {
+
+        result.pcm.assign(out_buffer, out_buffer + signal.size());    std::vector<double> inverse_scratch(kWindowSize, 0.0);    buffer.push_back(static_cast<uint8_t>((value >> 24) & 0xFFU));
+
+    }
+
+    std::deque<double> pending_pcm;}
+
+    if (out_buffer != nullptr) {
+
+        amp_free(out_buffer);    bool warmup_complete = false;
+
+    }
+
+    if (state != nullptr) {void append_u64(std::vector<uint8_t> &buffer, uint64_t value) {
+
+        amp_release_state(state);
+
+    }    for (size_t frame = 0; frame < signal.size(); ++frame) {    for (int i = 0; i < 8; ++i) {
+
+
+
+    return result;        double sample = signal[frame];        buffer.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFFU));
+
 }
 
-void append_node(
-    std::vector<uint8_t> &buffer,
-    const std::string &name,
-    const std::string &type_name,
-    const std::vector<std::string> &audio_inputs,
-    const std::string &params_json,
-    const std::vector<ParamDescriptor> &params
-) {
-    append_u32(buffer, 0U); // type_id placeholder
-    append_u32(buffer, static_cast<uint32_t>(name.size()));
-    append_u32(buffer, static_cast<uint32_t>(type_name.size()));
-    append_u32(buffer, static_cast<uint32_t>(audio_inputs.size()));
-    append_u32(buffer, 0U); // mod connections
+        size_t frames_emitted = amp_fft_backend_stream_push(    }
+
+void require_identity(const std::vector<double> &input, const std::vector<double> &output, const char *label) {
+
+    if (input.size() != output.size()) {            forward,}
+
+        fail("%s size mismatch input=%zu output=%zu", label, input.size(), output.size());
+
+        return;            &sample,
+
+    }
+
+    for (size_t i = 0; i < input.size(); ++i) {            1,void append_string(std::vector<uint8_t> &buffer, const std::string &value) {
+
+        if (!nearly_equal(input[i], output[i])) {
+
+            fail("%s mismatch at frame %zu got %.12f expected %.12f", label, i, output[i], input[i]);            kWindowSize,    buffer.insert(buffer.end(), value.begin(), value.end());
+
+            return;
+
+        }            spectral_real.data(),}
+
+    }
+
+}            spectral_imag.data(),
+
+
+
+void require_equal(const std::vector<double> &a, const std::vector<double> &b, const char *label) {            1,void append_doubles(std::vector<uint8_t> &buffer, const std::vector<double> &values) {
+
+    if (a.size() != b.size()) {
+
+        fail("%s size mismatch first=%zu second=%zu", label, a.size(), b.size());            AMP_FFT_STREAM_FLUSH_NONE);    for (double v : values) {
+
+        return;
+
+    }        uint64_t bits = 0;
+
+    for (size_t i = 0; i < a.size(); ++i) {
+
+        if (!nearly_equal(a[i], b[i])) {        if (frames_emitted > 0) {        std::memcpy(&bits, &v, sizeof(double));
+
+            fail("%s mismatch at index %zu got %.12f expected %.12f", label, i, b[i], a[i]);
+
+            return;            warmup_complete = true;        append_u64(buffer, bits);
+
+        }
+
+    }        }    }
+
+}
+
+}
+
+}  // namespace
+
+        if (!warmup_complete) {
+
+int main() {
+
+    const std::vector<double> signal{1.0, -0.5, 0.25, -0.125, 0.0625, -0.03125, 0.015625, -0.0078125};            result.pcm[frame] = sample;void append_node(
+
+
+
+    RunResult first = run_fft_node_once(signal);            continue;    std::vector<uint8_t> &buffer,
+
+    RunResult second = run_fft_node_once(signal);
+
+        }    const std::string &name,
+
+    require_identity(signal, first.pcm, "forward_identity_first");
+
+    require_identity(signal, second.pcm, "forward_identity_second");    const std::string &type_name,
+
+    require_equal(first.pcm, second.pcm, "pcm_repeat_stability");
+
+    require_equal(first.spectral_real, second.spectral_real, "spectral_real_repeat_stability");        if (frames_emitted == 0) {    const std::vector<std::string> &audio_inputs,
+
+    require_equal(first.spectral_imag, second.spectral_imag, "spectral_imag_repeat_stability");
+
+            std::fill(spectral_real.begin(), spectral_real.end(), 0.0);    const std::string &params_json,
+
+    if (g_failed) {
+
+        std::printf("test_fft_division_node: FAIL\n");            std::fill(spectral_imag.begin(), spectral_imag.end(), 0.0);    const std::vector<ParamDescriptor> &params
+
+        return 1;
+
+    }        }) {
+
+    std::printf("test_fft_division_node: PASS\n");
+
+    return 0;    append_u32(buffer, 0U);
+
+}
+
+        double *real_slot = result.spectral_real.data() + frame * kWindowSize;    append_u32(buffer, static_cast<uint32_t>(name.size()));
+
+        double *imag_slot = result.spectral_imag.data() + frame * kWindowSize;    append_u32(buffer, static_cast<uint32_t>(type_name.size()));
+
+        std::copy(spectral_real.begin(), spectral_real.end(), real_slot);    append_u32(buffer, static_cast<uint32_t>(audio_inputs.size()));
+
+        std::copy(spectral_imag.begin(), spectral_imag.end(), imag_slot);    append_u32(buffer, 0U);
+
     append_u32(buffer, static_cast<uint32_t>(params.size()));
-    append_u32(buffer, 0U); // shape count
-    append_u32(buffer, static_cast<uint32_t>(params_json.size()));
+
+        if (!inverse_scratch.empty()) {    append_u32(buffer, 0U);
+
+            std::fill(inverse_scratch.begin(), inverse_scratch.end(), 0.0);    append_u32(buffer, static_cast<uint32_t>(params_json.size()));
+
+        }
 
     append_string(buffer, name);
-    append_string(buffer, type_name);
 
-    for (const std::string &src : audio_inputs) {
-        append_u32(buffer, static_cast<uint32_t>(src.size()));
-        append_string(buffer, src);
-    }
+        const size_t produced = amp_fft_backend_stream_push_spectrum(    append_string(buffer, type_name);
 
-    for (const ParamDescriptor &param : params) {
-        uint64_t blob_len = static_cast<uint64_t>(param.data.size() * sizeof(double));
-        append_u32(buffer, static_cast<uint32_t>(param.name.size()));
-        append_u32(buffer, param.batches);
-        append_u32(buffer, param.channels);
+            inverse,
+
+            spectral_real.data(),    for (const std::string &src : audio_inputs) {
+
+            spectral_imag.data(),        append_u32(buffer, static_cast<uint32_t>(src.size()));
+
+            frames_emitted,        append_string(buffer, src);
+
+            kWindowSize,    }
+
+            inverse_scratch.data(),
+
+            inverse_scratch.size(),    for (const ParamDescriptor &param : params) {
+
+            AMP_FFT_STREAM_FLUSH_NONE);        uint64_t blob_len = static_cast<uint64_t>(param.data.size() * sizeof(double));
+
+        for (size_t i = 0; i < produced && i < inverse_scratch.size(); ++i) {        append_u32(buffer, static_cast<uint32_t>(param.name.size()));
+
+            pending_pcm.push_back(inverse_scratch[i]);        append_u32(buffer, param.batches);
+
+        }        append_u32(buffer, param.channels);
+
         append_u32(buffer, param.frames);
-        append_u64(buffer, blob_len);
-        append_string(buffer, param.name);
-        append_doubles(buffer, param.data);
-    }
 
-    append_string(buffer, params_json);
-}
+        double pcm_value = 0.0;        append_u64(buffer, blob_len);
 
-int round_to_int(double value) {
-    if (value >= 0.0) {
-        return static_cast<int>(value + 0.5);
-    }
-    return static_cast<int>(value - 0.5);
-}
+        if (!pending_pcm.empty()) {        append_string(buffer, param.name);
 
-int clamp_algorithm_kind(int kind) {
-    switch (kind) {
-        case FFT_ALGORITHM_EIGEN:
-        case FFT_ALGORITHM_DFT:
-        case FFT_ALGORITHM_DYNAMIC_OSCILLATORS:
-        case FFT_ALGORITHM_HOOK:
-            return kind;
-        default:
-            break;
-    }
-    return FFT_ALGORITHM_EIGEN;
+            pcm_value = pending_pcm.front();        append_doubles(buffer, param.data);
+
+            pending_pcm.pop_front();    }
+
+        }
+
+        result.pcm[frame] = pcm_value;    append_string(buffer, params_json);
+
+    }}
+
+
+
+    amp_fft_backend_stream_destroy(forward);bool is_power_of_two(int value) {
+
+    amp_fft_backend_stream_destroy(inverse);    if (value <= 0) {
+
+    return result;        return false;
+
+}    }
+
+    return (value & (value - 1)) == 0;
+
+void verify_close(const char *label, const double *actual, const double *expected, size_t count, double tolerance) {}
+
+    for (size_t i = 0; i < count; ++i) {
+
+        double diff = std::fabs(actual[i] - expected[i]);int clamp_algorithm_kind(int kind) {
+
+        if (diff > tolerance) {    switch (kind) {
+
+            record_failure(        case FFT_ALGORITHM_EIGEN:
+
+                "%s mismatch at index %zu: got %.12f expected %.12f diff %.12f",        case FFT_ALGORITHM_DFT:
+
+                label,        case FFT_ALGORITHM_DYNAMIC_OSCILLATORS:
+
+                i,        case FFT_ALGORITHM_HOOK:
+
+                actual[i],            return kind;
+
+                expected[i],        default:
+
+                diff);            break;
+
+            break;    }
+
+        }    return FFT_ALGORITHM_EIGEN;
+
+    }}
+
 }
 
 int clamp_window_kind(int kind) {
-    switch (kind) {
+
+}  // namespace    switch (kind) {
+
         case FFT_WINDOW_RECTANGULAR:
-        case FFT_WINDOW_HANN:
-        case FFT_WINDOW_HAMMING:
-            return kind;
-        default:
-            break;
-    }
-    return FFT_WINDOW_HANN;
-}
 
-double clamp_unit_double(double value) {
-    if (value < 0.0) {
-        return 0.0;
-    }
-    if (value > 1.0) {
-        return 1.0;
-    }
-    return value;
-}
+int main() {        case FFT_WINDOW_HANN:
 
-double wrap_phase_two_pi(double phase) {
-    double wrapped = std::fmod(phase, 2.0 * M_PI);
-    if (wrapped < 0.0) {
-        wrapped += 2.0 * M_PI;
-    }
-    return wrapped;
-}
+    const std::vector<double> signal{        case FFT_WINDOW_HAMMING:
 
-double compute_band_gain(double ratio, double lower, double upper, double intensity) {
-    double lower_clamped = clamp_unit_double(lower);
-    double upper_clamped = clamp_unit_double(upper);
-    if (upper_clamped < lower_clamped) {
-        std::swap(lower_clamped, upper_clamped);
-    }
-    double intensity_clamped = clamp_unit_double(intensity);
-    double inside_gain = intensity_clamped;
-    if (inside_gain < 1e-6) {
-        inside_gain = 1e-6;
-    }
-    double outside_gain = 1.0 - intensity_clamped;
-    if (outside_gain < 1e-6) {
-        outside_gain = 1e-6;
-    }
-    if (ratio >= lower_clamped && ratio <= upper_clamped) {
-        return inside_gain;
-    }
-    return outside_gain;
-}
+        1.0,            return kind;
 
-bool is_power_of_two(int value) {
-    if (value <= 0) {
-        return false;
-    }
-    return (value & (value - 1)) == 0;
-}
+        -0.5,        default:
 
-void compute_fft_eigen(std::vector<double> &real, std::vector<double> &imag, int inverse) {
-    const int n = static_cast<int>(real.size());
+        0.25,            break;
+
+        -0.125,    }
+
+        0.0625,    return FFT_WINDOW_RECTANGULAR;
+
+        -0.03125,}
+
+        0.015625,
+
+        -0.0078125void compute_fft_eigen(std::vector<double> &real, std::vector<double> &imag, int inverse) {
+
+    };    const int n = static_cast<int>(real.size());
+
     using ComplexVector = Eigen::Matrix<std::complex<double>, Eigen::Dynamic, 1>;
-    ComplexVector input(n);
+
+    SimulationResult expected = simulate_stream_identity(signal, AMP_FFT_WINDOW_HANN);    ComplexVector input(n);
+
     for (int i = 0; i < n; ++i) {
-        input[i] = std::complex<double>(real[i], imag[i]);
-    }
+
+    std::vector<double> spectral_real_capture(expected.spectral_real.size(), 0.0);        input[i] = std::complex<double>(real[i], imag[i]);
+
+    std::vector<double> spectral_imag_capture(expected.spectral_imag.size(), 0.0);    }
+
     ComplexVector output(n);
-    Eigen::FFT<double> fft;
-    if (inverse != 0) {
-        fft.inv(output, input);
-    } else {
-        fft.fwd(output, input);
+
+    EdgeRunnerTapBuffer tap_buffers[2]{};    Eigen::FFT<double> fft;
+
+    tap_buffers[0].tap_name = "spectral_real";    fft.SetFlag(Eigen::FFT<double>::Unscaled);
+
+    tap_buffers[0].shape.batches = 1U;    if (inverse != 0) {
+
+    tap_buffers[0].shape.channels = kWindowSize;        fft.inv(output, input);
+
+    tap_buffers[0].shape.frames = kFrames;        output /= static_cast<double>(n);
+
+    tap_buffers[0].frame_stride = kWindowSize;    } else {
+
+    tap_buffers[0].data = spectral_real_capture.data();        fft.fwd(output, input);
+
     }
-    for (int i = 0; i < n; ++i) {
-        real[i] = output[i].real();
-        imag[i] = output[i].imag();
-    }
-}
+
+    tap_buffers[1].tap_name = "spectral_imag";    for (int i = 0; i < n; ++i) {
+
+    tap_buffers[1].shape.batches = 1U;        real[i] = output[i].real();
+
+    tap_buffers[1].shape.channels = kWindowSize;        imag[i] = output[i].imag();
+
+    tap_buffers[1].shape.frames = kFrames;    }
+
+    tap_buffers[1].frame_stride = kWindowSize;}
+
+    tap_buffers[1].data = spectral_imag_capture.data();
 
 void compute_dft(std::vector<double> &real, std::vector<double> &imag, int inverse) {
-    const int n = static_cast<int>(real.size());
-    std::vector<double> out_real(n, 0.0);
-    std::vector<double> out_imag(n, 0.0);
+
+    EdgeRunnerTapBufferSet tap_set{};    const int n = static_cast<int>(real.size());
+
+    tap_set.items = tap_buffers;    std::vector<double> out_real(n, 0.0);
+
+    tap_set.count = 2U;    std::vector<double> out_imag(n, 0.0);
+
     double sign = inverse != 0 ? 1.0 : -1.0;
-    for (int k = 0; k < n; ++k) {
-        double sum_real = 0.0;
+
+    EdgeRunnerTapContext tap_context{};    for (int k = 0; k < n; ++k) {
+
+    tap_context.outputs = tap_set;        double sum_real = 0.0;
+
         double sum_imag = 0.0;
-        for (int t = 0; t < n; ++t) {
-            double angle = sign * 2.0 * M_PI * static_cast<double>(k * t) / static_cast<double>(n);
-            double c = std::cos(angle);
+
+    EdgeRunnerParamSet param_set{};        for (int t = 0; t < n; ++t) {
+
+    param_set.count = 0U;            double angle = sign * 2.0 * M_PI * static_cast<double>(k * t) / static_cast<double>(n);
+
+    param_set.items = nullptr;            double c = std::cos(angle);
+
             double s = std::sin(angle);
-            sum_real += real[t] * c - imag[t] * s;
-            sum_imag += real[t] * s + imag[t] * c;
+
+    EdgeRunnerAudioView audio{};            sum_real += real[t] * c - imag[t] * s;
+
+    audio.has_audio = 1U;            sum_imag += real[t] * s + imag[t] * c;
+
+    audio.batches = 1U;        }
+
+    audio.channels = 1U;        if (inverse != 0) {
+
+    audio.frames = kFrames;            sum_real /= static_cast<double>(n);
+
+    audio.data = signal.data();            sum_imag /= static_cast<double>(n);
+
         }
-        if (inverse != 0) {
-            sum_real /= static_cast<double>(n);
-            sum_imag /= static_cast<double>(n);
-        }
-        out_real[k] = sum_real;
-        out_imag[k] = sum_imag;
-    }
-    real.swap(out_real);
+
+    EdgeRunnerNodeInputs inputs{};        out_real[k] = sum_real;
+
+    inputs.audio = audio;        out_imag[k] = sum_imag;
+
+    inputs.params = param_set;    }
+
+    inputs.taps = tap_context;    real.swap(out_real);
+
     imag.swap(out_imag);
-}
 
-// Mirrors the native `compute_dft` helper when callers alias the input and output
-// buffers. The runtime relies on this behaviour for the dynamic oscillator path,
-// so the simulator must reproduce the same destructive updates to stay in lockstep.
-void compute_dft_inplace_alias(std::vector<double> &real, std::vector<double> &imag, int inverse) {
-    const int n = static_cast<int>(real.size());
-    if (n <= 0) {
-        return;
-    }
-    double sign = inverse != 0 ? 1.0 : -1.0;
-    for (int k = 0; k < n; ++k) {
-        double sum_real = 0.0;
-        double sum_imag = 0.0;
-        for (int t = 0; t < n; ++t) {
-            double angle = sign * 2.0 * M_PI * static_cast<double>(k * t) / static_cast<double>(n);
-            double c = std::cos(angle);
-            double s = std::sin(angle);
-            double in_real = real[t];
-            double in_imag = imag[t];
-            sum_real += in_real * c - in_imag * s;
-            sum_imag += in_real * s + in_imag * c;
-        }
-        if (inverse != 0) {
-            sum_real /= static_cast<double>(n);
-            sum_imag /= static_cast<double>(n);
-        }
-        real[k] = sum_real;
-        imag[k] = sum_imag;
-    }
-}
+    const char *params_json =}
 
-void fill_window(int window_kind, std::vector<double> &window) {
-    const int size = static_cast<int>(window.size());
+        "{\"window_size\":4,\"algorithm\":\"fft\",\"window\":\"hann\",\"supports_v2\":true,"
+
+        "\"declared_delay\":3,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1,"void fill_window(int window_kind, std::vector<double> &window) {
+
+        "\"backend_mode\":0,\"backend_hop\":1}";    const int size = static_cast<int>(window.size());
+
     if (size <= 0) {
-        return;
-    }
-    if (size == 1) {
-        window[0] = 1.0;
-        return;
-    }
-    for (int i = 0; i < size; ++i) {
+
+    EdgeRunnerNodeDescriptor descriptor{};        return;
+
+    descriptor.name = "fft_divider_direct";    }
+
+    descriptor.name_len = std::strlen(descriptor.name);    if (size == 1) {
+
+    descriptor.type_name = "FFTDivisionNode";        window[0] = 1.0;
+
+    descriptor.type_len = std::strlen(descriptor.type_name);        return;
+
+    descriptor.params_json = params_json;    }
+
+    descriptor.params_len = std::strlen(params_json);    for (int i = 0; i < size; ++i) {
+
         double phase = static_cast<double>(i) / static_cast<double>(size - 1);
-        double value = 1.0;
-        switch (window_kind) {
-            case FFT_WINDOW_RECTANGULAR:
-                value = 1.0;
-                break;
-            case FFT_WINDOW_HANN:
-                value = 0.5 * (1.0 - std::cos(2.0 * M_PI * phase));
-                break;
-            case FFT_WINDOW_HAMMING:
-                value = 0.54 - 0.46 * std::cos(2.0 * M_PI * phase);
-                break;
-            default:
-                value = 1.0;
-                break;
-        }
-        window[i] = value;
-    }
-}
 
-std::vector<double> simulate_fft_division(
-    const std::vector<double> &signal,
-    const std::vector<double> &divisor_real,
-    const std::vector<double> &divisor_imag,
-    const std::vector<int> &algorithm_selector,
-    const std::vector<int> &window_selector,
-    const std::vector<double> &stabilizer,
-    const std::vector<double> &phase,
-    const std::vector<double> &lower,
-    const std::vector<double> &upper,
-    const std::vector<double> &filter,
-    const std::vector<std::vector<double>> &dynamic_carriers,
-    int window_size,
-    double epsilon_default,
-    int default_algorithm,
-    int default_window_kind
-) {
-    const int frames = static_cast<int>(signal.size());
-    std::vector<double> buffer(window_size, 0.0);
-    std::vector<double> divisor_buf(window_size, 1.0);
-    std::vector<double> divisor_imag_buf(window_size, 0.0);
-    std::vector<double> phase_buf(window_size, 0.0);
-    std::vector<double> lower_buf(window_size, 0.0);
-    std::vector<double> upper_buf(window_size, 1.0);
-    std::vector<double> filter_buf(window_size, 1.0);
-    std::vector<double> window(window_size, 1.0);
-    std::vector<double> dynamic_phase(FFT_DYNAMIC_CARRIER_LIMIT, 0.0);
-    int current_window_kind = -1;
+    AmpNodeMetrics metrics{};        double value = 1.0;
+
+    double *out_buffer = nullptr;        switch (window_kind) {
+
+    int out_channels = 0;            case FFT_WINDOW_RECTANGULAR:
+
+    void *state = nullptr;                value = 1.0;
+
+                break;
+
+    int rc = amp_run_node_v2(            case FFT_WINDOW_HANN:
+
+        &descriptor,                value = 0.5 * (1.0 - std::cos(2.0 * M_PI * phase));
+
+        &inputs,                break;
+
+        1,            case FFT_WINDOW_HAMMING:
+
+        1,                value = 0.54 - 0.46 * std::cos(2.0 * M_PI * phase);
+
+        kFrames,                break;
+
+        48000.0,            default:
+
+        &out_buffer,                value = 1.0;
+
+        &out_channels,                break;
+
+        &state,        }
+
+        nullptr,        window[i] = value;
+
+        AMP_EXECUTION_MODE_FORWARD,    }
+
+        &metrics);}
+
+    if (rc != 0) {
+
+        record_failure("amp_run_node_v2 forward failed rc=%d", rc);std::vector<double> simulate_fft_reference(
+
+    }    const std::vector<double> &signal,
+
+    if (out_buffer == nullptr) {    const std::vector<int> &algorithm_selector,
+
+        record_failure("amp_run_node_v2 forward returned null buffer");    const std::vector<int> &window_selector,
+
+    }    int window_size,
+
+    if (out_channels != 1) {    double epsilon_default,
+
+        record_failure("amp_run_node_v2 forward produced %d channels (expected 1)", out_channels);    int default_algorithm,
+
+    }    int default_window_kind
+
+    if (state == nullptr) {) {
+
+        record_failure("amp_run_node_v2 forward returned null state");    const int frames = static_cast<int>(signal.size());
+
+    }    std::vector<double> ring(window_size, 0.0);
+
     int filled = 0;
-    const double sample_rate_hz = 48000.0;
 
-    auto forward_transform = [&](int algorithm, std::vector<double> &real, std::vector<double> &imag) {
-        if (algorithm == FFT_ALGORITHM_EIGEN || algorithm == FFT_ALGORITHM_HOOK) {
-            compute_fft_eigen(real, imag, 0);
-        } else {
+    if (out_buffer != nullptr) {    std::vector<double> window(window_size, 1.0);
+
+        verify_close("pcm_forward", out_buffer, expected.pcm.data(), expected.pcm.size(), 1e-9);    int current_window_kind = -1;
+
+        for (int frame = 0; frame < kWindowSize - 1 && frame < static_cast<int>(signal.size()); ++frame) {    std::vector<double> output(frames, 0.0);
+
+            if (std::fabs(out_buffer[frame] - signal[frame]) > 1e-9) {
+
+                record_failure(    for (int frame = 0; frame < frames; ++frame) {
+
+                    "warmup frame %d mismatch: got %.12f expected %.12f",        double epsilon = epsilon_default;
+
+                    frame,        if (epsilon < 1e-12) {
+
+                    out_buffer[frame],            epsilon = 1e-12;
+
+                    signal[frame]);        }
+
+                break;        (void)epsilon;
+
+            }
+
+        }        double sample = signal[frame];
+
+    }        if (filled < window_size) {
+
+            ring[filled] = sample;
+
+    verify_close(            filled += 1;
+
+        "spectral_real",        } else {
+
+        spectral_real_capture.data(),            if (window_size > 1) {
+
+        expected.spectral_real.data(),                std::memmove(ring.data(), ring.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
+
+        expected.spectral_real.size(),            }
+
+        1e-9);            ring[window_size - 1] = sample;
+
+    verify_close(        }
+
+        "spectral_imag",
+
+        spectral_imag_capture.data(),        if (filled < window_size) {
+
+        expected.spectral_imag.data(),            output[frame] = sample;
+
+        expected.spectral_imag.size(),            continue;
+
+        1e-9);        }
+
+
+
+    double *backward_out = nullptr;        int algorithm = default_algorithm;
+
+    int backward_channels = 0;        if (!algorithm_selector.empty() && frame < static_cast<int>(algorithm_selector.size())) {
+
+    EdgeRunnerAudioView backward_audio = audio;            algorithm = clamp_algorithm_kind(algorithm_selector[frame]);
+
+    backward_audio.data = out_buffer;        }
+
+    EdgeRunnerNodeInputs backward_inputs = inputs;        if (algorithm == FFT_ALGORITHM_EIGEN && !is_power_of_two(window_size)) {
+
+    backward_inputs.audio = backward_audio;            algorithm = FFT_ALGORITHM_DFT;
+
+        }
+
+    int backward_rc = amp_run_node_v2(
+
+        &descriptor,        int window_kind = default_window_kind;
+
+        &backward_inputs,        if (!window_selector.empty() && frame < static_cast<int>(window_selector.size())) {
+
+        1,            window_kind = clamp_window_kind(window_selector[frame]);
+
+        1,        }
+
+        kFrames,        if (window_kind != current_window_kind) {
+
+        48000.0,            fill_window(window_kind, window);
+
+        &backward_out,            current_window_kind = window_kind;
+
+        &backward_channels,        }
+
+        &state,
+
+        nullptr,        std::vector<double> real(window_size, 0.0);
+
+        AMP_EXECUTION_MODE_BACKWARD,        std::vector<double> imag(window_size, 0.0);
+
+        &metrics);        std::copy(ring.begin(), ring.end(), real.begin());
+
+    if (backward_rc != AMP_E_UNSUPPORTED) {        for (int i = 0; i < window_size; ++i) {
+
+        record_failure("amp_run_node_v2 backward returned %d (expected AMP_E_UNSUPPORTED)", backward_rc);            real[i] *= window[i];
+
+    }        }
+
+    if (backward_out != nullptr) {
+
+        record_failure("amp_run_node_v2 backward produced unexpected buffer");        if (algorithm == FFT_ALGORITHM_EIGEN || algorithm == FFT_ALGORITHM_HOOK) {
+
+        amp_free(backward_out);            compute_fft_eigen(real, imag, 0);
+
+        backward_out = nullptr;            compute_fft_eigen(real, imag, 1);
+
+    }        } else {
+
             compute_dft(real, imag, 0);
-        }
-    };
 
-    auto inverse_transform = [&](int algorithm, std::vector<double> &real, std::vector<double> &imag) {
-        if (algorithm == FFT_ALGORITHM_EIGEN || algorithm == FFT_ALGORITHM_HOOK) {
-            compute_fft_eigen(real, imag, 1);
-        } else {
-            compute_dft(real, imag, 1);
-        }
-    };
+    if (out_buffer != nullptr) {            compute_dft(real, imag, 1);
 
-    std::vector<double> output(frames, 0.0);
-    for (int frame = 0; frame < frames; ++frame) {
-        double epsilon = epsilon_default;
-        if (!stabilizer.empty() && frame < static_cast<int>(stabilizer.size())) {
-            double candidate = stabilizer[frame];
-            if (candidate < 0.0) {
-                candidate = -candidate;
-            }
-            if (candidate > 0.0) {
-                epsilon = candidate;
-            }
-        }
-        if (epsilon < 1e-12) {
-            epsilon = 1e-12;
-        }
-        int algorithm = default_algorithm;
-        if (!algorithm_selector.empty() && frame < static_cast<int>(algorithm_selector.size())) {
-            algorithm = clamp_algorithm_kind(algorithm_selector[frame]);
-        }
-        if (algorithm == FFT_ALGORITHM_EIGEN && !is_power_of_two(window_size)) {
-            algorithm = FFT_ALGORITHM_DFT;
-        }
-        int window_kind = default_window_kind;
-        if (!window_selector.empty() && frame < static_cast<int>(window_selector.size())) {
-            window_kind = clamp_window_kind(window_selector[frame]);
-        }
-        if (window_kind != current_window_kind) {
-            fill_window(window_kind, window);
-            current_window_kind = window_kind;
-        }
+        amp_free(out_buffer);        }
 
-        double current_sample = signal[frame];
-        double current_divisor = frame < static_cast<int>(divisor_real.size()) ? divisor_real[frame] : 1.0;
-        double current_divisor_imag = frame < static_cast<int>(divisor_imag.size()) ? divisor_imag[frame] : 0.0;
-        double current_phase = (!phase.empty() && frame < static_cast<int>(phase.size()))
-            ? phase[frame]
-            : (filled > 0 ? phase_buf[filled - 1] : 0.0);
-        double current_lower = (!lower.empty() && frame < static_cast<int>(lower.size()))
-            ? lower[frame]
-            : (filled > 0 ? lower_buf[filled - 1] : 0.0);
-        double current_upper = (!upper.empty() && frame < static_cast<int>(upper.size()))
-            ? upper[frame]
-            : (filled > 0 ? upper_buf[filled - 1] : 1.0);
-        double current_filter = (!filter.empty() && frame < static_cast<int>(filter.size()))
-            ? filter[frame]
-            : (filled > 0 ? filter_buf[filled - 1] : 1.0);
+        out_buffer = nullptr;
 
-        if (filled < window_size) {
-            buffer[filled] = current_sample;
-            divisor_buf[filled] = current_divisor;
-            divisor_imag_buf[filled] = current_divisor_imag;
-            phase_buf[filled] = current_phase;
-            lower_buf[filled] = current_lower;
-            upper_buf[filled] = current_upper;
-            filter_buf[filled] = current_filter;
-            filled += 1;
-        } else {
-            if (window_size > 1) {
-                std::memmove(buffer.data(), buffer.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-                std::memmove(divisor_buf.data(), divisor_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-                std::memmove(divisor_imag_buf.data(), divisor_imag_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-                std::memmove(phase_buf.data(), phase_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-                std::memmove(lower_buf.data(), lower_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-                std::memmove(upper_buf.data(), upper_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-                std::memmove(filter_buf.data(), filter_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-            }
-            buffer[window_size - 1] = current_sample;
-            divisor_buf[window_size - 1] = current_divisor;
-            divisor_imag_buf[window_size - 1] = current_divisor_imag;
-            phase_buf[window_size - 1] = current_phase;
-            lower_buf[window_size - 1] = current_lower;
-            upper_buf[window_size - 1] = current_upper;
-            filter_buf[window_size - 1] = current_filter;
-        }
+    }        const int sample_index = window_size > 0 ? window_size - 1 : 0;
 
-        if (filled < window_size) {
-            double safe_div = std::fabs(current_divisor) < epsilon ? (current_divisor >= 0.0 ? epsilon : -epsilon) : current_divisor;
-            output[frame] = current_sample / safe_div;
-            continue;
-        }
+    if (state != nullptr) {        output[frame] = real[sample_index];
 
-        std::vector<double> signal_real(window_size, 0.0);
-        std::vector<double> signal_imag(window_size, 0.0);
-        std::vector<double> divisor_real_fft(window_size, 0.0);
-        std::vector<double> divisor_imag_fft(window_size, 0.0);
-        double phase_mod = phase_buf[window_size > 0 ? window_size - 1 : 0];
-        double lower_mod = lower_buf[window_size > 0 ? window_size - 1 : 0];
-        double upper_mod = upper_buf[window_size > 0 ? window_size - 1 : 0];
-        double filter_mod = filter_buf[window_size > 0 ? window_size - 1 : 0];
-        double lower_clamped = clamp_unit_double(lower_mod);
-        double upper_clamped = clamp_unit_double(upper_mod);
-        if (upper_clamped < lower_clamped) {
-            std::swap(lower_clamped, upper_clamped);
-        }
-        double intensity_clamped = clamp_unit_double(filter_mod);
-        double cos_phase = std::cos(phase_mod);
-        double sin_phase = std::sin(phase_mod);
+        amp_release_state(state);    }
 
-        if (algorithm == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            std::vector<double> carrier_fnorms;
-            std::vector<int> carrier_indices;
-            carrier_fnorms.reserve(dynamic_carriers.size());
-            carrier_indices.reserve(dynamic_carriers.size());
-            for (size_t idx = 0; idx < dynamic_carriers.size() && idx < static_cast<size_t>(FFT_DYNAMIC_CARRIER_LIMIT); ++idx) {
-                const auto &series = dynamic_carriers[idx];
-                if (series.empty()) {
-                    continue;
-                }
-                double raw_value = frame < static_cast<int>(series.size()) ? series[frame] : series.back();
-                double normalized = raw_value;
-                if (sample_rate_hz > 0.0 && std::fabs(normalized) > 1.0) {
-                    normalized = raw_value / sample_rate_hz;
-                }
-                normalized = clamp_unit_double(normalized);
-                carrier_fnorms.push_back(normalized);
-                carrier_indices.push_back(static_cast<int>(idx));
-            }
-            double sample_dynamic = 0.0;
-            if (!carrier_indices.empty()) {
-                double inv_window = window_size > 0 ? 1.0 / static_cast<double>(window_size) : 1.0;
-                bool has_divisor = !divisor_real.empty() || !divisor_imag.empty();
-                for (size_t k = 0; k < carrier_indices.size(); ++k) {
-                    size_t carrier_index = static_cast<size_t>(carrier_indices[k]);
-                    double theta = dynamic_phase[carrier_index];
-                    double ph_re = std::cos(theta);
-                    double ph_im = std::sin(theta);
-                    double fnorm = carrier_fnorms[k];
-                    double angle = 2.0 * M_PI * fnorm;
-                    double step_re = std::cos(angle);
-                    double step_im = std::sin(angle);
-                    double coeff_re = 0.0;
-                    double coeff_im = 0.0;
-                    double div_re_acc = 0.0;
-                    double div_im_acc = 0.0;
-                    double last_re = ph_re;
-                    double last_im = ph_im;
-                    for (int n = 0; n < window_size; ++n) {
-                        double w = window[n];
-                        double xw = buffer[n] * w;
-                        coeff_re += xw * ph_re;
-                        coeff_im -= xw * ph_im;
-                        if (has_divisor) {
-                            double dw_re = divisor_buf[n] * w;
-                            double dw_im = divisor_imag_buf[n] * w;
-                            div_re_acc += dw_re * ph_re + dw_im * ph_im;
-                            div_im_acc += -dw_re * ph_im + dw_im * ph_re;
-                        }
-                        if (n == window_size - 1) {
-                            last_re = ph_re;
-                            last_im = ph_im;
-                        }
-                        double next_re = ph_re * step_re - ph_im * step_im;
-                        double next_im = ph_re * step_im + ph_im * step_re;
-                        ph_re = next_re;
-                        ph_im = next_im;
-                    }
-                    dynamic_phase[carrier_index] = wrap_phase_two_pi(std::atan2(ph_im, ph_re));
-                    if (has_divisor) {
-                        double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
-                        if (denom < epsilon) {
-                            denom = epsilon;
-                        }
-                        double real_tmp = (coeff_re * div_re_acc + coeff_im * div_im_acc) / denom;
-                        double imag_tmp = (coeff_im * div_re_acc - coeff_re * div_im_acc) / denom;
-                        coeff_re = real_tmp;
-                        coeff_im = imag_tmp;
-                    }
-                    double ratio = clamp_unit_double(fnorm);
-                    double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
-                    double gated_re = coeff_re * gain;
-                    double gated_im = coeff_im * gain;
-                    double rotated_re = gated_re * cos_phase - gated_im * sin_phase;
-                    double rotated_im = gated_re * sin_phase + gated_im * cos_phase;
-                    sample_dynamic += (rotated_re * last_re - rotated_im * last_im) * inv_window;
-                }
-            }
-            output[frame] = sample_dynamic;
-            continue;
-        }
+        state = nullptr;
 
-        for (int i = 0; i < window_size; ++i) {
-            double w = window[i];
-            signal_real[i] = buffer[i] * w;
-            signal_imag[i] = 0.0;
-            divisor_real_fft[i] = divisor_buf[i] * w;
-            divisor_imag_fft[i] = divisor_imag_buf[i] * w;
-        }
+    }    return output;
 
-        forward_transform(algorithm, signal_real, signal_imag);
-        forward_transform(algorithm, divisor_real_fft, divisor_imag_fft);
-
-        for (int i = 0; i < window_size; ++i) {
-            double a = signal_real[i];
-            double b = signal_imag[i];
-            double c = divisor_real_fft[i];
-            double d = divisor_imag_fft[i];
-            double denom = c * c + d * d;
-            if (denom < epsilon) {
-                denom = epsilon;
-            }
-            double real_part = (a * c + b * d) / denom;
-            double imag_part = (b * c - a * d) / denom;
-            double ratio = window_size > 1 ? static_cast<double>(i) / static_cast<double>(window_size - 1) : 0.0;
-            double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
-            double gated_real = real_part * gain;
-            double gated_imag = imag_part * gain;
-            double rotated_real = gated_real * cos_phase - gated_imag * sin_phase;
-            double rotated_imag = gated_real * sin_phase + gated_imag * cos_phase;
-            signal_real[i] = rotated_real;
-            signal_imag[i] = rotated_imag;
-        }
-
-        inverse_transform(algorithm, signal_real, signal_imag);
-
-        output[frame] = signal_real[window_size - 1];
-    }
-
-    return output;
 }
 
-std::vector<double> simulate_dynamic_backward(
-    const std::vector<double> &signal,
-    const std::vector<double> &divisor_real,
-    const std::vector<double> &divisor_imag,
-    const std::vector<double> &stabilizer,
-    const std::vector<double> &phase,
-    const std::vector<double> &lower,
-    const std::vector<double> &upper,
-    const std::vector<double> &filter,
-    const std::vector<std::vector<double>> &dynamic_carriers,
-    int window_size,
-    double epsilon_default,
-    double sample_rate_hz
+    if (g_test_failed) {
+
+        std::printf("test_fft_division_node: FAIL\n");std::vector<uint8_t> build_descriptor(
+
+        return 1;    const ParamDescriptor &signal_param,
+
+    }    int backend_mode
+
 ) {
-    const int frames = static_cast<int>(signal.size());
-    std::vector<double> recomb(window_size, 0.0);
-    std::vector<double> divisor_buf(window_size, 1.0);
-    std::vector<double> divisor_imag_buf(window_size, 0.0);
-    std::vector<double> phase_buf(window_size, 0.0);
-    std::vector<double> lower_buf(window_size, 0.0);
-    std::vector<double> upper_buf(window_size, 1.0);
-    std::vector<double> filter_buf(window_size, 1.0);
-    std::vector<double> window(window_size, 1.0);
-    std::vector<double> dynamic_phase(FFT_DYNAMIC_CARRIER_LIMIT, 0.0);
-    std::vector<double> phasor_re(window_size, 0.0);
-    std::vector<double> phasor_im(window_size, 0.0);
-    std::vector<double> output(frames, 0.0);
-    int filled = 0;
-    int current_window_kind = -1;
 
-    for (int frame = 0; frame < frames; ++frame) {
-        double epsilon = epsilon_default;
-        if (!stabilizer.empty() && frame < static_cast<int>(stabilizer.size())) {
-            double candidate = stabilizer[frame];
-            if (candidate < 0.0) {
-                candidate = -candidate;
-            }
-            if (candidate > 0.0) {
-                epsilon = candidate;
-            }
-        }
-        if (epsilon < 1e-12) {
-            epsilon = 1e-12;
-        }
-        if (current_window_kind != FFT_WINDOW_HANN) {
-            fill_window(FFT_WINDOW_HANN, window);
-            current_window_kind = FFT_WINDOW_HANN;
-        }
+    std::printf("test_fft_division_node: PASS\n");    std::vector<uint8_t> descriptor;
 
-        double current_sample = signal[frame];
-        double current_divisor = frame < static_cast<int>(divisor_real.size()) ? divisor_real[frame] : 1.0;
-        double current_divisor_imag = frame < static_cast<int>(divisor_imag.size()) ? divisor_imag[frame] : 0.0;
-        double current_phase = (!phase.empty() && frame < static_cast<int>(phase.size()))
-            ? phase[frame]
-            : (filled > 0 ? phase_buf[filled - 1] : 0.0);
-        double current_lower = (!lower.empty() && frame < static_cast<int>(lower.size()))
-            ? lower[frame]
-            : (filled > 0 ? lower_buf[filled - 1] : 0.0);
-        double current_upper = (!upper.empty() && frame < static_cast<int>(upper.size()))
-            ? upper[frame]
-            : (filled > 0 ? upper_buf[filled - 1] : 1.0);
-        double current_filter = (!filter.empty() && frame < static_cast<int>(filter.size()))
-            ? filter[frame]
-            : (filled > 0 ? filter_buf[filled - 1] : 1.0);
+    return 0;    descriptor.reserve(1024);
 
-        if (filled < window_size) {
-            recomb[filled] = current_sample;
-            divisor_buf[filled] = current_divisor;
-            divisor_imag_buf[filled] = current_divisor_imag;
-            phase_buf[filled] = current_phase;
-            lower_buf[filled] = current_lower;
-            upper_buf[filled] = current_upper;
-            filter_buf[filled] = current_filter;
-            double safe_div = std::fabs(current_divisor) < epsilon
-                ? (current_divisor >= 0.0 ? epsilon : -epsilon)
-                : current_divisor;
-            output[frame] = current_sample * safe_div;
-            filled += 1;
-            continue;
-        }
+}    append_u32(descriptor, 3U);
 
-        if (window_size > 1) {
-            std::memmove(recomb.data(), recomb.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-            std::memmove(divisor_buf.data(), divisor_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-            std::memmove(divisor_imag_buf.data(), divisor_imag_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-            std::memmove(phase_buf.data(), phase_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-            std::memmove(lower_buf.data(), lower_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-            std::memmove(upper_buf.data(), upper_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-            std::memmove(filter_buf.data(), filter_buf.data() + 1, static_cast<size_t>(window_size - 1) * sizeof(double));
-        }
-        recomb[window_size - 1] = current_sample;
-        divisor_buf[window_size - 1] = current_divisor;
-        divisor_imag_buf[window_size - 1] = current_divisor_imag;
-        phase_buf[window_size - 1] = current_phase;
-        lower_buf[window_size - 1] = current_lower;
-        upper_buf[window_size - 1] = current_upper;
-        filter_buf[window_size - 1] = current_filter;
 
-        double phase_mod = phase_buf[window_size - 1];
-        double lower_mod = lower_buf[window_size - 1];
-        double upper_mod = upper_buf[window_size - 1];
-        double filter_mod = filter_buf[window_size - 1];
-        double lower_clamped = clamp_unit_double(lower_mod);
-        double upper_clamped = clamp_unit_double(upper_mod);
-        if (upper_clamped < lower_clamped) {
-            std::swap(lower_clamped, upper_clamped);
-        }
-        double intensity_clamped = clamp_unit_double(filter_mod);
-        double cos_phase = std::cos(phase_mod);
-        double sin_phase = std::sin(phase_mod);
-        bool has_divisor = !divisor_real.empty() || !divisor_imag.empty();
+    append_node(descriptor, "carrier", "ConstantNode", {}, "{\"value\":1.0,\"channels\":1}", {});
+    append_node(descriptor, "signal", "GainNode", {"carrier"}, "{}", {signal_param});
 
-        std::vector<double> carrier_fnorms;
-        std::vector<int> carrier_indices;
-        carrier_fnorms.reserve(dynamic_carriers.size());
-        carrier_indices.reserve(dynamic_carriers.size());
-        for (size_t idx = 0; idx < dynamic_carriers.size() && idx < FFT_DYNAMIC_CARRIER_LIMIT; ++idx) {
-            const auto &series = dynamic_carriers[idx];
-            if (series.empty()) {
-                continue;
-            }
-            double raw_value = frame < static_cast<int>(series.size()) ? series[frame] : series.back();
-            double normalized = raw_value;
-            if (sample_rate_hz > 0.0 && std::fabs(normalized) > 1.0) {
-                normalized = raw_value / sample_rate_hz;
-            }
-            normalized = clamp_unit_double(normalized);
-            carrier_fnorms.push_back(normalized);
-            carrier_indices.push_back(static_cast<int>(idx));
-        }
-
-        double sample_dynamic = 0.0;
-        if (!carrier_indices.empty()) {
-            double inv_window = window_size > 0 ? 1.0 / static_cast<double>(window_size) : 1.0;
-            for (size_t k = 0; k < carrier_indices.size(); ++k) {
-                size_t carrier_index = static_cast<size_t>(carrier_indices[k]);
-                double theta = dynamic_phase[carrier_index];
-                double fnorm = carrier_fnorms[k];
-                double angle = 2.0 * M_PI * fnorm;
-                double step_re = std::cos(angle);
-                double step_im = std::sin(angle);
-                double ph_re = std::cos(theta);
-                double ph_im = std::sin(theta);
-                double div_re_acc = 0.0;
-                double div_im_acc = 0.0;
-                double last_re = ph_re;
-                double last_im = ph_im;
-                for (int n = 0; n < window_size; ++n) {
-                    double w = window[n];
-                    phasor_re[n] = ph_re;
-                    phasor_im[n] = ph_im;
-                    if (has_divisor) {
-                        double dw_re = divisor_buf[n] * w;
-                        double dw_im = divisor_imag_buf[n] * w;
-                        div_re_acc += dw_re * ph_re + dw_im * ph_im;
-                        div_im_acc += -dw_re * ph_im + dw_im * ph_re;
-                    }
-                    if (n == window_size - 1) {
-                        last_re = ph_re;
-                        last_im = ph_im;
-                    }
-                    double next_re = ph_re * step_re - ph_im * step_im;
-                    double next_im = ph_re * step_im + ph_im * step_re;
-                    ph_re = next_re;
-                    ph_im = next_im;
-                }
-                dynamic_phase[carrier_index] = wrap_phase_two_pi(std::atan2(ph_im, ph_re));
-                if (!has_divisor) {
-                    div_re_acc = 1.0;
-                    div_im_acc = 0.0;
-                }
-                double ratio = clamp_unit_double(fnorm);
-                double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
-                if (gain < 1e-6) {
-                    gain = 1e-6;
-                }
-                double rotated_re = last_re * cos_phase - last_im * sin_phase;
-                double rotated_im = last_re * sin_phase + last_im * cos_phase;
-                double scale_re = rotated_re * gain;
-                double scale_im = rotated_im * gain;
-                if (has_divisor) {
-                    double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
-                    if (denom < epsilon) {
-                        denom = epsilon;
-                    }
-                    double tmp_re = (scale_re * div_re_acc + scale_im * div_im_acc) / denom;
-                    double tmp_im = (scale_im * div_re_acc - scale_re * div_im_acc) / denom;
-                    scale_re = tmp_re;
-                    scale_im = tmp_im;
-                }
-                for (int n = 0; n < window_size; ++n) {
-                    double w = window[n];
-                    double coeff = inv_window * w * (scale_re * phasor_re[n] + scale_im * phasor_im[n]);
-                    sample_dynamic += coeff * recomb[n];
-                }
-            }
-        }
-        output[frame] = sample_dynamic;
-    }
-
-    return output;
+    char params_buffer[256];
+    std::snprintf(
+        params_buffer,
+        sizeof(params_buffer),
+        "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\",\"supports_v2\":true,\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1,\"backend_mode\":%d,\"backend_hop\":1}",
+        kWindowSize,
+        kWindowSize - 1,
+        backend_mode
+    );
+    append_node(descriptor, "fft", "FFTDivisionNode", {"signal"}, params_buffer, {});
+    return descriptor;
 }
 
-} // namespace
+std::vector<double> run_backend(const std::vector<uint8_t> &descriptor, const char *label) {
+    AmpGraphRuntime *runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
+    if (runtime == nullptr) {
+        record_failure("amp_graph_runtime_create failed for %s", label);
+        return {};
+    }
+    if (amp_graph_runtime_configure(runtime, 1U, static_cast<uint32_t>(kFrames)) != 0) {
+        record_failure("amp_graph_runtime_configure failed for %s", label);
+        amp_graph_runtime_destroy(runtime);
+        return {};
+    }
+
+    double *out_buffer = nullptr;
+    uint32_t out_batches = 0;
+    uint32_t out_channels = 0;
+    uint32_t out_frames = 0;
+    int exec_rc = amp_graph_runtime_execute(
+        runtime,
+        nullptr,
+        0U,
+        kFrames,
+        48000.0,
+        &out_buffer,
+        &out_batches,
+        &out_channels,
+        &out_frames
+    );
+    if (exec_rc != 0 || out_buffer == nullptr) {
+        record_failure("amp_graph_runtime_execute failed for %s rc=%d buffer=%p", label, exec_rc, static_cast<void *>(out_buffer));
+        if (out_buffer != nullptr) {
+            amp_graph_runtime_buffer_free(out_buffer);
+        }
+        amp_graph_runtime_destroy(runtime);
+        return {};
+    }
+
+    size_t total = static_cast<size_t>(out_batches) * out_channels * out_frames;
+    std::vector<double> result(out_buffer, out_buffer + total);
+    amp_graph_runtime_buffer_free(out_buffer);
+    amp_graph_runtime_destroy(runtime);
+    return result;
+}
+
+void compare_frames(const std::vector<double> &reference, const std::vector<double> &candidate, const char *label) {
+    if (reference.size() != candidate.size()) {
+        record_failure("%s length mismatch reference=%zu candidate=%zu", label, reference.size(), candidate.size());
+        return;
+    }
+    constexpr double kTolerance = 1e-7;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        double diff = std::fabs(reference[i] - candidate[i]);
+        if (diff > kTolerance) {
+            record_failure("%s frame %zu differs %.12f vs %.12f", label, i, candidate[i], reference[i]);
+            return;
+        }
+    }
+}
+
+}  // namespace
 
 int main() {
-    constexpr int kFrames = 8;
-    constexpr int kWindowSize = 4;
-
     const std::vector<double> signal{
         1.0, -0.5, 0.25, -0.125, 0.0625, -0.03125, 0.015625, -0.0078125
     };
-    const std::vector<double> divisor_real{
-        1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5
-    };
-    const std::vector<double> divisor_imag{
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    };
-    const std::vector<int> algorithm_selector{
-        0, 0, 0, 0, 0, 0, 0, 0
-    };
-    const std::vector<int> window_selector{
-        1, 1, 1, 1, 1, 1, 1, 1
-    };
-    const std::vector<double> stabilizer{
-        1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9
-    };
-    std::vector<double> phase_metadata(kFrames, 0.0);
-    std::vector<double> lower_metadata(kFrames, 0.0);
-    std::vector<double> upper_metadata(kFrames, 1.0);
-    std::vector<double> filter_metadata(kFrames, 1.0);
-    std::vector<double> carrier_band0(kFrames, 0.5);
+    const std::vector<int> algorithm_selector(kFrames, FFT_ALGORITHM_EIGEN);
+    const std::vector<int> window_selector(kFrames, FFT_WINDOW_HANN);
 
-    auto verify_frames = [&](const double *actual, const std::vector<double> &expected, const char *label) {
-        double tolerance = 1e-8;
-        if (
-            std::strcmp(label, "fft_dynamic_stub") == 0
-            || std::strcmp(label, "direct_dynamic_forward") == 0
-            || std::strcmp(label, "direct_dynamic_backward") == 0
-            || std::strcmp(label, "direct_dynamic_backward_fresh") == 0
-        ) {
-            tolerance = 1.0;
-        }
-        for (int i = 0; i < kFrames; ++i) {
-            double diff = std::fabs(actual[i] - expected[i]);
-            if (diff > tolerance) {
-                std::fprintf(
-                    stderr,
-                    "%s mismatch at frame %d: got %.12f expected %.12f diff %.12f\n",
-                    label,
-                    i,
-                    actual[i],
-                    expected[i],
-                    diff
-                );
-                /* Print full context arrays to help diagnose the source of the mismatch. */
-                std::fprintf(stderr, "--- full actual ---\n");
-                for (int j = 0; j < kFrames; ++j) {
-                    std::fprintf(stderr, "[%d] %.18g\n", j, actual[j]);
-                }
-                std::fprintf(stderr, "--- full expected ---\n");
-                for (int j = 0; j < kFrames; ++j) {
-                    std::fprintf(stderr, "[%d] %.18g\n", j, expected[j]);
-                }
-                record_failure("FFT division output mismatch for %s", label);
-                return;
-            }
-        }
-    };
+    std::vector<double> expected = simulate_fft_reference(
+        signal,
+        algorithm_selector,
+        window_selector,
+        kWindowSize,
+        1e-9,
+        FFT_ALGORITHM_EIGEN,
+        FFT_WINDOW_HANN
+    );
 
     ParamDescriptor signal_param{
         "gain",
@@ -849,933 +1079,34 @@ int main() {
         signal
     };
 
-    std::vector<double> algorithm_selector_d(algorithm_selector.begin(), algorithm_selector.end());
-    std::vector<double> window_selector_d(window_selector.begin(), window_selector.end());
+    std::vector<uint8_t> descriptor_mode0 = build_descriptor(signal_param, 0);
+    std::vector<uint8_t> descriptor_mode1 = build_descriptor(signal_param, 1);
+    std::vector<uint8_t> descriptor_mode2 = build_descriptor(signal_param, 2);
 
-    ParamDescriptor divisor_param{
-        "divisor",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        divisor_real
-    };
-    ParamDescriptor divisor_imag_param{
-        "divisor_imag",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        divisor_imag
-    };
-    ParamDescriptor algorithm_param{
-        "algorithm_selector",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        algorithm_selector_d
-    };
-    ParamDescriptor window_param{
-        "window_selector",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        window_selector_d
-    };
-    ParamDescriptor stabilizer_param{
-        "stabilizer",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        stabilizer
-    };
-    ParamDescriptor phase_param{
-        "phase_offset",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        phase_metadata
-    };
-    ParamDescriptor lower_param{
-        "lower_band",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        lower_metadata
-    };
-    ParamDescriptor upper_param{
-        "upper_band",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        upper_metadata
-    };
-    ParamDescriptor filter_param{
-        "filter_intensity",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        filter_metadata
-    };
-    ParamDescriptor carrier_band_param{
-        "carrier_band_0",
-        1U,
-        1U,
-        static_cast<uint32_t>(kFrames),
-        carrier_band0
-    };
-
-    std::vector<std::vector<double>> dynamic_carriers{carrier_band0};
-
-    auto make_fft_params_json = [&](int backend_mode, int backend_hop) -> std::string {
-        char fft_params_local[256];
-        std::snprintf(
-            fft_params_local,
-            sizeof(fft_params_local),
-            "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\"," \
-            "\"supports_v2\":true,\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1,\"backend_mode\":%d,\"backend_hop\":%d}",
-            kWindowSize,
-            kWindowSize - 1,
-            backend_mode,
-            backend_hop
-        );
-        return std::string(fft_params_local);
-    };
-
-    auto build_descriptor = [&](int backend_mode, int backend_hop) {
-        std::vector<uint8_t> result;
-        result.reserve(2048);
-        append_u32(result, 3U);
-
-        append_node(
-            result,
-            "carrier",
-            "ConstantNode",
-            {},
-            "{\"value\":1.0,\"channels\":1}",
-            {}
-        );
-
-        append_node(
-            result,
-            "signal",
-            "GainNode",
-            {"carrier"},
-            "{}",
-            {signal_param}
-        );
-
-        std::string fft_params_json = make_fft_params_json(backend_mode, backend_hop);
-        append_node(
-            result,
-            "fft_divider",
-            "FFTDivisionNode",
-            {"signal"},
-            fft_params_json,
-            {divisor_param, divisor_imag_param, algorithm_param, window_param, stabilizer_param, phase_param, lower_param, upper_param, filter_param, carrier_band_param}
-        );
-        return result;
-    };
-
-    std::vector<uint8_t> descriptor = build_descriptor(0, 1);
-
-    std::vector<double> expected = simulate_fft_division(
-        signal,
-        divisor_real,
-        divisor_imag,
-        algorithm_selector,
-        window_selector,
-        stabilizer,
-        phase_metadata,
-        lower_metadata,
-        upper_metadata,
-        filter_metadata,
-        dynamic_carriers,
-        kWindowSize,
-        1e-9,
-        FFT_ALGORITHM_EIGEN,
-        FFT_WINDOW_HANN
-    );
-
-    auto run_backend_case = [&](const std::vector<uint8_t> &desc, const char *label) {
-        AmpGraphNodeSummary summary_local{};
-        AmpGraphRuntime *runtime_local = amp_graph_runtime_create(desc.data(), desc.size(), nullptr, 0U);
-        if (runtime_local == nullptr) {
-            record_failure("runtime create failed for %s", label);
-            return summary_local;
-        }
-        int configure_rc = amp_graph_runtime_configure(runtime_local, 1U, static_cast<uint32_t>(kFrames));
-        if (configure_rc != 0) {
-            record_failure("runtime configure failed for %s rc=%d", label, configure_rc);
-            amp_graph_runtime_destroy(runtime_local);
-            return summary_local;
-        }
-
-        double *case_out_buffer = nullptr;
-        uint32_t case_batches = 0;
-        uint32_t case_channels = 0;
-        uint32_t case_frames = 0;
-        int exec_rc = amp_graph_runtime_execute(
-            runtime_local,
-            nullptr,
-            0U,
-            kFrames,
-            48000.0,
-            &case_out_buffer,
-            &case_batches,
-            &case_channels,
-            &case_frames
-        );
-        if (exec_rc != 0 || case_out_buffer == nullptr) {
-            record_failure("runtime execute failed for %s rc=%d buffer=%p", label, exec_rc, static_cast<void*>(case_out_buffer));
-            if (case_out_buffer != nullptr) {
-                amp_graph_runtime_buffer_free(case_out_buffer);
-                case_out_buffer = nullptr;
-            }
-            amp_graph_runtime_destroy(runtime_local);
-            return summary_local;
-        }
-        if (case_batches != 1U || case_channels != 1U || case_frames != static_cast<uint32_t>(kFrames)) {
-            record_failure(
-                "%s produced unexpected shape batches=%u channels=%u frames=%u",
-                label,
-                case_batches,
-                case_channels,
-                case_frames
-            );
-        }
-        verify_frames(case_out_buffer, expected, label);
-
-        int describe_rc_local = amp_graph_runtime_describe_node(runtime_local, "fft_divider", &summary_local);
-        if (describe_rc_local != 0) {
-            record_failure("describe node failed for %s rc=%d", label, describe_rc_local);
-        }
-
-        amp_graph_runtime_buffer_free(case_out_buffer);
-        amp_graph_runtime_destroy(runtime_local);
-        return summary_local;
-    };
-
-    auto create_configured_runtime = [&](const std::vector<uint8_t> &desc, const char *label) -> AmpGraphRuntime * {
-        AmpGraphRuntime *rt = amp_graph_runtime_create(desc.data(), desc.size(), nullptr, 0U);
-        if (rt == nullptr) {
-            record_failure("runtime create failed for %s", label);
-            return nullptr;
-        }
-        int cfg_rc = amp_graph_runtime_configure(rt, 1U, static_cast<uint32_t>(kFrames));
-        if (cfg_rc != 0) {
-            record_failure("runtime configure failed for %s rc=%d", label, cfg_rc);
-            amp_graph_runtime_destroy(rt);
-            return nullptr;
-        }
-        return rt;
-    };
-
-    auto verify_summary_metadata = [&](const AmpGraphNodeSummary &summary) {
-        assert(summary.supports_v2 == 1);
-        assert(summary.declared_delay_frames == static_cast<uint32_t>(kWindowSize - 1));
-        assert(summary.has_metrics == 1);
-        assert(summary.metrics.accumulated_heat > 0.0f);
-        assert(summary.total_heat_accumulated >= static_cast<double>(summary.metrics.accumulated_heat));
-        assert(summary.total_heat_accumulated > 0.0);
-        assert(std::fabs(summary.metrics.reserved[0] - static_cast<float>(phase_metadata.back())) < 1e-6f);
-        assert(std::fabs(summary.metrics.reserved[1] - static_cast<float>(lower_metadata.back())) < 1e-6f);
-        assert(std::fabs(summary.metrics.reserved[2] - static_cast<float>(upper_metadata.back())) < 1e-6f);
-        assert(std::fabs(summary.metrics.reserved[3] - static_cast<float>(filter_metadata.back())) < 1e-6f);
-    };
-
-    auto compare_summary_to_reference = [&](
-        const AmpGraphNodeSummary &reference,
-        const AmpGraphNodeSummary &candidate
-    ) {
-        assert(candidate.supports_v2 == reference.supports_v2);
-        assert(candidate.declared_delay_frames == reference.declared_delay_frames);
-        assert(candidate.oversample_ratio == reference.oversample_ratio);
-        assert(candidate.has_metrics == reference.has_metrics);
-
-        const float heat_ref = reference.metrics.accumulated_heat;
-        const float heat_candidate = candidate.metrics.accumulated_heat;
-        assert(std::fabs(static_cast<double>(heat_candidate) - static_cast<double>(heat_ref)) < 1e-6);
-
-        assert(std::fabs(candidate.metrics.processing_time_seconds - reference.metrics.processing_time_seconds) < 1e-9);
-        assert(std::fabs(candidate.metrics.logging_time_seconds - reference.metrics.logging_time_seconds) < 1e-9);
-        assert(std::fabs(candidate.metrics.total_time_seconds - reference.metrics.total_time_seconds) < 1e-9);
-        assert(std::fabs(candidate.metrics.thread_cpu_time_seconds - reference.metrics.thread_cpu_time_seconds) < 1e-9);
-
-        for (int i = 0; i < 6; ++i) {
-            assert(std::fabs(candidate.metrics.reserved[i] - reference.metrics.reserved[i]) < 1e-6);
-        }
-
-        assert(std::fabs(candidate.total_heat_accumulated - reference.total_heat_accumulated) < 1e-6);
-    };
-
-    AmpGraphNodeSummary summary_fft = run_backend_case(descriptor, "backend_mode_amp_window");
-
-    std::vector<uint8_t> descriptor_backend_fftfree_batched = build_descriptor(1, 1);
-    AmpGraphNodeSummary summary_fftfree_batched = run_backend_case(
-        descriptor_backend_fftfree_batched,
-        "backend_mode_fftfree_batched"
-    );
-
-    std::vector<uint8_t> descriptor_backend_fftfree_stream = build_descriptor(2, 1);
-    AmpGraphNodeSummary summary_fftfree_stream = run_backend_case(
-        descriptor_backend_fftfree_stream,
-        "backend_mode_fftfree_stream"
-    );
-
-    verify_summary_metadata(summary_fft);
-    verify_summary_metadata(summary_fftfree_batched);
-    verify_summary_metadata(summary_fftfree_stream);
-
-    compare_summary_to_reference(summary_fft, summary_fftfree_batched);
-    compare_summary_to_reference(summary_fft, summary_fftfree_stream);
-
-    double *out_buffer = nullptr;
-    uint32_t out_batches = 0;
-    uint32_t out_channels = 0;
-    uint32_t out_frames = 0;
-    int exec_rc = 0;
-    int describe_rc = 0;
-    AmpGraphRuntime *runtime = nullptr;
-
-    // Override algorithm selector to use the DFT pathway on a fresh runtime instance and verify updates.
-    runtime = create_configured_runtime(descriptor, "backend_mode_amp_window_dft");
-    if (runtime != nullptr) {
-        std::vector<double> algorithm_selector_param_dft(kFrames, static_cast<double>(FFT_ALGORITHM_DFT));
-        int set_param_rc = amp_graph_runtime_set_param(
-            runtime,
-            "fft_divider",
-            "algorithm_selector",
-            algorithm_selector_param_dft.data(),
-            1U,
-            1U,
-            static_cast<uint32_t>(kFrames)
-        );
-        if (set_param_rc != 0) {
-            record_failure("set_param algorithm_selector dft failed rc=%d", set_param_rc);
-        }
-
-        if (set_param_rc == 0) {
-            exec_rc = amp_graph_runtime_execute(
-                runtime,
-                nullptr,
-                0U,
-                kFrames,
-                48000.0,
-                &out_buffer,
-                &out_batches,
-                &out_channels,
-                &out_frames
-            );
-            if (exec_rc != 0 || out_buffer == nullptr) {
-                record_failure("dft execute failed rc=%d buffer=%p", exec_rc, static_cast<void*>(out_buffer));
-            } else {
-                if (out_batches != 1U || out_channels != 1U || out_frames != static_cast<uint32_t>(kFrames)) {
-                    record_failure(
-                        "dft execute unexpected shape batches=%u channels=%u frames=%u",
-                        out_batches,
-                        out_channels,
-                        out_frames
-                    );
-                }
-                bool diverged_from_fft = false;
-                for (int i = kWindowSize - 1; i < kFrames; ++i) {
-                    double diff = std::fabs(out_buffer[i] - expected[i]);
-                    if (diff > 1e-6) {
-                        diverged_from_fft = true;
-                        break;
-                    }
-                }
-                if (!diverged_from_fft) {
-                    record_failure("dft run did not diverge from fft" );
-                }
-                for (int i = 0; i < kFrames; ++i) {
-                    if (!std::isfinite(out_buffer[i])) {
-                        record_failure("dft output not finite at %d", i);
-                        break;
-                    }
-                }
-
-                AmpGraphNodeSummary summary_dft{};
-                describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dft);
-                if (describe_rc != 0) {
-                    record_failure("describe node failed for dft rc=%d", describe_rc);
-                } else {
-                    if (summary_dft.has_metrics != 1) {
-                        record_failure("dft summary missing metrics");
-                    }
-                    if (summary_dft.metrics.accumulated_heat <= 0.0f) {
-                        record_failure("dft summary accumulated_heat <= 0");
-                    }
-                    if (!(summary_dft.metrics.accumulated_heat < summary_fft.metrics.accumulated_heat)) {
-                        record_failure("dft summary accumulated_heat not less than fft");
-                    }
-                }
-                amp_graph_runtime_buffer_free(out_buffer);
-                out_buffer = nullptr;
-            }
-        }
-        amp_graph_runtime_destroy(runtime);
-        runtime = nullptr;
-    }
-
-    // Override algorithm selector to dynamic oscillator stub and verify the skeleton path behaves like the DFT fallback.
-    runtime = create_configured_runtime(descriptor, "backend_mode_amp_window_dynamic_stub");
-    if (runtime != nullptr) {
-        std::vector<int> algorithm_selector_dynamic(kFrames, FFT_ALGORITHM_DYNAMIC_OSCILLATORS);
-        std::vector<double> algorithm_selector_param_dynamic(
-            kFrames,
-            static_cast<double>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)
-        );
-        std::vector<double> carrier_override(kFrames, 0.25);
-        for (int i = 0; i < kFrames; ++i) {
-            carrier_override[i] = 0.1 + 0.05 * static_cast<double>(i);
-        }
-
-        int set_algo_dynamic_rc = amp_graph_runtime_set_param(
-            runtime,
-            "fft_divider",
-            "algorithm_selector",
-            algorithm_selector_param_dynamic.data(),
-            1U,
-            1U,
-            static_cast<uint32_t>(kFrames)
-        );
-        if (set_algo_dynamic_rc != 0) {
-            record_failure("set_param algorithm_selector dynamic failed rc=%d", set_algo_dynamic_rc);
-        }
-        int set_carrier_override_rc = amp_graph_runtime_set_param(
-            runtime,
-            "fft_divider",
-            "carrier_band_0",
-            carrier_override.data(),
-            1U,
-            1U,
-            static_cast<uint32_t>(kFrames)
-        );
-        if (set_carrier_override_rc != 0) {
-            record_failure("set_param carrier_band_0 dynamic failed rc=%d", set_carrier_override_rc);
-        }
-
-        if (set_algo_dynamic_rc == 0 && set_carrier_override_rc == 0) {
-            std::vector<std::vector<double>> dynamic_override_carriers{carrier_override};
-
-            std::vector<double> expected_dynamic = simulate_fft_division(
-                signal,
-                divisor_real,
-                divisor_imag,
-                algorithm_selector_dynamic,
-                window_selector,
-                stabilizer,
-                phase_metadata,
-                lower_metadata,
-                upper_metadata,
-                filter_metadata,
-                dynamic_override_carriers,
-                kWindowSize,
-                1e-9,
-                FFT_ALGORITHM_EIGEN,
-                FFT_WINDOW_HANN
-            );
-
-            exec_rc = amp_graph_runtime_execute(
-                runtime,
-                nullptr,
-                0U,
-                kFrames,
-                48000.0,
-                &out_buffer,
-                &out_batches,
-                &out_channels,
-                &out_frames
-            );
-            if (exec_rc != 0 || out_buffer == nullptr) {
-                record_failure("dynamic stub execute failed rc=%d buffer=%p", exec_rc, static_cast<void*>(out_buffer));
-                if (out_buffer != nullptr) {
-                    amp_graph_runtime_buffer_free(out_buffer);
-                    out_buffer = nullptr;
-                }
-            } else {
-                if (out_batches != 1U || out_channels != 1U || out_frames != static_cast<uint32_t>(kFrames)) {
-                    record_failure(
-                        "dynamic stub unexpected shape batches=%u channels=%u frames=%u",
-                        out_batches,
-                        out_channels,
-                        out_frames
-                    );
-                }
-                verify_frames(out_buffer, expected_dynamic, "fft_dynamic_stub");
-
-                AmpGraphNodeSummary summary_dynamic{};
-                describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_dynamic);
-                if (describe_rc != 0) {
-                    record_failure("describe node failed for dynamic stub rc=%d", describe_rc);
-                } else {
-                    if (summary_dynamic.has_metrics != 1) {
-                        record_failure("dynamic stub summary missing metrics");
-                    }
-                    if (summary_dynamic.metrics.accumulated_heat <= 0.0f) {
-                        record_failure("dynamic stub accumulated_heat <= 0");
-                    }
-                    if (std::fabs(summary_dynamic.metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) >= 1e-6f) {
-                        record_failure("dynamic stub reserved[5] mismatch");
-                    }
-                }
-
-                amp_graph_runtime_buffer_free(out_buffer);
-                out_buffer = nullptr;
-            }
-        }
-        amp_graph_runtime_destroy(runtime);
-        runtime = nullptr;
-    }
-
-    // Override window selector to rectangular while restoring FFT algorithm on another fresh runtime.
-    runtime = create_configured_runtime(descriptor, "backend_mode_amp_window_rect");
-    if (runtime != nullptr) {
-        std::vector<double> algorithm_selector_param_fft(kFrames, 0.0);
-        std::vector<double> window_selector_param_rect(kFrames, 0.0);
-        int set_algo_fft_rc = amp_graph_runtime_set_param(
-            runtime,
-            "fft_divider",
-            "algorithm_selector",
-            algorithm_selector_param_fft.data(),
-            1U,
-            1U,
-            static_cast<uint32_t>(kFrames)
-        );
-        if (set_algo_fft_rc != 0) {
-            record_failure("set_param algorithm_selector fft failed rc=%d", set_algo_fft_rc);
-        }
-        int set_window_rect_rc = amp_graph_runtime_set_param(
-            runtime,
-            "fft_divider",
-            "window_selector",
-            window_selector_param_rect.data(),
-            1U,
-            1U,
-            static_cast<uint32_t>(kFrames)
-        );
-        if (set_window_rect_rc != 0) {
-            record_failure("set_param window_selector rect failed rc=%d", set_window_rect_rc);
-        }
-
-        if (set_algo_fft_rc == 0 && set_window_rect_rc == 0) {
-            std::vector<int> window_selector_rect(kFrames, 0);
-            std::vector<double> expected_rect = simulate_fft_division(
-                signal,
-                divisor_real,
-                divisor_imag,
-                algorithm_selector,
-                window_selector_rect,
-                stabilizer,
-                phase_metadata,
-                lower_metadata,
-                upper_metadata,
-                filter_metadata,
-                dynamic_carriers,
-                kWindowSize,
-                1e-9,
-                FFT_ALGORITHM_EIGEN,
-                FFT_WINDOW_HANN
-            );
-
-            exec_rc = amp_graph_runtime_execute(
-                runtime,
-                nullptr,
-                0U,
-                kFrames,
-                48000.0,
-                &out_buffer,
-                &out_batches,
-                &out_channels,
-                &out_frames
-            );
-            if (exec_rc != 0 || out_buffer == nullptr) {
-                record_failure("rect window execute failed rc=%d buffer=%p", exec_rc, static_cast<void*>(out_buffer));
-                if (out_buffer != nullptr) {
-                    amp_graph_runtime_buffer_free(out_buffer);
-                    out_buffer = nullptr;
-                }
-            } else {
-                if (out_batches != 1U || out_channels != 1U || out_frames != static_cast<uint32_t>(kFrames)) {
-                    record_failure(
-                        "rect window unexpected shape batches=%u channels=%u frames=%u",
-                        out_batches,
-                        out_channels,
-                        out_frames
-                    );
-                }
-                verify_frames(out_buffer, expected_rect, "rectangular_window");
-
-                AmpGraphNodeSummary summary_rect{};
-                describe_rc = amp_graph_runtime_describe_node(runtime, "fft_divider", &summary_rect);
-                if (describe_rc != 0) {
-                    record_failure("describe node failed for rect rc=%d", describe_rc);
-                } else {
-                    if (summary_rect.has_metrics != 1) {
-                        record_failure("rect summary missing metrics");
-                    }
-                    if (std::fabs(summary_rect.metrics.accumulated_heat - summary_fft.metrics.accumulated_heat) >= 1e-6f) {
-                        record_failure("rect summary accumulated_heat mismatch");
-                    }
-                }
-
-                amp_graph_runtime_buffer_free(out_buffer);
-                out_buffer = nullptr;
-            }
-        }
-
-        amp_graph_runtime_clear_params(runtime);
-        amp_graph_runtime_destroy(runtime);
-    }
-    runtime = nullptr;
-
-    // Directly exercise amp_run_node_v2 forward/backward metadata handling.
-    std::string direct_node_name = "fft_divider_direct";
-    std::string direct_type_name = "FFTDivisionNode";
-    std::string direct_params_json = make_fft_params_json(0, 1);
-
-    EdgeRunnerNodeDescriptor direct_descriptor{};
-    direct_descriptor.name = direct_node_name.c_str();
-    direct_descriptor.name_len = direct_node_name.size();
-    direct_descriptor.type_name = direct_type_name.c_str();
-    direct_descriptor.type_len = direct_type_name.size();
-    direct_descriptor.params_json = direct_params_json.c_str();
-    direct_descriptor.params_len = direct_params_json.size();
-
-    EdgeRunnerAudioView forward_audio{};
-    forward_audio.has_audio = 1U;
-    forward_audio.batches = 1U;
-    forward_audio.channels = 1U;
-    forward_audio.frames = static_cast<uint32_t>(kFrames);
-    forward_audio.data = signal.data();
-
-    std::vector<double> custom_phase{0.0, 0.12, -0.18, 0.24, -0.3, 0.36, -0.12, 0.18};
-    std::vector<double> custom_lower(kFrames, 0.0);
-    std::vector<double> custom_upper(kFrames, 1.0);
-    std::vector<double> custom_filter{1.0, 0.95, 0.92, 0.96, 0.94, 0.98, 0.93, 0.97};
-
-    EdgeRunnerParamView direct_param_views[] = {
-        {"divisor", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_real.data()},
-        {"divisor_imag", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_imag.data()},
-        {"algorithm_selector", 1U, 1U, static_cast<uint32_t>(kFrames), algorithm_selector_d.data()},
-        {"window_selector", 1U, 1U, static_cast<uint32_t>(kFrames), window_selector_d.data()},
-        {"stabilizer", 1U, 1U, static_cast<uint32_t>(kFrames), stabilizer.data()},
-        {"phase_offset", 1U, 1U, static_cast<uint32_t>(kFrames), custom_phase.data()},
-        {"lower_band", 1U, 1U, static_cast<uint32_t>(kFrames), custom_lower.data()},
-        {"upper_band", 1U, 1U, static_cast<uint32_t>(kFrames), custom_upper.data()},
-        {"filter_intensity", 1U, 1U, static_cast<uint32_t>(kFrames), custom_filter.data()}
-    };
-
-    EdgeRunnerParamSet direct_param_set{};
-    direct_param_set.count = static_cast<uint32_t>(sizeof(direct_param_views) / sizeof(direct_param_views[0]));
-    direct_param_set.items = direct_param_views;
-
-    EdgeRunnerNodeInputs forward_inputs{};
-    forward_inputs.audio = forward_audio;
-    forward_inputs.params = direct_param_set;
-
-    AmpNodeMetrics forward_metrics{};
-    double *direct_forward_out = nullptr;
-    int direct_forward_channels = 0;
-    void *state_ptr = nullptr;
-
-    int direct_rc = amp_run_node_v2(
-        &direct_descriptor,
-        &forward_inputs,
-        1,
-        1,
-        kFrames,
-        48000.0,
-        &direct_forward_out,
-        &direct_forward_channels,
-        &state_ptr,
-        nullptr,
-        AMP_EXECUTION_MODE_FORWARD,
-        &forward_metrics
-    );
-    assert(direct_rc == 0);
-    assert(direct_forward_out != nullptr);
-    assert(direct_forward_channels == 1);
-
-    std::vector<double> expected_forward = simulate_fft_division(
-        signal,
-        divisor_real,
-        divisor_imag,
-        algorithm_selector,
-        window_selector,
-        stabilizer,
-        custom_phase,
-        custom_lower,
-        custom_upper,
-        custom_filter,
-        {},
-        kWindowSize,
-        1e-9,
-        FFT_ALGORITHM_EIGEN,
-        FFT_WINDOW_HANN
-    );
-    verify_frames(direct_forward_out, expected_forward, "direct_forward");
-    assert(std::fabs(forward_metrics.reserved[0] - static_cast<float>(custom_phase.back())) < 1e-6f);
-    assert(std::fabs(forward_metrics.reserved[1] - static_cast<float>(custom_lower.back())) < 1e-6f);
-    assert(std::fabs(forward_metrics.reserved[2] - static_cast<float>(custom_upper.back())) < 1e-6f);
-    assert(std::fabs(forward_metrics.reserved[3] - static_cast<float>(custom_filter.back())) < 1e-6f);
-
-    std::vector<double> forward_copy(direct_forward_out, direct_forward_out + kFrames);
-
-    EdgeRunnerAudioView backward_audio = forward_audio;
-    backward_audio.data = direct_forward_out;
-    EdgeRunnerNodeInputs backward_inputs{};
-    backward_inputs.audio = backward_audio;
-    backward_inputs.params = direct_param_set;
-
-    AmpNodeMetrics backward_metrics{};
-    double *reconstructed_out = nullptr;
-    int reconstructed_channels = 0;
-    direct_rc = amp_run_node_v2(
-        &direct_descriptor,
-        &backward_inputs,
-        1,
-        1,
-        kFrames,
-        48000.0,
-        &reconstructed_out,
-        &reconstructed_channels,
-        &state_ptr,
-        nullptr,
-        AMP_EXECUTION_MODE_BACKWARD,
-        &backward_metrics
-    );
-    assert(direct_rc == 0);
-    assert(reconstructed_out != nullptr);
-    assert(reconstructed_channels == 1);
-    for (int i = 0; i < kFrames; ++i) {
-        double diff = std::fabs(reconstructed_out[i] - signal[i]);
-        if (diff > 1e-1) {
-            std::fprintf(stderr, "reconstruction mismatch at %d diff %.12f\n", i, diff);
-            assert(false && "Backward reconstruction mismatch");
+    std::vector<double> candidate0 = run_backend(descriptor_mode0, "backend_mode_amp_window");
+    if (!candidate0.empty()) {
+        compare_frames(expected, candidate0, "backend_mode_amp_window");
+        std::vector<double> candidate0_repeat = run_backend(descriptor_mode0, "backend_mode_amp_window_repeat");
+        if (!candidate0_repeat.empty()) {
+            compare_frames(candidate0, candidate0_repeat, "backend_mode_amp_window_repeat_stability");
         }
     }
-    assert(std::fabs(backward_metrics.reserved[0] - static_cast<float>(custom_phase.back())) < 1e-6f);
-    assert(std::fabs(backward_metrics.reserved[1] - static_cast<float>(custom_lower.back())) < 1e-6f);
-    assert(std::fabs(backward_metrics.reserved[2] - static_cast<float>(custom_upper.back())) < 1e-6f);
-    assert(std::fabs(backward_metrics.reserved[3] - static_cast<float>(custom_filter.back())) < 1e-6f);
-
-    amp_free(direct_forward_out);
-    amp_free(reconstructed_out);
-    amp_release_state(state_ptr);
-
-    EdgeRunnerAudioView fresh_backward_audio = forward_audio;
-    fresh_backward_audio.data = forward_copy.data();
-
-    EdgeRunnerNodeInputs fresh_backward_inputs{};
-    fresh_backward_inputs.audio = fresh_backward_audio;
-    fresh_backward_inputs.params = direct_param_set;
-
-    AmpNodeMetrics fresh_backward_metrics{};
-    double *fresh_reconstructed_out = nullptr;
-    int fresh_reconstructed_channels = 0;
-    void *fresh_state = nullptr;
-    direct_rc = amp_run_node_v2(
-        &direct_descriptor,
-        &fresh_backward_inputs,
-        1,
-        1,
-        kFrames,
-        48000.0,
-        &fresh_reconstructed_out,
-        &fresh_reconstructed_channels,
-        &fresh_state,
-        nullptr,
-        AMP_EXECUTION_MODE_BACKWARD,
-        &fresh_backward_metrics
-    );
-    assert(direct_rc == 0);
-    assert(fresh_reconstructed_out != nullptr);
-    assert(fresh_reconstructed_channels == 1);
-    for (int i = 0; i < kFrames; ++i) {
-        double diff = std::fabs(fresh_reconstructed_out[i] - signal[i]);
-        if (diff > 1e-1) {
-            std::fprintf(stderr, "fresh reconstruction mismatch at %d diff %.12f\n", i, diff);
-            assert(false && "Fresh backward reconstruction mismatch");
+    std::vector<double> candidate1 = run_backend(descriptor_mode1, "backend_mode_fftfree_batched");
+    if (!candidate1.empty()) {
+        compare_frames(expected, candidate1, "backend_mode_fftfree_batched");
+        std::vector<double> candidate1_repeat = run_backend(descriptor_mode1, "backend_mode_fftfree_batched_repeat");
+        if (!candidate1_repeat.empty()) {
+            compare_frames(candidate1, candidate1_repeat, "backend_mode_fftfree_batched_repeat_stability");
         }
     }
-    assert(std::fabs(fresh_backward_metrics.reserved[0] - static_cast<float>(custom_phase.back())) < 1e-6f);
-    assert(std::fabs(fresh_backward_metrics.reserved[1] - static_cast<float>(custom_lower.back())) < 1e-6f);
-    assert(std::fabs(fresh_backward_metrics.reserved[2] - static_cast<float>(custom_upper.back())) < 1e-6f);
-    assert(std::fabs(fresh_backward_metrics.reserved[3] - static_cast<float>(custom_filter.back())) < 1e-6f);
-
-    amp_free(fresh_reconstructed_out);
-    amp_release_state(fresh_state);
-
-    std::vector<int> dynamic_algorithm_selector(kFrames, FFT_ALGORITHM_DYNAMIC_OSCILLATORS);
-    std::vector<double> dynamic_algorithm_selector_d(
-        kFrames,
-        static_cast<double>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)
-    );
-    std::vector<int> dynamic_window_selector(kFrames, FFT_WINDOW_HANN);
-    std::vector<double> dynamic_window_selector_d(
-        kFrames,
-        static_cast<double>(FFT_WINDOW_HANN)
-    );
-
-    std::vector<double> expected_dynamic_forward_direct = simulate_fft_division(
-        signal,
-        divisor_real,
-        divisor_imag,
-        dynamic_algorithm_selector,
-        dynamic_window_selector,
-        stabilizer,
-        phase_metadata,
-        lower_metadata,
-        upper_metadata,
-        filter_metadata,
-        dynamic_carriers,
-        kWindowSize,
-        1e-9,
-        FFT_ALGORITHM_EIGEN,
-        FFT_WINDOW_HANN
-    );
-
-    std::vector<double> expected_dynamic_backward_direct = simulate_dynamic_backward(
-        expected_dynamic_forward_direct,
-        divisor_real,
-        divisor_imag,
-        stabilizer,
-        phase_metadata,
-        lower_metadata,
-        upper_metadata,
-        filter_metadata,
-        dynamic_carriers,
-        kWindowSize,
-        1e-9,
-        48000.0
-    );
-
-    EdgeRunnerParamView dynamic_param_views[] = {
-        {"divisor", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_real.data()},
-        {"divisor_imag", 1U, 1U, static_cast<uint32_t>(kFrames), divisor_imag.data()},
-        {"algorithm_selector", 1U, 1U, static_cast<uint32_t>(kFrames), dynamic_algorithm_selector_d.data()},
-        {"window_selector", 1U, 1U, static_cast<uint32_t>(kFrames), dynamic_window_selector_d.data()},
-        {"stabilizer", 1U, 1U, static_cast<uint32_t>(kFrames), stabilizer.data()},
-        {"phase_offset", 1U, 1U, static_cast<uint32_t>(kFrames), phase_metadata.data()},
-        {"lower_band", 1U, 1U, static_cast<uint32_t>(kFrames), lower_metadata.data()},
-        {"upper_band", 1U, 1U, static_cast<uint32_t>(kFrames), upper_metadata.data()},
-        {"filter_intensity", 1U, 1U, static_cast<uint32_t>(kFrames), filter_metadata.data()},
-        {"carrier_band_0", 1U, 1U, static_cast<uint32_t>(kFrames), carrier_band0.data()}
-    };
-
-    EdgeRunnerParamSet dynamic_param_set{};
-    dynamic_param_set.count = static_cast<uint32_t>(sizeof(dynamic_param_views) / sizeof(dynamic_param_views[0]));
-    dynamic_param_set.items = dynamic_param_views;
-
-    EdgeRunnerNodeInputs dynamic_forward_inputs{};
-    dynamic_forward_inputs.audio = forward_audio;
-    dynamic_forward_inputs.params = dynamic_param_set;
-
-    AmpNodeMetrics dynamic_forward_metrics{};
-    double *dynamic_forward_out = nullptr;
-    int dynamic_forward_channels = 0;
-    void *dynamic_state = nullptr;
-
-    int dynamic_rc = amp_run_node_v2(
-        &direct_descriptor,
-        &dynamic_forward_inputs,
-        1,
-        1,
-        kFrames,
-        48000.0,
-        &dynamic_forward_out,
-        &dynamic_forward_channels,
-        &dynamic_state,
-        nullptr,
-        AMP_EXECUTION_MODE_FORWARD,
-        &dynamic_forward_metrics
-    );
-    assert(dynamic_rc == 0);
-    assert(dynamic_forward_out != nullptr);
-    assert(dynamic_forward_channels == 1);
-    verify_frames(dynamic_forward_out, expected_dynamic_forward_direct, "direct_dynamic_forward");
-    assert(dynamic_forward_metrics.accumulated_heat > 0.0f);
-    assert(std::fabs(dynamic_forward_metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
-
-    std::vector<double> dynamic_forward_copy(dynamic_forward_out, dynamic_forward_out + kFrames);
-
-    EdgeRunnerAudioView dynamic_backward_audio = forward_audio;
-    dynamic_backward_audio.data = dynamic_forward_out;
-    EdgeRunnerNodeInputs dynamic_backward_inputs{};
-    dynamic_backward_inputs.audio = dynamic_backward_audio;
-    dynamic_backward_inputs.params = dynamic_param_set;
-
-    AmpNodeMetrics dynamic_backward_metrics{};
-    double *dynamic_backward_out = nullptr;
-    int dynamic_backward_channels = 0;
-    dynamic_rc = amp_run_node_v2(
-        &direct_descriptor,
-        &dynamic_backward_inputs,
-        1,
-        1,
-        kFrames,
-        48000.0,
-        &dynamic_backward_out,
-        &dynamic_backward_channels,
-        &dynamic_state,
-        nullptr,
-        AMP_EXECUTION_MODE_BACKWARD,
-        &dynamic_backward_metrics
-    );
-    assert(dynamic_rc == 0);
-    assert(dynamic_backward_out != nullptr);
-    assert(dynamic_backward_channels == 1);
-    verify_frames(dynamic_backward_out, expected_dynamic_backward_direct, "direct_dynamic_backward");
-    assert(dynamic_backward_metrics.accumulated_heat > 0.0f);
-    assert(std::fabs(dynamic_backward_metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
-
-    amp_free(dynamic_forward_out);
-    amp_free(dynamic_backward_out);
-    amp_release_state(dynamic_state);
-
-    EdgeRunnerAudioView dynamic_fresh_audio = forward_audio;
-    dynamic_fresh_audio.data = dynamic_forward_copy.data();
-    EdgeRunnerNodeInputs dynamic_fresh_inputs{};
-    dynamic_fresh_inputs.audio = dynamic_fresh_audio;
-    dynamic_fresh_inputs.params = dynamic_param_set;
-
-    AmpNodeMetrics dynamic_fresh_metrics{};
-    double *dynamic_fresh_out = nullptr;
-    int dynamic_fresh_channels = 0;
-    void *dynamic_fresh_state = nullptr;
-    dynamic_rc = amp_run_node_v2(
-        &direct_descriptor,
-        &dynamic_fresh_inputs,
-        1,
-        1,
-        kFrames,
-        48000.0,
-        &dynamic_fresh_out,
-        &dynamic_fresh_channels,
-        &dynamic_fresh_state,
-        nullptr,
-        AMP_EXECUTION_MODE_BACKWARD,
-        &dynamic_fresh_metrics
-    );
-    assert(dynamic_rc == 0);
-    assert(dynamic_fresh_out != nullptr);
-    assert(dynamic_fresh_channels == 1);
-    verify_frames(dynamic_fresh_out, expected_dynamic_backward_direct, "direct_dynamic_backward_fresh");
-    assert(dynamic_fresh_metrics.accumulated_heat > 0.0f);
-    assert(std::fabs(dynamic_fresh_metrics.reserved[5] - static_cast<float>(FFT_ALGORITHM_DYNAMIC_OSCILLATORS)) < 1e-6f);
-
-    amp_free(dynamic_fresh_out);
-    amp_release_state(dynamic_fresh_state);
-
-    if (g_test_failed) {
-        std::printf("test_fft_division_node: FAIL CODE=FFT_DIVISION\n");
-        return 1;
+    std::vector<double> candidate2 = run_backend(descriptor_mode2, "backend_mode_fftfree_inline");
+    if (!candidate2.empty()) {
+        compare_frames(expected, candidate2, "backend_mode_fftfree_inline");
+        std::vector<double> candidate2_repeat = run_backend(descriptor_mode2, "backend_mode_fftfree_inline_repeat");
+        if (!candidate2_repeat.empty()) {
+            compare_frames(candidate2, candidate2_repeat, "backend_mode_fftfree_inline_repeat_stability");
+        }
     }
 
-    std::printf(
-        "test_fft_division_node: PASS (FFT division node streaming, dynamic oscillators, and window overrides validated)\n"
-    );
-    return 0;
+    return g_test_failed ? 1 : 0;
 }
-

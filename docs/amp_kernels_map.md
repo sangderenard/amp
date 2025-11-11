@@ -37,7 +37,7 @@ This document inventories the major regions inside `src/native/amp_kernels.c` so
 - **Extraction notes:** natural home in `amp_util.c`; ensure `ensure_param_plane` remains accessible to all node files.
 
 ### 6. Node Execution Includes (L3164-L3180)
-- **Content:** per-node DSP implementations now live under `src/native/nodes/<name>/*.inc` and are included directly into the translation unit. The include block lists Constant, Controller, LFO, Envelope, Pitch, Oscillator Pitch, Subharmonic, Oscillator, Resampler, Parametric Driver, Pitch Shift, Gain, FFT Division (forward/backward), Mix, Sine Oscillator, and Safety modules.【F:src/native/amp_kernels.c†L3164-L3180】【F:src/native/nodes/fft_division/fft_division_nodes.inc†L1-L990】
+- **Content:** per-node DSP implementations now live under `src/native/nodes/<name>/*.inc` and are included directly into the translation unit. The include block lists Constant, Controller, LFO, Envelope, Pitch, Oscillator Pitch, Subharmonic, Oscillator, Resampler, Parametric Driver, Pitch Shift, Gain, FFT Division (pass-through forward; backward unsupported), Mix, Sine Oscillator, and Safety modules.【F:src/native/amp_kernels.c†L3164-L3180】【F:src/native/nodes/fft_division/fft_division_nodes.inc†L1-L990】
 - **Dependencies:** node modules reuse helpers from Sections 3–5 and access `node_state_t` defined earlier.
 - **Extraction notes:** nodes are now organised by folder; further refactors can promote these `.inc` files into standalone translation units by updating the build to compile them separately.
 
@@ -60,3 +60,9 @@ This document inventories the major regions inside `src/native/amp_kernels.c` so
 - Peel off simpler nodes (Gain, Mix, Sine, Safety) as self-contained translation units once utilities are shared; they mainly depend on Sections 5 and 8.
 - Isolate FFT division node by migrating Sections 6/7 related code plus shared state helpers, paving the way for functional rewrites without touching runtime glue.
 - Keep runtime dispatch (Section 8) minimal by replacing switch cases with external declarations once node modules provide registration hooks.
+
+
+Note: See docs/spectral_workstation_plan.md for the current stripped FFT pass-through and the staged spectral-operator roadmap.
+
+
+Spectral I/O follows the packing standard documented in docs/spectral_packing_standard.md.

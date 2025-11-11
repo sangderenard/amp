@@ -5,7 +5,7 @@
 #include <complex>
 #include <unsupported/Eigen/FFT>
 
-#include "fftfree/fft_cffi.hpp"
+#include "../fftfree/fft_cffi.hpp"
 extern "C" {
 #include "amp_fft_backend.h"
 }

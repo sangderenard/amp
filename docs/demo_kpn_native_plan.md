@@ -12,7 +12,7 @@ This document tracks the implementation plan for a native-only KPN demo that:
 
 - Build an `AudioGraph` with the following logical pieces:
    - `ParametricDriverNode` → `PitchShiftNode` → optional `ContinuousTimebaseNode` bridge → `OscNode` → `MixNode` sink.
-   - `FFTDivisionNode` connected as a tap consumer of the mix output. The PCM stream remains the primary sink while the FFT node exposes `spectral_bins` and `pcm_tap` groups per the new contracts.
+   - `FFTDivisionNode connected as a tap consumer of the mix output. In the current pass-through build it behaves as an analysis pass; planned tap groups for spectral bins/PCM will arrive with the spectral workstation milestones (see docs/spectral_workstation_plan.md).
    - Scheduler configuration mirrors the legacy demo (learned scheduler with tuned bias params) to maintain timing parity.
 
 - The graph is compiled by the existing Python code (`AudioGraph`) and serialized into two blobs:
@@ -98,3 +98,4 @@ cmake --build build --config Release
 ## Next actions
 
 - Implement the tap-aware streamer collection (PCM ring + spectral dump queue), verify parity with the legacy demo, and run a short validation render that emits both the WAV and PNG assets. Report native build status if the DLL rebuild is required.
+

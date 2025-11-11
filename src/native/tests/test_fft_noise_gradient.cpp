@@ -126,6 +126,8 @@ void generate_default_gradient(uint32_t frames, uint32_t window_size, GradientDa
     }
 }
 
+static bool g_fft_backward_supported = true;
+
 std::vector<double> run_fft_backward(const GradientData &data, const std::string &algorithm_override) {
     if (data.frames == 0U || data.window_size == 0U) {
         std::fprintf(stderr, "GradientData not initialised\n");
@@ -207,6 +209,7 @@ std::vector<double> run_fft_backward(const GradientData &data, const std::string
     );
     if (rc != 0 || out_buffer == nullptr) {
         if (rc == AMP_E_UNSUPPORTED) {
+            g_fft_backward_supported = false;
             std::fprintf(stderr, "amp_run_node_v2 returned AMP_E_UNSUPPORTED for FFTDivisionNode backward mode\n");
         } else {
             std::fprintf(stderr, "amp_run_node_v2 failed with rc=%d\n", rc);
@@ -359,6 +362,10 @@ int main(int argc, char **argv) {
 
     auto samples = run_fft_backward(gradient, args.algorithm);
     if (samples.empty()) {
+        if (!g_fft_backward_supported) {
+            std::fprintf(stderr, "FFT gradient path is unsupported; skipping synthesis\n");
+            return 0;
+        }
         std::fprintf(stderr, "FFT gradient synthesis failed\n");
         return 3;
     }

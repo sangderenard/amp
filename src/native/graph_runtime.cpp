@@ -173,6 +173,20 @@ struct VectorizationPolicy {
     bool archtypal_mode{false};
 };
 
+struct SpectralWorkingSpaceConfig {
+    uint32_t duration_frames{0};
+    uint32_t frequency_bins{0};
+    std::string time_projection_default{"buffered_fill"};
+    std::string freq_projection_default{"identity"};
+};
+
+struct LaneProjectionConfig {
+    std::string input_name;
+    std::string time_policy{"buffered_fill"};
+    std::string freq_policy{"identity"};
+    std::string phase_policy{"preserve"};
+};
+
 enum class EdgeRingReleasePolicy : uint8_t {
     AllConsumers = 0,
     PrimaryConsumer = 1
@@ -218,11 +232,26 @@ struct EdgeReader {
     double optional_default_value{0.0};
 };
 
+struct TapChannelSemantic {
+    std::string role;
+    uint32_t components_per_frame{1U};
+    bool imag_zero{false};
+};
+
 struct OutputTap {
     std::string name;
     std::shared_ptr<EdgeRing> ring;
     EdgeRingContract contract{};
     bool primary{false};
+    std::string buffer_class;
+    TensorShape declared_shape{};
+    bool expose_in_context{false};
+    std::vector<TapChannelSemantic> channel_semantics;
+};
+
+struct TapOutputBuffer {
+    OutputTap *tap{nullptr};
+    std::vector<double> scratch;
 };
 
 struct ModConnectionInfo {
@@ -320,6 +349,8 @@ struct RuntimeNode {
     std::unordered_map<std::string, size_t> param_cache_index;
     bool param_cache_dirty{true};
     VectorizationPolicy vector_policy{};
+    SpectralWorkingSpaceConfig spectral_working_space{};
+    std::vector<LaneProjectionConfig> lane_projections;
     EdgeRingContract output_contract{};
     std::vector<OutputTap> outputs;
     std::vector<EdgeReader> input_edges;
@@ -336,6 +367,7 @@ struct RuntimeNode {
         bool valid{false};
     };
     std::vector<InputHoldState> input_hold_cache;
+    bool expose_tap_context{false};
 
     RuntimeNode() = default;
 
@@ -353,6 +385,7 @@ static bool metadata_key_exists(const std::string &json, const char *key);
 static bool parse_bool_metadata(const std::string &json, const char *key, bool fallback);
 static double parse_double_metadata(const std::string &json, const char *key, double fallback);
 static std::string sanitize_metadata_key_component(const std::string &value);
+static void configure_tap_channel_semantics(const RuntimeNode &node, OutputTap &tap);
 
 static void configure_input_reader_metadata(RuntimeNode &node, EdgeReader &reader, size_t slot) {
     if (slot < node.audio_inputs.size()) {
@@ -788,6 +821,130 @@ static std::string sanitize_metadata_key_component(const std::string &value) {
     return sanitized;
 }
 
+static std::string trim_metadata_value(const std::string &value) {
+    size_t start = 0U;
+    size_t end = value.size();
+    while (start < end && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1U])) != 0) {
+        --end;
+    }
+    if (start >= end) {
+        return std::string();
+    }
+    return value.substr(start, end - start);
+}
+
+static std::vector<std::string> split_metadata_csv(const std::string &csv) {
+    std::vector<std::string> tokens;
+    if (csv.empty()) {
+        return tokens;
+    }
+    size_t start = 0U;
+    while (start < csv.size()) {
+        size_t end = csv.find(',', start);
+        if (end == std::string::npos) {
+            end = csv.size();
+        }
+        std::string token = trim_metadata_value(csv.substr(start, end - start));
+        if (!token.empty()) {
+            tokens.push_back(std::move(token));
+        }
+        if (end == csv.size()) {
+            break;
+        }
+        start = end + 1U;
+    }
+    return tokens;
+}
+
+static std::vector<uint32_t> parse_uint_list_from_csv(const std::string &csv) {
+    std::vector<uint32_t> values;
+    auto tokens = split_metadata_csv(csv);
+    values.reserve(tokens.size());
+    for (const std::string &token : tokens) {
+        const char *begin = token.c_str();
+        char *endptr = nullptr;
+        unsigned long parsed = std::strtoul(begin, &endptr, 10);
+        if (begin != endptr) {
+            if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+                parsed = static_cast<unsigned long>(std::numeric_limits<uint32_t>::max());
+            }
+            values.push_back(static_cast<uint32_t>(parsed));
+        } else {
+            values.push_back(0U);
+        }
+    }
+    return values;
+}
+
+static std::vector<bool> parse_bool_list_from_csv(const std::string &csv) {
+    std::vector<bool> values;
+    auto tokens = split_metadata_csv(csv);
+    values.reserve(tokens.size());
+    for (const std::string &token : tokens) {
+        bool flag = false;
+        if (!token.empty()) {
+            std::string lowered;
+            lowered.reserve(token.size());
+            for (char ch : token) {
+                lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+            }
+            if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+                flag = true;
+            }
+        }
+        values.push_back(flag);
+    }
+    return values;
+}
+
+static void configure_tap_channel_semantics(const RuntimeNode &node, OutputTap &tap) {
+    tap.channel_semantics.clear();
+    std::string sanitized = sanitize_metadata_key_component(tap.name);
+    if (sanitized.empty()) {
+        sanitized = "tap";
+    }
+    std::string prefix = "tap_" + sanitized + "_";
+    std::string roles_key = prefix + "channel_roles";
+    std::vector<std::string> roles = split_metadata_csv(
+        parse_string_metadata(node.params_json, roles_key.c_str(), "")
+    );
+    if (roles.empty() && node.type_name == "FFTDivisionNode") {
+        roles.emplace_back("pcm");
+        roles.emplace_back("spectrum");
+    }
+    if (roles.empty()) {
+        return;
+    }
+    std::string components_key = prefix + "channel_components";
+    std::vector<uint32_t> component_counts = parse_uint_list_from_csv(
+        parse_string_metadata(node.params_json, components_key.c_str(), "")
+    );
+    std::string imag_zero_key = prefix + "channel_imag_zero";
+    std::vector<bool> imag_zero_flags = parse_bool_list_from_csv(
+        parse_string_metadata(node.params_json, imag_zero_key.c_str(), "")
+    );
+
+    for (size_t idx = 0U; idx < roles.size(); ++idx) {
+        TapChannelSemantic semantic{};
+        semantic.role = roles[idx];
+        uint32_t default_components = (semantic.role == "pcm" || semantic.role == "spectrum") ? 2U : 1U;
+        if (idx < component_counts.size() && component_counts[idx] > 0U) {
+            semantic.components_per_frame = component_counts[idx];
+        } else {
+            semantic.components_per_frame = default_components;
+        }
+        if (idx < imag_zero_flags.size()) {
+            semantic.imag_zero = imag_zero_flags[idx];
+        } else {
+            semantic.imag_zero = (semantic.role == "pcm");
+        }
+        tap.channel_semantics.push_back(std::move(semantic));
+    }
+}
+
 /*** Error helpers ***/
 static void runtime_clear_error(AmpGraphRuntime *runtime) {
     if (!runtime) return;
@@ -1063,6 +1220,12 @@ static void runtime_initialize_edge_rings(AmpGraphRuntime *runtime, uint32_t def
             ring_shape.batches = batches;
             ring_shape.channels = channels;
             ring_shape.frames = capacity;
+            if (tap.declared_shape.batches > 0U) {
+                ring_shape.batches = tap.declared_shape.batches;
+            }
+            if (tap.declared_shape.channels > 0U) {
+                ring_shape.channels = tap.declared_shape.channels;
+            }
 
             tap.ring->storage = make_tensor(ring_shape);
             tap.ring->storage->shape = ring_shape;
@@ -1143,12 +1306,22 @@ static bool kpn_node_ready(
         feasible = std::min(feasible, ready);
     }
 
-    uint32_t free_space = edge_ring_free(*primary->ring);
-    if (free_space < min_frames) {
-        return false;
+    uint32_t free_space = std::numeric_limits<uint32_t>::max();
+    bool have_output_ring = false;
+    for (const OutputTap &tap : node.outputs) {
+        if (!tap.ring) continue;
+        have_output_ring = true;
+        uint32_t tap_free = edge_ring_free(*tap.ring);
+        if (tap_free < min_frames) {
+            return false;
+        }
+        tap_free = align_frames_down(tap_free, min_frames);
+        if (tap_free < min_frames) {
+            return false;
+        }
+        free_space = std::min(free_space, tap_free);
     }
-    free_space = align_frames_down(free_space, min_frames);
-    if (free_space < min_frames) {
+    if (!have_output_ring || free_space == std::numeric_limits<uint32_t>::max()) {
         return false;
     }
     feasible = std::min(feasible, free_space);
@@ -1397,6 +1570,70 @@ static int kpn_execute_node_block(
         param_views.push_back(view);
     }
 
+    std::vector<TapOutputBuffer> tap_output_buffers;
+    std::vector<EdgeRunnerTapBuffer> tap_buffer_views;
+    std::vector<EdgeRunnerTapStatus> tap_status_views;
+    EdgeRunnerTapContext tap_context{};
+    if (node.expose_tap_context && frames > 0U) {
+        tap_status_views.reserve(node.outputs.size());
+        tap_buffer_views.reserve(node.outputs.size());
+        tap_output_buffers.reserve(node.outputs.size());
+        for (OutputTap &tap : node.outputs) {
+            EdgeRunnerTapStatus status{};
+            status.tap_name = tap.name.c_str();
+            if (tap.ring) {
+                status.subscriber_count = static_cast<uint32_t>(tap.ring->reader_tails.size());
+                status.connected = status.subscriber_count > 0 ? 1U : 0U;
+                uint32_t primary_consumer = tap.ring->contract.primary_consumer;
+                status.primary_consumer_present =
+                    (primary_consumer != EDGE_RING_HOST_CONSUMER &&
+                     tap.ring->reader_tails.find(primary_consumer) != tap.ring->reader_tails.end())
+                        ? 1U
+                        : 0U;
+            }
+            tap_status_views.push_back(status);
+
+            if (tap.primary || !tap.expose_in_context || !tap.ring) {
+                continue;
+            }
+            TapOutputBuffer buffer_entry{};
+            buffer_entry.tap = &tap;
+            size_t stride = edge_ring_frame_stride(*tap.ring);
+            if (stride == 0U) {
+                uint32_t batches_hint = tap.ring->storage ? tap.ring->storage->shape.batches : 1U;
+                uint32_t channels_hint = tap.ring->storage ? tap.ring->storage->shape.channels : 1U;
+                stride = static_cast<size_t>(std::max<uint32_t>(1U, batches_hint) *
+                                             std::max<uint32_t>(1U, channels_hint));
+            }
+            buffer_entry.scratch.resize(static_cast<size_t>(frames) * stride);
+            std::fill(buffer_entry.scratch.begin(), buffer_entry.scratch.end(), 0.0);
+            tap_output_buffers.push_back(std::move(buffer_entry));
+
+            EdgeRunnerTapBuffer view{};
+            view.tap_name = tap.name.c_str();
+            view.buffer_class = tap.buffer_class.empty() ? "pcm" : tap.buffer_class.c_str();
+            if (tap.ring && tap.ring->storage) {
+                view.shape.batches = tap.ring->storage->shape.batches;
+                view.shape.channels = tap.ring->storage->shape.channels;
+            } else {
+                view.shape.batches = 1U;
+                view.shape.channels = 1U;
+            }
+            view.shape.frames = frames;
+            view.frame_stride = stride;
+            view.data = tap_output_buffers.back().scratch.data();
+            tap_buffer_views.push_back(view);
+        }
+        if (!tap_buffer_views.empty()) {
+            tap_context.outputs.items = tap_buffer_views.data();
+            tap_context.outputs.count = static_cast<uint32_t>(tap_buffer_views.size());
+        }
+        if (!tap_status_views.empty()) {
+            tap_context.status.items = tap_status_views.data();
+            tap_context.status.count = static_cast<uint32_t>(tap_status_views.size());
+        }
+    }
+
     EdgeRunnerNodeInputs inputs{};
     if (!node.audio_workspace.empty() && total_channels > 0U) {
         inputs.audio.has_audio = 1;
@@ -1414,6 +1651,9 @@ static int kpn_execute_node_block(
     if (!param_views.empty()) {
         inputs.params.count = static_cast<uint32_t>(param_views.size());
         inputs.params.items = param_views.data();
+    }
+    if (node.expose_tap_context && (tap_context.outputs.count > 0U || tap_context.status.count > 0U)) {
+        inputs.taps = tap_context;
     }
 
     double *frame_buffer = nullptr;
@@ -1494,6 +1734,13 @@ static int kpn_execute_node_block(
     size_t output_stride = static_cast<size_t>(output_shape.batches) * static_cast<size_t>(output_shape.channels);
     std::memcpy(node.output->data(), frame_buffer, static_cast<size_t>(frames) * output_stride * sizeof(double));
     amp_free(frame_buffer);
+
+    if (!tap_output_buffers.empty()) {
+        for (TapOutputBuffer &buffer_entry : tap_output_buffers) {
+            if (!buffer_entry.tap || !buffer_entry.tap->ring) continue;
+            edge_ring_write(*buffer_entry.tap->ring, buffer_entry.scratch.data(), frames);
+        }
+    }
 
     node.output->shape = output_shape;
     node.output_batches = node.output->shape.batches;
@@ -2001,6 +2248,12 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             if (!reader.read_string(src_len, source)) return false;
             node->audio_inputs.push_back(std::move(source));
         }
+        node->lane_projections.resize(node->audio_inputs.size());
+        for (size_t lane_idx = 0; lane_idx < node->audio_inputs.size(); ++lane_idx) {
+            LaneProjectionConfig cfg{};
+            cfg.input_name = node->audio_inputs[lane_idx];
+            node->lane_projections[lane_idx] = std::move(cfg);
+        }
 
         // Mod connections
         for (uint32_t m = 0; m < mod_count; ++m) {
@@ -2081,6 +2334,24 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
     node->vector_policy.max_block_frames = parse_uint_metadata(node->params_json, "vector_max_block_frames", 0U);
     node->vector_policy.priority_weight = parse_double_metadata(node->params_json, "vector_priority_weight", 1.0);
         node->vector_policy.archtypal_mode = parse_bool_metadata(node->params_json, "vector_archtypal_mode", false);
+        node->spectral_working_space.duration_frames = parse_uint_metadata(node->params_json, "working_ft_duration_frames", 0U);
+        node->spectral_working_space.frequency_bins = parse_uint_metadata(node->params_json, "working_ft_frequency_bins", 0U);
+        std::string working_time_default = parse_string_metadata(
+            node->params_json,
+            "working_ft_time_projection",
+            node->spectral_working_space.time_projection_default
+        );
+        if (!working_time_default.empty()) {
+            node->spectral_working_space.time_projection_default = working_time_default;
+        }
+        std::string working_freq_default = parse_string_metadata(
+            node->params_json,
+            "working_ft_frequency_projection",
+            node->spectral_working_space.freq_projection_default
+        );
+        if (!working_freq_default.empty()) {
+            node->spectral_working_space.freq_projection_default = working_freq_default;
+        }
         node->prefill_frames = parse_uint_metadata(node->params_json, "prefill_frames", 0U);
         node->prefill_only = parse_bool_metadata(node->params_json, "prefill_only", false);
         node->constant_node = parse_bool_metadata(node->params_json, "constant_node", false);
@@ -2116,6 +2387,41 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         runtime->nodes.push_back(std::move(node));
     }
 
+    for (auto &entry : runtime->nodes) {
+        for (size_t lane_idx = 0; lane_idx < entry->lane_projections.size(); ++lane_idx) {
+            LaneProjectionConfig &lane_cfg = entry->lane_projections[lane_idx];
+            std::string input_name = lane_cfg.input_name;
+            std::string sanitized = sanitize_metadata_key_component(input_name);
+            std::string time_key = "projection_" + sanitized + "_time_policy";
+            std::string freq_key = "projection_" + sanitized + "_frequency_policy";
+            std::string phase_key = "projection_" + sanitized + "_phase_policy";
+            lane_cfg.time_policy = parse_string_metadata(
+                entry->params_json,
+                time_key.c_str(),
+                entry->spectral_working_space.time_projection_default
+            );
+            if (lane_cfg.time_policy.empty()) {
+                lane_cfg.time_policy = entry->spectral_working_space.time_projection_default;
+            }
+            lane_cfg.freq_policy = parse_string_metadata(
+                entry->params_json,
+                freq_key.c_str(),
+                entry->spectral_working_space.freq_projection_default
+            );
+            if (lane_cfg.freq_policy.empty()) {
+                lane_cfg.freq_policy = entry->spectral_working_space.freq_projection_default;
+            }
+            lane_cfg.phase_policy = parse_string_metadata(
+                entry->params_json,
+                phase_key.c_str(),
+                lane_cfg.phase_policy
+            );
+            if (lane_cfg.phase_policy.empty()) {
+                lane_cfg.phase_policy = "preserve";
+            }
+        }
+    }
+
     // Resolve audio indices and build channels/rings
     for (auto &entry : runtime->nodes) {
         entry->audio_indices.clear();
@@ -2130,10 +2436,14 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             tap.name = "default";
             tap.primary = true;
             tap.contract = entry->output_contract;
+            tap.buffer_class = "pcm";
             entry->outputs.push_back(std::move(tap));
         } else {
             bool found_primary = false;
             for (auto &tap : entry->outputs) {
+                if (tap.buffer_class.empty()) {
+                    tap.buffer_class = tap.primary ? "pcm" : "aux";
+                }
                 if (tap.primary) {
                     found_primary = true;
                     break;
@@ -2142,6 +2452,45 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             if (!found_primary) {
                 entry->outputs.front().primary = true;
             }
+        }
+        if (entry->type_name == "FFTDivisionNode") {
+            bool enable_spectrum_taps = parse_bool_metadata(entry->params_json, "enable_spectrum_taps", true);
+            uint32_t window_size = parse_uint_metadata(entry->params_json, "window_size", 0U);
+            if (enable_spectrum_taps && window_size > 0U) {
+                uint32_t slot_batches = entry->channel_hint > 0U ? entry->channel_hint : 1U;
+                auto tap_exists = [&](const std::string &tap_name) {
+                    for (const auto &tap : entry->outputs) {
+                        if (tap.name == tap_name) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!tap_exists("spectral_real")) {
+                    OutputTap real{};
+                    real.name = "spectral_real";
+                    real.primary = false;
+                    real.contract = entry->output_contract;
+                    real.buffer_class = "spectrum";
+                    real.declared_shape = make_shape(slot_batches, window_size, 0U);
+                    real.expose_in_context = true;
+                    entry->outputs.push_back(std::move(real));
+                }
+                if (!tap_exists("spectral_imag")) {
+                    OutputTap imag{};
+                    imag.name = "spectral_imag";
+                    imag.primary = false;
+                    imag.contract = entry->output_contract;
+                    imag.buffer_class = "spectrum";
+                    imag.declared_shape = make_shape(slot_batches, window_size, 0U);
+                    imag.expose_in_context = true;
+                    entry->outputs.push_back(std::move(imag));
+                }
+                entry->expose_tap_context = true;
+            }
+        }
+        for (auto &tap : entry->outputs) {
+            configure_tap_channel_semantics(*entry, tap);
         }
     }
 
@@ -2836,6 +3185,59 @@ static int execute_runtime_with_history_impl(
             param_views.push_back(view);
         }
 
+        std::vector<TapOutputBuffer> tap_output_buffers;
+        std::vector<EdgeRunnerTapBuffer> tap_buffer_views;
+        std::vector<EdgeRunnerTapStatus> tap_status_views;
+        EdgeRunnerTapContext tap_context{};
+        if (node.expose_tap_context && frames > 0U) {
+            tap_output_buffers.reserve(node.outputs.size());
+            tap_buffer_views.reserve(node.outputs.size());
+            tap_status_views.reserve(node.outputs.size());
+            for (OutputTap &tap : node.outputs) {
+                EdgeRunnerTapStatus status{};
+                status.tap_name = tap.name.c_str();
+                status.connected = 1U;
+                status.subscriber_count = 1U;
+                status.primary_consumer_present = 1U;
+                tap_status_views.push_back(status);
+                if (tap.primary || !tap.expose_in_context) {
+                    continue;
+                }
+                TapOutputBuffer buffer_entry{};
+                buffer_entry.tap = &tap;
+                uint32_t tap_batches = tap.declared_shape.batches > 0U
+                    ? tap.declared_shape.batches
+                    : std::max<uint32_t>(1U, node.channel_hint);
+                uint32_t tap_channels = tap.declared_shape.channels > 0U
+                    ? tap.declared_shape.channels
+                    : (tap.ring && tap.ring->storage
+                        ? tap.ring->storage->shape.channels
+                        : std::max<uint32_t>(1U, node.channel_hint));
+                size_t stride = static_cast<size_t>(tap_batches) * tap_channels;
+                buffer_entry.scratch.resize(static_cast<size_t>(frames) * stride);
+                std::fill(buffer_entry.scratch.begin(), buffer_entry.scratch.end(), 0.0);
+                tap_output_buffers.push_back(std::move(buffer_entry));
+
+                EdgeRunnerTapBuffer view{};
+                view.tap_name = tap.name.c_str();
+                view.buffer_class = tap.buffer_class.empty() ? "pcm" : tap.buffer_class.c_str();
+                view.shape.batches = tap_batches;
+                view.shape.channels = tap_channels;
+                view.shape.frames = frames;
+                view.frame_stride = stride;
+                view.data = tap_output_buffers.back().scratch.data();
+                tap_buffer_views.push_back(view);
+            }
+            if (!tap_buffer_views.empty()) {
+                tap_context.outputs.items = tap_buffer_views.data();
+                tap_context.outputs.count = static_cast<uint32_t>(tap_buffer_views.size());
+            }
+            if (!tap_status_views.empty()) {
+                tap_context.status.items = tap_status_views.data();
+                tap_context.status.count = static_cast<uint32_t>(tap_status_views.size());
+            }
+        }
+
         EdgeRunnerNodeInputs inputs{};
         if (audio_tensor) {
             inputs.audio.has_audio = 1;
@@ -2853,6 +3255,9 @@ static int execute_runtime_with_history_impl(
         if (!param_views.empty()) {
             inputs.params.count = static_cast<uint32_t>(param_views.size());
             inputs.params.items = param_views.data();
+        }
+        if (node.expose_tap_context && (tap_context.outputs.count > 0U || tap_context.status.count > 0U)) {
+            inputs.taps = tap_context;
         }
 
         double *frame_buffer = nullptr;

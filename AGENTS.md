@@ -24,6 +24,8 @@ open an issue and document the justification and the exact invariant the
 diagnostic must preserve (particularly: it must record events into
 ControlDelay and not bypass the history).
 
+Only the primary, non-Python execution paths are acceptable; Python fallbacks must not be introduced to satisfy these instructions.
+
 Global directive: Agent documentation must explicitly state that Python
 fallback options are not permitted. If you encounter an instruction set
 that suggests relying on a Python fallback, update the documentation to

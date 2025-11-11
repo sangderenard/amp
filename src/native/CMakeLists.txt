@@ -186,16 +186,16 @@ if (AMP_NATIVE_BUILD_TESTS)
     add_test(NAME test_fft_noise_gradient COMMAND test_fft_noise_gradient --output output.wav)
     set_tests_properties(test_fft_noise_gradient PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
-    add_executable(test_fft_division_node
-        tests/test_fft_division_node.cpp
+    add_executable(test_fft_division_kpn
+        tests/test_fft_division_kpn.cpp
     )
-    target_include_directories(test_fft_division_node PRIVATE
+    target_include_directories(test_fft_division_kpn PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${EIGEN3_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    target_link_libraries(test_fft_division_node PRIVATE amp_native)
-    add_test(NAME test_fft_division_node COMMAND test_fft_division_node)
+    target_link_libraries(test_fft_division_kpn PRIVATE amp_native)
+    add_test(NAME test_fft_division_kpn COMMAND test_fft_division_kpn)
 
     # Diagnostic: compare Eigen FFT vs backend (fftfree) outputs
     add_executable(test_fft_backend_compare
@@ -211,7 +211,6 @@ if (AMP_NATIVE_BUILD_TESTS)
 
     add_executable(test_fft_backend_transform
         tests/test_fft_backend_transform.cpp
-        tests/mock_fftfree.cpp
     )
     target_include_directories(test_fft_backend_transform PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -219,11 +218,11 @@ if (AMP_NATIVE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
+    target_link_libraries(test_fft_backend_transform PRIVATE fft_cffi)
     add_test(NAME test_fft_backend_transform COMMAND test_fft_backend_transform)
 
     add_executable(test_fft_backend_stream
         tests/test_fft_backend_stream.cpp
-        tests/mock_fftfree.cpp
     )
     target_include_directories(test_fft_backend_stream PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -231,6 +230,7 @@ if (AMP_NATIVE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
+    target_link_libraries(test_fft_backend_stream PRIVATE fft_cffi)
     add_test(NAME test_fft_backend_stream COMMAND test_fft_backend_stream)
 
     add_executable(test_pitch_shift_node
@@ -249,7 +249,7 @@ if (AMP_NATIVE_BUILD_TESTS)
         test_thermo_param
         test_amp_run_node_v2
         test_fft_noise_gradient
-        test_fft_division_node
+        test_fft_division_kpn
         test_fft_backend_compare
         test_fft_backend_transform
         test_fft_backend_stream

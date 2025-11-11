@@ -1,3 +1,487 @@
+static double read_param_tensor3(
+    const EdgeRunnerParamView *view,
+    int batch,
+    int channel,
+    int frame,
+    double default_value
+) {
+    if (view == NULL || view->data == NULL) {
+        return default_value;
+    }
+    if (batch < 0 || channel < 0 || frame < 0) {
+        return default_value;
+    }
+    size_t batches = view->batches > 0U ? view->batches : 1U;
+    size_t channels = view->channels > 0U ? view->channels : 1U;
+    size_t frames = view->frames > 0U ? view->frames : 1U;
+    if ((size_t)batch >= batches || (size_t)channel >= channels || (size_t)frame >= frames) {
+        return default_value;
+    }
+    size_t index = ((size_t)batch * channels + (size_t)channel) * frames + (size_t)frame;
+    return view->data[index];
+}
+
+static void write_param_tensor3(
+    const EdgeRunnerParamView *view,
+    int batch,
+    int channel,
+    int frame,
+    double value
+) {
+    if (view == NULL || view->data == NULL) {
+        return;
+    }
+    if (batch < 0 || channel < 0 || frame < 0) {
+        return;
+    }
+    size_t batches = view->batches > 0U ? view->batches : 1U;
+    size_t channels = view->channels > 0U ? view->channels : 1U;
+    size_t frames = view->frames > 0U ? view->frames : 1U;
+    if ((size_t)batch >= batches || (size_t)channel >= channels || (size_t)frame >= frames) {
+        return;
+    }
+    size_t index = ((size_t)batch * channels + (size_t)channel) * frames + (size_t)frame;
+    double *mutable_data = (double *)(view->data);
+    mutable_data[index] = value;
+}
+
+static const EdgeRunnerTapBuffer *find_tap_buffer(
+    const EdgeRunnerTapContext *context,
+    const char *tap_name
+) {
+    if (context == NULL || tap_name == NULL) {
+        return NULL;
+    }
+    if (context->outputs.items == NULL) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < context->outputs.count; ++i) {
+        const EdgeRunnerTapBuffer *buffer = &context->outputs.items[i];
+        if (buffer->tap_name == NULL) {
+            continue;
+        }
+        if (strcmp(buffer->tap_name, tap_name) == 0) {
+            return buffer;
+        }
+    }
+    return NULL;
+}
+
+static void tap_buffer_write_row(
+    const EdgeRunnerTapBuffer *buffer,
+    int batch,
+    int frame_index,
+    const double *src,
+    int value_count
+) {
+    if (buffer == NULL || buffer->data == NULL || src == NULL) {
+        return;
+    }
+    if (batch < 0 || frame_index < 0 || value_count <= 0) {
+        return;
+    }
+    size_t batches = buffer->shape.batches > 0U ? buffer->shape.batches : 1U;
+    size_t channels = buffer->shape.channels > 0U ? buffer->shape.channels : 1U;
+    if ((size_t)batch >= batches) {
+        return;
+    }
+    if (buffer->shape.frames > 0U && (uint32_t)frame_index >= buffer->shape.frames) {
+        return;
+    }
+    size_t stride = buffer->frame_stride > 0U ? buffer->frame_stride : (batches * channels);
+    size_t copy = (size_t)value_count;
+    if (copy > channels) {
+        copy = channels;
+    }
+    double *frame_ptr = buffer->data + (size_t)frame_index * stride;
+    double *batch_ptr = frame_ptr + (size_t)batch * channels;
+    memcpy(batch_ptr, src, copy * sizeof(double));
+    if (copy < channels) {
+        size_t remaining = channels - copy;
+        memset(batch_ptr + copy, 0, remaining * sizeof(double));
+    }
+}
+
+static void zero_spectral_buffer(double *spectral_real, double *spectral_imag, int window_size) {
+    if (spectral_real != NULL) {
+        memset(spectral_real, 0, (size_t)window_size * sizeof(double));
+    }
+    if (spectral_imag != NULL) {
+        memset(spectral_imag, 0, (size_t)window_size * sizeof(double));
+    }
+}
+
+static void zero_tensor_slice(
+    FftWorkingTensor *tensor,
+    int tensor_page,
+    int slot,
+    int tensor_slice,
+    int tensor_freq_bins
+) {
+    if (tensor == NULL || tensor_freq_bins <= 0) {
+        return;
+    }
+    for (int bin = 0; bin < tensor_freq_bins; ++bin) {
+        (*tensor)(tensor_page, slot, bin, tensor_slice) = std::complex<double>(0.0, 0.0);
+    }
+}
+
+#if defined(__cplusplus)
+static double *fftdiv_spectral_scratch_real_ptr(node_state_t *state, int cache_page, int lane, int tensor_slice) {
+    if (state == NULL) {
+        return NULL;
+    }
+    auto &scratch = state->u.fftdiv.spectral_scratch;
+    if (cache_page < 0 || lane < 0 || tensor_slice < 0) {
+        return NULL;
+    }
+    if (cache_page >= scratch.cache_pages || lane >= scratch.lanes || tensor_slice >= scratch.time_slices) {
+        return NULL;
+    }
+    if (scratch.freq_bins <= 0) {
+        return NULL;
+    }
+    const size_t offset = ((((size_t)cache_page * (size_t)scratch.lanes) + (size_t)lane) *
+        (size_t)scratch.time_slices + (size_t)tensor_slice) * (size_t)scratch.freq_bins;
+    if (offset >= scratch.real.size()) {
+        return NULL;
+    }
+    return scratch.real.data() + offset;
+}
+
+static double *fftdiv_spectral_scratch_imag_ptr(node_state_t *state, int cache_page, int lane, int tensor_slice) {
+    if (state == NULL) {
+        return NULL;
+    }
+    auto &scratch = state->u.fftdiv.spectral_scratch;
+    if (cache_page < 0 || lane < 0 || tensor_slice < 0) {
+        return NULL;
+    }
+    if (cache_page >= scratch.cache_pages || lane >= scratch.lanes || tensor_slice >= scratch.time_slices) {
+        return NULL;
+    }
+    if (scratch.freq_bins <= 0) {
+        return NULL;
+    }
+    const size_t offset = ((((size_t)cache_page * (size_t)scratch.lanes) + (size_t)lane) *
+        (size_t)scratch.time_slices + (size_t)tensor_slice) * (size_t)scratch.freq_bins;
+    if (offset >= scratch.imag.size()) {
+        return NULL;
+    }
+    return scratch.imag.data() + offset;
+}
+
+static int fftdiv_spectral_scratch_bins(const node_state_t *state) {
+    if (state == NULL) {
+        return 0;
+    }
+    return state->u.fftdiv.spectral_scratch.freq_bins;
+}
+#endif
+
+static void fftdiv_copy_spectrum_to_working(
+    FftWorkingTensor *tensor,
+    int tensor_page,
+    int tensor_lane,
+    int tensor_slice,
+    int tensor_freq_bins,
+    const double *source_real,
+    const double *source_imag,
+    int source_bins
+) {
+    if (tensor == NULL || tensor_freq_bins <= 0) {
+        return;
+    }
+    if (source_real == NULL || source_imag == NULL || source_bins <= 0) {
+        for (int bin = 0; bin < tensor_freq_bins; ++bin) {
+            (*tensor)(tensor_page, tensor_lane, bin, tensor_slice) = std::complex<double>(0.0, 0.0);
+        }
+        return;
+    }
+    int limit = tensor_freq_bins < source_bins ? tensor_freq_bins : source_bins;
+    for (int bin = 0; bin < limit; ++bin) {
+        (*tensor)(tensor_page, tensor_lane, bin, tensor_slice) = std::complex<double>(source_real[bin], source_imag[bin]);
+    }
+    for (int bin = limit; bin < tensor_freq_bins; ++bin) {
+        (*tensor)(tensor_page, tensor_lane, bin, tensor_slice) = std::complex<double>(0.0, 0.0);
+    }
+}
+
+static int stage_ingest_spectrum_input(
+    double *spectral_real,
+    double *spectral_imag,
+    int window_size,
+    const EdgeRunnerParamView *spectral_real_view,
+    const EdgeRunnerParamView *spectral_imag_view,
+    int tap_slot,
+    int frame_index,
+    int reset_buffer,
+    int reset_scratch,
+    double *scratch_real_target,
+    double *scratch_imag_target,
+    int scratch_bins
+) {
+    int contributed = 0;
+    (void)spectral_real;
+    (void)spectral_imag;
+    if ((spectral_real_view == NULL || spectral_real_view->data == NULL) &&
+        (spectral_imag_view == NULL || spectral_imag_view->data == NULL)) {
+        if (reset_scratch && scratch_real_target != NULL && scratch_imag_target != NULL && scratch_bins > 0) {
+            memset(scratch_real_target, 0, (size_t)scratch_bins * sizeof(double));
+            memset(scratch_imag_target, 0, (size_t)scratch_bins * sizeof(double));
+        }
+        return 0;
+    }
+
+    if (reset_scratch && scratch_real_target != NULL && scratch_imag_target != NULL && scratch_bins > 0) {
+        memset(scratch_real_target, 0, (size_t)scratch_bins * sizeof(double));
+        memset(scratch_imag_target, 0, (size_t)scratch_bins * sizeof(double));
+    }
+
+    if (scratch_real_target == NULL || scratch_imag_target == NULL || scratch_bins <= 0) {
+        (void)spectral_real;
+        (void)spectral_imag;
+        return 0;
+    }
+
+    const int process_bins = window_size;
+    const int copy_bins = scratch_bins < process_bins ? scratch_bins : process_bins;
+    for (int bin = 0; bin < copy_bins; ++bin) {
+        double add_real = read_param_tensor3(spectral_real_view, tap_slot, bin, frame_index, 0.0);
+        double add_imag = read_param_tensor3(spectral_imag_view, tap_slot, bin, frame_index, 0.0);
+        if (add_real != 0.0 || add_imag != 0.0) {
+            scratch_real_target[bin] += add_real;
+            scratch_imag_target[bin] += add_imag;
+            contributed = 1;
+        }
+    }
+
+    if (reset_scratch && scratch_bins > process_bins) {
+        memset(scratch_real_target + process_bins, 0, (size_t)(scratch_bins - process_bins) * sizeof(double));
+        memset(scratch_imag_target + process_bins, 0, (size_t)(scratch_bins - process_bins) * sizeof(double));
+    }
+
+    return contributed;
+}
+
+#if defined(__cplusplus)
+static void fftdiv_copy_working_to_slot_buffer(
+    FftWorkingTensor *tensor,
+    int tensor_page,
+    int tensor_lane,
+    int tensor_slice,
+    int tensor_freq_bins,
+    double *slot_real,
+    double *slot_imag,
+    int slot_bins
+) {
+    if (tensor == NULL || slot_real == NULL || slot_imag == NULL || slot_bins <= 0) {
+        return;
+    }
+    const int limit = tensor_freq_bins < slot_bins ? tensor_freq_bins : slot_bins;
+    for (int bin = 0; bin < limit; ++bin) {
+        const std::complex<double> value = (*tensor)(tensor_page, tensor_lane, bin, tensor_slice);
+        slot_real[bin] = value.real();
+        slot_imag[bin] = value.imag();
+    }
+    for (int bin = limit; bin < slot_bins; ++bin) {
+        slot_real[bin] = 0.0;
+        slot_imag[bin] = 0.0;
+    }
+}
+#endif
+
+static void stage_run_operator_stack(
+    node_state_t *state,
+    double *spectral_real,
+    double *spectral_imag,
+    int window_size,
+    FftWorkingTensor *tensor,
+    int tensor_page,
+    int tensor_lane,
+    int tensor_slice,
+    int tensor_freq_bins
+) {
+    (void)spectral_real;
+    (void)spectral_imag;
+    (void)window_size;
+    (void)tensor;
+    (void)tensor_page;
+    (void)tensor_lane;
+    (void)tensor_slice;
+    (void)tensor_freq_bins;
+#if defined(__cplusplus)
+    if (state == nullptr) {
+        return;
+    }
+    (void)state;
+    /* TODO: execute operator_steps using operator_arena tensors. */
+#else
+    (void)state;
+    /* Operators mutate the spectral buffer in-place. Intentionally left empty for now. */
+#endif
+}
+
+static void stage_emit_spectral(
+    double *spectral_real,
+    double *spectral_imag,
+    int window_size,
+    const EdgeRunnerTapBuffer *spectral_real_tap,
+    const EdgeRunnerTapBuffer *spectral_imag_tap,
+    int tap_slot,
+    int frame_index,
+    FftWorkingTensor *tensor,
+    int tensor_page,
+    int tensor_lane,
+    int tensor_slice,
+    int tensor_freq_bins
+) {
+    int have_real_target = (spectral_real_tap != NULL && spectral_real_tap->data != NULL);
+    int have_imag_target = (spectral_imag_tap != NULL && spectral_imag_tap->data != NULL);
+    if (!have_real_target && !have_imag_target) {
+        return;
+    }
+    if (tensor != NULL && tensor_freq_bins > 0) {
+        const int copy_bins = tensor_freq_bins < window_size ? tensor_freq_bins : window_size;
+        for (int bin = 0; bin < copy_bins; ++bin) {
+            const std::complex<double> value = (*tensor)(tensor_page, tensor_lane, bin, tensor_slice);
+            spectral_real[bin] = value.real();
+            spectral_imag[bin] = value.imag();
+        }
+        for (int bin = copy_bins; bin < window_size; ++bin) {
+            spectral_real[bin] = 0.0;
+            spectral_imag[bin] = 0.0;
+        }
+    }
+    tap_buffer_write_row(spectral_real_tap, tap_slot, frame_index, spectral_real, window_size);
+    tap_buffer_write_row(spectral_imag_tap, tap_slot, frame_index, spectral_imag, window_size);
+}
+
+#if defined(__cplusplus)
+static int fftdiv_realize_operator_arena(node_state_t *state) {
+    if (state == nullptr) {
+        return 0;
+    }
+    auto &arena = state->u.fftdiv.operator_arena;
+    for (auto &entry : arena) {
+        auto &spec = entry.spec;
+        const bool spec_valid = (
+            spec.cache_pages > 0 &&
+            spec.lanes > 0 &&
+            spec.freq_bins > 0 &&
+            spec.time_slices > 0);
+        if (!spec_valid) {
+            entry.tensor.reset();
+            continue;
+        }
+        const bool allocate_new = !entry.tensor
+            || entry.tensor->dimension(0) != spec.cache_pages
+            || entry.tensor->dimension(1) != spec.lanes
+            || entry.tensor->dimension(2) != spec.freq_bins
+            || entry.tensor->dimension(3) != spec.time_slices;
+        if (allocate_new) {
+            using EigenIndex = Eigen::Index;
+            entry.tensor = std::unique_ptr<FftWorkingTensor>(
+                new (std::nothrow) FftWorkingTensor(
+                    static_cast<EigenIndex>(spec.cache_pages),
+                    static_cast<EigenIndex>(spec.lanes),
+                    static_cast<EigenIndex>(spec.freq_bins),
+                    static_cast<EigenIndex>(spec.time_slices)));
+            if (!entry.tensor) {
+                return -1;
+            }
+            entry.tensor->setZero();
+        }
+    }
+    return 0;
+}
+
+static void fftdiv_prepare_operator_frame(node_state_t *state) {
+    if (state == nullptr) {
+        return;
+    }
+    for (auto &entry : state->u.fftdiv.operator_arena) {
+        if (!entry.tensor) {
+            continue;
+        }
+        if (!entry.spec.persistent) {
+            entry.tensor->setZero();
+        }
+    }
+}
+#endif
+
+#if defined(__cplusplus)
+static void fftdiv_prepare_lane_plan(
+    node_state_t *state,
+    int slot_count,
+    const EdgeRunnerNodeInputs *inputs,
+    const EdgeRunnerParamView *spectral_input_real_view,
+    const EdgeRunnerParamView *spectral_input_imag_view,
+    const EdgeRunnerTapBuffer *spectral_real_tap,
+    const EdgeRunnerTapBuffer *spectral_imag_tap
+) {
+    if (state == nullptr) {
+        return;
+    }
+    auto &plan = state->u.fftdiv.lane_plan;
+    if (plan.size() < static_cast<size_t>(slot_count)) {
+        plan.resize(static_cast<size_t>(slot_count));
+    }
+
+    const bool spectral_out_available =
+        (spectral_real_tap != nullptr && spectral_real_tap->data != nullptr) ||
+        (spectral_imag_tap != nullptr && spectral_imag_tap->data != nullptr);
+
+    const bool pcm_input_connected =
+        inputs != nullptr &&
+        inputs->audio.has_audio &&
+        inputs->audio.data != nullptr;
+
+    const uint32_t audio_batches = (inputs != nullptr && inputs->audio.batches > 0U)
+        ? inputs->audio.batches
+        : 1U;
+    const uint32_t audio_channels = (inputs != nullptr && inputs->audio.channels > 0U)
+        ? inputs->audio.channels
+        : 1U;
+    const uint32_t pcm_slot_limit = audio_batches * audio_channels;
+
+    const uint32_t real_batches = (spectral_input_real_view != nullptr && spectral_input_real_view->batches > 0U)
+        ? spectral_input_real_view->batches
+        : 0U;
+    const uint32_t imag_batches = (spectral_input_imag_view != nullptr && spectral_input_imag_view->batches > 0U)
+        ? spectral_input_imag_view->batches
+        : 0U;
+
+    for (int slot = 0; slot < slot_count; ++slot) {
+        auto &lane = plan[(size_t)slot];
+        lane.slot_index = slot;
+        lane.tensor_lane = slot;
+
+        const bool has_pcm_feed = pcm_input_connected && (uint32_t)slot < pcm_slot_limit;
+        const bool spect_real_in =
+            spectral_input_real_view != nullptr &&
+            spectral_input_real_view->data != nullptr &&
+            (real_batches == 0U || (uint32_t)slot < real_batches);
+        const bool spect_imag_in =
+            spectral_input_imag_view != nullptr &&
+            spectral_input_imag_view->data != nullptr &&
+            (imag_batches == 0U || (uint32_t)slot < imag_batches);
+        const bool has_spectral_in = spect_real_in || spect_imag_in;
+
+        const bool enable_pcm_in = has_pcm_feed || has_spectral_in;
+        const bool enable_pcm_out = enable_pcm_in || has_spectral_in;
+
+        lane.enable_pcm_in = enable_pcm_in;
+        lane.enable_pcm_out = enable_pcm_out;
+        lane.enable_spectral_in = has_spectral_in;
+        lane.enable_spectral_out = spectral_out_available;
+        lane.active = (lane.enable_pcm_in || lane.enable_spectral_in) &&
+            (lane.enable_pcm_out || lane.enable_spectral_out);
+    }
+}
+#endif
+
 static int run_fft_division_node(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
@@ -10,6 +494,7 @@ static int run_fft_division_node(
     node_state_t *state,
     AmpNodeMetrics *metrics
 ) {
+    (void)sample_rate;
     if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
         return -1;
     }
@@ -36,103 +521,91 @@ static int run_fft_division_node(
     if (window_size <= 0) {
         window_size = 1;
     }
-    double epsilon_default = json_get_double(descriptor->params_json, descriptor->params_len, "stabilizer", 1e-9);
-    double epsilon_json = json_get_double(descriptor->params_json, descriptor->params_len, "epsilon", epsilon_default);
-    if (epsilon_json <= 0.0) {
-        epsilon_json = 1e-9;
-    }
-    int max_batch_windows = json_get_int(
-        descriptor->params_json,
-        descriptor->params_len,
-        "max_batch_windows",
-        32
-    );
-    if (max_batch_windows <= 0) {
-        max_batch_windows = 1;
-    }
-    int enable_remainder = json_get_bool(
-        descriptor->params_json,
-        descriptor->params_len,
-        "enable_remainder",
-        1
-    );
-    int backend_mode_param = json_get_int(
-        descriptor->params_json,
-        descriptor->params_len,
-        "backend_mode",
-        0
-    );
-    if (backend_mode_param < 0) {
-        backend_mode_param = 0;
-    }
-    if (backend_mode_param > 2) {
-        backend_mode_param = 2;
-    }
-    int backend_hop_param = json_get_int(
-        descriptor->params_json,
-        descriptor->params_len,
-        "backend_hop",
-        1
-    );
-    if (backend_hop_param <= 0) {
-        backend_hop_param = 1;
-    }
 
     int default_algorithm = parse_algorithm_string(descriptor->params_json, descriptor->params_len, FFT_ALGORITHM_EIGEN);
     default_algorithm = clamp_algorithm_kind(default_algorithm);
     int default_window_kind = parse_window_string(descriptor->params_json, descriptor->params_len, FFT_WINDOW_HANN);
     default_window_kind = clamp_window_kind(default_window_kind);
 
-    if (ensure_fft_state_buffers(state, slot_count, window_size, max_batch_windows) != 0) {
+    if (ensure_fft_state_buffers(state, slot_count, window_size, 1) != 0) {
         return -1;
     }
-    state->u.fftdiv.batches = batches;
-    state->u.fftdiv.channels = input_channels;
-    state->u.fftdiv.algorithm = default_algorithm;
-    state->u.fftdiv.epsilon = epsilon_json;
-    state->u.fftdiv.enable_remainder = enable_remainder ? 1 : 0;
-    state->u.fftdiv.max_batch_windows = max_batch_windows;
-    state->u.fftdiv.backend_mode = backend_mode_param;
-    state->u.fftdiv.backend_hop = backend_hop_param;
-    if (state->u.fftdiv.window_kind != default_window_kind) {
-        fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
-        state->u.fftdiv.window_kind = default_window_kind;
+    state->u.fftdiv.window_kind = default_window_kind;
+    state->u.fftdiv.window_size = window_size;
+
+    int working_freq_bins = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "working_ft_frequency_bins",
+        window_size
+    );
+    if (working_freq_bins <= 0) {
+        working_freq_bins = window_size;
     }
-    if (state->u.fftdiv.backend_mode == 2) {
-        if (
-            state->u.fftdiv.backend_stream_window_size != window_size
-            || state->u.fftdiv.backend_stream_window_kind != state->u.fftdiv.window_kind
-            || state->u.fftdiv.backend_stream_hop != state->u.fftdiv.backend_hop
-        ) {
-            fftdiv_destroy_stream_handles(state);
-            state->u.fftdiv.backend_stream_window_size = window_size;
-            state->u.fftdiv.backend_stream_window_kind = state->u.fftdiv.window_kind;
-            state->u.fftdiv.backend_stream_hop = state->u.fftdiv.backend_hop;
-        }
-    } else {
-        if (
-            state->u.fftdiv.backend_stream_signal != NULL
-            || state->u.fftdiv.backend_stream_div_real != NULL
-            || state->u.fftdiv.backend_stream_div_imag != NULL
-        ) {
-            fftdiv_destroy_stream_handles(state);
-        }
-        state->u.fftdiv.backend_stream_window_size = window_size;
-        state->u.fftdiv.backend_stream_window_kind = state->u.fftdiv.window_kind;
-        state->u.fftdiv.backend_stream_hop = state->u.fftdiv.backend_hop;
+    int working_time_slices = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "working_ft_duration_frames",
+        frames > 0 ? frames : 1
+    );
+    if (working_time_slices <= 0) {
+        working_time_slices = 1;
+    }
+    int working_cache_pages = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "working_ft_cache_pages",
+        1
+    );
+    if (working_cache_pages <= 0) {
+        working_cache_pages = 1;
+    }
+    if (ensure_fft_working_tensor(state, working_cache_pages, slot_count, working_freq_bins, working_time_slices) != 0) {
+        return -1;
     }
 
-    const EdgeRunnerParamView *divisor_view = find_param(inputs, "divisor");
-    const EdgeRunnerParamView *divisor_imag_view = find_param(inputs, "divisor_imag");
-    const EdgeRunnerParamView *algorithm_view = find_param(inputs, "algorithm_selector");
-    const EdgeRunnerParamView *window_view = find_param(inputs, "window_selector");
-    const EdgeRunnerParamView *stabilizer_view = find_param(inputs, "stabilizer");
-    const EdgeRunnerParamView *phase_view = find_param(inputs, "phase_offset");
-    const EdgeRunnerParamView *lower_view = find_param(inputs, "lower_band");
-    const EdgeRunnerParamView *upper_view = find_param(inputs, "upper_band");
-    const EdgeRunnerParamView *filter_view = find_param(inputs, "filter_intensity");
-    const EdgeRunnerParamView *carrier_views[FFT_DYNAMIC_CARRIER_LIMIT];
-    uint32_t carrier_view_count = collect_dynamic_carrier_views(inputs, carrier_views, FFT_DYNAMIC_CARRIER_LIMIT);
+    if (ensure_fft_spectral_scratch(state, working_cache_pages, slot_count, window_size, working_time_slices) != 0) {
+        return -1;
+    }
+
+    if (ensure_fft_stream_slots(state, slot_count, window_size, default_window_kind) != 0) {
+        return -1;
+    }
+#if defined(__cplusplus)
+    if (state->u.fftdiv.stream_slots.size() < static_cast<size_t>(slot_count)) {
+        return -1;
+    }
+    state->u.fftdiv.default_lane_count = slot_count;
+    state->u.fftdiv.lane_plan.resize(static_cast<size_t>(slot_count));
+#endif
+
+    char spectral_aggregation_mode[32];
+    spectral_aggregation_mode[0] = '\0';
+    int preserve_tensor_on_ingest = 0;
+    if (json_copy_string(
+            descriptor->params_json,
+            descriptor->params_len,
+            "spectral_input_aggregation",
+            spectral_aggregation_mode,
+            sizeof(spectral_aggregation_mode)) != 0) {
+        for (size_t i = 0; spectral_aggregation_mode[i] != '\0'; ++i) {
+            spectral_aggregation_mode[i] = (char)tolower((unsigned char)spectral_aggregation_mode[i]);
+        }
+        if (strcmp(spectral_aggregation_mode, "accumulate") == 0 ||
+            strcmp(spectral_aggregation_mode, "aggregate") == 0 ||
+            strcmp(spectral_aggregation_mode, "sum") == 0 ||
+            strcmp(spectral_aggregation_mode, "preserve") == 0 ||
+            strcmp(spectral_aggregation_mode, "buffered_fill") == 0) {
+            preserve_tensor_on_ingest = 1;
+        }
+    }
+    int preserve_tensor_flag = json_get_bool(
+        descriptor->params_json,
+        descriptor->params_len,
+        "preserve_spectral_tensor_on_ingest",
+        preserve_tensor_on_ingest
+    );
+    state->u.fftdiv.preserve_tensor_on_ingest = preserve_tensor_flag ? 1 : 0;
 
     size_t total_samples = (size_t)slot_count * (size_t)frames;
     double *buffer = (double *)malloc(total_samples * sizeof(double));
@@ -142,661 +615,409 @@ static int run_fft_division_node(
     }
 
     const double *audio_base = (inputs->audio.has_audio && inputs->audio.data != NULL) ? inputs->audio.data : NULL;
-    size_t divisor_total = param_total_count(divisor_view);
-    size_t divisor_imag_total = param_total_count(divisor_imag_view);
-    size_t algorithm_total = param_total_count(algorithm_view);
-    size_t window_total = param_total_count(window_view);
-    size_t stabilizer_total = param_total_count(stabilizer_view);
-    size_t phase_total = param_total_count(phase_view);
-    size_t lower_total = param_total_count(lower_view);
-    size_t upper_total = param_total_count(upper_view);
-    size_t filter_total = param_total_count(filter_view);
-
-    fft_dynamic_carrier_summary_t carrier_summary = summarize_dynamic_carriers(inputs);
-    double *window_weights = state->u.fftdiv.window;
-    int max_batch_capacity = state->u.fftdiv.batch_capacity > 0 ? state->u.fftdiv.batch_capacity : 1;
-    int max_batch_runtime = state->u.fftdiv.max_batch_windows;
-    if (max_batch_runtime <= 0 || max_batch_runtime > max_batch_capacity) {
-        max_batch_runtime = max_batch_capacity;
+    const EdgeRunnerParamView *spectral_input_real_view = find_param(inputs, "spectral_input_real");
+    const EdgeRunnerParamView *spectral_input_imag_view = find_param(inputs, "spectral_input_imag");
+    const EdgeRunnerTapBuffer *spectral_real_tap = find_tap_buffer(&inputs->taps, "spectral_real");
+    const EdgeRunnerTapBuffer *spectral_imag_tap = find_tap_buffer(&inputs->taps, "spectral_imag");
+    if (spectral_real_tap == NULL || spectral_imag_tap == NULL) {
+        free(buffer);
+        return AMP_E_UNSUPPORTED;
     }
-    int batch_count = 0;
-    int batch_algorithm_kind = -1;
-    const fft_algorithm_class_t *batch_algorithm_class = NULL;
 
-    for (int frame_index = 0; frame_index < frames; ++frame_index) {
-        size_t base_index = (size_t)frame_index * (size_t)slot_count;
-        double epsilon_frame = epsilon_json;
-        if (stabilizer_total > 0U) {
-            double candidate = read_param_value(stabilizer_view, base_index, epsilon_frame);
-            if (candidate < 0.0) {
-                candidate = -candidate;
+    FftWorkingTensor *working_tensor = state->u.fftdiv.working_tensor;
+    int tensor_cache_cursor = state->u.fftdiv.working_tensor_cache_cursor;
+    int tensor_time_cursor = state->u.fftdiv.working_tensor_time_cursor;
+    const int tensor_time_slices = state->u.fftdiv.working_tensor_time_slices > 0
+        ? state->u.fftdiv.working_tensor_time_slices
+        : 1;
+    const int tensor_freq_bins = state->u.fftdiv.working_tensor_freq_bins > 0
+        ? state->u.fftdiv.working_tensor_freq_bins
+        : window_size;
+    const int tensor_cache_pages = state->u.fftdiv.working_tensor_cache_pages > 0
+        ? state->u.fftdiv.working_tensor_cache_pages
+        : 1;
+    if (tensor_cache_cursor < 0 || tensor_cache_cursor >= tensor_cache_pages) {
+        tensor_cache_cursor = 0;
+    }
+    int scratch_cache_cursor = state->u.fftdiv.spectral_scratch.cache_cursor;
+    int scratch_time_cursor = state->u.fftdiv.spectral_scratch.time_cursor;
+    const int scratch_cache_pages = state->u.fftdiv.spectral_scratch.cache_pages > 0
+        ? state->u.fftdiv.spectral_scratch.cache_pages
+        : 1;
+    const int scratch_time_slices = state->u.fftdiv.spectral_scratch.time_slices > 0
+        ? state->u.fftdiv.spectral_scratch.time_slices
+        : 1;
+    if (scratch_cache_cursor < 0 || scratch_cache_cursor >= scratch_cache_pages) {
+        scratch_cache_cursor = 0;
+    }
+    if (scratch_time_cursor < 0 || scratch_time_cursor >= scratch_time_slices) {
+        scratch_time_cursor = 0;
+    }
+#if defined(__cplusplus)
+    fftdiv_prepare_lane_plan(
+        state,
+        slot_count,
+        inputs,
+        spectral_input_real_view,
+        spectral_input_imag_view,
+        spectral_real_tap,
+        spectral_imag_tap);
+
+    int active_lane_count = 0;
+    for (const auto &lane_meta : state->u.fftdiv.lane_plan) {
+        if (lane_meta.active) {
+            active_lane_count += 1;
+        }
+    }
+    if (fftdiv_realize_operator_arena(state) != 0) {
+        free(buffer);
+        return -1;
+    }
+#endif
+
+    const int frame_index = 0;
+    size_t base_index = 0;
+#if defined(__cplusplus)
+        fftdiv_prepare_operator_frame(state);
+        const int tensor_slice = tensor_time_cursor;
+    const int scratch_slice = scratch_time_cursor;
+        int ready_lane_count = 0;
+    int working_tensor_updated = 0;
+
+    std::vector<size_t> lane_frames_emitted(static_cast<size_t>(slot_count), 0U);
+    std::vector<double> lane_last_sample(static_cast<size_t>(slot_count), 0.0);
+    std::vector<double> lane_pcm_batch(static_cast<size_t>(slot_count) * static_cast<size_t>(frames), 0.0);
+
+        for (int slot = 0; slot < slot_count; ++slot) {
+            size_t data_idx = base_index + (size_t)slot;
+            auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
+            double *slot_spectral_real = slot_state.forward_real.data();
+            double *slot_spectral_imag = slot_state.forward_imag.data();
+            auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
+
+            lane.frame_ready = false;
+            lane.staged_pcm_value = 0.0;
+            lane.staged_pcm_valid = false;
+
+            if (slot_spectral_real == NULL || slot_spectral_imag == NULL) {
+                double passthrough = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
+                lane.staged_pcm_value = passthrough;
+                lane.staged_pcm_valid = true;
+                continue;
             }
-            if (candidate > 0.0) {
-                epsilon_frame = candidate;
+
+            const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
+            double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
+            double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
+            const int scratch_bins = fftdiv_spectral_scratch_bins(state);
+
+            if (!lane.active) {
+                if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
+                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
+                }
+                slot_state.inverse_queue.clear();
+                lane.staged_pcm_value = 0.0;
+                lane.staged_pcm_valid = true;
+                continue;
             }
-        }
-        if (epsilon_frame < 1e-12) {
-            epsilon_frame = 1e-12;
-        }
-        int algorithm_kind = default_algorithm;
-        if (algorithm_total > 0U) {
-            double raw = read_param_value(algorithm_view, base_index, (double)algorithm_kind);
-            algorithm_kind = clamp_algorithm_kind(round_to_int(raw));
-        }
-        const fft_algorithm_class_t *algorithm_class = select_fft_algorithm(algorithm_kind);
-        if (algorithm_class == NULL) {
-            free(buffer);
-            return AMP_E_UNSUPPORTED;
-        }
-        if (algorithm_class->requires_hook && !amp_fft_backend_has_hook()) {
-            free(buffer);
-            return AMP_E_UNSUPPORTED;
-        }
-        if (algorithm_class->requires_power_of_two && !is_power_of_two_int(window_size)) {
-            algorithm_class = select_fft_algorithm(FFT_ALGORITHM_DFT);
-            if (algorithm_class == NULL) {
-                free(buffer);
-                return AMP_E_UNSUPPORTED;
+
+            size_t frames_emitted = 0;
+            double last_sample = 0.0;
+            if (lane.enable_pcm_in && audio_base != NULL) {
+                const size_t hop = (size_t)slot_count;
+                double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
+                for (int frame_cursor = 0; frame_cursor < frames; ++frame_cursor) {
+                    const size_t audio_index = (size_t)frame_cursor * hop + (size_t)slot;
+                    if (audio_index < (size_t)slot_count * (size_t)frames) {
+                        last_sample = audio_base[audio_index];
+                    } else {
+                        last_sample = 0.0;
+                    }
+                    pcm_cursor[frame_cursor] = last_sample;
+                }
+                if (slot_state.forward_handle != NULL && frames > 0) {
+                    frames_emitted = amp_fft_backend_stream_push(
+                        slot_state.forward_handle,
+                        pcm_cursor,
+                        (size_t)frames,
+                        window_size,
+                        slot_spectral_real,
+                        slot_spectral_imag,
+                        1,
+                        AMP_FFT_STREAM_FLUSH_NONE);
+                }
             }
-        }
-        algorithm_kind = algorithm_class->kind;
-        int window_kind = default_window_kind;
-        if (window_total > 0U) {
-            double raw_w = read_param_value(window_view, base_index, (double)window_kind);
-            window_kind = clamp_window_kind(round_to_int(raw_w));
-        }
-        if (state->u.fftdiv.window_kind != window_kind) {
-            fill_window_weights(state->u.fftdiv.window, window_size, window_kind);
-            state->u.fftdiv.window_kind = window_kind;
-        }
-        state->u.fftdiv.algorithm = algorithm_kind;
-        state->u.fftdiv.epsilon = epsilon_frame;
-        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            state->u.fftdiv.dynamic_carrier_band_count = 0;
-            state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
-            state->u.fftdiv.dynamic_k_active = 0;
-        } else if (algorithm_class->supports_dynamic_carriers) {
-            state->u.fftdiv.dynamic_carrier_band_count = (int)carrier_summary.band_count;
-            state->u.fftdiv.dynamic_carrier_last_sum = carrier_summary.last_sum;
-            state->u.fftdiv.dynamic_k_active = (int)carrier_summary.band_count;
-        } else {
-            state->u.fftdiv.dynamic_carrier_band_count = 0;
-            state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
-            state->u.fftdiv.dynamic_k_active = 0;
+            lane_frames_emitted[(size_t)slot] = frames_emitted;
+            lane_last_sample[(size_t)slot] = last_sample;
+            if (frames_emitted > 0) {
+                slot_state.warmup_complete = true;
+            }
+            if (!slot_state.warmup_complete) {
+                lane.staged_pcm_value = last_sample;
+                lane.staged_pcm_valid = true;
+                continue;
+            }
+            if (frames_emitted == 0) {
+                zero_spectral_buffer(slot_spectral_real, slot_spectral_imag, window_size);
+                if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
+                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
+                }
+            }
+
+            int spectral_ready = (frames_emitted > 0) ? 1 : 0;
+            const int reset_spectral_buffer = spectral_ready ? 0 : 1;
+            const int reset_scratch_slice = state->u.fftdiv.preserve_tensor_on_ingest ? 0 : reset_spectral_buffer;
+
+            if (scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                if (frames_emitted > 0) {
+                    const int scratch_copy_bins = (scratch_bins < window_size) ? scratch_bins : window_size;
+                    memcpy(scratch_real, slot_spectral_real, (size_t)scratch_copy_bins * sizeof(double));
+                    memcpy(scratch_imag, slot_spectral_imag, (size_t)scratch_copy_bins * sizeof(double));
+                    if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_copy_bins < scratch_bins) {
+                        memset(scratch_real + scratch_copy_bins, 0, (size_t)(scratch_bins - scratch_copy_bins) * sizeof(double));
+                        memset(scratch_imag + scratch_copy_bins, 0, (size_t)(scratch_bins - scratch_copy_bins) * sizeof(double));
+                    }
+                } else if (reset_spectral_buffer && !state->u.fftdiv.preserve_tensor_on_ingest) {
+                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
+                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
+                }
+            }
+
+            if (lane.enable_spectral_in) {
+                spectral_ready |= stage_ingest_spectrum_input(
+                    slot_spectral_real,
+                    slot_spectral_imag,
+                    window_size,
+                    spectral_input_real_view,
+                    spectral_input_imag_view,
+                    slot,
+                    frame_index,
+                    reset_spectral_buffer,
+                    reset_scratch_slice,
+                    scratch_real,
+                    scratch_imag,
+                    scratch_bins);
+            }
+
+            if (!spectral_ready) {
+                if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
+                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
+                }
+                if (!lane.enable_pcm_out) {
+                    slot_state.inverse_queue.clear();
+                    lane.staged_pcm_value = 0.0;
+                } else if (!slot_state.inverse_queue.empty()) {
+                    lane.staged_pcm_value = slot_state.inverse_queue.front();
+                } else {
+                    lane.staged_pcm_value = 0.0;
+                }
+                lane.staged_pcm_valid = true;
+                continue;
+            }
+
+            lane.frame_ready = true;
+            ready_lane_count += 1;
+
+            if (!lane.enable_pcm_out) {
+                lane.staged_pcm_value = 0.0;
+            } else if (!slot_state.inverse_queue.empty()) {
+                lane.staged_pcm_value = slot_state.inverse_queue.front();
+            } else {
+                lane.staged_pcm_value = 0.0;
+            }
+            lane.staged_pcm_valid = true;
         }
 
-        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            if (batch_count > 0 && batch_algorithm_class != NULL) {
-                fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
-            }
-        }
+        const bool barrier_satisfied =
+            (active_lane_count == 0) ? true : (ready_lane_count == active_lane_count);
 
-        int filled = state->u.fftdiv.filled;
-        double phase_last = state->u.fftdiv.last_phase;
-        double lower_last = state->u.fftdiv.last_lower;
-        double upper_last = state->u.fftdiv.last_upper;
-        double filter_last = state->u.fftdiv.last_filter;
+        for (int slot = 0; slot < slot_count; ++slot) {
+            size_t data_idx = base_index + (size_t)slot;
+            auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
+            double *slot_spectral_real = slot_state.forward_real.data();
+            double *slot_spectral_imag = slot_state.forward_imag.data();
+            auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
+            const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
+            double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
+            double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
+            const int scratch_bins = fftdiv_spectral_scratch_bins(state);
+
+            double output_value = lane.staged_pcm_valid ? lane.staged_pcm_value : 0.0;
+
+            if (barrier_satisfied && lane.active && lane.frame_ready && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                if (working_tensor != NULL && tensor_freq_bins > 0) {
+                    const double *commit_real = scratch_real;
+                    const double *commit_imag = scratch_imag;
+                    int commit_bins = scratch_bins;
+                    if (commit_real == NULL || commit_imag == NULL || commit_bins <= 0) {
+                        commit_real = slot_spectral_real;
+                        commit_imag = slot_spectral_imag;
+                        commit_bins = window_size;
+                    }
+                    fftdiv_copy_spectrum_to_working(
+                        working_tensor,
+                        tensor_cache_cursor,
+                        tensor_lane,
+                        tensor_slice,
+                        tensor_freq_bins,
+                        commit_real,
+                        commit_imag,
+                        commit_bins);
+                    if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                        memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
+                        memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
+                    }
+                    working_tensor_updated = 1;
+                }
+                stage_run_operator_stack(
+                    state,
+                    slot_spectral_real,
+                    slot_spectral_imag,
+                    window_size,
+                    working_tensor,
+                    tensor_cache_cursor,
+                    tensor_lane,
+                    tensor_slice,
+                    tensor_freq_bins);
+
+                if ((lane.enable_pcm_out || lane.enable_spectral_out) &&
+                    working_tensor != NULL &&
+                    slot_spectral_real != NULL &&
+                    slot_spectral_imag != NULL) {
+                    fftdiv_copy_working_to_slot_buffer(
+                        working_tensor,
+                        tensor_cache_cursor,
+                        tensor_lane,
+                        tensor_slice,
+                        tensor_freq_bins,
+                        slot_spectral_real,
+                        slot_spectral_imag,
+                        window_size);
+                }
+
+                if (lane.enable_spectral_out) {
+                    stage_emit_spectral(
+                        slot_spectral_real,
+                        slot_spectral_imag,
+                        window_size,
+                        spectral_real_tap,
+                        spectral_imag_tap,
+                        slot,
+                        frame_index,
+                        working_tensor,
+                        tensor_cache_cursor,
+                        tensor_lane,
+                        tensor_slice,
+                        tensor_freq_bins);
+                }
+
+                if (lane.enable_pcm_out && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
+                    const size_t produced_pcm = amp_fft_backend_stream_push_spectrum(
+                        slot_state.inverse_handle,
+                        slot_spectral_real,
+                        slot_spectral_imag,
+                        1,
+                        window_size,
+                        slot_state.inverse_scratch.data(),
+                        slot_state.inverse_scratch.size(),
+                        AMP_FFT_STREAM_FLUSH_NONE);
+                    for (size_t i = 0; i < produced_pcm && i < slot_state.inverse_scratch.size(); ++i) {
+                        slot_state.inverse_queue.push_back(slot_state.inverse_scratch[i]);
+                    }
+                } else if (!lane.enable_pcm_out) {
+                    slot_state.inverse_queue.clear();
+                }
+
+                if (lane.enable_pcm_out && !slot_state.inverse_queue.empty()) {
+                    output_value = slot_state.inverse_queue.front();
+                    slot_state.inverse_queue.pop_front();
+                } else if (!lane.enable_pcm_out) {
+                    output_value = 0.0;
+                } else {
+                    output_value = 0.0;
+                }
+            } else {
+                if (!barrier_satisfied && lane.frame_ready) {
+                    if (slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                        zero_spectral_buffer(slot_spectral_real, slot_spectral_imag, window_size);
+                    }
+                    if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                        memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
+                        memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
+                    }
+                }
+                if (!lane.enable_pcm_out) {
+                    slot_state.inverse_queue.clear();
+                }
+            }
+
+            lane.frame_ready = false;
+            lane.staged_pcm_valid = false;
+            buffer[data_idx] = output_value;
+        }
+#else
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t data_idx = base_index + (size_t)slot;
             double sample = 0.0;
             if (audio_base != NULL) {
                 sample = audio_base[data_idx];
             }
-            double divisor_sample = divisor_total > 0U ? read_param_value(divisor_view, base_index + (size_t)slot, 1.0) : 1.0;
-            double divisor_imag_sample = divisor_imag_total > 0U ? read_param_value(divisor_imag_view, base_index + (size_t)slot, 0.0) : 0.0;
-            double phase_sample = phase_total > 0U ? read_param_value(phase_view, base_index + (size_t)slot, phase_last) : phase_last;
-            double lower_sample = lower_total > 0U ? read_param_value(lower_view, base_index + (size_t)slot, lower_last) : lower_last;
-            double upper_sample = upper_total > 0U ? read_param_value(upper_view, base_index + (size_t)slot, upper_last) : upper_last;
-            double filter_sample = filter_total > 0U ? read_param_value(filter_view, base_index + (size_t)slot, filter_last) : filter_last;
-            size_t offset = (size_t)slot * (size_t)window_size;
-            double *input_ring = state->u.fftdiv.input_buffer + offset;
-            double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
-            double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
-            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
-            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
-            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
-            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
-            if (filled < window_size) {
-                input_ring[filled] = sample;
-                divisor_ring[filled] = divisor_sample;
-                divisor_imag_ring[filled] = divisor_imag_sample;
-                phase_ring[filled] = phase_sample;
-                lower_ring[filled] = lower_sample;
-                upper_ring[filled] = upper_sample;
-                filter_ring[filled] = filter_sample;
-            } else {
-                if (window_size > 1) {
-                    memmove(input_ring, input_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(divisor_ring, divisor_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(divisor_imag_ring, divisor_imag_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(phase_ring, phase_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(lower_ring, lower_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(upper_ring, upper_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(filter_ring, filter_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                }
-                input_ring[window_size - 1] = sample;
-                divisor_ring[window_size - 1] = divisor_sample;
-                divisor_imag_ring[window_size - 1] = divisor_imag_sample;
-                phase_ring[window_size - 1] = phase_sample;
-                lower_ring[window_size - 1] = lower_sample;
-                upper_ring[window_size - 1] = upper_sample;
-                filter_ring[window_size - 1] = filter_sample;
-            }
-            phase_last = phase_sample;
-            lower_last = lower_sample;
-            upper_last = upper_sample;
-            filter_last = filter_sample;
+            buffer[data_idx] = sample;
         }
-        state->u.fftdiv.last_phase = phase_last;
-        state->u.fftdiv.last_lower = lower_last;
-        state->u.fftdiv.last_upper = upper_last;
-        state->u.fftdiv.last_filter = filter_last;
-        if (filled < window_size) {
-            filled += 1;
-            state->u.fftdiv.filled = filled;
-        }
-        if (state->u.fftdiv.filled < window_size) {
-            if (batch_count > 0 && batch_algorithm_class != NULL) {
-                fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
-            }
-            for (int slot = 0; slot < slot_count; ++slot) {
-                double divisor_sample = divisor_total > 0U ? read_param_value(divisor_view, base_index + (size_t)slot, 1.0) : 1.0;
-                double safe_div = fabs(divisor_sample) < epsilon_frame ? (divisor_sample >= 0.0 ? epsilon_frame : -epsilon_frame) : divisor_sample;
-                double sample = audio_base != NULL ? audio_base[base_index + (size_t)slot] : 0.0;
-                buffer[base_index + (size_t)slot] = sample / safe_div;
-            }
-            continue;
-        }
-        int dynamic_active_frame = 0;
-        double dynamic_sum_frame = 0.0;
-        state->u.fftdiv.dynamic_k_active = 0;
-        state->u.fftdiv.remainder_energy = 0.0;
-        for (int slot = 0; slot < slot_count; ++slot) {
-            size_t offset = (size_t)slot * (size_t)window_size;
-            double *input_ring = state->u.fftdiv.input_buffer + offset;
-            double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
-            double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
-            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
-            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
-            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
-            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
-            double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
-            double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
-            double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
-            double filter_mod = filter_ring[window_size > 0 ? window_size - 1 : 0];
-            double lower_clamped = clamp_unit_double(lower_mod);
-            double upper_clamped = clamp_unit_double(upper_mod);
-            if (upper_clamped < lower_clamped) {
-                double tmp_bounds = lower_clamped;
-                lower_clamped = upper_clamped;
-                upper_clamped = tmp_bounds;
-            }
-            double intensity_clamped = clamp_unit_double(filter_mod);
-            double cos_phase = cos(phase_mod);
-            double sin_phase = sin(phase_mod);
+#endif
 
-            if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-                double carrier_fnorm[FFT_DYNAMIC_CARRIER_LIMIT];
-                int carrier_indices_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                double theta0[FFT_DYNAMIC_CARRIER_LIMIT];
-                double step_re_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                double step_im_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                double b_re[FFT_DYNAMIC_CARRIER_LIMIT];
-                double b_im[FFT_DYNAMIC_CARRIER_LIMIT];
-                double div_re_acc[FFT_DYNAMIC_CARRIER_LIMIT];
-                double div_im_acc[FFT_DYNAMIC_CARRIER_LIMIT];
-                double last_re[FFT_DYNAMIC_CARRIER_LIMIT];
-                double last_im[FFT_DYNAMIC_CARRIER_LIMIT];
-                double gram_real[FFT_DYNAMIC_CARRIER_LIMIT * FFT_DYNAMIC_CARRIER_LIMIT];
-                double gram_imag[FFT_DYNAMIC_CARRIER_LIMIT * FFT_DYNAMIC_CARRIER_LIMIT];
-                double amp_re[FFT_DYNAMIC_CARRIER_LIMIT];
-                double amp_im[FFT_DYNAMIC_CARRIER_LIMIT];
-                double ph_re_buffer[FFT_DYNAMIC_CARRIER_LIMIT];
-                double ph_im_buffer[FFT_DYNAMIC_CARRIER_LIMIT];
-                int active_count = 0;
-                double carrier_sum_slot = 0.0;
-                for (uint32_t idx = 0; idx < carrier_view_count && idx < FFT_DYNAMIC_CARRIER_LIMIT; ++idx) {
-                    const EdgeRunnerParamView *carrier_view = carrier_views[idx];
-                    if (carrier_view == NULL) {
-                        continue;
-                    }
-                    size_t total = param_total_count(carrier_view);
-                    if (total == 0U) {
-                        continue;
-                    }
-                    double raw_value = read_param_value(
-                        carrier_view,
-                        base_index + (size_t)slot,
-                        0.0
-                    );
-                    carrier_sum_slot += raw_value;
-                    double normalized = raw_value;
-                    if (sample_rate > 0.0 && fabs(normalized) > 1.0) {
-                        normalized = raw_value / sample_rate;
-                    }
-                    normalized = clamp_unit_double(normalized);
-                    carrier_fnorm[active_count] = normalized;
-                    carrier_indices_local[active_count] = (int)idx;
-                    active_count += 1;
-                }
-                double *remainder_ring = state->u.fftdiv.result_buffer + offset;
-                for (int i = 0; i < window_size; ++i) {
-                    state->u.fftdiv.div_fft_real[offset + (size_t)i] = 0.0;
-                    state->u.fftdiv.div_fft_imag[offset + (size_t)i] = 0.0;
-                    remainder_ring[i] = 0.0;
-                }
-                if (active_count > 0) {
-                    size_t phase_offset = (size_t)slot * (size_t)FFT_DYNAMIC_CARRIER_LIMIT;
-                    double inv_window = window_size > 0 ? 1.0 / (double)window_size : 1.0;
-                    int has_divisor = (divisor_total > 0U) || (divisor_imag_total > 0U);
-                    for (int k = 0; k < active_count; ++k) {
-                        size_t carrier_index = (size_t)carrier_indices_local[k];
-                        size_t phase_index = phase_offset + carrier_index;
-                        double theta = state->u.fftdiv.dynamic_phase[phase_index];
-                        theta0[k] = theta;
-                        double fnorm = carrier_fnorm[k];
-                        double angle = 2.0 * M_PI * fnorm;
-                        double step_re = cos(angle);
-                        double step_im = sin(angle);
-                        step_re_local[k] = step_re;
-                        step_im_local[k] = step_im;
-                        state->u.fftdiv.dynamic_step_re[phase_index] = step_re;
-                        state->u.fftdiv.dynamic_step_im[phase_index] = step_im;
-                        ph_re_buffer[k] = cos(theta);
-                        ph_im_buffer[k] = sin(theta);
-                        b_re[k] = 0.0;
-                        b_im[k] = 0.0;
-                        div_re_acc[k] = 0.0;
-                        div_im_acc[k] = 0.0;
-                        last_re[k] = ph_re_buffer[k];
-                        last_im[k] = ph_im_buffer[k];
-                        for (int j = 0; j < active_count; ++j) {
-                            gram_real[k * active_count + j] = 0.0;
-                            gram_imag[k * active_count + j] = 0.0;
-                        }
-                    }
-                    double phi_re_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                    double phi_im_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                    for (int n = 0; n < window_size; ++n) {
-                        double w = window_weights != NULL ? window_weights[n] : 1.0;
-                        double xw = input_ring[n] * w;
-                        for (int k = 0; k < active_count; ++k) {
-                            double ph_re = ph_re_buffer[k];
-                            double ph_im = ph_im_buffer[k];
-                            double wr = ph_re * w;
-                            double wi = ph_im * w;
-                            phi_re_local[k] = wr;
-                            phi_im_local[k] = wi;
-                            b_re[k] += xw * wr;
-                            b_im[k] -= xw * wi;
-                            if (has_divisor) {
-                                double dw_re = divisor_ring[n] * w;
-                                double dw_im = divisor_imag_ring[n] * w;
-                                div_re_acc[k] += dw_re * ph_re + dw_im * ph_im;
-                                div_im_acc[k] += -dw_re * ph_im + dw_im * ph_re;
-                            }
-                            if (n == window_size - 1) {
-                                last_re[k] = ph_re;
-                                last_im[k] = ph_im;
-                            }
-                        }
-                        for (int i_local = 0; i_local < active_count; ++i_local) {
-                            for (int j_local = i_local; j_local < active_count; ++j_local) {
-                                double a_re = phi_re_local[i_local];
-                                double a_im = phi_im_local[i_local];
-                                double b_re_local = phi_re_local[j_local];
-                                double b_im_local = phi_im_local[j_local];
-                                double re = a_re * b_re_local + a_im * b_im_local;
-                                double im = a_re * b_im_local - a_im * b_re_local;
-                                gram_real[i_local * active_count + j_local] += re;
-                                gram_imag[i_local * active_count + j_local] += im;
-                                if (i_local != j_local) {
-                                    gram_real[j_local * active_count + i_local] += re;
-                                    gram_imag[j_local * active_count + i_local] -= im;
-                                }
-                            }
-                        }
-                        for (int k = 0; k < active_count; ++k) {
-                            double next_re = ph_re_buffer[k] * step_re_local[k] - ph_im_buffer[k] * step_im_local[k];
-                            double next_im = ph_re_buffer[k] * step_im_local[k] + ph_im_buffer[k] * step_re_local[k];
-                            ph_re_buffer[k] = next_re;
-                            ph_im_buffer[k] = next_im;
-                        }
-                    }
-                    for (int k = 0; k < active_count; ++k) {
-                        size_t carrier_index = (size_t)carrier_indices_local[k];
-                        size_t phase_index = phase_offset + carrier_index;
-                        double theta_next = theta0[k] + 2.0 * M_PI * carrier_fnorm[k] * (double)window_size;
-                        state->u.fftdiv.dynamic_phase[phase_index] = wrap_phase_two_pi(theta_next);
-                        if (!has_divisor) {
-                            div_re_acc[k] = 1.0;
-                            div_im_acc[k] = 0.0;
-                        }
-                    }
-                    double coeff_re_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                    double coeff_im_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                    if (state->u.fftdiv.enable_remainder) {
-                        int dim = active_count * 2;
-                        double normal_matrix[FFT_DYNAMIC_CARRIER_LIMIT * 2 * FFT_DYNAMIC_CARRIER_LIMIT * 2];
-                        double rhs_vec[FFT_DYNAMIC_CARRIER_LIMIT * 2];
-                        for (int i_local = 0; i_local < dim * dim; ++i_local) {
-                            normal_matrix[i_local] = 0.0;
-                        }
-                        for (int i_local = 0; i_local < dim; ++i_local) {
-                            rhs_vec[i_local] = 0.0;
-                        }
-                        double trace = 0.0;
-                        for (int k = 0; k < active_count; ++k) {
-                            trace += gram_real[k * active_count + k];
-                        }
-                        double lambda = 0.0;
-                        if (active_count > 0 && trace > 0.0) {
-                            lambda = 1e-8 * (trace / (double)active_count);
-                        }
-                        for (int i_local = 0; i_local < active_count; ++i_local) {
-                            for (int j_local = 0; j_local < active_count; ++j_local) {
-                                double real_part = gram_real[i_local * active_count + j_local];
-                                double imag_part = gram_imag[i_local * active_count + j_local];
-                                if (i_local == j_local) {
-                                    real_part += lambda;
-                                }
-                                normal_matrix[i_local * dim + j_local] = real_part;
-                                normal_matrix[i_local * dim + (j_local + active_count)] = -imag_part;
-                                normal_matrix[(i_local + active_count) * dim + j_local] = imag_part;
-                                normal_matrix[(i_local + active_count) * dim + (j_local + active_count)] = real_part;
-                            }
-                            rhs_vec[i_local] = b_re[i_local];
-                            rhs_vec[i_local + active_count] = b_im[i_local];
-                        }
-                        if (solve_linear_system(normal_matrix, rhs_vec, dim) == 0) {
-                            for (int k = 0; k < active_count; ++k) {
-                                coeff_re_local[k] = rhs_vec[k];
-                                coeff_im_local[k] = rhs_vec[k + active_count];
-                            }
-                        } else {
-                            for (int k = 0; k < active_count; ++k) {
-                                coeff_re_local[k] = b_re[k];
-                                coeff_im_local[k] = b_im[k];
-                            }
-                        }
-                    } else {
-                        for (int k = 0; k < active_count; ++k) {
-                            coeff_re_local[k] = b_re[k];
-                            coeff_im_local[k] = b_im[k];
-                        }
-                    }
-                    double sample_dynamic = 0.0;
-                    for (int k = 0; k < active_count; ++k) {
-                        double coeff_re = coeff_re_local[k];
-                        double coeff_im = coeff_im_local[k];
-                        double div_re = div_re_acc[k];
-                        double div_im = div_im_acc[k];
-                        if (has_divisor) {
-                            double denom = div_re * div_re + div_im * div_im;
-                            if (denom < epsilon_frame) {
-                                denom = epsilon_frame;
-                            }
-                            double real_tmp = (coeff_re * div_re + coeff_im * div_im) / denom;
-                            double imag_tmp = (coeff_im * div_re - coeff_re * div_im) / denom;
-                            coeff_re = real_tmp;
-                            coeff_im = imag_tmp;
-                        }
-                        double ratio = carrier_fnorm[k];
-                        if (ratio < 0.0) {
-                            ratio = 0.0;
-                        } else if (ratio > 1.0) {
-                            ratio = 1.0;
-                        }
-                        double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
-                        double gated_re = coeff_re * gain;
-                        double gated_im = coeff_im * gain;
-                        double rotated_re = gated_re * cos_phase - gated_im * sin_phase;
-                        double rotated_im = gated_re * sin_phase + gated_im * cos_phase;
-                        amp_re[k] = rotated_re;
-                        amp_im[k] = rotated_im;
-                        sample_dynamic += (rotated_re * last_re[k] - rotated_im * last_im[k]) * inv_window;
-                    }
-                    if (state->u.fftdiv.enable_remainder) {
-                        double *modeled_ring = state->u.fftdiv.work_real;
-                        for (int i = 0; i < window_size; ++i) {
-                            modeled_ring[i] = 0.0;
-                        }
-                        for (int k = 0; k < active_count; ++k) {
-                            ph_re_buffer[k] = cos(theta0[k]);
-                            ph_im_buffer[k] = sin(theta0[k]);
-                        }
-                        double remainder_energy_local = 0.0;
-                        for (int n = 0; n < window_size; ++n) {
-                            double sum_val = 0.0;
-                            for (int k = 0; k < active_count; ++k) {
-                                sum_val += amp_re[k] * ph_re_buffer[k] - amp_im[k] * ph_im_buffer[k];
-                            }
-                            modeled_ring[n] = sum_val * inv_window;
-                            double residual_val = input_ring[n] - modeled_ring[n];
-                            remainder_ring[n] = residual_val;
-                            remainder_energy_local += residual_val * residual_val;
-                            for (int k = 0; k < active_count; ++k) {
-                                double next_re = ph_re_buffer[k] * step_re_local[k] - ph_im_buffer[k] * step_im_local[k];
-                                double next_im = ph_re_buffer[k] * step_im_local[k] + ph_im_buffer[k] * step_re_local[k];
-                                ph_re_buffer[k] = next_re;
-                                ph_im_buffer[k] = next_im;
-                            }
-                        }
-                        state->u.fftdiv.remainder_energy += remainder_energy_local;
-                    } else {
-                        size_t tail_index = (size_t)(window_size > 0 ? window_size - 1 : 0);
-                        remainder_ring[tail_index] = sample_dynamic;
-                    }
-                    buffer[base_index + (size_t)slot] = sample_dynamic;
-                    if (active_count > dynamic_active_frame) {
-                        dynamic_active_frame = active_count;
-                    }
-                    dynamic_sum_frame += carrier_sum_slot;
-                    continue;
-                }
-                buffer[base_index + (size_t)slot] = 0.0;
-                continue;
-            }
-
-            if (batch_count > 0 && algorithm_kind != batch_algorithm_kind) {
-                if (batch_algorithm_class != NULL) {
-                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-                }
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
-            }
-            if (batch_count == 0) {
-                batch_algorithm_kind = algorithm_kind;
-                batch_algorithm_class = algorithm_class;
-            }
-            if (batch_count >= max_batch_runtime) {
-                if (batch_algorithm_class != NULL) {
-                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-                }
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
-            }
-
-            size_t batch_offset = (size_t)batch_count * (size_t)window_size;
-            double *batched_real = state->u.fftdiv.batch_input_real + batch_offset;
-            double *batched_imag = state->u.fftdiv.batch_input_imag + batch_offset;
-            double *batched_div_real = state->u.fftdiv.batch_div_real + batch_offset;
-            double *batched_div_imag = state->u.fftdiv.batch_div_imag + batch_offset;
-
-            const int use_backend = (batch_algorithm_class != NULL && batch_algorithm_class->forward == fft_algorithm_backend_forward) ? 1 : 0;
-            int include_in_batch = 1;
-            if (use_backend && state->u.fftdiv.backend_mode == 2) {
-                include_in_batch = 0;
-                void *signal_ctx = fftdiv_ensure_stream_handle(
-                    state,
-                    state->u.fftdiv.backend_stream_signal,
-                    slot,
-                    window_size,
-                    state->u.fftdiv.backend_hop,
-                    state->u.fftdiv.window_kind
-                );
-                void *div_real_ctx = fftdiv_ensure_stream_handle(
-                    state,
-                    state->u.fftdiv.backend_stream_div_real,
-                    slot,
-                    window_size,
-                    state->u.fftdiv.backend_hop,
-                    state->u.fftdiv.window_kind
-                );
-                void *div_imag_ctx = fftdiv_ensure_stream_handle(
-                    state,
-                    state->u.fftdiv.backend_stream_div_imag,
-                    slot,
-                    window_size,
-                    state->u.fftdiv.backend_hop,
-                    state->u.fftdiv.window_kind
-                );
-                if (signal_ctx != NULL && div_real_ctx != NULL && div_imag_ctx != NULL) {
-                    int tail_index = window_size > 0 ? window_size - 1 : 0;
-                    double signal_sample = input_ring[tail_index];
-                    double divisor_sample_real = divisor_ring[tail_index];
-                    double divisor_sample_imag = divisor_imag_ring[tail_index];
-                    size_t frames_signal = amp_fft_backend_stream_push(
-                        signal_ctx,
-                        &signal_sample,
-                        1,
-                        window_size,
-                        batched_real,
-                        batched_imag,
-                        1,
-                        AMP_FFT_STREAM_FLUSH_NONE
-                    );
-                    double *tmp_div_real_re = state->u.fftdiv.work_real;
-                    double *tmp_div_real_im = state->u.fftdiv.work_imag;
-                    double *tmp_div_imag_re = state->u.fftdiv.div_real;
-                    double *tmp_div_imag_im = state->u.fftdiv.div_imag;
-                    size_t frames_div_real = amp_fft_backend_stream_push(
-                        div_real_ctx,
-                        &divisor_sample_real,
-                        1,
-                        window_size,
-                        tmp_div_real_re,
-                        tmp_div_real_im,
-                        1,
-                        AMP_FFT_STREAM_FLUSH_NONE
-                    );
-                    size_t frames_div_imag = amp_fft_backend_stream_push(
-                        div_imag_ctx,
-                        &divisor_sample_imag,
-                        1,
-                        window_size,
-                        tmp_div_imag_re,
-                        tmp_div_imag_im,
-                        1,
-                        AMP_FFT_STREAM_FLUSH_NONE
-                    );
-                    if (frames_signal > 0 && frames_div_real > 0 && frames_div_imag > 0) {
-                        for (int i = 0; i < window_size; ++i) {
-                            const double a_real = tmp_div_real_re[i];
-                            const double a_imag = tmp_div_real_im[i];
-                            const double b_real = tmp_div_imag_re[i];
-                            const double b_imag = tmp_div_imag_im[i];
-                            batched_div_real[i] = a_real - b_imag;
-                            batched_div_imag[i] = a_imag + b_real;
-                        }
-                        include_in_batch = 1;
-                    }
-                }
-                if (!include_in_batch) {
-                    continue;
-                }
-            } else {
-                int apply_window_weights = 1;
-                if (use_backend && state->u.fftdiv.backend_mode != 0) {
-                    apply_window_weights = 0;
-                }
-                for (int i = 0; i < window_size; ++i) {
-                    const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
-                    double sample = input_ring[i] * w;
-                    double div_re_sample = divisor_ring[i] * w;
-                    double div_im_sample = divisor_imag_ring[i] * w;
-                    batched_real[i] = sample;
-                    batched_imag[i] = 0.0;
-                    batched_div_real[i] = div_re_sample;
-                    batched_div_imag[i] = div_im_sample;
+#if defined(__cplusplus)
+        if (working_tensor_updated) {
+            if (tensor_cache_pages > 0) {
+                tensor_cache_cursor += 1;
+                if (tensor_cache_cursor >= tensor_cache_pages) {
+                    tensor_cache_cursor = 0;
                 }
             }
-
-            state->u.fftdiv.batch_slot_map[batch_count] = slot;
-            state->u.fftdiv.batch_slot_offset[batch_count] = offset;
-            state->u.fftdiv.batch_output_index[batch_count] = base_index + (size_t)slot;
-            state->u.fftdiv.batch_phase[batch_count] = phase_mod;
-            state->u.fftdiv.batch_lower[batch_count] = lower_mod;
-            state->u.fftdiv.batch_upper[batch_count] = upper_mod;
-            state->u.fftdiv.batch_filter[batch_count] = filter_mod;
-            state->u.fftdiv.batch_epsilon[batch_count] = epsilon_frame;
-
-            batch_count += 1;
-            if (batch_count >= max_batch_runtime) {
-                if (batch_algorithm_class != NULL) {
-                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
+            if (tensor_time_slices > 0) {
+                tensor_time_cursor += 1;
+                if (tensor_time_cursor >= tensor_time_slices) {
+                    tensor_time_cursor = 0;
                 }
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
+            }
+            if (scratch_cache_pages > 0) {
+                scratch_cache_cursor += 1;
+                if (scratch_cache_cursor >= scratch_cache_pages) {
+                    scratch_cache_cursor = 0;
+                }
+            }
+            if (scratch_time_slices > 0) {
+                scratch_time_cursor += 1;
+                if (scratch_time_cursor >= scratch_time_slices) {
+                    scratch_time_cursor = 0;
+                }
             }
         }
-        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            state->u.fftdiv.dynamic_carrier_band_count = dynamic_active_frame;
-            state->u.fftdiv.dynamic_carrier_last_sum = dynamic_sum_frame;
-            state->u.fftdiv.dynamic_k_active = dynamic_active_frame;
-        }
-        state->u.fftdiv.position = window_size - 1;
-    }
+#endif
 
-    /* Flush any remaining batched windows that were not processed inside the loop. */
-    if (batch_count > 0 && batch_algorithm_class != NULL) {
-        fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-        batch_count = 0;
-        batch_algorithm_kind = -1;
-        batch_algorithm_class = NULL;
-    }
+    state->u.fftdiv.working_tensor_time_cursor = tensor_time_cursor;
+    state->u.fftdiv.working_tensor_cache_cursor = tensor_cache_cursor;
+#if defined(__cplusplus)
+    state->u.fftdiv.spectral_scratch.cache_cursor = scratch_cache_cursor;
+    state->u.fftdiv.spectral_scratch.time_cursor = scratch_time_cursor;
+#endif
 
     *out_buffer = buffer;
     *out_channels = input_channels;
+
     if (metrics != NULL) {
-        metrics->measured_delay_frames = (uint32_t)(window_size > 0 ? window_size - 1 : 0);
-        double complexity = 0.0;
-        if (state->u.fftdiv.algorithm == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            complexity = (double)slot_count * (double)state->u.fftdiv.dynamic_k_active * (double)window_size * 8.0;
-        } else if (
-            state->u.fftdiv.algorithm == FFT_ALGORITHM_EIGEN
-            || state->u.fftdiv.algorithm == FFT_ALGORITHM_HOOK
-        ) {
-            double stages = log((double)window_size) / log(2.0);
-            if (stages < 1.0) {
-                stages = 1.0;
-            }
-            complexity = (double)slot_count * (double)window_size * (stages * 6.0 + 4.0);
-        } else {
-            complexity = (double)slot_count * (double)window_size * (double)window_size * 2.0;
-        }
-        float heat = (float)(complexity / 1000.0);
-        if (heat < 0.001f) {
-            heat = 0.001f;
-        }
-        metrics->accumulated_heat = heat;
-        state->u.fftdiv.total_heat += (double)heat;
-        metrics->reserved[0] = state->u.fftdiv.last_phase;
-        metrics->reserved[1] = state->u.fftdiv.last_lower;
-        metrics->reserved[2] = state->u.fftdiv.last_upper;
-        metrics->reserved[3] = state->u.fftdiv.last_filter;
-        metrics->reserved[4] = (double)window_size;
-        metrics->reserved[5] = (double)state->u.fftdiv.algorithm;
+        metrics->accumulated_heat = 0.0f;
+        metrics->reserved[0] = 0.0f;
+        metrics->reserved[1] = 0.0f;
+        metrics->reserved[2] = 0.0f;
+        metrics->reserved[3] = 0.0f;
+        metrics->reserved[4] = (float)window_size;
+        metrics->reserved[5] = (float)default_algorithm;
     }
+
     return 0;
 }
 
@@ -812,544 +1033,15 @@ static int run_fft_division_node_backward(
     node_state_t *state,
     AmpNodeMetrics *metrics
 ) {
-    if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
-        return -1;
-    }
-    if (frames <= 0) {
-        frames = 1;
-    }
-    if (batches <= 0) {
-        batches = 1;
-    }
-    int input_channels = channels;
-    if (input_channels <= 0) {
-        if (inputs->audio.channels > 0U) {
-            input_channels = (int)inputs->audio.channels;
-        } else {
-            input_channels = 1;
-        }
-    }
-    int slot_count = batches * input_channels;
-    if (slot_count <= 0) {
-        slot_count = 1;
-    }
-
-    int window_size = json_get_int(descriptor->params_json, descriptor->params_len, "window_size", 8);
-    if (window_size <= 0) {
-        window_size = 1;
-    }
-    double epsilon_default = json_get_double(descriptor->params_json, descriptor->params_len, "stabilizer", 1e-9);
-    double epsilon_json = json_get_double(descriptor->params_json, descriptor->params_len, "epsilon", epsilon_default);
-    if (epsilon_json <= 0.0) {
-        epsilon_json = 1e-9;
-    }
-    int max_batch_windows = json_get_int(
-        descriptor->params_json,
-        descriptor->params_len,
-        "max_batch_windows",
-        32
-    );
-    if (max_batch_windows <= 0) {
-        max_batch_windows = 1;
-    }
-
-    int default_algorithm = parse_algorithm_string(descriptor->params_json, descriptor->params_len, FFT_ALGORITHM_EIGEN);
-    default_algorithm = clamp_algorithm_kind(default_algorithm);
-    int default_window_kind = parse_window_string(descriptor->params_json, descriptor->params_len, FFT_WINDOW_HANN);
-    default_window_kind = clamp_window_kind(default_window_kind);
-
-    if (ensure_fft_state_buffers(state, slot_count, window_size, max_batch_windows) != 0) {
-        return -1;
-    }
-    state->u.fftdiv.max_batch_windows = max_batch_windows;
-    if (state->u.fftdiv.window_kind != default_window_kind) {
-        fill_window_weights(state->u.fftdiv.window, window_size, default_window_kind);
-        state->u.fftdiv.window_kind = default_window_kind;
-    }
-
-    const EdgeRunnerParamView *divisor_view = find_param(inputs, "divisor");
-    const EdgeRunnerParamView *divisor_imag_view = find_param(inputs, "divisor_imag");
-    const EdgeRunnerParamView *stabilizer_view = find_param(inputs, "stabilizer");
-    const EdgeRunnerParamView *algorithm_view = find_param(inputs, "algorithm_selector");
-    const EdgeRunnerParamView *window_view = find_param(inputs, "window_selector");
-    const EdgeRunnerParamView *phase_view = find_param(inputs, "phase_offset");
-    const EdgeRunnerParamView *lower_view = find_param(inputs, "lower_band");
-    const EdgeRunnerParamView *upper_view = find_param(inputs, "upper_band");
-    const EdgeRunnerParamView *filter_view = find_param(inputs, "filter_intensity");
-
-    size_t divisor_total = param_total_count(divisor_view);
-    size_t divisor_imag_total = param_total_count(divisor_imag_view);
-    size_t stabilizer_total = param_total_count(stabilizer_view);
-    size_t algorithm_total = param_total_count(algorithm_view);
-    size_t window_total = param_total_count(window_view);
-    size_t phase_total = param_total_count(phase_view);
-    size_t lower_total = param_total_count(lower_view);
-    size_t upper_total = param_total_count(upper_view);
-    size_t filter_total = param_total_count(filter_view);
-
-    const EdgeRunnerParamView *carrier_views[FFT_DYNAMIC_CARRIER_LIMIT];
-    uint32_t carrier_view_count = collect_dynamic_carrier_views(inputs, carrier_views, FFT_DYNAMIC_CARRIER_LIMIT);
-
-    size_t total_samples = (size_t)slot_count * (size_t)frames;
-    double *buffer = (double *)malloc(total_samples * sizeof(double));
-    amp_last_alloc_count = total_samples;
-    if (buffer == NULL) {
-        return -1;
-    }
-
-    const double *audio_base = (inputs->audio.has_audio && inputs->audio.data != NULL) ? inputs->audio.data : NULL;
-    int recomb_filled = state->u.fftdiv.recomb_filled;
-    double phase_last_state = state->u.fftdiv.last_phase;
-    double lower_last_state = state->u.fftdiv.last_lower;
-    double upper_last_state = state->u.fftdiv.last_upper;
-    double filter_last_state = state->u.fftdiv.last_filter;
-
-    fft_dynamic_carrier_summary_t carrier_summary = summarize_dynamic_carriers(inputs);
-
-    for (int frame_index = 0; frame_index < frames; ++frame_index) {
-        size_t base_index = (size_t)frame_index * (size_t)slot_count;
-        double epsilon_frame = epsilon_json;
-        if (stabilizer_total > 0U) {
-            double candidate = read_param_value(stabilizer_view, base_index, epsilon_frame);
-            if (candidate < 0.0) {
-                candidate = -candidate;
-            }
-            if (candidate > 0.0) {
-                epsilon_frame = candidate;
-            }
-        }
-        if (epsilon_frame < 1e-12) {
-            epsilon_frame = 1e-12;
-        }
-        int algorithm_kind = default_algorithm;
-        if (algorithm_total > 0U) {
-            double raw = read_param_value(algorithm_view, base_index, (double)algorithm_kind);
-            algorithm_kind = clamp_algorithm_kind(round_to_int(raw));
-        }
-        const fft_algorithm_class_t *algorithm_class = select_fft_algorithm(algorithm_kind);
-        if (algorithm_class == NULL) {
-            free(buffer);
-            return AMP_E_UNSUPPORTED;
-        }
-        if (algorithm_class->requires_hook && !amp_fft_backend_has_hook()) {
-            free(buffer);
-            return AMP_E_UNSUPPORTED;
-        }
-        if (algorithm_class->requires_power_of_two && !is_power_of_two_int(window_size)) {
-            algorithm_class = select_fft_algorithm(FFT_ALGORITHM_DFT);
-            if (algorithm_class == NULL) {
-                free(buffer);
-                return AMP_E_UNSUPPORTED;
-            }
-        }
-        algorithm_kind = algorithm_class->kind;
-        if (algorithm_kind == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            double *window_weights = state->u.fftdiv.window;
-            double inv_window = window_size > 0 ? 1.0 / (double)window_size : 1.0;
-            int dynamic_active_frame = 0;
-            double dynamic_sum_frame = 0.0;
-            state->u.fftdiv.dynamic_k_active = 0;
-            state->u.fftdiv.algorithm = algorithm_kind;
-            state->u.fftdiv.epsilon = epsilon_frame;
-            for (int slot = 0; slot < slot_count; ++slot) {
-                size_t offset = (size_t)slot * (size_t)window_size;
-                double *recomb_ring = state->u.fftdiv.recomb_buffer + offset;
-                double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
-                double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
-                double *phase_ring = state->u.fftdiv.phase_buffer + offset;
-                double *lower_ring = state->u.fftdiv.lower_buffer + offset;
-                double *upper_ring = state->u.fftdiv.upper_buffer + offset;
-                double *filter_ring = state->u.fftdiv.filter_buffer + offset;
-                double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
-                double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
-                double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
-                double filter_mod = filter_ring[window_size > 0 ? window_size - 1 : 0];
-                double lower_clamped = clamp_unit_double(lower_mod);
-                double upper_clamped = clamp_unit_double(upper_mod);
-                if (upper_clamped < lower_clamped) {
-                    double tmp_bounds = lower_clamped;
-                    lower_clamped = upper_clamped;
-                    upper_clamped = tmp_bounds;
-                }
-                double intensity_clamped = clamp_unit_double(filter_mod);
-                double cos_phase = cos(phase_mod);
-                double sin_phase = sin(phase_mod);
-                int has_divisor = (divisor_total > 0U) || (divisor_imag_total > 0U);
-                double carrier_fnorm[FFT_DYNAMIC_CARRIER_LIMIT];
-                int carrier_indices_local[FFT_DYNAMIC_CARRIER_LIMIT];
-                int active_count = 0;
-                double carrier_sum_slot = 0.0;
-                for (uint32_t idx = 0; idx < carrier_view_count && idx < FFT_DYNAMIC_CARRIER_LIMIT; ++idx) {
-                    const EdgeRunnerParamView *carrier_view = carrier_views[idx];
-                    if (carrier_view == NULL) {
-                        continue;
-                    }
-                    size_t total = param_total_count(carrier_view);
-                    if (total == 0U) {
-                        continue;
-                    }
-                    double raw_value = read_param_value(
-                        carrier_view,
-                        base_index + (size_t)slot,
-                        0.0
-                    );
-                    carrier_sum_slot += raw_value;
-                    double normalized = raw_value;
-                    if (sample_rate > 0.0 && fabs(normalized) > 1.0) {
-                        normalized = raw_value / sample_rate;
-                    }
-                    normalized = clamp_unit_double(normalized);
-                    carrier_fnorm[active_count] = normalized;
-                    carrier_indices_local[active_count] = (int)idx;
-                    active_count += 1;
-                }
-                if (active_count > 0) {
-                    size_t phase_offset = (size_t)slot * (size_t)FFT_DYNAMIC_CARRIER_LIMIT;
-                    double *phasor_re = state->u.fftdiv.work_real;
-                    double *phasor_im = state->u.fftdiv.work_imag;
-                    double sample_dynamic = 0.0;
-                    for (int k = 0; k < active_count; ++k) {
-                        size_t carrier_index = (size_t)carrier_indices_local[k];
-                        size_t phase_index = phase_offset + carrier_index;
-                        double theta = state->u.fftdiv.dynamic_phase[phase_index];
-                        double fnorm = carrier_fnorm[k];
-                        double angle = 2.0 * M_PI * fnorm;
-                        double step_re = cos(angle);
-                        double step_im = sin(angle);
-                        state->u.fftdiv.dynamic_step_re[phase_index] = step_re;
-                        state->u.fftdiv.dynamic_step_im[phase_index] = step_im;
-                        double ph_re = cos(theta);
-                        double ph_im = sin(theta);
-                        double div_re_acc = 0.0;
-                        double div_im_acc = 0.0;
-                        double last_re = ph_re;
-                        double last_im = ph_im;
-                        for (int n = 0; n < window_size; ++n) {
-                            double w = window_weights != NULL ? window_weights[n] : 1.0;
-                            phasor_re[n] = ph_re;
-                            phasor_im[n] = ph_im;
-                            if (has_divisor) {
-                                double dw_re = divisor_ring[n] * w;
-                                double dw_im = divisor_imag_ring[n] * w;
-                                div_re_acc += dw_re * ph_re + dw_im * ph_im;
-                                div_im_acc += -dw_re * ph_im + dw_im * ph_re;
-                            }
-                            if (n == window_size - 1) {
-                                last_re = ph_re;
-                                last_im = ph_im;
-                            }
-                            double next_re = ph_re * step_re - ph_im * step_im;
-                            double next_im = ph_re * step_im + ph_im * step_re;
-                            ph_re = next_re;
-                            ph_im = next_im;
-                        }
-                        double theta_next = state->u.fftdiv.dynamic_phase[phase_index] + angle * (double)window_size;
-                        state->u.fftdiv.dynamic_phase[phase_index] = wrap_phase_two_pi(theta_next);
-                        if (!has_divisor) {
-                            div_re_acc = 1.0;
-                            div_im_acc = 0.0;
-                        }
-                        double ratio = clamp_unit_double(fnorm);
-                        double gain = compute_band_gain(ratio, lower_clamped, upper_clamped, intensity_clamped);
-                        if (gain < 1e-6) {
-                            gain = 1e-6;
-                        }
-                        double rotated_re = last_re * cos_phase - last_im * sin_phase;
-                        double rotated_im = last_re * sin_phase + last_im * cos_phase;
-                        double scale_re = rotated_re * gain;
-                        double scale_im = rotated_im * gain;
-                        if (has_divisor) {
-                            double denom = div_re_acc * div_re_acc + div_im_acc * div_im_acc;
-                            if (denom < epsilon_frame) {
-                                denom = epsilon_frame;
-                            }
-                            double tmp_re = (scale_re * div_re_acc + scale_im * div_im_acc) / denom;
-                            double tmp_im = (scale_im * div_re_acc - scale_re * div_im_acc) / denom;
-                            scale_re = tmp_re;
-                            scale_im = tmp_im;
-                        }
-                        for (int n = 0; n < window_size; ++n) {
-                            double w = window_weights != NULL ? window_weights[n] : 1.0;
-                            double coeff = inv_window * w * (scale_re * phasor_re[n] + scale_im * phasor_im[n]);
-                            sample_dynamic += coeff * recomb_ring[n];
-                        }
-                    }
-                    buffer[base_index + (size_t)slot] = sample_dynamic;
-                    if (active_count > dynamic_active_frame) {
-                        dynamic_active_frame = active_count;
-                    }
-                    dynamic_sum_frame += carrier_sum_slot;
-                    continue;
-                }
-                buffer[base_index + (size_t)slot] = 0.0;
-            }
-            state->u.fftdiv.dynamic_carrier_band_count = dynamic_active_frame;
-            state->u.fftdiv.dynamic_carrier_last_sum = dynamic_sum_frame;
-            state->u.fftdiv.dynamic_k_active = dynamic_active_frame;
-            state->u.fftdiv.position = window_size > 0 ? window_size - 1 : 0;
-            continue;
-        }
-        int window_kind = default_window_kind;
-        if (window_total > 0U) {
-            double raw_w = read_param_value(window_view, base_index, (double)window_kind);
-            window_kind = clamp_window_kind(round_to_int(raw_w));
-        }
-        if (state->u.fftdiv.window_kind != window_kind) {
-            fill_window_weights(state->u.fftdiv.window, window_size, window_kind);
-            state->u.fftdiv.window_kind = window_kind;
-        }
-        state->u.fftdiv.algorithm = algorithm_kind;
-        state->u.fftdiv.epsilon = epsilon_frame;
-        if (algorithm_class->supports_dynamic_carriers) {
-            state->u.fftdiv.dynamic_carrier_band_count = (int)carrier_summary.band_count;
-            state->u.fftdiv.dynamic_carrier_last_sum = carrier_summary.last_sum;
-        } else {
-            state->u.fftdiv.dynamic_carrier_band_count = 0;
-            state->u.fftdiv.dynamic_carrier_last_sum = 0.0;
-        }
-
-        double phase_last = phase_last_state;
-        double lower_last = lower_last_state;
-        double upper_last = upper_last_state;
-        double filter_last = filter_last_state;
-
-        for (int slot = 0; slot < slot_count; ++slot) {
-            size_t data_idx = base_index + (size_t)slot;
-            double sample = audio_base != NULL ? audio_base[data_idx] : 0.0;
-            size_t offset = (size_t)slot * (size_t)window_size;
-            double *recomb_ring = state->u.fftdiv.recomb_buffer + offset;
-            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
-            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
-            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
-            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
-            double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
-            double *divisor_imag_ring = state->u.fftdiv.divisor_imag_buffer + offset;
-
-            size_t tail_index = (size_t)(window_size > 0 ? window_size - 1 : 0);
-            double phase_default = (recomb_filled < window_size) ? phase_ring[recomb_filled] : phase_ring[tail_index];
-            double lower_default = (recomb_filled < window_size) ? lower_ring[recomb_filled] : lower_ring[tail_index];
-            double upper_default = (recomb_filled < window_size) ? upper_ring[recomb_filled] : upper_ring[tail_index];
-            double filter_default = (recomb_filled < window_size) ? filter_ring[recomb_filled] : filter_ring[tail_index];
-            double divisor_default = (recomb_filled < window_size) ? divisor_ring[recomb_filled] : divisor_ring[tail_index];
-            double divisor_imag_default = (recomb_filled < window_size) ? divisor_imag_ring[recomb_filled] : divisor_imag_ring[tail_index];
-
-            double phase_sample = phase_total > 0U
-                ? read_param_value(phase_view, base_index + (size_t)slot, phase_default)
-                : phase_default;
-            double lower_sample = lower_total > 0U
-                ? read_param_value(lower_view, base_index + (size_t)slot, lower_default)
-                : lower_default;
-            double upper_sample = upper_total > 0U
-                ? read_param_value(upper_view, base_index + (size_t)slot, upper_default)
-                : upper_default;
-            double filter_sample = filter_total > 0U
-                ? read_param_value(filter_view, base_index + (size_t)slot, filter_default)
-                : filter_default;
-            double divisor_sample = divisor_total > 0U
-                ? read_param_value(divisor_view, base_index + (size_t)slot, divisor_default)
-                : divisor_default;
-            double divisor_imag_sample = divisor_imag_total > 0U
-                ? read_param_value(divisor_imag_view, base_index + (size_t)slot, divisor_imag_default)
-                : divisor_imag_default;
-
-            if (recomb_filled < window_size) {
-                recomb_ring[recomb_filled] = sample;
-                phase_ring[recomb_filled] = phase_sample;
-                lower_ring[recomb_filled] = lower_sample;
-                upper_ring[recomb_filled] = upper_sample;
-                filter_ring[recomb_filled] = filter_sample;
-                divisor_ring[recomb_filled] = divisor_sample;
-                divisor_imag_ring[recomb_filled] = divisor_imag_sample;
-            } else {
-                if (window_size > 1) {
-                    memmove(recomb_ring, recomb_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(phase_ring, phase_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(lower_ring, lower_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(upper_ring, upper_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(filter_ring, filter_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(divisor_ring, divisor_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                    memmove(divisor_imag_ring, divisor_imag_ring + 1, (size_t)(window_size - 1) * sizeof(double));
-                }
-                recomb_ring[window_size - 1] = sample;
-                phase_ring[window_size - 1] = phase_sample;
-                lower_ring[window_size - 1] = lower_sample;
-                upper_ring[window_size - 1] = upper_sample;
-                filter_ring[window_size - 1] = filter_sample;
-                divisor_ring[window_size - 1] = divisor_sample;
-                divisor_imag_ring[window_size - 1] = divisor_imag_sample;
-            }
-
-            phase_last = phase_sample;
-            lower_last = lower_sample;
-            upper_last = upper_sample;
-            filter_last = filter_sample;
-        }
-
-        phase_last_state = phase_last;
-        lower_last_state = lower_last;
-        upper_last_state = upper_last;
-        filter_last_state = filter_last;
-        state->u.fftdiv.last_phase = phase_last;
-        state->u.fftdiv.last_lower = lower_last;
-        state->u.fftdiv.last_upper = upper_last;
-        state->u.fftdiv.last_filter = filter_last;
-        if (recomb_filled < window_size) {
-            recomb_filled += 1;
-            if (recomb_filled > window_size) {
-                recomb_filled = window_size;
-            }
-            for (int slot = 0; slot < slot_count; ++slot) {
-                size_t data_idx = base_index + (size_t)slot;
-                size_t offset = (size_t)slot * (size_t)window_size;
-                double *divisor_ring = state->u.fftdiv.divisor_buffer + offset;
-                double divisor_sample = divisor_ring[recomb_filled > 0 ? recomb_filled - 1 : 0];
-                if (divisor_total > 0U) {
-                    divisor_sample = read_param_value(divisor_view, base_index + (size_t)slot, divisor_sample);
-                }
-                double safe_div = fabs(divisor_sample) < epsilon_frame
-                    ? (divisor_sample >= 0.0 ? epsilon_frame : -epsilon_frame)
-                    : divisor_sample;
-                double quotient_sample = audio_base != NULL ? audio_base[data_idx] : 0.0;
-                buffer[data_idx] = quotient_sample * safe_div;
-            }
-            continue;
-        }
-
-        /* Use the batched FFT path for all STFT work (push each slot into the batch
-           buffers and call fftdiv_flush_batch). This removes the non-batched/inline
-           FFT path and ensures the backend algorithm is used uniformly. */
-        double *window_weights = state->u.fftdiv.window;
-        int max_batch_capacity = state->u.fftdiv.batch_capacity > 0 ? state->u.fftdiv.batch_capacity : 1;
-        int max_batch_runtime = state->u.fftdiv.max_batch_windows;
-        if (max_batch_runtime <= 0 || max_batch_runtime > max_batch_capacity) {
-            max_batch_runtime = max_batch_capacity;
-        }
-        int batch_count = 0;
-        int batch_algorithm_kind = -1;
-        const fft_algorithm_class_t *batch_algorithm_class = NULL;
-
-        for (int slot = 0; slot < slot_count; ++slot) {
-            size_t offset = (size_t)slot * (size_t)window_size;
-            double *recomb_ring = state->u.fftdiv.recomb_buffer + offset;
-            double *phase_ring = state->u.fftdiv.phase_buffer + offset;
-            double *lower_ring = state->u.fftdiv.lower_buffer + offset;
-            double *upper_ring = state->u.fftdiv.upper_buffer + offset;
-            double *filter_ring = state->u.fftdiv.filter_buffer + offset;
-            double phase_mod = phase_ring[window_size > 0 ? window_size - 1 : 0];
-            double lower_mod = lower_ring[window_size > 0 ? window_size - 1 : 0];
-            double upper_mod = upper_ring[window_size > 0 ? window_size - 1 : 0];
-            double filter_mod = filter_ring[window_size > 0 ? window_size - 1 : 0];
-            double lower_clamped = clamp_unit_double(lower_mod);
-            double upper_clamped = clamp_unit_double(upper_mod);
-            if (upper_clamped < lower_clamped) {
-                double tmp_bounds = lower_clamped;
-                lower_clamped = upper_clamped;
-                upper_clamped = tmp_bounds;
-            }
-            double intensity_clamped = clamp_unit_double(filter_mod);
-
-            if (batch_count > 0 && algorithm_kind != batch_algorithm_kind) {
-                if (batch_algorithm_class != NULL) {
-                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-                }
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
-            }
-            if (batch_count == 0) {
-                batch_algorithm_kind = algorithm_kind;
-                batch_algorithm_class = algorithm_class;
-            }
-            if (batch_count >= max_batch_runtime) {
-                if (batch_algorithm_class != NULL) {
-                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-                }
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
-            }
-
-            size_t batch_offset = (size_t)batch_count * (size_t)window_size;
-            double *batched_real = state->u.fftdiv.batch_input_real + batch_offset;
-            double *batched_imag = state->u.fftdiv.batch_input_imag + batch_offset;
-            double *batched_div_real = state->u.fftdiv.batch_div_real + batch_offset;
-            double *batched_div_imag = state->u.fftdiv.batch_div_imag + batch_offset;
-
-            const int use_backend = (batch_algorithm_class != NULL && batch_algorithm_class->forward == fft_algorithm_backend_forward) ? 1 : 0;
-            int apply_window_weights = use_backend ? 0 : 1;
-            if (use_backend && state->u.fftdiv.backend_mode == 0) {
-                apply_window_weights = 1;
-            }
-            for (int i = 0; i < window_size; ++i) {
-                const double w = (apply_window_weights && window_weights != NULL) ? window_weights[i] : 1.0;
-                double sample = recomb_ring[i] * w;
-                double div_re_sample = state->u.fftdiv.divisor_buffer[offset + (size_t)i] * w;
-                double div_im_sample = state->u.fftdiv.divisor_imag_buffer[offset + (size_t)i] * w;
-                batched_real[i] = sample;
-                batched_imag[i] = 0.0;
-                batched_div_real[i] = div_re_sample;
-                batched_div_imag[i] = div_im_sample;
-            }
-
-            state->u.fftdiv.batch_slot_map[batch_count] = slot;
-            state->u.fftdiv.batch_slot_offset[batch_count] = offset;
-            state->u.fftdiv.batch_output_index[batch_count] = base_index + (size_t)slot;
-            state->u.fftdiv.batch_phase[batch_count] = phase_mod;
-            state->u.fftdiv.batch_lower[batch_count] = lower_mod;
-            state->u.fftdiv.batch_upper[batch_count] = upper_mod;
-            state->u.fftdiv.batch_filter[batch_count] = filter_mod;
-            state->u.fftdiv.batch_epsilon[batch_count] = epsilon_frame;
-
-            batch_count += 1;
-            if (batch_count >= max_batch_runtime) {
-                if (batch_algorithm_class != NULL) {
-                    fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-                }
-                batch_count = 0;
-                batch_algorithm_kind = -1;
-                batch_algorithm_class = NULL;
-            }
-        }
-        if (batch_count > 0 && batch_algorithm_class != NULL) {
-            fftdiv_flush_batch(state, batch_algorithm_class, window_size, batch_count, buffer);
-            batch_count = 0;
-            batch_algorithm_kind = -1;
-            batch_algorithm_class = NULL;
-        }
-    }
-    state->u.fftdiv.recomb_filled = recomb_filled;
-    *out_buffer = buffer;
-    *out_channels = input_channels;
-    if (metrics != NULL) {
-        metrics->measured_delay_frames = (uint32_t)(window_size > 0 ? window_size - 1 : 0);
-        double complexity = 0.0;
-        if (state->u.fftdiv.algorithm == FFT_ALGORITHM_DYNAMIC_OSCILLATORS) {
-            complexity = (double)slot_count * (double)state->u.fftdiv.dynamic_k_active * (double)window_size * 8.0;
-        } else if (
-            state->u.fftdiv.algorithm == FFT_ALGORITHM_EIGEN
-            || state->u.fftdiv.algorithm == FFT_ALGORITHM_HOOK
-        ) {
-            double stages = log((double)window_size) / log(2.0);
-            if (stages < 1.0) {
-                stages = 1.0;
-            }
-            complexity = (double)slot_count * (double)window_size * (stages * 6.0 + 4.0);
-        } else {
-            complexity = (double)slot_count * (double)window_size * (double)window_size * 2.0;
-        }
-        float heat = (float)(complexity / 1000.0);
-        if (heat < 0.001f) {
-            heat = 0.001f;
-        }
-        metrics->accumulated_heat = heat;
-        state->u.fftdiv.total_heat += (double)heat;
-        metrics->reserved[0] = state->u.fftdiv.last_phase;
-        metrics->reserved[1] = state->u.fftdiv.last_lower;
-        metrics->reserved[2] = state->u.fftdiv.last_upper;
-        metrics->reserved[3] = state->u.fftdiv.last_filter;
-        metrics->reserved[4] = (double)window_size;
-        metrics->reserved[5] = (double)state->u.fftdiv.algorithm;
-    }
-    return 0;
+    (void)descriptor;
+    (void)inputs;
+    (void)batches;
+    (void)channels;
+    (void)frames;
+    (void)sample_rate;
+    (void)out_buffer;
+    (void)out_channels;
+    (void)state;
+    (void)metrics;
+    return AMP_E_UNSUPPORTED;
 }
-

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 #ifndef AMP_NATIVE_USE_FFTFREE
 #error "AMP_NATIVE_USE_FFTFREE must be defined; fftfree backend is mandatory"
@@ -564,6 +565,125 @@ AMP_CAPI size_t amp_fft_backend_stream_push(
         }
     }
     return frames;
+}
+
+AMP_CAPI void *amp_fft_backend_stream_create_inverse(
+    int n,
+    int window,
+    int hop,
+    int synthesis_window_kind
+) {
+    if (n <= 0) {
+        return nullptr;
+    }
+    if (window <= 0) {
+        window = n;
+    }
+    if (hop <= 0) {
+        hop = 1;
+    }
+    if (synthesis_window_kind < 0) {
+        synthesis_window_kind = FFT_WINDOW_RECT;
+    }
+    return fft_init_full_v2(
+        static_cast<std::size_t>(n),
+        0,
+        1,
+        1,
+        FFT_KERNEL_COOLEYTUKEY,
+        0,
+        nullptr,
+        0,
+        2,
+        window,
+        hop,
+        2,
+        FFT_TRANSFORM_C2C,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        synthesis_window_kind,
+        0.0f,
+        0.0f,
+        synthesis_window_kind,
+        0.0f,
+        0.0f,
+        FFT_WINDOW_NORM_NONE,
+        FFT_COLA_NORMALIZE);
+}
+
+AMP_CAPI size_t amp_fft_backend_stream_push_spectrum(
+    void *handle,
+    const double *in_real,
+    const double *in_imag,
+    size_t frames,
+    int n,
+    double *out_pcm,
+    size_t max_samples,
+    int flush_mode
+) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    if (frames > 0 && (in_real == nullptr || n <= 0)) {
+        return 0;
+    }
+    if (n <= 0) {
+        return 0;
+    }
+
+    std::vector<float> real_f;
+    std::vector<float> imag_f;
+    if (frames > 0) {
+        const size_t total = frames * static_cast<size_t>(n);
+        real_f.resize(total, 0.0f);
+        imag_f.resize(total, 0.0f);
+        for (size_t i = 0; i < total; ++i) {
+            real_f[i] = static_cast<float>(in_real[i]);
+            if (in_imag != nullptr) {
+                imag_f[i] = static_cast<float>(in_imag[i]);
+            }
+        }
+    }
+
+    std::vector<float> pcm_f;
+    float *pcm_ptr = nullptr;
+    if (out_pcm != nullptr && max_samples > 0) {
+        pcm_f.resize(max_samples, 0.0f);
+        pcm_ptr = pcm_f.data();
+    }
+
+    const size_t produced = fft_stream_push_spectrum(
+        handle,
+        frames > 0 ? real_f.data() : nullptr,
+        frames > 0 && !imag_f.empty() ? imag_f.data() : nullptr,
+        frames,
+        pcm_ptr,
+        max_samples,
+        flush_mode);
+
+    if (pcm_ptr != nullptr && produced > 0) {
+        const size_t copy = std::min(produced, max_samples);
+        for (size_t i = 0; i < copy; ++i) {
+            out_pcm[i] = static_cast<double>(pcm_f[i]);
+        }
+    }
+
+    return produced;
+}
+
+AMP_CAPI size_t amp_fft_backend_stream_pending_pcm(void *handle) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    return fft_stream_pending_pcm(handle);
 }
 
 AMP_CAPI void amp_fft_backend_transform(

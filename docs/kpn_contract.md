@@ -23,7 +23,7 @@ This contract consolidates the runtime expectations that every AMP Kahn Process 
 
 ## Reversible Execution and Instrumentation
 - **Forward and backward flows:** Nodes implement a forward renderer (current `amp_run_node`) and provide hooks for reversible/adjoint execution so differentiable workflows can re-use the same contract. Preserve deterministic results whether operating on single frames or batched windows.【F:docs/kpn_development_guidance.md†L20-L33】
-- **FFT metadata surfaces:** Frequency-domain processors publish per-frame phase offsets, band bounds, and filter intensities through descriptor parameters. Implementations such as the reversible FFT divider consume these tensors in both forward and backward modes and report the latest values via `AmpNodeMetrics.reserved[0..3]` when running under `amp_run_node_v2`, keeping forward/backward telemetry aligned without Python fallbacks.【F:src/native/amp_kernels.c†L4090-L4269】【F:src/native/tests/test_fft_division_node.cpp†L588-L816】
+- **FFT metadata surfaces:** Frequency-domain processors may publish phase/band/filter metadata when spectral operators are enabled (currently disabled in pass-through). implementations such as the spectral workstation (FFTDivisionNode) once operators are reintroduced consume these tensors in both forward and backward modes and report the latest values via `AmpNodeMetrics.reserved[0..3]` when running under `amp_run_node_v2`, keeping forward/backward telemetry aligned without Python fallbacks.【F:src/native/amp_kernels.c†L4090-L4269】【F:src/native/tests/test_fft_division_node.cpp†L588-L816】
 - **Slew-aware integrators:** Integrations must respect configured slew limits and cooperate with the runtime’s instrumentation layers that monitor traversal latency and thermodynamic output. Avoid per-frame allocations to keep profiling stable.【F:docs/kpn_development_guidance.md†L28-L33】【F:src/native/include/amp_native.h†L70-L79】
 
 ## Descriptor Authoring Checklist
@@ -49,3 +49,4 @@ When authoring a node descriptor (or serialising it from Python graph assembly),
 - **Modulation schema:** Documents how modulation tensors should be applied, matching the runtime’s add/multiply semantics.【F:src/native/include/amp_native.h†L60-L79】
 
 Keep this checklist in sync with runtime evolutions. When the ABI expands (e.g., `amp_run_node_v2`), update this document first and cross-link any new requirements from the action plan.
+

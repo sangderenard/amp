@@ -35,6 +35,42 @@ typedef struct {
     const double *data;
 } EdgeRunnerParamView;
 
+typedef struct {
+    uint32_t batches;
+    uint32_t channels;
+    uint32_t frames;
+} EdgeRunnerTensorShape;
+
+typedef struct {
+    const char *tap_name;
+    const char *buffer_class;
+    EdgeRunnerTensorShape shape;
+    size_t frame_stride;
+    double *data;
+} EdgeRunnerTapBuffer;
+
+typedef struct {
+    EdgeRunnerTapBuffer *items;
+    uint32_t count;
+} EdgeRunnerTapBufferSet;
+
+typedef struct {
+    const char *tap_name;
+    uint32_t connected;
+    uint32_t subscriber_count;
+    uint32_t primary_consumer_present;
+} EdgeRunnerTapStatus;
+
+typedef struct {
+    EdgeRunnerTapStatus *items;
+    uint32_t count;
+} EdgeRunnerTapStatusSet;
+
+typedef struct {
+    EdgeRunnerTapBufferSet outputs;
+    EdgeRunnerTapStatusSet status;
+} EdgeRunnerTapContext;
+
 /*
  * Node/oscillator contract (notes)
  * --------------------------------
@@ -93,6 +129,7 @@ typedef struct {
 typedef struct {
     EdgeRunnerAudioView audio;
     EdgeRunnerParamSet params;
+    EdgeRunnerTapContext taps;
 } EdgeRunnerNodeInputs;
 
 typedef struct {

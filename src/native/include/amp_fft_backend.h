@@ -82,6 +82,26 @@ AMP_CAPI size_t amp_fft_backend_stream_push(
     int flush_mode
 );
 
+AMP_CAPI void *amp_fft_backend_stream_create_inverse(
+    int n,
+    int window,
+    int hop,
+    int synthesis_window_kind
+);
+
+AMP_CAPI size_t amp_fft_backend_stream_push_spectrum(
+    void *handle,
+    const double *in_real,
+    const double *in_imag,
+    size_t frames,
+    int n,
+    double *out_pcm,
+    size_t max_samples,
+    int flush_mode
+);
+
+AMP_CAPI size_t amp_fft_backend_stream_pending_pcm(void *handle);
+
 AMP_CAPI int amp_fft_backend_has_hook(void);
 
 #ifdef __cplusplus
