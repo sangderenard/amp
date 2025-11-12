@@ -1575,9 +1575,16 @@ typedef struct {
             struct StreamSlot {
                 void *forward_handle{nullptr};
                 void *inverse_handle{nullptr};
+                std::vector<double> forward_stage_real;
+                std::vector<double> forward_stage_imag;
                 std::vector<double> forward_real;
                 std::vector<double> forward_imag;
                 std::size_t forward_frame_capacity{0U};
+                std::size_t forward_ring_capacity_frames{0U};
+                std::size_t forward_ring_write{0U};
+                std::size_t forward_ring_read{0U};
+                std::size_t forward_ring_filled{0U};
+                bool forward_ring_wrapped{false};
                 std::size_t forward_frames_ready{0U};
                 std::vector<double> inverse_scratch;
                 std::deque<double> inverse_queue;
@@ -1624,6 +1631,7 @@ typedef struct {
 #endif
             size_t stream_max_pcm_block;
             size_t stream_max_fft_frames;
+            size_t spectral_ring_capacity_frames;
             size_t stream_backlog_cycles;
             int preserve_tensor_on_ingest;
             int64_t wheel_frame_counter;
@@ -2828,9 +2836,16 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
             amp_fft_backend_stream_destroy(slot.inverse_handle);
             slot.inverse_handle = nullptr;
         }
+        slot.forward_stage_real.clear();
+        slot.forward_stage_imag.clear();
         slot.forward_real.clear();
         slot.forward_imag.clear();
         slot.forward_frame_capacity = 0U;
+        slot.forward_ring_capacity_frames = 0U;
+        slot.forward_ring_write = 0U;
+        slot.forward_ring_read = 0U;
+        slot.forward_ring_filled = 0U;
+        slot.forward_ring_wrapped = false;
         slot.forward_frames_ready = 0U;
         slot.inverse_scratch.clear();
         slot.inverse_queue.clear();
@@ -2856,11 +2871,19 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
         window_kind = FFT_WINDOW_RECTANGULAR;
     }
 
-    size_t frame_capacity = state->u.fftdiv.stream_max_fft_frames;
-    if (frame_capacity == 0U) {
-        frame_capacity = 1U;
+    size_t ring_frames = state->u.fftdiv.spectral_ring_capacity_frames;
+    if (ring_frames == 0U) {
+        ring_frames = state->u.fftdiv.stream_max_fft_frames;
     }
-    const size_t spectral_capacity = frame_capacity * (size_t)window_size;
+    if (ring_frames == 0U) {
+        ring_frames = 1U;
+    }
+    size_t stage_frames = state->u.fftdiv.stream_max_fft_frames;
+    if (stage_frames == 0U) {
+        stage_frames = 1U;
+    }
+    const size_t spectral_capacity = ring_frames * (size_t)window_size;
+    const size_t stage_capacity = stage_frames * (size_t)window_size;
 
     bool rebuild = false;
     if (state->u.fftdiv.stream_slots.size() != static_cast<std::size_t>(slots)) {
@@ -2873,6 +2896,12 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
     if (!rebuild) {
         try {
             for (auto &slot : state->u.fftdiv.stream_slots) {
+                if (slot.forward_stage_real.size() != stage_capacity) {
+                    slot.forward_stage_real.assign(stage_capacity, 0.0);
+                }
+                if (slot.forward_stage_imag.size() != stage_capacity) {
+                    slot.forward_stage_imag.assign(stage_capacity, 0.0);
+                }
                 if (slot.forward_real.size() != spectral_capacity) {
                     slot.forward_real.assign(spectral_capacity, 0.0);
                 }
@@ -2882,7 +2911,12 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
                 if (slot.inverse_scratch.size() != static_cast<std::size_t>(window_size)) {
                     slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
                 }
-                slot.forward_frame_capacity = frame_capacity;
+                slot.forward_frame_capacity = stage_frames;
+                slot.forward_ring_capacity_frames = ring_frames;
+                slot.forward_ring_write = 0U;
+                slot.forward_ring_read = 0U;
+                slot.forward_ring_filled = 0U;
+                slot.forward_ring_wrapped = false;
                 slot.forward_frames_ready = 0U;
             }
         } catch (...) {
@@ -2903,9 +2937,16 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             if (slot.inverse_handle == nullptr) {
                 throw std::bad_alloc();
             }
+            slot.forward_stage_real.assign(stage_capacity, 0.0);
+            slot.forward_stage_imag.assign(stage_capacity, 0.0);
             slot.forward_real.assign(spectral_capacity, 0.0);
             slot.forward_imag.assign(spectral_capacity, 0.0);
-            slot.forward_frame_capacity = frame_capacity;
+            slot.forward_frame_capacity = stage_frames;
+            slot.forward_ring_capacity_frames = ring_frames;
+            slot.forward_ring_write = 0U;
+            slot.forward_ring_read = 0U;
+            slot.forward_ring_filled = 0U;
+            slot.forward_ring_wrapped = false;
             slot.forward_frames_ready = 0U;
             slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
             slot.inverse_queue.clear();
@@ -2940,6 +2981,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.preserve_tensor_on_ingest = 0;
     state->u.fftdiv.stream_max_pcm_block = 0;
     state->u.fftdiv.stream_max_fft_frames = 0;
+    state->u.fftdiv.spectral_ring_capacity_frames = 0;
     state->u.fftdiv.stream_backlog_cycles = 1;
 #if defined(__cplusplus)
     delete state->u.fftdiv.working_tensor;
