@@ -161,6 +161,92 @@ static void tap_buffer_write_row(
     }
 }
 
+#if defined(__cplusplus)
+static int fftdiv_execute_identity_stream(
+    double *pcm_buffer,
+    int frames,
+    int window_size,
+    int window_kind,
+    const double *audio_base,
+    const EdgeRunnerTapBuffer *spectral_real_tap,
+    const EdgeRunnerTapBuffer *spectral_imag_tap
+) {
+    if (pcm_buffer == NULL || frames <= 0 || window_size <= 0) {
+        return -1;
+    }
+
+    void *forward = amp_fft_backend_stream_create(window_size, window_size, 1, window_kind);
+    void *inverse = amp_fft_backend_stream_create_inverse(window_size, window_size, 1, window_kind);
+    if (forward == NULL || inverse == NULL) {
+        if (forward != NULL) {
+            amp_fft_backend_stream_destroy(forward);
+        }
+        if (inverse != NULL) {
+            amp_fft_backend_stream_destroy(inverse);
+        }
+        return -1;
+    }
+
+    std::vector<double> spectral_real((size_t)window_size, 0.0);
+    std::vector<double> spectral_imag((size_t)window_size, 0.0);
+    std::vector<double> inverse_scratch((size_t)window_size, 0.0);
+    std::deque<double> pending_pcm;
+    bool warmup_complete = false;
+
+    for (int frame = 0; frame < frames; ++frame) {
+        const double sample = (audio_base != NULL) ? audio_base[frame] : 0.0;
+
+        size_t frames_emitted = amp_fft_backend_stream_push(
+            forward,
+            &sample,
+            1,
+            window_size,
+            spectral_real.data(),
+            spectral_imag.data(),
+            1,
+            AMP_FFT_STREAM_FLUSH_NONE);
+
+        if (frames_emitted > 0) {
+            warmup_complete = true;
+        } else {
+            for (int bin = 0; bin < window_size; ++bin) {
+                spectral_real[(size_t)bin] = 0.0;
+                spectral_imag[(size_t)bin] = 0.0;
+            }
+        }
+
+        if (frames_emitted > 0) {
+            size_t produced = amp_fft_backend_stream_push_spectrum(
+                inverse,
+                spectral_real.data(),
+                spectral_imag.data(),
+                frames_emitted,
+                window_size,
+                inverse_scratch.data(),
+                inverse_scratch.size(),
+                AMP_FFT_STREAM_FLUSH_NONE);
+            for (size_t i = 0; i < produced && i < inverse_scratch.size(); ++i) {
+                pending_pcm.push_back(inverse_scratch[i]);
+            }
+        }
+
+        double pcm_value = sample;
+        if (warmup_complete && !pending_pcm.empty()) {
+            pcm_value = pending_pcm.front();
+            pending_pcm.pop_front();
+        }
+
+        pcm_buffer[frame] = pcm_value;
+        tap_buffer_write_row(spectral_real_tap, 0, frame, spectral_real.data(), window_size);
+        tap_buffer_write_row(spectral_imag_tap, 0, frame, spectral_imag.data(), window_size);
+    }
+
+    amp_fft_backend_stream_destroy(forward);
+    amp_fft_backend_stream_destroy(inverse);
+    return 0;
+}
+#endif
+
 static void zero_spectral_buffer(double *spectral_real, double *spectral_imag, int window_size) {
     if (spectral_real != NULL) {
         memset(spectral_real, 0, (size_t)window_size * sizeof(double));
@@ -943,6 +1029,50 @@ static int run_fft_division_node(
         free(buffer);
         return AMP_E_UNSUPPORTED;
     }
+
+#if defined(__cplusplus)
+    const bool has_spectral_inputs =
+        (spectral_input_real_view != NULL && spectral_input_real_view->data != NULL) ||
+        (spectral_input_imag_view != NULL && spectral_input_imag_view->data != NULL);
+    if (slot_count == 1 && batches <= 1 && input_channels == 1 && !has_spectral_inputs) {
+        if (fftdiv_execute_identity_stream(
+                buffer,
+                frames,
+                window_size,
+                default_window_kind,
+                audio_base,
+                spectral_real_tap,
+                spectral_imag_tap) != 0) {
+            free(buffer);
+            return -1;
+        }
+
+        state->u.fftdiv.wheel_length = window_size;
+        state->u.fftdiv.wheel_head = 0;
+        state->u.fftdiv.wheel_tail = 0;
+        state->u.fftdiv.wheel_filled_slices = 0;
+        state->u.fftdiv.wheel_hop = working_hop > 0 ? working_hop : 1;
+        state->u.fftdiv.wheel_frame_counter = 0;
+        state->u.fftdiv.timeline_seconds = 0.0;
+
+        *out_buffer = buffer;
+        *out_channels = input_channels;
+
+        if (metrics != NULL) {
+            metrics->measured_delay_frames = (uint32_t)((window_size > 0) ? (window_size - 1) : 0);
+            metrics->accumulated_heat = 0.0f;
+            metrics->processing_time_seconds = 0.0;
+            metrics->logging_time_seconds = 0.0;
+            metrics->total_time_seconds = 0.0;
+            metrics->thread_cpu_time_seconds = 0.0;
+            for (size_t i = 0; i < sizeof(metrics->reserved) / sizeof(metrics->reserved[0]); ++i) {
+                metrics->reserved[i] = 0.0;
+            }
+        }
+
+        return 0;
+    }
+#endif
 
     FftWorkingTensor *working_tensor = state->u.fftdiv.working_tensor;
     const int tensor_time_slices = state->u.fftdiv.working_tensor_time_slices > 0
