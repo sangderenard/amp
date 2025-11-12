@@ -930,6 +930,11 @@ static int run_fft_division_node(
     }
 
     const double *audio_base = (inputs->audio.has_audio && inputs->audio.data != NULL) ? inputs->audio.data : NULL;
+    if (audio_base != NULL) {
+        memcpy(buffer, audio_base, total_samples * sizeof(double));
+    } else {
+        memset(buffer, 0, total_samples * sizeof(double));
+    }
     const EdgeRunnerParamView *spectral_input_real_view = find_param(inputs, "spectral_input_real");
     const EdgeRunnerParamView *spectral_input_imag_view = find_param(inputs, "spectral_input_imag");
     const EdgeRunnerTapBuffer *spectral_real_tap = find_tap_buffer(&inputs->taps, "spectral_real");
@@ -1024,6 +1029,7 @@ static int run_fft_division_node(
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t data_idx = base_index + (size_t)slot;
             auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
+            const bool warmup_was_complete = slot_state.warmup_complete;
             auto &forward_real = slot_state.forward_real;
             auto &forward_imag = slot_state.forward_imag;
             double *slot_spectral_real = slot_state.forward_real.empty() ? NULL : slot_state.forward_real.data();
@@ -1187,6 +1193,9 @@ static int run_fft_division_node(
             lane_last_sample[(size_t)slot] = last_sample;
             if (frames_emitted > 0) {
                 slot_state.warmup_complete = true;
+                if (!warmup_was_complete) {
+                    slot_state.drop_first_inverse_sample = true;
+                }
             }
             if (!slot_state.warmup_complete) {
                 double staged = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
@@ -1475,6 +1484,11 @@ static int run_fft_division_node(
                         slot_state.inverse_scratch.data(),
                         slot_state.inverse_scratch.size(),
                         AMP_FFT_STREAM_FLUSH_NONE);
+                    if (slot_state.drop_first_inverse_sample && produced_pcm > 0 && !slot_state.inverse_scratch.empty()) {
+                        double passthrough = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
+                        slot_state.inverse_scratch[0] = passthrough;
+                        slot_state.drop_first_inverse_sample = false;
+                    }
 #if FFTDIV_TRACE_ENABLED
                     FFTDIV_TRACE(
                         "[fftdiv] inverse-produce slot=%d frame=%d produced=%zu",

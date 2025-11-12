@@ -27,6 +27,11 @@ if (NOT EXISTS "${EIGEN3_INCLUDE_DIR}/Eigen/Core")
     endif()
 endif()
 
+if (NOT TARGET Eigen3::Eigen)
+    add_library(Eigen3::Eigen INTERFACE IMPORTED)
+    set_target_properties(Eigen3::Eigen PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
+endif()
+
 set(FFTFREE_BUILD_SHARED OFF CACHE BOOL "Build fft_cffi as a shared library" FORCE)
 set(FFTFREE_BUILD_APPS OFF CACHE BOOL "Build fftfree standalone demos and tools" FORCE)
 set(FFTFREE_BUILD_TESTS OFF CACHE BOOL "Build fftfree test executables" FORCE)
