@@ -1590,6 +1590,7 @@ typedef struct {
                 std::deque<double> inverse_queue;
                 bool warmup_complete{false};
                 bool drop_first_inverse_sample{false};
+                double last_pcm_output{0.0};
             };
             std::vector<StreamSlot> stream_slots;
             struct LaneBinding {
@@ -1601,8 +1602,6 @@ typedef struct {
                 bool enable_spectral_out{false};
                 bool active{false};
                 bool frame_ready{false};
-                double staged_pcm_value{0.0};
-                bool staged_pcm_valid{false};
             };
             std::vector<LaneBinding> lane_plan;
             FftDivSpectralScratch spectral_scratch;
@@ -2851,6 +2850,7 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.inverse_queue.clear();
         slot.warmup_complete = false;
         slot.drop_first_inverse_sample = false;
+        slot.last_pcm_output = 0.0;
     }
     state->u.fftdiv.stream_slots.clear();
 }
@@ -2952,6 +2952,7 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.inverse_queue.clear();
             slot.warmup_complete = false;
             slot.drop_first_inverse_sample = false;
+            slot.last_pcm_output = 0.0;
         }
     } catch (...) {
         fftdiv_reset_stream_slots(state);
