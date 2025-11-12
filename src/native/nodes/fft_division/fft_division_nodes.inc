@@ -52,8 +52,6 @@ static void write_param_tensor3(
 
 struct FftDivLaneFrameState {
     bool frame_ready{false};
-    bool staged_pcm_valid{false};
-    double staged_pcm_value{0.0};
 };
 
 struct FftDivFilledSlice {
@@ -68,6 +66,7 @@ struct FftDivFilledSlice {
     double timeline_seconds{0.0};
     bool working_tensor_updated{false};
     std::vector<FftDivLaneFrameState> lanes;
+    std::vector<size_t> lane_frame_offsets;
 };
 
 typedef struct {
@@ -1208,7 +1207,6 @@ static int run_fft_division_node(
     const int scratch_slice = scratch_time_cursor;
 
     std::vector<size_t> lane_frames_emitted(static_cast<size_t>(slot_count), 0U);
-    std::vector<double> lane_last_sample(static_cast<size_t>(slot_count), 0.0);
     std::vector<double> lane_pcm_batch(static_cast<size_t>(slot_count) * static_cast<size_t>(frames), 0.0);
 
         for (int slot = 0; slot < slot_count; ++slot) {
@@ -1222,13 +1220,8 @@ static int run_fft_division_node(
             auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
 
             lane.frame_ready = false;
-            lane.staged_pcm_value = 0.0;
-            lane.staged_pcm_valid = false;
 
             if (slot_spectral_real == NULL || slot_spectral_imag == NULL) {
-                double passthrough = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
-                lane.staged_pcm_value = passthrough;
-                lane.staged_pcm_valid = true;
                 continue;
             }
 
@@ -1243,24 +1236,20 @@ static int run_fft_division_node(
                     memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
                 }
                 slot_state.inverse_queue.clear();
-                lane.staged_pcm_value = 0.0;
-                lane.staged_pcm_valid = true;
                 continue;
             }
 
             size_t frames_emitted = 0;
-            double last_sample = 0.0;
             if (lane.enable_pcm_in && audio_base != NULL) {
                 const size_t hop = (size_t)slot_count;
                 double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
                 for (int frame_cursor = 0; frame_cursor < frames; ++frame_cursor) {
                     const size_t audio_index = (size_t)frame_cursor * hop + (size_t)slot;
+                    double input_sample = 0.0;
                     if (audio_index < (size_t)slot_count * (size_t)frames) {
-                        last_sample = audio_base[audio_index];
-                    } else {
-                        last_sample = 0.0;
+                        input_sample = audio_base[audio_index];
                     }
-                    pcm_cursor[frame_cursor] = last_sample;
+                    pcm_cursor[frame_cursor] = input_sample;
                 }
                 if (slot_state.forward_handle != NULL && frames > 0) {
                     size_t stage_capacity_frames = slot_state.forward_frame_capacity;
@@ -1406,7 +1395,6 @@ static int run_fft_division_node(
             }
             lane_frames_emitted[(size_t)slot] = frames_emitted;
             slot_state.forward_frames_ready = slot_state.forward_ring_filled;
-            lane_last_sample[(size_t)slot] = last_sample;
             if (frames_emitted > 0) {
                 slot_state.warmup_complete = true;
                 if (!warmup_was_complete) {
@@ -1414,17 +1402,14 @@ static int run_fft_division_node(
                 }
             }
             if (!slot_state.warmup_complete) {
-                double staged = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
 #if FFTDIV_TRACE_ENABLED
                 FFTDIV_TRACE(
                     "[fftdiv] warmup slot=%d frame=%d emitted=%zu staged=%f",
                     slot,
                     frame_index_int,
                     frames_emitted,
-                    staged);
+                    slot_state.last_pcm_output);
 #endif
-                lane.staged_pcm_value = staged;
-                lane.staged_pcm_valid = true;
                 continue;
             }
             if (frames_emitted == 0) {
@@ -1492,35 +1477,9 @@ static int run_fft_division_node(
                 }
                 if (!lane.enable_pcm_out) {
                     slot_state.inverse_queue.clear();
-                    lane.staged_pcm_value = 0.0;
-                } else if (!slot_state.inverse_queue.empty()) {
-                    lane.staged_pcm_value = slot_state.inverse_queue.front();
-                } else {
-                    lane.staged_pcm_value = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
                 }
-                lane.staged_pcm_valid = true;
                 continue;
             }
-            if (!lane.enable_pcm_out) {
-                lane.staged_pcm_value = 0.0;
-            } else if (!slot_state.inverse_queue.empty()) {
-#if FFTDIV_TRACE_ENABLED
-                size_t inverse_pending_post = (slot_state.inverse_handle != NULL)
-                    ? amp_fft_backend_stream_pending_pcm(slot_state.inverse_handle)
-                    : 0U;
-                FFTDIV_TRACE(
-                    "[fftdiv] emit slot=%d frame=%d value=%f queue_before=%zu pending_pcm=%zu",
-                    slot,
-                    frame_index_int,
-                    slot_state.inverse_queue.front(),
-                    (size_t)slot_state.inverse_queue.size(),
-                    inverse_pending_post);
-#endif
-                lane.staged_pcm_value = slot_state.inverse_queue.front();
-            } else {
-                lane.staged_pcm_value = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
-            }
-            lane.staged_pcm_valid = true;
         }
     double effective_sample_rate = state->u.fftdiv.sample_rate_hint;
     if (sample_rate > 0.0) {
@@ -1573,14 +1532,6 @@ static int run_fft_division_node(
                 }
             }
 
-            if (!lane_iter.enable_pcm_out) {
-                lane_iter.staged_pcm_value = 0.0;
-            } else if (!slot_state_iter.inverse_queue.empty()) {
-                lane_iter.staged_pcm_value = slot_state_iter.inverse_queue.front();
-            } else {
-                lane_iter.staged_pcm_value = lane_last_sample[(size_t)slot];
-            }
-            lane_iter.staged_pcm_valid = true;
         }
 
         const bool barrier_satisfied = (active_lane_count == 0)
@@ -1672,29 +1623,33 @@ static int run_fft_division_node(
             }
         }
 
-    const size_t next_slice_index = filled_slices.size();
-    FftDivFilledSlice slice;
+        const size_t next_slice_index = filled_slices.size();
+        FftDivFilledSlice slice;
         slice.tensor_slice = tensor_slice_iter;
         slice.scratch_slice = scratch_slice_iter;
         slice.view_filled_override = view_filled_override;
         slice.wheel_head = wheel_head_cursor;
         slice.wheel_tail = wheel_tail_cursor;
         slice.frame_index = frame_index_iter;
-    slice.pcm_sample_index = frame_index_iter * (int64_t)slot_count;
-    slice.slice_index = next_slice_index;
+        slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)slot_count;
+        slice.slice_index = next_slice_index;
         slice.timeline_seconds = timeline_cursor;
         slice.working_tensor_updated = iteration_updated;
         slice.lanes.resize(static_cast<size_t>(slot_count));
+        slice.lane_frame_offsets.resize(static_cast<size_t>(slot_count), 0U);
 
         for (int slot = 0; slot < slot_count; ++slot) {
             auto &lane_meta = state->u.fftdiv.lane_plan[(size_t)slot];
             auto &lane_snapshot = slice.lanes[(size_t)slot];
             lane_snapshot.frame_ready = lane_meta.frame_ready;
-            lane_snapshot.staged_pcm_valid = lane_meta.staged_pcm_valid;
-            lane_snapshot.staged_pcm_value = lane_meta.staged_pcm_value;
+            if ((size_t)slot < slice.lane_frame_offsets.size()) {
+                const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
+                    ? lane_frame_offsets[(size_t)slot]
+                    : 0U;
+                slice.lane_frame_offsets[(size_t)slot] = frame_offset;
+            }
 
             lane_meta.frame_ready = false;
-            lane_meta.staged_pcm_valid = false;
 
             if (lane_snapshot.frame_ready && (size_t)slot < lane_frame_offsets.size()) {
                 if (lane_frames_remaining[(size_t)slot] > 0U) {
@@ -1732,15 +1687,6 @@ static int run_fft_division_node(
     }
 
     if (filled_slices.empty()) {
-        for (int slot = 0; slot < slot_count; ++slot) {
-            size_t data_idx = base_index + (size_t)slot;
-            auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
-            double fallback = lane.staged_pcm_valid
-                ? lane.staged_pcm_value
-                : lane_last_sample[(size_t)slot];
-            buffer[data_idx] = fallback;
-            lane_last_sample[(size_t)slot] = fallback;
-        }
         metrics_window_span = 0;
     } else {
         for (const auto &slice : filled_slices) {
@@ -1782,20 +1728,32 @@ static int run_fft_division_node(
             }
         }
 
-        size_t output_cursor = 0;
+        std::vector<size_t> lane_frames_consumed(static_cast<size_t>(slot_count), 0U);
         for (const auto &slice : filled_slices) {
             const int tensor_slice_iter = slice.tensor_slice;
             const int scratch_slice_iter = slice.scratch_slice;
             const int64_t frame_index_iter = slice.frame_index;
+            const size_t base_output_index = (slice.pcm_sample_index >= 0)
+                ? (size_t)slice.pcm_sample_index
+                : 0U;
 
             for (int slot = 0; slot < slot_count; ++slot) {
-                size_t data_idx = output_cursor + (size_t)slot;
+                size_t data_idx = base_output_index + (size_t)slot;
                 if (data_idx >= (size_t)slot_count * (size_t)frames) {
                     break;
                 }
                 auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
-                const double *ring_real = fftdiv_ring_frame_real(slot_state, 0U, window_size);
-                const double *ring_imag = fftdiv_ring_frame_imag(slot_state, 0U, window_size);
+                const size_t assigned_offset = (slice.lane_frame_offsets.size() > (size_t)slot)
+                    ? slice.lane_frame_offsets[(size_t)slot]
+                    : 0U;
+                const size_t consumed_so_far = (lane_frames_consumed.size() > (size_t)slot)
+                    ? lane_frames_consumed[(size_t)slot]
+                    : 0U;
+                const size_t relative_offset = (assigned_offset >= consumed_so_far)
+                    ? (assigned_offset - consumed_so_far)
+                    : 0U;
+                const double *ring_real = fftdiv_ring_frame_real(slot_state, relative_offset, window_size);
+                const double *ring_imag = fftdiv_ring_frame_imag(slot_state, relative_offset, window_size);
                 double *slot_spectral_real = (ring_real != NULL)
                     ? const_cast<double *>(ring_real)
                     : slot_state.forward_real.data();
@@ -1808,10 +1766,8 @@ static int run_fft_division_node(
                 double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice_iter);
                 double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, tensor_lane, scratch_slice_iter);
                 const int scratch_bins = fftdiv_spectral_scratch_bins(state);
-
-                double output_value = lane_snapshot.staged_pcm_valid
-                    ? lane_snapshot.staged_pcm_value
-                    : lane_last_sample[(size_t)slot];
+                double *buffer_ptr = buffer + data_idx;
+                bool wrote_output = false;
 
                 if (lane_snapshot.frame_ready && lane.active && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
                     if ((lane.enable_pcm_out || lane.enable_spectral_out) &&
@@ -1863,8 +1819,7 @@ static int run_fft_division_node(
                             slot_state.inverse_scratch.size(),
                             AMP_FFT_STREAM_FLUSH_NONE);
                         if (slot_state.drop_first_inverse_sample && produced_pcm > 0 && !slot_state.inverse_scratch.empty()) {
-                            double passthrough = lane_last_sample[(size_t)slot];
-                            slot_state.inverse_scratch[0] = passthrough;
+                            slot_state.inverse_scratch[0] = slot_state.last_pcm_output;
                             slot_state.drop_first_inverse_sample = false;
                         }
 #if FFTDIV_TRACE_ENABLED
@@ -1889,16 +1844,24 @@ static int run_fft_division_node(
                     }
 
                     if (lane.enable_pcm_out && !slot_state.inverse_queue.empty()) {
-                        output_value = slot_state.inverse_queue.front();
+                        const double output_value = slot_state.inverse_queue.front();
                         slot_state.inverse_queue.pop_front();
+                        *buffer_ptr = output_value;
+                        slot_state.last_pcm_output = output_value;
+                        wrote_output = true;
                     } else if (!lane.enable_pcm_out) {
-                        output_value = 0.0;
+                        slot_state.last_pcm_output = 0.0;
+                        *buffer_ptr = 0.0;
+                        wrote_output = true;
                     }
 
                     if (slot_state.forward_ring_filled > 0U && slot_state.forward_ring_capacity_frames > 0U) {
                         slot_state.forward_ring_read =
                             (slot_state.forward_ring_read + 1U) % slot_state.forward_ring_capacity_frames;
                         slot_state.forward_ring_filled -= 1U;
+                        if (lane_frames_consumed.size() > (size_t)slot) {
+                            lane_frames_consumed[(size_t)slot] += 1U;
+                        }
                     }
                 } else {
                     if (!lane.enable_pcm_out) {
@@ -1911,24 +1874,30 @@ static int run_fft_division_node(
                             memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
                         }
                     }
+                    if (lane.enable_pcm_out && !slot_state.inverse_queue.empty()) {
+                        const double output_value = slot_state.inverse_queue.front();
+                        slot_state.inverse_queue.pop_front();
+                        *buffer_ptr = output_value;
+                        slot_state.last_pcm_output = output_value;
+                        wrote_output = true;
+                    } else if (!lane.enable_pcm_out) {
+                        slot_state.last_pcm_output = 0.0;
+                        *buffer_ptr = 0.0;
+                        wrote_output = true;
+                    }
                 }
-
-                buffer[data_idx] = output_value;
-                lane_last_sample[(size_t)slot] = output_value;
+                if (wrote_output) {
 #if FFTDIV_TRACE_ENABLED
-                FFTDIV_TRACE(
-                    "[fftdiv] buffer slot=%d frame=%lld value=%f queue_after=%zu",
-                    slot,
-                    (long long)slice.frame_index,
-                    output_value,
-                    (size_t)slot_state.inverse_queue.size());
+                    FFTDIV_TRACE(
+                        "[fftdiv] buffer slot=%d frame=%lld value=%f queue_after=%zu",
+                        slot,
+                        (long long)slice.frame_index,
+                        *buffer_ptr,
+                        (size_t)slot_state.inverse_queue.size());
 #endif
+                }
             }
 
-            output_cursor += static_cast<size_t>(slot_count);
-            if (output_cursor >= (size_t)slot_count * (size_t)frames) {
-                break;
-            }
         }
 
         wheel_head = wheel_head_cursor;
