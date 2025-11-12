@@ -5,6 +5,8 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <float.h>
 #ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
@@ -1580,6 +1582,7 @@ typedef struct {
                 std::vector<double> inverse_scratch;
                 std::deque<double> inverse_queue;
                 bool warmup_complete{false};
+                bool drop_first_inverse_sample{false};
             };
             std::vector<StreamSlot> stream_slots;
             struct LaneBinding {
@@ -2832,6 +2835,7 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.inverse_scratch.clear();
         slot.inverse_queue.clear();
         slot.warmup_complete = false;
+        slot.drop_first_inverse_sample = false;
     }
     state->u.fftdiv.stream_slots.clear();
 }
@@ -2906,6 +2910,7 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
             slot.inverse_queue.clear();
             slot.warmup_complete = false;
+            slot.drop_first_inverse_sample = false;
         }
     } catch (...) {
         fftdiv_reset_stream_slots(state);
