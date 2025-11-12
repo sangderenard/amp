@@ -235,6 +235,141 @@ static int fftdiv_spectral_scratch_bins(const node_state_t *state) {
     return state->u.fftdiv.spectral_scratch.freq_bins;
 }
 
+static void fftdiv_ring_ensure_capacity(
+    std::vector<double> &buffer,
+    std::size_t required
+) {
+    if (buffer.size() < required) {
+        buffer.resize(required, 0.0);
+    }
+}
+
+template <typename SlotState>
+static void fftdiv_ring_append_frames(
+    node_state_t *state,
+    SlotState &slot,
+    const double *stage_real,
+    const double *stage_imag,
+    size_t frames,
+    int window_size
+) {
+    if (state == nullptr || window_size <= 0 || stage_real == nullptr || stage_imag == nullptr) {
+        return;
+    }
+    if (frames == 0) {
+        return;
+    }
+    const std::size_t capacity_frames = slot.forward_ring_capacity_frames > 0
+        ? slot.forward_ring_capacity_frames
+        : 1U;
+    if (slot.forward_real.size() < capacity_frames * (std::size_t)window_size) {
+        fftdiv_ring_ensure_capacity(slot.forward_real, capacity_frames * (std::size_t)window_size);
+    }
+    if (slot.forward_imag.size() < capacity_frames * (std::size_t)window_size) {
+        fftdiv_ring_ensure_capacity(slot.forward_imag, capacity_frames * (std::size_t)window_size);
+    }
+    std::size_t write = slot.forward_ring_write % capacity_frames;
+    std::size_t read = slot.forward_ring_read % capacity_frames;
+    std::size_t filled = slot.forward_ring_filled;
+    const std::size_t bins = (std::size_t)window_size;
+
+    if (frames >= capacity_frames) {
+        // Keep only the most recent frames.
+        const std::size_t skip = frames - capacity_frames;
+        stage_real += skip * bins;
+        stage_imag += skip * bins;
+        frames = capacity_frames;
+        read = 0U;
+        write = 0U;
+        filled = 0U;
+        slot.forward_ring_wrapped = true;
+    }
+
+    const std::size_t free_frames = (filled < capacity_frames) ? (capacity_frames - filled) : 0U;
+    if (frames > free_frames) {
+        const std::size_t drop = frames - free_frames;
+        if (drop < filled) {
+            read = (read + drop) % capacity_frames;
+            filled -= drop;
+        } else {
+            read = write;
+            filled = 0U;
+        }
+        slot.forward_ring_wrapped = true;
+    }
+
+    std::size_t remaining = frames;
+    while (remaining > 0) {
+        const std::size_t write_frames = std::min(remaining, capacity_frames - write);
+        const std::size_t copy_bins = write_frames * bins;
+        const std::size_t write_offset = write * bins;
+        const std::size_t stage_offset = (frames - remaining) * bins;
+        std::memcpy(
+            slot.forward_real.data() + write_offset,
+            stage_real + stage_offset,
+            copy_bins * sizeof(double));
+        std::memcpy(
+            slot.forward_imag.data() + write_offset,
+            stage_imag + stage_offset,
+            copy_bins * sizeof(double));
+        write = (write + write_frames) % capacity_frames;
+        remaining -= write_frames;
+    }
+
+    filled += frames;
+    if (filled > capacity_frames) {
+        filled = capacity_frames;
+        slot.forward_ring_wrapped = true;
+        read = write;
+    }
+
+    slot.forward_ring_write = write;
+    slot.forward_ring_read = read;
+    slot.forward_ring_filled = filled;
+}
+
+template <typename SlotState>
+static const double *fftdiv_ring_frame_real(
+    const SlotState &slot,
+    size_t frame_offset,
+    int window_size
+) {
+    if (window_size <= 0 || slot.forward_ring_capacity_frames == 0U) {
+        return nullptr;
+    }
+    if (slot.forward_ring_filled == 0U || frame_offset >= slot.forward_ring_filled) {
+        return nullptr;
+    }
+    const std::size_t capacity_frames = slot.forward_ring_capacity_frames;
+    const std::size_t index = (slot.forward_ring_read + frame_offset) % capacity_frames;
+    const std::size_t offset = index * (std::size_t)window_size;
+    if (offset + (std::size_t)window_size > slot.forward_real.size()) {
+        return nullptr;
+    }
+    return slot.forward_real.data() + offset;
+}
+
+template <typename SlotState>
+static const double *fftdiv_ring_frame_imag(
+    const SlotState &slot,
+    size_t frame_offset,
+    int window_size
+) {
+    if (window_size <= 0 || slot.forward_ring_capacity_frames == 0U) {
+        return nullptr;
+    }
+    if (slot.forward_ring_filled == 0U || frame_offset >= slot.forward_ring_filled) {
+        return nullptr;
+    }
+    const std::size_t capacity_frames = slot.forward_ring_capacity_frames;
+    const std::size_t index = (slot.forward_ring_read + frame_offset) % capacity_frames;
+    const std::size_t offset = index * (std::size_t)window_size;
+    if (offset + (std::size_t)window_size > slot.forward_imag.size()) {
+        return nullptr;
+    }
+    return slot.forward_imag.data() + offset;
+}
+
 struct FftDivActiveWindowView {
     std::complex<double> *base{nullptr};
     int lanes{0};
@@ -882,6 +1017,15 @@ static int run_fft_division_node(
     state->u.fftdiv.wheel_hop = working_hop;
     state->u.fftdiv.wheel_length = working_time_slices;
     state->u.fftdiv.wheel_active_window_span = working_active_window_span;
+    size_t spectral_ring_frames = desired_frame_capacity;
+    size_t wheel_frames = (working_time_slices > 0) ? (size_t)working_time_slices : 0U;
+    if (spectral_ring_frames < wheel_frames) {
+        spectral_ring_frames = wheel_frames;
+    }
+    if (spectral_ring_frames == 0U) {
+        spectral_ring_frames = 1U;
+    }
+    state->u.fftdiv.spectral_ring_capacity_frames = spectral_ring_frames;
 
     if (ensure_fft_stream_slots(state, slot_count, window_size, default_window_kind) != 0) {
         return -1;
@@ -1030,8 +1174,8 @@ static int run_fft_division_node(
             size_t data_idx = base_index + (size_t)slot;
             auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
             const bool warmup_was_complete = slot_state.warmup_complete;
-            auto &forward_real = slot_state.forward_real;
-            auto &forward_imag = slot_state.forward_imag;
+            auto &forward_stage_real = slot_state.forward_stage_real;
+            auto &forward_stage_imag = slot_state.forward_stage_imag;
             double *slot_spectral_real = slot_state.forward_real.empty() ? NULL : slot_state.forward_real.data();
             double *slot_spectral_imag = slot_state.forward_imag.empty() ? NULL : slot_state.forward_imag.data();
             auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
@@ -1078,35 +1222,49 @@ static int run_fft_division_node(
                     pcm_cursor[frame_cursor] = last_sample;
                 }
                 if (slot_state.forward_handle != NULL && frames > 0) {
-                    size_t frame_capacity = slot_state.forward_frame_capacity;
-                    if (frame_capacity == 0U) {
-                        frame_capacity = state->u.fftdiv.stream_max_fft_frames;
+                    size_t stage_capacity_frames = slot_state.forward_frame_capacity;
+                    if (stage_capacity_frames == 0U) {
+                        stage_capacity_frames = state->u.fftdiv.stream_max_fft_frames;
                     }
-                    if (frame_capacity == 0U) {
-                        frame_capacity = 1U;
+                    if (stage_capacity_frames == 0U) {
+                        stage_capacity_frames = 1U;
                     }
-                    const size_t spectral_capacity = frame_capacity * (size_t)window_size;
-                    if (slot_state.forward_real.size() != spectral_capacity) {
+                    const size_t stage_capacity = stage_capacity_frames * (size_t)window_size;
+                    if (slot_state.forward_stage_real.size() != stage_capacity) {
                         try {
-                            slot_state.forward_real.assign(spectral_capacity, 0.0);
+                            slot_state.forward_stage_real.assign(stage_capacity, 0.0);
+                        } catch (...) {
+                            slot_state.forward_stage_real.clear();
+                        }
+                    }
+                    if (slot_state.forward_stage_imag.size() != stage_capacity) {
+                        try {
+                            slot_state.forward_stage_imag.assign(stage_capacity, 0.0);
+                        } catch (...) {
+                            slot_state.forward_stage_imag.clear();
+                        }
+                    }
+                    if (slot_state.forward_real.size() != slot_state.forward_ring_capacity_frames * (size_t)window_size) {
+                        try {
+                            slot_state.forward_real.assign(
+                                slot_state.forward_ring_capacity_frames * (size_t)window_size,
+                                0.0);
                         } catch (...) {
                             slot_state.forward_real.clear();
                         }
-                    } else {
-                        std::fill_n(slot_state.forward_real.begin(), spectral_capacity, 0.0);
                     }
-                    if (slot_state.forward_imag.size() != spectral_capacity) {
+                    if (slot_state.forward_imag.size() != slot_state.forward_ring_capacity_frames * (size_t)window_size) {
                         try {
-                            slot_state.forward_imag.assign(spectral_capacity, 0.0);
+                            slot_state.forward_imag.assign(
+                                slot_state.forward_ring_capacity_frames * (size_t)window_size,
+                                0.0);
                         } catch (...) {
                             slot_state.forward_imag.clear();
                         }
-                    } else {
-                        std::fill_n(slot_state.forward_imag.begin(), spectral_capacity, 0.0);
                     }
-                    slot_state.forward_frame_capacity = frame_capacity;
-                    slot_spectral_real = slot_state.forward_real.empty() ? NULL : slot_state.forward_real.data();
-                    slot_spectral_imag = slot_state.forward_imag.empty() ? NULL : slot_state.forward_imag.data();
+                    slot_state.forward_frame_capacity = stage_capacity_frames;
+                    slot_spectral_real = slot_state.forward_stage_real.empty() ? NULL : slot_state.forward_stage_real.data();
+                    slot_spectral_imag = slot_state.forward_stage_imag.empty() ? NULL : slot_state.forward_stage_imag.data();
 #if FFTDIV_TRACE_ENABLED
                     const int pcm_trace_limit = 16;
                     const int pcm_values_to_log = (frames < pcm_trace_limit) ? frames : pcm_trace_limit;
@@ -1144,6 +1302,22 @@ static int run_fft_division_node(
                             slot_spectral_imag,
                             frame_capacity,
                             AMP_FFT_STREAM_FLUSH_NONE);
+                        if (frames_emitted > 0) {
+                            fftdiv_ring_append_frames(
+                                state,
+                                slot_state,
+                                slot_spectral_real,
+                                slot_spectral_imag,
+                                frames_emitted,
+                                window_size);
+                            const double *ring_real = fftdiv_ring_frame_real(slot_state, 0U, window_size);
+                            const double *ring_imag = fftdiv_ring_frame_imag(slot_state, 0U, window_size);
+                            if (ring_real != NULL && ring_imag != NULL) {
+                                slot_spectral_real = const_cast<double *>(ring_real);
+                                slot_spectral_imag = const_cast<double *>(ring_imag);
+                            }
+                            slot_state.forward_frames_ready = slot_state.forward_ring_filled;
+                        }
 #if FFTDIV_TRACE_ENABLED
                         size_t inverse_pending_after = (slot_state.inverse_handle != NULL)
                             ? amp_fft_backend_stream_pending_pcm(slot_state.inverse_handle)
@@ -1180,16 +1354,17 @@ static int run_fft_division_node(
 #endif
                     } else {
                         frames_emitted = 0U;
-                        slot_state.forward_real.assign(spectral_capacity, 0.0);
-                        slot_state.forward_imag.assign(spectral_capacity, 0.0);
-                        slot_state.forward_frame_capacity = frame_capacity;
+                        const size_t ring_capacity = slot_state.forward_ring_capacity_frames * (size_t)window_size;
+                        slot_state.forward_real.assign(ring_capacity, 0.0);
+                        slot_state.forward_imag.assign(ring_capacity, 0.0);
+                        slot_state.forward_frame_capacity = stage_capacity_frames;
                         slot_spectral_real = slot_state.forward_real.data();
                         slot_spectral_imag = slot_state.forward_imag.data();
                     }
                 }
             }
             lane_frames_emitted[(size_t)slot] = frames_emitted;
-            slot_state.forward_frames_ready = frames_emitted;
+            slot_state.forward_frames_ready = slot_state.forward_ring_filled;
             lane_last_sample[(size_t)slot] = last_sample;
             if (frames_emitted > 0) {
                 slot_state.warmup_complete = true;
@@ -1286,8 +1461,10 @@ static int run_fft_division_node(
                 continue;
             }
 
-            lane.frame_ready = true;
-            ready_lane_count += 1;
+            lane.frame_ready = (slot_state.forward_ring_filled > 0U);
+            if (lane.frame_ready) {
+                ready_lane_count += 1;
+            }
 
             if (!lane.enable_pcm_out) {
                 lane.staged_pcm_value = 0.0;
@@ -1425,8 +1602,14 @@ static int run_fft_division_node(
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t data_idx = base_index + (size_t)slot;
             auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
-            double *slot_spectral_real = slot_state.forward_real.data();
-            double *slot_spectral_imag = slot_state.forward_imag.data();
+            const double *ring_real = fftdiv_ring_frame_real(slot_state, 0U, window_size);
+            const double *ring_imag = fftdiv_ring_frame_imag(slot_state, 0U, window_size);
+            double *slot_spectral_real = (ring_real != NULL)
+                ? const_cast<double *>(ring_real)
+                : slot_state.forward_real.data();
+            double *slot_spectral_imag = (ring_imag != NULL)
+                ? const_cast<double *>(ring_imag)
+                : slot_state.forward_imag.data();
             auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
             const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
             double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice);
@@ -1517,6 +1700,11 @@ static int run_fft_division_node(
                     output_value = 0.0;
                 } else {
                     output_value = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
+                }
+                if (slot_state.forward_ring_filled > 0U && slot_state.forward_ring_capacity_frames > 0U) {
+                    slot_state.forward_ring_read =
+                        (slot_state.forward_ring_read + 1U) % slot_state.forward_ring_capacity_frames;
+                    slot_state.forward_ring_filled -= 1U;
                 }
             } else {
                 if (!barrier_satisfied && lane.frame_ready) {
