@@ -45,6 +45,65 @@ static void write_param_tensor3(
     mutable_data[index] = value;
 }
 
+typedef struct {
+    const char *name;
+    int window_size;
+    int hop;
+    int freq_bins;
+    int time_slices;
+    int pcm_block_frames;
+    int backlog_cycles;
+} FftDivPresetSpec;
+
+#ifndef FFTDIV_TRACE_ENABLED
+#define FFTDIV_TRACE_ENABLED 1
+#endif
+
+#if FFTDIV_TRACE_ENABLED
+#define FFTDIV_TRACE(...)                                                        \
+    do {                                                                         \
+        fprintf(stderr, __VA_ARGS__);                                            \
+        fprintf(stderr, "\n");                                                \
+        fflush(stderr);                                                          \
+    } while (0)
+#else
+#define FFTDIV_TRACE(...) ((void)0)
+#endif
+
+static int fftdiv_names_equal(const char *lhs, const char *rhs) {
+    if (lhs == NULL || rhs == NULL) {
+        return 0;
+    }
+    while (*lhs != '\0' && *rhs != '\0') {
+        int la = tolower((unsigned char)(*lhs));
+        int rb = tolower((unsigned char)(*rhs));
+        if (la != rb) {
+            return 0;
+        }
+        lhs += 1;
+        rhs += 1;
+    }
+    return *lhs == '\0' && *rhs == '\0';
+}
+
+static const FftDivPresetSpec *fftdiv_find_preset(const char *name) {
+    if (name == NULL || *name == '\0') {
+        return NULL;
+    }
+    static const FftDivPresetSpec kPresets[] = {
+        { "analysis_1024", 2048, 1024, 1024, 1024, 2048, 512 },
+        { "analysis_512", 1024, 256, 1024, 2048, 1024, 512 },
+        { "low_latency", 512, 128, 512, 1024, 512, 256 }
+    };
+    const size_t count = sizeof(kPresets) / sizeof(kPresets[0]);
+    for (size_t i = 0; i < count; ++i) {
+        if (fftdiv_names_equal(name, kPresets[i].name)) {
+            return &kPresets[i];
+        }
+    }
+    return NULL;
+}
+
 static const EdgeRunnerTapBuffer *find_tap_buffer(
     const EdgeRunnerTapContext *context,
     const char *tap_name
@@ -127,44 +186,42 @@ static void zero_tensor_slice(
 }
 
 #if defined(__cplusplus)
-static double *fftdiv_spectral_scratch_real_ptr(node_state_t *state, int cache_page, int lane, int tensor_slice) {
+static double *fftdiv_spectral_scratch_real_ptr(node_state_t *state, int lane, int tensor_slice) {
     if (state == NULL) {
         return NULL;
     }
     auto &scratch = state->u.fftdiv.spectral_scratch;
-    if (cache_page < 0 || lane < 0 || tensor_slice < 0) {
+    if (lane < 0 || tensor_slice < 0) {
         return NULL;
     }
-    if (cache_page >= scratch.cache_pages || lane >= scratch.lanes || tensor_slice >= scratch.time_slices) {
+    if (lane >= scratch.lanes || tensor_slice >= scratch.time_slices) {
         return NULL;
     }
     if (scratch.freq_bins <= 0) {
         return NULL;
     }
-    const size_t offset = ((((size_t)cache_page * (size_t)scratch.lanes) + (size_t)lane) *
-        (size_t)scratch.time_slices + (size_t)tensor_slice) * (size_t)scratch.freq_bins;
+    const size_t offset = (((size_t)lane * (size_t)scratch.time_slices) + (size_t)tensor_slice) * (size_t)scratch.freq_bins;
     if (offset >= scratch.real.size()) {
         return NULL;
     }
     return scratch.real.data() + offset;
 }
 
-static double *fftdiv_spectral_scratch_imag_ptr(node_state_t *state, int cache_page, int lane, int tensor_slice) {
+static double *fftdiv_spectral_scratch_imag_ptr(node_state_t *state, int lane, int tensor_slice) {
     if (state == NULL) {
         return NULL;
     }
     auto &scratch = state->u.fftdiv.spectral_scratch;
-    if (cache_page < 0 || lane < 0 || tensor_slice < 0) {
+    if (lane < 0 || tensor_slice < 0) {
         return NULL;
     }
-    if (cache_page >= scratch.cache_pages || lane >= scratch.lanes || tensor_slice >= scratch.time_slices) {
+    if (lane >= scratch.lanes || tensor_slice >= scratch.time_slices) {
         return NULL;
     }
     if (scratch.freq_bins <= 0) {
         return NULL;
     }
-    const size_t offset = ((((size_t)cache_page * (size_t)scratch.lanes) + (size_t)lane) *
-        (size_t)scratch.time_slices + (size_t)tensor_slice) * (size_t)scratch.freq_bins;
+    const size_t offset = (((size_t)lane * (size_t)scratch.time_slices) + (size_t)tensor_slice) * (size_t)scratch.freq_bins;
     if (offset >= scratch.imag.size()) {
         return NULL;
     }
@@ -177,6 +234,162 @@ static int fftdiv_spectral_scratch_bins(const node_state_t *state) {
     }
     return state->u.fftdiv.spectral_scratch.freq_bins;
 }
+
+struct FftDivActiveWindowView {
+    std::complex<double> *base{nullptr};
+    int lanes{0};
+    int freq_bins{0};
+    int wheel_length{0};
+    int window_span{0};
+    int window_start{0};
+
+    bool valid() const {
+        return base != nullptr && lanes > 0 && freq_bins > 0 && wheel_length > 0 && window_span > 0;
+    }
+
+    std::complex<double> *element(int time, int freq, int lane) const {
+        if (!valid() || time < 0 || time >= window_span || freq < 0 || freq >= freq_bins || lane < 0 || lane >= lanes) {
+            return nullptr;
+        }
+        const int slice = (window_start + time) % wheel_length;
+        const size_t lane_stride = static_cast<size_t>(freq_bins) * static_cast<size_t>(wheel_length);
+        const size_t freq_stride = static_cast<size_t>(wheel_length);
+        const size_t index =
+            static_cast<size_t>(lane) * lane_stride +
+            static_cast<size_t>(freq) * freq_stride +
+            static_cast<size_t>(slice);
+        return base + index;
+    }
+
+    std::complex<double> *time_slice(int time) const {
+        if (!valid() || time < 0 || time >= window_span) {
+            return nullptr;
+        }
+        const int slice = (window_start + time) % wheel_length;
+        return base + static_cast<size_t>(slice);
+    }
+
+    size_t time_stride() const {
+        return 1U;
+    }
+
+    size_t freq_stride() const {
+        return static_cast<size_t>(wheel_length);
+    }
+
+    size_t lane_stride() const {
+        return static_cast<size_t>(freq_bins) * static_cast<size_t>(wheel_length);
+    }
+};
+
+static FftDivActiveWindowView fftdiv_build_active_window_view_internal(
+    node_state_t *state,
+    FftWorkingTensor *tensor,
+    int tensor_page,
+    int tensor_slice,
+    int filled_override
+) {
+    FftDivActiveWindowView view;
+    if (state == nullptr || tensor == nullptr) {
+        return view;
+    }
+
+    const int lane_count = state->u.fftdiv.working_tensor_lanes > 0
+        ? state->u.fftdiv.working_tensor_lanes
+        : state->u.fftdiv.default_lane_count;
+    const int freq_bins = state->u.fftdiv.working_tensor_freq_bins;
+    const int wheel_length = state->u.fftdiv.working_tensor_time_slices;
+    if (lane_count <= 0 || freq_bins <= 0 || wheel_length <= 0) {
+        return view;
+    }
+
+    if (tensor_page < 0) {
+        tensor_page = 0;
+    }
+    if (tensor_slice < 0) {
+        tensor_slice = 0;
+    }
+    tensor_slice %= wheel_length;
+
+    int requested_span = state->u.fftdiv.wheel_active_window_span;
+    if (requested_span <= 0) {
+        requested_span = wheel_length;
+    }
+    if (requested_span > wheel_length) {
+        requested_span = wheel_length;
+    }
+
+    int available = (filled_override >= 0) ? filled_override : state->u.fftdiv.wheel_filled_slices;
+    if (available < 0) {
+        available = 0;
+    }
+    if (available > wheel_length) {
+        available = wheel_length;
+    }
+
+    view.base = tensor->data() + static_cast<size_t>(tensor_page) * static_cast<size_t>(lane_count) * static_cast<size_t>(freq_bins) * static_cast<size_t>(wheel_length);
+    view.lanes = lane_count;
+    view.freq_bins = freq_bins;
+    view.wheel_length = wheel_length;
+    view.window_start = tensor_slice % wheel_length;
+
+    if (available == 0) {
+        view.window_span = 0;
+        return view;
+    }
+
+    int window_span = requested_span;
+    if (window_span > available) {
+        window_span = available;
+    }
+    if (window_span <= 0) {
+        window_span = available;
+    }
+
+    int window_start = tensor_slice - (window_span - 1);
+    while (window_start < 0) {
+        window_start += wheel_length;
+    }
+    window_start %= wheel_length;
+
+    view.window_span = window_span;
+    view.window_start = window_start;
+    return view;
+}
+
+static FftDivActiveWindowView fftdiv_build_active_window_view(
+    node_state_t *state,
+    FftWorkingTensor *tensor,
+    int tensor_page,
+    int tensor_slice
+) {
+    return fftdiv_build_active_window_view_internal(state, tensor, tensor_page, tensor_slice, -1);
+}
+
+struct FftDivOperatorLaneBinding {
+    int slot_index{-1};
+    int tensor_lane{-1};
+    bool enable_pcm_in{false};
+    bool enable_pcm_out{false};
+    bool enable_spectral_in{false};
+    bool enable_spectral_out{false};
+    bool active{false};
+};
+
+struct FftDivOperatorContext {
+    FftDivActiveWindowView window;
+    const FftDivOperatorLaneBinding *lanes{nullptr};
+    size_t lane_count{0U};
+    int hop{0};
+    int window_size{0};
+    int wheel_length{0};
+    int wheel_head{0};
+    int wheel_tail{0};
+    int64_t frame_index{0};
+    double sample_rate{0.0};
+    double timeline_seconds{0.0};
+    double hop_seconds{0.0};
+};
 #endif
 
 static void fftdiv_copy_spectrum_to_working(
@@ -291,36 +504,25 @@ static void fftdiv_copy_working_to_slot_buffer(
 }
 #endif
 
-static void stage_run_operator_stack(
-    node_state_t *state,
-    double *spectral_real,
-    double *spectral_imag,
-    int window_size,
-    FftWorkingTensor *tensor,
-    int tensor_page,
-    int tensor_lane,
-    int tensor_slice,
-    int tensor_freq_bins
-) {
-    (void)spectral_real;
-    (void)spectral_imag;
-    (void)window_size;
-    (void)tensor;
-    (void)tensor_page;
-    (void)tensor_lane;
-    (void)tensor_slice;
-    (void)tensor_freq_bins;
 #if defined(__cplusplus)
+static void fftdiv_run_operator_stack(
+    node_state_t *state,
+    const FftDivOperatorContext &context
+) {
     if (state == nullptr) {
         return;
     }
+    if (!context.window.valid()) {
+        return;
+    }
+    if (state->u.fftdiv.operator_steps.empty()) {
+        return;
+    }
     (void)state;
-    /* TODO: execute operator_steps using operator_arena tensors. */
-#else
-    (void)state;
-    /* Operators mutate the spectral buffer in-place. Intentionally left empty for now. */
-#endif
+    (void)context;
+    /* TODO: execute operator_steps using operator_arena tensors and context. */
 }
+#endif
 
 static void stage_emit_spectral(
     double *spectral_real,
@@ -517,7 +719,59 @@ static int run_fft_division_node(
         slot_count = 1;
     }
 
-    int window_size = json_get_int(descriptor->params_json, descriptor->params_len, "window_size", 8);
+    const size_t runtime_pcm_block = frames > 0 ? (size_t)frames : 1U;
+    int default_window_size = 8;
+    int default_hop = (default_window_size > 1) ? default_window_size / 2 : 1;
+    int default_freq_bins = default_window_size;
+    int default_time_slices = frames > 0 ? frames : 1;
+    int default_pcm_block_frames = (int)runtime_pcm_block;
+    size_t default_backlog_cycles = state->u.fftdiv.stream_backlog_cycles > 0U
+        ? state->u.fftdiv.stream_backlog_cycles
+        : 1U;
+
+    char preset_name[64];
+    preset_name[0] = '\0';
+    if (json_copy_string(
+            descriptor->params_json,
+            descriptor->params_len,
+            "stream_preset",
+            preset_name,
+            sizeof(preset_name)) != 0) {
+        const FftDivPresetSpec *preset = fftdiv_find_preset(preset_name);
+        if (preset != NULL) {
+            if (preset->window_size > 0) {
+                default_window_size = preset->window_size;
+            }
+            if (preset->hop > 0) {
+                default_hop = preset->hop;
+            } else if (default_window_size > 1) {
+                default_hop = default_window_size / 2;
+            } else {
+                default_hop = 1;
+            }
+            if (preset->freq_bins > 0) {
+                default_freq_bins = preset->freq_bins;
+            } else {
+                default_freq_bins = default_window_size;
+            }
+            if (preset->time_slices > 0) {
+                default_time_slices = preset->time_slices;
+            }
+            if (preset->pcm_block_frames > 0) {
+                default_pcm_block_frames = preset->pcm_block_frames;
+            }
+            if (preset->backlog_cycles > 0) {
+                default_backlog_cycles = (size_t)preset->backlog_cycles;
+            }
+        }
+    }
+
+    int window_size = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "window_size",
+        default_window_size
+    );
     if (window_size <= 0) {
         window_size = 1;
     }
@@ -537,7 +791,7 @@ static int run_fft_division_node(
         descriptor->params_json,
         descriptor->params_len,
         "working_ft_frequency_bins",
-        window_size
+        (default_freq_bins > 0) ? default_freq_bins : window_size
     );
     if (working_freq_bins <= 0) {
         working_freq_bins = window_size;
@@ -545,28 +799,89 @@ static int run_fft_division_node(
     int working_time_slices = json_get_int(
         descriptor->params_json,
         descriptor->params_len,
-        "working_ft_duration_frames",
-        frames > 0 ? frames : 1
+        "working_ft_time_slices",
+        json_get_int(
+            descriptor->params_json,
+            descriptor->params_len,
+            "working_ft_duration_frames",
+            (default_time_slices > 0) ? default_time_slices : (frames > 0 ? frames : 1))
     );
     if (working_time_slices <= 0) {
         working_time_slices = 1;
     }
-    int working_cache_pages = json_get_int(
+    int working_hop = json_get_int(
         descriptor->params_json,
         descriptor->params_len,
-        "working_ft_cache_pages",
-        1
+        "working_ft_hop",
+        default_hop > 0 ? default_hop : (window_size > 1 ? window_size / 2 : 1)
     );
-    if (working_cache_pages <= 0) {
-        working_cache_pages = 1;
+    if (working_hop <= 0) {
+        working_hop = 1;
     }
-    if (ensure_fft_working_tensor(state, working_cache_pages, slot_count, working_freq_bins, working_time_slices) != 0) {
+    if (working_time_slices == 1) {
+        working_hop = 1;
+    } else if (working_hop > working_time_slices) {
+        working_hop = working_time_slices;
+    }
+    int working_active_window_span = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "working_ft_active_window_span",
+        working_time_slices
+    );
+    if (working_active_window_span <= 0) {
+        working_active_window_span = working_time_slices;
+    }
+    if (working_active_window_span > working_time_slices) {
+        working_active_window_span = working_time_slices;
+    }
+    if (working_active_window_span < working_hop) {
+        /* Enforce overlap so the active span always covers the most recent hop. */
+        working_active_window_span = working_hop;
+    }
+    int configured_pcm_block_param = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "stream_pcm_block_frames",
+        (default_pcm_block_frames > 0) ? default_pcm_block_frames : (int)runtime_pcm_block
+    );
+    if (configured_pcm_block_param <= 0) {
+        configured_pcm_block_param = (int)runtime_pcm_block;
+    }
+    size_t configured_pcm_block = (size_t)configured_pcm_block_param;
+    size_t requested_pcm_block = runtime_pcm_block;
+    if (configured_pcm_block > requested_pcm_block) {
+        requested_pcm_block = configured_pcm_block;
+    }
+    int backlog_cycles_param = json_get_int(
+        descriptor->params_json,
+        descriptor->params_len,
+        "stream_backlog_cycles",
+        (int)(default_backlog_cycles > 0U ? default_backlog_cycles : 1U)
+    );
+    size_t backlog_cycles = (backlog_cycles_param > 0) ? (size_t)backlog_cycles_param : 1U;
+    state->u.fftdiv.stream_backlog_cycles = backlog_cycles;
+    size_t hop_stride = (size_t)(working_hop > 0 ? working_hop : 1);
+    size_t frames_per_block = (requested_pcm_block + hop_stride - 1U) / hop_stride;
+    if (frames_per_block == 0U) {
+        frames_per_block = 1U;
+    }
+    size_t desired_frame_capacity = frames_per_block * state->u.fftdiv.stream_backlog_cycles;
+    if (desired_frame_capacity == 0U) {
+        desired_frame_capacity = frames_per_block;
+    }
+    state->u.fftdiv.stream_max_pcm_block = requested_pcm_block;
+    state->u.fftdiv.stream_max_fft_frames = desired_frame_capacity;
+    if (ensure_fft_working_tensor(state, slot_count, working_freq_bins, working_time_slices) != 0) {
         return -1;
     }
 
-    if (ensure_fft_spectral_scratch(state, working_cache_pages, slot_count, window_size, working_time_slices) != 0) {
+    if (ensure_fft_spectral_scratch(state, slot_count, window_size, working_time_slices) != 0) {
         return -1;
     }
+    state->u.fftdiv.wheel_hop = working_hop;
+    state->u.fftdiv.wheel_length = working_time_slices;
+    state->u.fftdiv.wheel_active_window_span = working_active_window_span;
 
     if (ensure_fft_stream_slots(state, slot_count, window_size, default_window_kind) != 0) {
         return -1;
@@ -625,31 +940,34 @@ static int run_fft_division_node(
     }
 
     FftWorkingTensor *working_tensor = state->u.fftdiv.working_tensor;
-    int tensor_cache_cursor = state->u.fftdiv.working_tensor_cache_cursor;
-    int tensor_time_cursor = state->u.fftdiv.working_tensor_time_cursor;
     const int tensor_time_slices = state->u.fftdiv.working_tensor_time_slices > 0
         ? state->u.fftdiv.working_tensor_time_slices
         : 1;
     const int tensor_freq_bins = state->u.fftdiv.working_tensor_freq_bins > 0
         ? state->u.fftdiv.working_tensor_freq_bins
         : window_size;
-    const int tensor_cache_pages = state->u.fftdiv.working_tensor_cache_pages > 0
-        ? state->u.fftdiv.working_tensor_cache_pages
-        : 1;
-    if (tensor_cache_cursor < 0 || tensor_cache_cursor >= tensor_cache_pages) {
-        tensor_cache_cursor = 0;
+    int wheel_length = state->u.fftdiv.wheel_length > 0 ? state->u.fftdiv.wheel_length : tensor_time_slices;
+    if (wheel_length <= 0) {
+        wheel_length = 1;
     }
-    int scratch_cache_cursor = state->u.fftdiv.spectral_scratch.cache_cursor;
+    int wheel_head = state->u.fftdiv.wheel_head;
+    int wheel_tail = state->u.fftdiv.wheel_tail;
+    int wheel_filled = state->u.fftdiv.wheel_filled_slices;
+    int wheel_hop = state->u.fftdiv.wheel_hop > 0 ? state->u.fftdiv.wheel_hop : 1;
+    if (wheel_head < 0 || wheel_head >= wheel_length) {
+        wheel_head = 0;
+    }
+    if (wheel_tail < 0 || wheel_tail >= wheel_length) {
+        wheel_tail = 0;
+    }
+    if (wheel_filled < 0) {
+        wheel_filled = 0;
+    }
+    const int tensor_page = 0;
     int scratch_time_cursor = state->u.fftdiv.spectral_scratch.time_cursor;
-    const int scratch_cache_pages = state->u.fftdiv.spectral_scratch.cache_pages > 0
-        ? state->u.fftdiv.spectral_scratch.cache_pages
-        : 1;
     const int scratch_time_slices = state->u.fftdiv.spectral_scratch.time_slices > 0
         ? state->u.fftdiv.spectral_scratch.time_slices
         : 1;
-    if (scratch_cache_cursor < 0 || scratch_cache_cursor >= scratch_cache_pages) {
-        scratch_cache_cursor = 0;
-    }
     if (scratch_time_cursor < 0 || scratch_time_cursor >= scratch_time_slices) {
         scratch_time_cursor = 0;
     }
@@ -663,6 +981,20 @@ static int run_fft_division_node(
         spectral_real_tap,
         spectral_imag_tap);
 
+    std::vector<FftDivOperatorLaneBinding> operator_lane_bindings;
+    operator_lane_bindings.resize(static_cast<size_t>(slot_count));
+    for (int slot = 0; slot < slot_count; ++slot) {
+        const auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
+        auto &binding = operator_lane_bindings[(size_t)slot];
+        binding.slot_index = lane.slot_index;
+        binding.tensor_lane = lane.tensor_lane;
+        binding.enable_pcm_in = lane.enable_pcm_in;
+        binding.enable_pcm_out = lane.enable_pcm_out;
+        binding.enable_spectral_in = lane.enable_spectral_in;
+        binding.enable_spectral_out = lane.enable_spectral_out;
+        binding.active = lane.active;
+    }
+
     int active_lane_count = 0;
     for (const auto &lane_meta : state->u.fftdiv.lane_plan) {
         if (lane_meta.active) {
@@ -675,11 +1007,12 @@ static int run_fft_division_node(
     }
 #endif
 
-    const int frame_index = 0;
+    int frame_index_int = 0;
     size_t base_index = 0;
+    int metrics_window_span = 0;
 #if defined(__cplusplus)
         fftdiv_prepare_operator_frame(state);
-        const int tensor_slice = tensor_time_cursor;
+        const int tensor_slice = wheel_head;
     const int scratch_slice = scratch_time_cursor;
         int ready_lane_count = 0;
     int working_tensor_updated = 0;
@@ -691,8 +1024,10 @@ static int run_fft_division_node(
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t data_idx = base_index + (size_t)slot;
             auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
-            double *slot_spectral_real = slot_state.forward_real.data();
-            double *slot_spectral_imag = slot_state.forward_imag.data();
+            auto &forward_real = slot_state.forward_real;
+            auto &forward_imag = slot_state.forward_imag;
+            double *slot_spectral_real = slot_state.forward_real.empty() ? NULL : slot_state.forward_real.data();
+            double *slot_spectral_imag = slot_state.forward_imag.empty() ? NULL : slot_state.forward_imag.data();
             auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
 
             lane.frame_ready = false;
@@ -707,8 +1042,8 @@ static int run_fft_division_node(
             }
 
             const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
-            double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
-            double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
+            double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice);
+            double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, tensor_lane, scratch_slice);
             const int scratch_bins = fftdiv_spectral_scratch_bins(state);
 
             if (!lane.active) {
@@ -737,28 +1072,144 @@ static int run_fft_division_node(
                     pcm_cursor[frame_cursor] = last_sample;
                 }
                 if (slot_state.forward_handle != NULL && frames > 0) {
-                    frames_emitted = amp_fft_backend_stream_push(
-                        slot_state.forward_handle,
-                        pcm_cursor,
-                        (size_t)frames,
-                        window_size,
-                        slot_spectral_real,
-                        slot_spectral_imag,
-                        1,
-                        AMP_FFT_STREAM_FLUSH_NONE);
+                    size_t frame_capacity = slot_state.forward_frame_capacity;
+                    if (frame_capacity == 0U) {
+                        frame_capacity = state->u.fftdiv.stream_max_fft_frames;
+                    }
+                    if (frame_capacity == 0U) {
+                        frame_capacity = 1U;
+                    }
+                    const size_t spectral_capacity = frame_capacity * (size_t)window_size;
+                    if (slot_state.forward_real.size() != spectral_capacity) {
+                        try {
+                            slot_state.forward_real.assign(spectral_capacity, 0.0);
+                        } catch (...) {
+                            slot_state.forward_real.clear();
+                        }
+                    } else {
+                        std::fill_n(slot_state.forward_real.begin(), spectral_capacity, 0.0);
+                    }
+                    if (slot_state.forward_imag.size() != spectral_capacity) {
+                        try {
+                            slot_state.forward_imag.assign(spectral_capacity, 0.0);
+                        } catch (...) {
+                            slot_state.forward_imag.clear();
+                        }
+                    } else {
+                        std::fill_n(slot_state.forward_imag.begin(), spectral_capacity, 0.0);
+                    }
+                    slot_state.forward_frame_capacity = frame_capacity;
+                    slot_spectral_real = slot_state.forward_real.empty() ? NULL : slot_state.forward_real.data();
+                    slot_spectral_imag = slot_state.forward_imag.empty() ? NULL : slot_state.forward_imag.data();
+#if FFTDIV_TRACE_ENABLED
+                    const int pcm_trace_limit = 16;
+                    const int pcm_values_to_log = (frames < pcm_trace_limit) ? frames : pcm_trace_limit;
+                    FFTDIV_TRACE(
+                        "[fftdiv] pcm-block slot=%d frame=%d frames=%d log=%d",
+                        slot,
+                        frame_index_int,
+                        frames,
+                        pcm_values_to_log);
+                    for (int frame_cursor = 0; frame_cursor < pcm_values_to_log; ++frame_cursor) {
+                        FFTDIV_TRACE(
+                            "[fftdiv] pcm[%d]=%.12f",
+                            frame_cursor,
+                            pcm_cursor[frame_cursor]);
+                    }
+                    size_t inverse_pending_before = (slot_state.inverse_handle != NULL)
+                        ? amp_fft_backend_stream_pending_pcm(slot_state.inverse_handle)
+                        : 0U;
+                    FFTDIV_TRACE(
+                        "[fftdiv] forward-pre slot=%d frame=%d warmup=%d queue=%zu pending_pcm=%zu capacity=%zu",
+                        slot,
+                        frame_index_int,
+                        slot_state.warmup_complete ? 1 : 0,
+                        (size_t)slot_state.inverse_queue.size(),
+                        inverse_pending_before,
+                        frame_capacity);
+#endif
+                    if (slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                        frames_emitted = amp_fft_backend_stream_push(
+                            slot_state.forward_handle,
+                            pcm_cursor,
+                            (size_t)frames,
+                            window_size,
+                            slot_spectral_real,
+                            slot_spectral_imag,
+                            frame_capacity,
+                            AMP_FFT_STREAM_FLUSH_NONE);
+#if FFTDIV_TRACE_ENABLED
+                        size_t inverse_pending_after = (slot_state.inverse_handle != NULL)
+                            ? amp_fft_backend_stream_pending_pcm(slot_state.inverse_handle)
+                            : 0U;
+                        FFTDIV_TRACE(
+                            "[fftdiv] forward-post slot=%d frame=%d emitted=%zu warmup=%d queue=%zu pending_pcm=%zu",
+                            slot,
+                            frame_index_int,
+                            frames_emitted,
+                            slot_state.warmup_complete ? 1 : 0,
+                            (size_t)slot_state.inverse_queue.size(),
+                            inverse_pending_after);
+                        if (slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                            const size_t spectrum_frames_to_log = (frames_emitted < 4U) ? frames_emitted : 4U;
+                            const int spectrum_bins_to_log = (window_size < 16) ? window_size : 16;
+                            for (size_t emitted_index = 0; emitted_index < spectrum_frames_to_log; ++emitted_index) {
+                                const size_t base = emitted_index * (size_t)window_size;
+                                FFTDIV_TRACE(
+                                    "[fftdiv] spectrum slot=%d frame=%d emitted_idx=%zu bins=%d",
+                                    slot,
+                                    frame_index_int,
+                                    emitted_index,
+                                    spectrum_bins_to_log);
+                                for (int bin = 0; bin < spectrum_bins_to_log; ++bin) {
+                                    const size_t idx = base + (size_t)bin;
+                                    FFTDIV_TRACE(
+                                        "[fftdiv] spec[%zu]=%.12f%+.12fi",
+                                        idx,
+                                        slot_spectral_real[idx],
+                                        slot_spectral_imag[idx]);
+                                }
+                            }
+                        }
+#endif
+                    } else {
+                        frames_emitted = 0U;
+                        slot_state.forward_real.assign(spectral_capacity, 0.0);
+                        slot_state.forward_imag.assign(spectral_capacity, 0.0);
+                        slot_state.forward_frame_capacity = frame_capacity;
+                        slot_spectral_real = slot_state.forward_real.data();
+                        slot_spectral_imag = slot_state.forward_imag.data();
+                    }
                 }
             }
             lane_frames_emitted[(size_t)slot] = frames_emitted;
+            slot_state.forward_frames_ready = frames_emitted;
             lane_last_sample[(size_t)slot] = last_sample;
             if (frames_emitted > 0) {
                 slot_state.warmup_complete = true;
             }
             if (!slot_state.warmup_complete) {
-                lane.staged_pcm_value = last_sample;
+                double staged = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
+#if FFTDIV_TRACE_ENABLED
+                FFTDIV_TRACE(
+                    "[fftdiv] warmup slot=%d frame=%d emitted=%zu staged=%f",
+                    slot,
+                    frame_index_int,
+                    frames_emitted,
+                    staged);
+#endif
+                lane.staged_pcm_value = staged;
                 lane.staged_pcm_valid = true;
                 continue;
             }
             if (frames_emitted == 0) {
+#if FFTDIV_TRACE_ENABLED
+                FFTDIV_TRACE(
+                    "[fftdiv] zero-spectrum slot=%d frame=%d queue=%zu",
+                    slot,
+                    frame_index_int,
+                    (size_t)slot_state.inverse_queue.size());
+#endif
                 zero_spectral_buffer(slot_spectral_real, slot_spectral_imag, window_size);
                 if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
                     memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
@@ -793,7 +1244,7 @@ static int run_fft_division_node(
                     spectral_input_real_view,
                     spectral_input_imag_view,
                     slot,
-                    frame_index,
+                    frame_index_int,
                     reset_spectral_buffer,
                     reset_scratch_slice,
                     scratch_real,
@@ -802,6 +1253,14 @@ static int run_fft_division_node(
             }
 
             if (!spectral_ready) {
+#if FFTDIV_TRACE_ENABLED
+                FFTDIV_TRACE(
+                    "[fftdiv] spectral-wait slot=%d frame=%d queue=%zu warmup=%d",
+                    slot,
+                    frame_index_int,
+                    (size_t)slot_state.inverse_queue.size(),
+                    slot_state.warmup_complete ? 1 : 0);
+#endif
                 if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
                     memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
                     memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
@@ -812,7 +1271,7 @@ static int run_fft_division_node(
                 } else if (!slot_state.inverse_queue.empty()) {
                     lane.staged_pcm_value = slot_state.inverse_queue.front();
                 } else {
-                    lane.staged_pcm_value = 0.0;
+                    lane.staged_pcm_value = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
                 }
                 lane.staged_pcm_valid = true;
                 continue;
@@ -824,15 +1283,135 @@ static int run_fft_division_node(
             if (!lane.enable_pcm_out) {
                 lane.staged_pcm_value = 0.0;
             } else if (!slot_state.inverse_queue.empty()) {
+#if FFTDIV_TRACE_ENABLED
+                size_t inverse_pending_post = (slot_state.inverse_handle != NULL)
+                    ? amp_fft_backend_stream_pending_pcm(slot_state.inverse_handle)
+                    : 0U;
+                FFTDIV_TRACE(
+                    "[fftdiv] emit slot=%d frame=%d value=%f queue_before=%zu pending_pcm=%zu",
+                    slot,
+                    frame_index_int,
+                    slot_state.inverse_queue.front(),
+                    (size_t)slot_state.inverse_queue.size(),
+                    inverse_pending_post);
+#endif
                 lane.staged_pcm_value = slot_state.inverse_queue.front();
             } else {
-                lane.staged_pcm_value = 0.0;
+                lane.staged_pcm_value = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
             }
             lane.staged_pcm_valid = true;
         }
 
-        const bool barrier_satisfied =
-            (active_lane_count == 0) ? true : (ready_lane_count == active_lane_count);
+    const bool barrier_satisfied = (active_lane_count == 0) ? true : (ready_lane_count == active_lane_count);
+#if FFTDIV_TRACE_ENABLED
+    FFTDIV_TRACE(
+        "[fftdiv] barrier frame=%d satisfied=%d ready=%d active=%d",
+        frame_index_int,
+        barrier_satisfied ? 1 : 0,
+        ready_lane_count,
+        active_lane_count);
+#endif
+
+#if defined(__cplusplus)
+    int view_filled_override = wheel_filled;
+    FftDivActiveWindowView active_window_view;
+    double effective_sample_rate = state->u.fftdiv.sample_rate_hint;
+    if (sample_rate > 0.0) {
+        effective_sample_rate = sample_rate;
+        state->u.fftdiv.sample_rate_hint = sample_rate;
+    }
+    const double hop_seconds = (effective_sample_rate > 0.0)
+        ? ((double)wheel_hop) / effective_sample_rate
+        : 0.0;
+    const int64_t frame_counter = state->u.fftdiv.wheel_frame_counter;
+    frame_index_int = (int)frame_counter;
+    const double timeline_seconds = state->u.fftdiv.timeline_seconds;
+#endif
+    if (barrier_satisfied && working_tensor != NULL && tensor_freq_bins > 0) {
+            for (int slot = 0; slot < slot_count; ++slot) {
+                auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
+                double *slot_spectral_real = slot_state.forward_real.data();
+                double *slot_spectral_imag = slot_state.forward_imag.data();
+                auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
+                if (!lane.active || !lane.frame_ready || slot_spectral_real == NULL || slot_spectral_imag == NULL) {
+                    continue;
+                }
+
+                const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
+                double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice);
+                double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, tensor_lane, scratch_slice);
+                const int scratch_bins = fftdiv_spectral_scratch_bins(state);
+
+                const double *commit_real = scratch_real;
+                const double *commit_imag = scratch_imag;
+                int commit_bins = scratch_bins;
+                if (commit_real == NULL || commit_imag == NULL || commit_bins <= 0) {
+                    commit_real = slot_spectral_real;
+                    commit_imag = slot_spectral_imag;
+                    commit_bins = window_size;
+                }
+
+                fftdiv_copy_spectrum_to_working(
+                    working_tensor,
+                    tensor_page,
+                    tensor_lane,
+                    tensor_slice,
+                    tensor_freq_bins,
+                    commit_real,
+                    commit_imag,
+                    commit_bins);
+                /* TODO: introduce interpolation when tensor_freq_bins != commit_bins. */
+                if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
+                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
+                }
+
+                working_tensor_updated = 1;
+            }
+
+            if (working_tensor_updated) {
+                if (wheel_filled >= wheel_length) {
+                    view_filled_override = wheel_length;
+                } else {
+                    int hop_for_span = (wheel_hop > 0) ? wheel_hop : 1;
+                    view_filled_override = wheel_filled + hop_for_span;
+                    if (view_filled_override > wheel_length) {
+                        view_filled_override = wheel_length;
+                    }
+                }
+            }
+
+            active_window_view = fftdiv_build_active_window_view_internal(
+                state,
+                working_tensor,
+                tensor_page,
+                tensor_slice,
+                view_filled_override);
+
+            if (active_window_view.valid()) {
+                FftDivOperatorContext operator_context;
+                operator_context.window = active_window_view;
+                operator_context.lanes = operator_lane_bindings.empty()
+                    ? nullptr
+                    : operator_lane_bindings.data();
+                operator_context.lane_count = operator_lane_bindings.size();
+                operator_context.hop = wheel_hop;
+                operator_context.window_size = window_size;
+                operator_context.wheel_length = wheel_length;
+                operator_context.wheel_head = wheel_head;
+                operator_context.wheel_tail = wheel_tail;
+                operator_context.frame_index = frame_counter;
+                operator_context.sample_rate = effective_sample_rate;
+                operator_context.timeline_seconds = timeline_seconds;
+                operator_context.hop_seconds = hop_seconds;
+                fftdiv_run_operator_stack(state, operator_context);
+                metrics_window_span = active_window_view.window_span;
+            } else {
+                metrics_window_span = 0;
+            }
+        } else {
+            metrics_window_span = 0;
+        }
 
         for (int slot = 0; slot < slot_count; ++slot) {
             size_t data_idx = base_index + (size_t)slot;
@@ -841,55 +1420,19 @@ static int run_fft_division_node(
             double *slot_spectral_imag = slot_state.forward_imag.data();
             auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
             const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
-            double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
-            double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, scratch_cache_cursor, tensor_lane, scratch_slice);
+            double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice);
+            double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, tensor_lane, scratch_slice);
             const int scratch_bins = fftdiv_spectral_scratch_bins(state);
 
             double output_value = lane.staged_pcm_valid ? lane.staged_pcm_value : 0.0;
 
             if (barrier_satisfied && lane.active && lane.frame_ready && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
-                if (working_tensor != NULL && tensor_freq_bins > 0) {
-                    const double *commit_real = scratch_real;
-                    const double *commit_imag = scratch_imag;
-                    int commit_bins = scratch_bins;
-                    if (commit_real == NULL || commit_imag == NULL || commit_bins <= 0) {
-                        commit_real = slot_spectral_real;
-                        commit_imag = slot_spectral_imag;
-                        commit_bins = window_size;
-                    }
-                    fftdiv_copy_spectrum_to_working(
-                        working_tensor,
-                        tensor_cache_cursor,
-                        tensor_lane,
-                        tensor_slice,
-                        tensor_freq_bins,
-                        commit_real,
-                        commit_imag,
-                        commit_bins);
-                    if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
-                        memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
-                        memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
-                    }
-                    working_tensor_updated = 1;
-                }
-                stage_run_operator_stack(
-                    state,
-                    slot_spectral_real,
-                    slot_spectral_imag,
-                    window_size,
-                    working_tensor,
-                    tensor_cache_cursor,
-                    tensor_lane,
-                    tensor_slice,
-                    tensor_freq_bins);
-
                 if ((lane.enable_pcm_out || lane.enable_spectral_out) &&
                     working_tensor != NULL &&
-                    slot_spectral_real != NULL &&
-                    slot_spectral_imag != NULL) {
+                    tensor_freq_bins > 0) {
                     fftdiv_copy_working_to_slot_buffer(
                         working_tensor,
-                        tensor_cache_cursor,
+                        tensor_page,
                         tensor_lane,
                         tensor_slice,
                         tensor_freq_bins,
@@ -906,15 +1449,23 @@ static int run_fft_division_node(
                         spectral_real_tap,
                         spectral_imag_tap,
                         slot,
-                        frame_index,
+                        frame_index_int,
                         working_tensor,
-                        tensor_cache_cursor,
+                        tensor_page,
                         tensor_lane,
                         tensor_slice,
                         tensor_freq_bins);
                 }
 
                 if (lane.enable_pcm_out && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
+#if FFTDIV_TRACE_ENABLED
+                    FFTDIV_TRACE(
+                        "[fftdiv] inverse-pre slot=%d frame=%d queue_before=%zu scratch=%zu",
+                        slot,
+                        frame_index_int,
+                        (size_t)slot_state.inverse_queue.size(),
+                        slot_state.inverse_scratch.size());
+#endif
                     const size_t produced_pcm = amp_fft_backend_stream_push_spectrum(
                         slot_state.inverse_handle,
                         slot_spectral_real,
@@ -924,9 +1475,23 @@ static int run_fft_division_node(
                         slot_state.inverse_scratch.data(),
                         slot_state.inverse_scratch.size(),
                         AMP_FFT_STREAM_FLUSH_NONE);
+#if FFTDIV_TRACE_ENABLED
+                    FFTDIV_TRACE(
+                        "[fftdiv] inverse-produce slot=%d frame=%d produced=%zu",
+                        slot,
+                        frame_index_int,
+                        produced_pcm);
+#endif
                     for (size_t i = 0; i < produced_pcm && i < slot_state.inverse_scratch.size(); ++i) {
                         slot_state.inverse_queue.push_back(slot_state.inverse_scratch[i]);
                     }
+#if FFTDIV_TRACE_ENABLED
+                    FFTDIV_TRACE(
+                        "[fftdiv] inverse-post slot=%d frame=%d queue_after=%zu",
+                        slot,
+                        frame_index_int,
+                        (size_t)slot_state.inverse_queue.size());
+#endif
                 } else if (!lane.enable_pcm_out) {
                     slot_state.inverse_queue.clear();
                 }
@@ -937,7 +1502,7 @@ static int run_fft_division_node(
                 } else if (!lane.enable_pcm_out) {
                     output_value = 0.0;
                 } else {
-                    output_value = 0.0;
+                    output_value = (audio_base != NULL) ? audio_base[data_idx] : 0.0;
                 }
             } else {
                 if (!barrier_satisfied && lane.frame_ready) {
@@ -957,6 +1522,14 @@ static int run_fft_division_node(
             lane.frame_ready = false;
             lane.staged_pcm_valid = false;
             buffer[data_idx] = output_value;
+#if FFTDIV_TRACE_ENABLED
+            FFTDIV_TRACE(
+                "[fftdiv] buffer slot=%d frame=%d value=%f queue_after=%zu",
+                slot,
+                frame_index_int,
+                output_value,
+                (size_t)slot_state.inverse_queue.size());
+#endif
         }
 #else
         for (int slot = 0; slot < slot_count; ++slot) {
@@ -971,22 +1544,17 @@ static int run_fft_division_node(
 
 #if defined(__cplusplus)
         if (working_tensor_updated) {
-            if (tensor_cache_pages > 0) {
-                tensor_cache_cursor += 1;
-                if (tensor_cache_cursor >= tensor_cache_pages) {
-                    tensor_cache_cursor = 0;
-                }
-            }
-            if (tensor_time_slices > 0) {
-                tensor_time_cursor += 1;
-                if (tensor_time_cursor >= tensor_time_slices) {
-                    tensor_time_cursor = 0;
-                }
-            }
-            if (scratch_cache_pages > 0) {
-                scratch_cache_cursor += 1;
-                if (scratch_cache_cursor >= scratch_cache_pages) {
-                    scratch_cache_cursor = 0;
+            const bool wheel_was_full = (wheel_filled >= wheel_length);
+            if (wheel_length > 0) {
+                wheel_head = (wheel_head + wheel_hop) % wheel_length;
+                if (!wheel_was_full) {
+                    wheel_filled += wheel_hop;
+                    if (wheel_filled > wheel_length) {
+                        wheel_filled = wheel_length;
+                    }
+                } else {
+                    wheel_filled = wheel_length;
+                    wheel_tail = (wheel_tail + wheel_hop) % wheel_length;
                 }
             }
             if (scratch_time_slices > 0) {
@@ -995,13 +1563,17 @@ static int run_fft_division_node(
                     scratch_time_cursor = 0;
                 }
             }
+            state->u.fftdiv.wheel_frame_counter += 1;
+            state->u.fftdiv.timeline_seconds += hop_seconds;
         }
 #endif
 
-    state->u.fftdiv.working_tensor_time_cursor = tensor_time_cursor;
-    state->u.fftdiv.working_tensor_cache_cursor = tensor_cache_cursor;
+    state->u.fftdiv.wheel_length = wheel_length;
+    state->u.fftdiv.wheel_head = wheel_head;
+    state->u.fftdiv.wheel_tail = wheel_tail;
+    state->u.fftdiv.wheel_filled_slices = wheel_filled;
+    state->u.fftdiv.wheel_hop = wheel_hop;
 #if defined(__cplusplus)
-    state->u.fftdiv.spectral_scratch.cache_cursor = scratch_cache_cursor;
     state->u.fftdiv.spectral_scratch.time_cursor = scratch_time_cursor;
 #endif
 
@@ -1010,12 +1582,12 @@ static int run_fft_division_node(
 
     if (metrics != NULL) {
         metrics->accumulated_heat = 0.0f;
-        metrics->reserved[0] = 0.0f;
-        metrics->reserved[1] = 0.0f;
-        metrics->reserved[2] = 0.0f;
-        metrics->reserved[3] = 0.0f;
-        metrics->reserved[4] = (float)window_size;
-        metrics->reserved[5] = (float)default_algorithm;
+        metrics->reserved[0] = (double)state->u.fftdiv.wheel_active_window_span;
+        metrics->reserved[1] = (double)metrics_window_span;
+        metrics->reserved[2] = (double)wheel_filled;
+        metrics->reserved[3] = (double)wheel_length;
+        metrics->reserved[4] = (double)window_size;
+        metrics->reserved[5] = (double)default_algorithm;
     }
 
     return 0;

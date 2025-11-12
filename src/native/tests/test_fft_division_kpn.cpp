@@ -228,6 +228,12 @@ int main() {
         return 5;
     }
 
+    std::fprintf(stderr, "candidate: ");
+    for (double v : candidate) {
+        std::fprintf(stderr, "%.12f ", v);
+    }
+    std::fprintf(stderr, "\n");
+
     if (!compare_frames(signal, candidate)) {
         return 6;
     }

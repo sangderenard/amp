@@ -35,6 +35,10 @@
 using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>;
 #endif
 
+#if defined(__cplusplus)
+struct FftDivOperatorLaneBinding;
+#endif
+
 #include "amp_native.h"
 #include "amp_fft_backend.h"
 #include "amp_debug_alloc.h"
@@ -1457,11 +1461,9 @@ typedef enum {
 
 #if defined(__cplusplus)
 struct FftDivSpectralScratch {
-    int cache_pages;
     int lanes;
     int freq_bins;
     int time_slices;
-    int cache_cursor;
     int time_cursor;
     std::vector<double> real;
     std::vector<double> imag;
@@ -1561,15 +1563,20 @@ typedef struct {
             int working_tensor_lanes;
             int working_tensor_freq_bins;
             int working_tensor_time_slices;
-            int working_tensor_time_cursor;
-            int working_tensor_cache_pages;
-            int working_tensor_cache_cursor;
+            int wheel_length;
+            int wheel_head;
+            int wheel_tail;
+            int wheel_filled_slices;
+            int wheel_hop;
+            int wheel_active_window_span;
             int default_lane_count;
             struct StreamSlot {
                 void *forward_handle{nullptr};
                 void *inverse_handle{nullptr};
                 std::vector<double> forward_real;
                 std::vector<double> forward_imag;
+                std::size_t forward_frame_capacity{0U};
+                std::size_t forward_frames_ready{0U};
                 std::vector<double> inverse_scratch;
                 std::deque<double> inverse_queue;
                 bool warmup_complete{false};
@@ -1612,7 +1619,13 @@ typedef struct {
             std::vector<OperatorTensorEntry> operator_arena;
             std::vector<OperatorStep> operator_steps;
 #endif
+            size_t stream_max_pcm_block;
+            size_t stream_max_fft_frames;
+            size_t stream_backlog_cycles;
             int preserve_tensor_on_ingest;
+            int64_t wheel_frame_counter;
+            double sample_rate_hint;
+            double timeline_seconds;
         } fftdiv;
         struct {
             int mode;
@@ -2814,6 +2827,8 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         }
         slot.forward_real.clear();
         slot.forward_imag.clear();
+        slot.forward_frame_capacity = 0U;
+        slot.forward_frames_ready = 0U;
         slot.inverse_scratch.clear();
         slot.inverse_queue.clear();
         slot.warmup_complete = false;
@@ -2837,6 +2852,12 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
         window_kind = FFT_WINDOW_RECTANGULAR;
     }
 
+    size_t frame_capacity = state->u.fftdiv.stream_max_fft_frames;
+    if (frame_capacity == 0U) {
+        frame_capacity = 1U;
+    }
+    const size_t spectral_capacity = frame_capacity * (size_t)window_size;
+
     bool rebuild = false;
     if (state->u.fftdiv.stream_slots.size() != static_cast<std::size_t>(slots)) {
         rebuild = true;
@@ -2846,16 +2867,22 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
     }
 
     if (!rebuild) {
-        for (auto &slot : state->u.fftdiv.stream_slots) {
-            if (slot.forward_real.size() != static_cast<std::size_t>(window_size)) {
-                slot.forward_real.assign(static_cast<std::size_t>(window_size), 0.0);
+        try {
+            for (auto &slot : state->u.fftdiv.stream_slots) {
+                if (slot.forward_real.size() != spectral_capacity) {
+                    slot.forward_real.assign(spectral_capacity, 0.0);
+                }
+                if (slot.forward_imag.size() != spectral_capacity) {
+                    slot.forward_imag.assign(spectral_capacity, 0.0);
+                }
+                if (slot.inverse_scratch.size() != static_cast<std::size_t>(window_size)) {
+                    slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
+                }
+                slot.forward_frame_capacity = frame_capacity;
+                slot.forward_frames_ready = 0U;
             }
-            if (slot.forward_imag.size() != static_cast<std::size_t>(window_size)) {
-                slot.forward_imag.assign(static_cast<std::size_t>(window_size), 0.0);
-            }
-            if (slot.inverse_scratch.size() != static_cast<std::size_t>(window_size)) {
-                slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
-            }
+        } catch (...) {
+            return -1;
         }
         return 0;
     }
@@ -2872,8 +2899,10 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             if (slot.inverse_handle == nullptr) {
                 throw std::bad_alloc();
             }
-            slot.forward_real.assign(static_cast<std::size_t>(window_size), 0.0);
-            slot.forward_imag.assign(static_cast<std::size_t>(window_size), 0.0);
+            slot.forward_real.assign(spectral_capacity, 0.0);
+            slot.forward_imag.assign(spectral_capacity, 0.0);
+            slot.forward_frame_capacity = frame_capacity;
+            slot.forward_frames_ready = 0U;
             slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
             slot.inverse_queue.clear();
             slot.warmup_complete = false;
@@ -2904,26 +2933,35 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.window_size = 0;
     state->u.fftdiv.window_kind = -1;
     state->u.fftdiv.preserve_tensor_on_ingest = 0;
+    state->u.fftdiv.stream_max_pcm_block = 0;
+    state->u.fftdiv.stream_max_fft_frames = 0;
+    state->u.fftdiv.stream_backlog_cycles = 1;
 #if defined(__cplusplus)
     delete state->u.fftdiv.working_tensor;
     state->u.fftdiv.working_tensor = NULL;
     state->u.fftdiv.working_tensor_lanes = 0;
     state->u.fftdiv.working_tensor_freq_bins = 0;
     state->u.fftdiv.working_tensor_time_slices = 0;
-    state->u.fftdiv.working_tensor_time_cursor = 0;
-    state->u.fftdiv.working_tensor_cache_pages = 0;
-    state->u.fftdiv.working_tensor_cache_cursor = 0;
+    state->u.fftdiv.wheel_length = 0;
+    state->u.fftdiv.wheel_head = 0;
+    state->u.fftdiv.wheel_tail = 0;
+    state->u.fftdiv.wheel_filled_slices = 0;
+    state->u.fftdiv.wheel_hop = 0;
+    state->u.fftdiv.wheel_active_window_span = 0;
     state->u.fftdiv.default_lane_count = 0;
     fftdiv_reset_stream_slots(state);
     state->u.fftdiv.lane_plan.clear();
     state->u.fftdiv.spectral_scratch.real.clear();
     state->u.fftdiv.spectral_scratch.imag.clear();
-    state->u.fftdiv.spectral_scratch.cache_pages = 0;
     state->u.fftdiv.spectral_scratch.lanes = 0;
     state->u.fftdiv.spectral_scratch.freq_bins = 0;
     state->u.fftdiv.spectral_scratch.time_slices = 0;
-    state->u.fftdiv.spectral_scratch.cache_cursor = 0;
     state->u.fftdiv.spectral_scratch.time_cursor = 0;
+    state->u.fftdiv.operator_arena.clear();
+    state->u.fftdiv.operator_steps.clear();
+    state->u.fftdiv.wheel_frame_counter = 0;
+    state->u.fftdiv.sample_rate_hint = 0.0;
+    state->u.fftdiv.timeline_seconds = 0.0;
 #endif
 }
 
@@ -2942,16 +2980,12 @@ static int ensure_fft_state_buffers(node_state_t *state, int slots, int window_s
 
 static int ensure_fft_working_tensor(
     node_state_t *state,
-    int cache_pages,
     int lanes,
     int frequency_bins,
     int time_slices
 ) {
     if (state == NULL) {
         return -1;
-    }
-    if (cache_pages <= 0) {
-        cache_pages = 1;
     }
     if (lanes <= 0) {
         lanes = 1;
@@ -2964,7 +2998,6 @@ static int ensure_fft_working_tensor(
     }
     if (
         state->u.fftdiv.working_tensor != NULL &&
-        state->u.fftdiv.working_tensor_cache_pages == cache_pages &&
         state->u.fftdiv.working_tensor_lanes == lanes &&
         state->u.fftdiv.working_tensor_freq_bins == frequency_bins &&
         state->u.fftdiv.working_tensor_time_slices == time_slices
@@ -2973,25 +3006,32 @@ static int ensure_fft_working_tensor(
     }
     delete state->u.fftdiv.working_tensor;
     state->u.fftdiv.working_tensor = NULL;
-    state->u.fftdiv.working_tensor_cache_pages = 0;
     state->u.fftdiv.working_tensor_lanes = 0;
     state->u.fftdiv.working_tensor_freq_bins = 0;
     state->u.fftdiv.working_tensor_time_slices = 0;
-    state->u.fftdiv.working_tensor_time_cursor = 0;
-    state->u.fftdiv.working_tensor_cache_cursor = 0;
+    state->u.fftdiv.wheel_length = 0;
+    state->u.fftdiv.wheel_head = 0;
+    state->u.fftdiv.wheel_tail = 0;
+    state->u.fftdiv.wheel_filled_slices = 0;
+    state->u.fftdiv.wheel_frame_counter = 0;
+    state->u.fftdiv.timeline_seconds = 0.0;
 
-    FftWorkingTensor *tensor = new (std::nothrow) FftWorkingTensor(cache_pages, lanes, frequency_bins, time_slices);
+    FftWorkingTensor *tensor = new (std::nothrow) FftWorkingTensor(1, lanes, frequency_bins, time_slices);
     if (tensor == NULL) {
         return -1;
     }
     tensor->setZero();
     state->u.fftdiv.working_tensor = tensor;
-    state->u.fftdiv.working_tensor_cache_pages = cache_pages;
     state->u.fftdiv.working_tensor_lanes = lanes;
     state->u.fftdiv.working_tensor_freq_bins = frequency_bins;
     state->u.fftdiv.working_tensor_time_slices = time_slices;
-    state->u.fftdiv.working_tensor_time_cursor = 0;
-    state->u.fftdiv.working_tensor_cache_cursor = 0;
+    state->u.fftdiv.wheel_length = time_slices;
+    state->u.fftdiv.wheel_head = 0;
+    state->u.fftdiv.wheel_tail = 0;
+    state->u.fftdiv.wheel_filled_slices = 0;
+    if (state->u.fftdiv.wheel_hop <= 0 || state->u.fftdiv.wheel_hop > time_slices) {
+        state->u.fftdiv.wheel_hop = (time_slices > 0) ? time_slices : 1;
+    }
     if (state->u.fftdiv.default_lane_count > lanes) {
         state->u.fftdiv.default_lane_count = lanes;
     }
@@ -3001,16 +3041,12 @@ static int ensure_fft_working_tensor(
 #if defined(__cplusplus)
 static int ensure_fft_spectral_scratch(
     node_state_t *state,
-    int cache_pages,
     int lanes,
     int frequency_bins,
     int time_slices
 ) {
     if (state == NULL) {
         return -1;
-    }
-    if (cache_pages <= 0) {
-        cache_pages = 1;
     }
     if (lanes <= 0) {
         lanes = 1;
@@ -3022,9 +3058,8 @@ static int ensure_fft_spectral_scratch(
         time_slices = 1;
     }
     auto &scratch = state->u.fftdiv.spectral_scratch;
-    const size_t required = static_cast<size_t>(cache_pages) * static_cast<size_t>(lanes) * static_cast<size_t>(frequency_bins) * static_cast<size_t>(time_slices);
+    const size_t required = static_cast<size_t>(lanes) * static_cast<size_t>(frequency_bins) * static_cast<size_t>(time_slices);
     if (
-        scratch.cache_pages == cache_pages &&
         scratch.lanes == lanes &&
         scratch.freq_bins == frequency_bins &&
         scratch.time_slices == time_slices &&
@@ -3039,32 +3074,26 @@ static int ensure_fft_spectral_scratch(
     } catch (...) {
         scratch.real.clear();
         scratch.imag.clear();
-        scratch.cache_pages = 0;
         scratch.lanes = 0;
         scratch.freq_bins = 0;
         scratch.time_slices = 0;
-        scratch.cache_cursor = 0;
         scratch.time_cursor = 0;
         return -1;
     }
-    scratch.cache_pages = cache_pages;
     scratch.lanes = lanes;
     scratch.freq_bins = frequency_bins;
     scratch.time_slices = time_slices;
-    scratch.cache_cursor = 0;
     scratch.time_cursor = 0;
     return 0;
 }
 #else
 static int ensure_fft_spectral_scratch(
     node_state_t *state,
-    int cache_pages,
     int lanes,
     int frequency_bins,
     int time_slices
 ) {
     (void)state;
-    (void)cache_pages;
     (void)lanes;
     (void)frequency_bins;
     (void)time_slices;
