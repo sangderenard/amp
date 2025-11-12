@@ -18,6 +18,8 @@ constexpr int kFrames = 8;
 constexpr int kWindowSize = 4;
 constexpr double kSampleRate = 48000.0;
 constexpr double kTolerance = 1e-9;
+constexpr size_t kStreamingFrames = 4096;
+constexpr size_t kStreamingChunk = 64;
 
 bool g_failed = false;
 
@@ -42,6 +44,15 @@ struct RunResult {
     std::vector<double> spectral_real;
     std::vector<double> spectral_imag;
     AmpNodeMetrics metrics{};
+};
+
+struct StreamingRunResult {
+    std::vector<double> pcm;
+    std::vector<double> spectral_real;
+    std::vector<double> spectral_imag;
+    std::vector<AmpNodeMetrics> metrics_per_call;
+    size_t call_count{0};
+    bool state_allocated{false};
 };
 
 struct SimulationResult {
@@ -77,8 +88,17 @@ EdgeRunnerNodeDescriptor build_descriptor(std::string &params_json) {
     return descriptor;
 }
 
-EdgeRunnerAudioView build_audio_view(const std::vector<double> &signal) {
+EdgeRunnerAudioView build_audio_view_span(const double *data, size_t frames) {
     EdgeRunnerAudioView audio{};
+    audio.has_audio = 1U;
+    audio.batches = 1U;
+    audio.channels = 1U;
+    audio.frames = static_cast<uint32_t>(frames);
+    audio.data = data;
+    return audio;
+}
+
+EdgeRunnerAudioView build_audio_view(const std::vector<double> &signal) {
     if (signal.size() != static_cast<size_t>(kFrames)) {
         record_failure(
             "signal length %zu does not match expected frame count %d",
@@ -86,12 +106,7 @@ EdgeRunnerAudioView build_audio_view(const std::vector<double> &signal) {
             kFrames
         );
     }
-    audio.has_audio = 1U;
-    audio.batches = 1U;
-    audio.channels = 1U;
-    audio.frames = static_cast<uint32_t>(signal.size());
-    audio.data = signal.data();
-    return audio;
+    return build_audio_view_span(signal.data(), signal.size());
 }
 
 RunResult run_fft_node_once(const std::vector<double> &signal) {
@@ -183,6 +198,124 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     }
 
     result.metrics = metrics;
+    return result;
+}
+
+StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, size_t chunk_frames) {
+    StreamingRunResult result;
+    const size_t total_frames = signal.size();
+    result.pcm.assign(total_frames, 0.0);
+    result.spectral_real.assign(total_frames * kWindowSize, 0.0);
+    result.spectral_imag.assign(total_frames * kWindowSize, 0.0);
+
+    if (chunk_frames == 0) {
+        record_failure("chunk size must be greater than zero");
+        return result;
+    }
+
+    std::string params_json;
+    EdgeRunnerNodeDescriptor descriptor = build_descriptor(params_json);
+
+    EdgeRunnerParamSet params{};
+    params.count = 0U;
+    params.items = nullptr;
+
+    void *state = nullptr;
+    bool saw_state = false;
+
+    for (size_t offset = 0; offset < total_frames; offset += chunk_frames) {
+        const size_t frames = std::min(chunk_frames, total_frames - offset);
+
+        EdgeRunnerAudioView audio = build_audio_view_span(signal.data() + offset, frames);
+
+        EdgeRunnerTapBuffer tap_buffers[2]{};
+        tap_buffers[0].tap_name = "spectral_real";
+        tap_buffers[0].buffer_class = nullptr;
+        tap_buffers[0].shape.batches = 1U;
+        tap_buffers[0].shape.channels = kWindowSize;
+        tap_buffers[0].shape.frames = static_cast<uint32_t>(frames);
+        tap_buffers[0].frame_stride = kWindowSize;
+        tap_buffers[0].data = result.spectral_real.data() + offset * kWindowSize;
+
+        tap_buffers[1].tap_name = "spectral_imag";
+        tap_buffers[1].buffer_class = nullptr;
+        tap_buffers[1].shape = tap_buffers[0].shape;
+        tap_buffers[1].frame_stride = kWindowSize;
+        tap_buffers[1].data = result.spectral_imag.data() + offset * kWindowSize;
+
+        EdgeRunnerTapBufferSet tap_set{};
+        tap_set.items = tap_buffers;
+        tap_set.count = 2U;
+
+        EdgeRunnerTapStatusSet status_set{};
+        status_set.items = nullptr;
+        status_set.count = 0U;
+
+        EdgeRunnerTapContext tap_context{};
+        tap_context.outputs = tap_set;
+        tap_context.status = status_set;
+
+        EdgeRunnerNodeInputs inputs{};
+        inputs.audio = audio;
+        inputs.params = params;
+        inputs.taps = tap_context;
+
+        double *out_buffer = nullptr;
+        int out_channels = 0;
+        AmpNodeMetrics metrics{};
+
+        const int rc = amp_run_node_v2(
+            &descriptor,
+            &inputs,
+            1,
+            1,
+            static_cast<int>(frames),
+            kSampleRate,
+            &out_buffer,
+            &out_channels,
+            &state,
+            nullptr,
+            AMP_EXECUTION_MODE_FORWARD,
+            &metrics
+        );
+
+        if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
+            record_failure(
+                "streaming call %zu failed rc=%d buffer=%p channels=%d",
+                offset / chunk_frames,
+                rc,
+                static_cast<void *>(out_buffer),
+                out_channels
+            );
+        } else {
+            std::copy(out_buffer, out_buffer + frames, result.pcm.begin() + offset);
+        }
+
+        if (out_buffer != nullptr) {
+            amp_free(out_buffer);
+            out_buffer = nullptr;
+        }
+
+        if (state == nullptr) {
+            record_failure("streaming call %zu did not return persistent state", offset / chunk_frames);
+        } else {
+            saw_state = true;
+            result.state_allocated = true;
+        }
+
+        result.metrics_per_call.push_back(metrics);
+        result.call_count += 1;
+    }
+
+    if (state != nullptr) {
+        amp_release_state(state);
+        state = nullptr;
+    }
+
+    if (!saw_state) {
+        record_failure("streaming run never produced node state");
+    }
+
     return result;
 }
 
@@ -440,6 +573,15 @@ int main() {
     RunResult first = run_fft_node_once(signal);
     RunResult second = run_fft_node_once(signal);
 
+    std::vector<double> streaming_signal(kStreamingFrames, 0.0);
+    for (size_t i = 0; i < streaming_signal.size(); ++i) {
+        double t = static_cast<double>(i);
+        streaming_signal[i] = std::sin(0.005 * t) * std::cos(0.013 * t);
+    }
+
+    SimulationResult streaming_expected = simulate_stream_identity(streaming_signal, AMP_FFT_WINDOW_HANN);
+    StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, kStreamingChunk);
+
     verify_close("pcm_vs_expected", first.pcm.data(), expected.pcm.data(), expected.pcm.size(), 1e-9);
     verify_close(
         "spectral_real_vs_expected",
@@ -464,6 +606,52 @@ int main() {
 
     verify_metrics(first.metrics, "forward_metrics");
     verify_metrics(second.metrics, "repeat_metrics");
+
+    verify_close(
+        "streaming_pcm_vs_expected",
+        streaming_result.pcm.data(),
+        streaming_expected.pcm.data(),
+        streaming_expected.pcm.size(),
+        1e-9
+    );
+    verify_close(
+        "streaming_spectral_real_vs_expected",
+        streaming_result.spectral_real.data(),
+        streaming_expected.spectral_real.data(),
+        streaming_expected.spectral_real.size(),
+        1e-8
+    );
+    verify_close(
+        "streaming_spectral_imag_vs_expected",
+        streaming_result.spectral_imag.data(),
+        streaming_expected.spectral_imag.data(),
+        streaming_expected.spectral_imag.size(),
+        1e-8
+    );
+
+    if (streaming_result.call_count != (kStreamingFrames + kStreamingChunk - 1) / kStreamingChunk) {
+        record_failure(
+            "streaming call count mismatch got %zu expected %zu",
+            streaming_result.call_count,
+            (kStreamingFrames + kStreamingChunk - 1) / kStreamingChunk
+        );
+    }
+
+    if (!streaming_result.state_allocated) {
+        record_failure("streaming_result did not retain node state");
+    }
+
+    if (streaming_result.metrics_per_call.size() != streaming_result.call_count) {
+        record_failure(
+            "metrics_per_call size %zu does not match call count %zu",
+            streaming_result.metrics_per_call.size(),
+            streaming_result.call_count
+        );
+    }
+
+    for (size_t i = 0; i < streaming_result.metrics_per_call.size(); ++i) {
+        verify_metrics(streaming_result.metrics_per_call[i], "streaming_metrics");
+    }
 
     require_backward_unsupported(signal, first.pcm);
 
