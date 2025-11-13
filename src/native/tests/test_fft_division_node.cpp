@@ -214,8 +214,38 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         if (rc == AMP_E_PENDING) {
             if (out_buffer != nullptr) {
                 amp_free(out_buffer);
+                out_buffer = nullptr;
             }
-            continue;
+            if (consumed_frames >= total_frames) {
+                double *flush_buffer = nullptr;
+                int flush_channels = 0;
+                AmpNodeMetrics flush_metrics{};
+                int flush_rc = amp_wait_node_completion(
+                    &descriptor,
+                    &inputs,
+                    1,
+                    1,
+                    static_cast<int>(audio.frames),
+                    kSampleRate,
+                    &state,
+                    &flush_buffer,
+                    &flush_channels,
+                    &flush_metrics
+                );
+                if (flush_rc == 0 && flush_buffer != nullptr && flush_channels == 1) {
+                    out_buffer = flush_buffer;
+                    out_channels = flush_channels;
+                    metrics = flush_metrics;
+                    rc = 0;
+                } else {
+                    if (flush_buffer != nullptr) {
+                        amp_free(flush_buffer);
+                    }
+                    continue;
+                }
+            } else {
+                continue;
+            }
         }
 
         if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
@@ -414,6 +444,38 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         if (rc == AMP_E_PENDING) {
             if (out_buffer != nullptr) {
                 amp_free(out_buffer);
+                out_buffer = nullptr;
+            }
+            if (offset >= total_frames) {
+                double *flush_buffer = nullptr;
+                int flush_channels = 0;
+                AmpNodeMetrics flush_metrics{};
+                int flush_rc = amp_wait_node_completion(
+                    &descriptor,
+                    &inputs,
+                    1,
+                    static_cast<int>(inputs.audio.channels > 0U ? inputs.audio.channels : 1U),
+                    static_cast<int>(frames),
+                    kSampleRate,
+                    &state,
+                    &flush_buffer,
+                    &flush_channels,
+                    &flush_metrics
+                );
+                if (flush_rc == 0 && flush_buffer != nullptr && flush_channels == 1) {
+                    out_buffer = flush_buffer;
+                    out_channels = flush_channels;
+                    metrics = flush_metrics;
+                    if (!result.metrics_per_call.empty()) {
+                        result.metrics_per_call.back() = metrics;
+                    }
+                    rc = 0;
+                } else {
+                    if (flush_buffer != nullptr) {
+                        amp_free(flush_buffer);
+                    }
+                    continue;
+                }
             }
         } else if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
             record_failure(
