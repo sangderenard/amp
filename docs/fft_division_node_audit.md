@@ -142,6 +142,19 @@ The adjoint closely mirrors the forward pass:
   harness compares node output to an in-test C++ simulation, covering both FFT and DFT code paths,
   the oscillator-bank resynthesis, and the arbitrary bin gating controls.【F:src/native/tests/test_fft_division_node.cpp†L598-L879】
 
+## Synchronisation contract
+
+* Nodes that maintain internal streaming pipelines (FFTDivisionNode today) now expose
+  `amp_wait_node_completion` as a blocking helper. Callers may provide the same `EdgeRunnerNodeInputs`
+  structure used for the triggering invocation—tap buffers included—and the runtime will inject zero
+  audio while draining the pipeline until either an output buffer materialises or the node reports it
+  is still pending. This allows harnesses to wait for frames instead of busy-spinning on repeated
+  `AMP_E_PENDING` returns.【F:src/native/include/amp_native.h†L406-L417】【F:src/native/amp_kernels.c†L3520-L3560】【F:src/native/nodes/fft_division/fft_division_nodes.inc†L1933-L2014】
+* `test_fft_division_node.cpp` demonstrates the pattern: once all stimulus frames are submitted it
+  calls `amp_wait_node_completion` with the last tap buffers so spectral taps continue to capture the
+  drain output without issuing additional `amp_run_node_v2` calls that would otherwise spin without a
+  readiness signal.【F:src/native/tests/test_fft_division_node.cpp†L201-L236】【F:src/native/tests/test_fft_division_node.cpp†L380-L414】
+
 ## Diagnostic tooling
 
 The headless gradient harness (`test_fft_noise_gradient`) and its companion Python helper

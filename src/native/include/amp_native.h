@@ -413,6 +413,18 @@ AMP_CAPI int amp_run_node_v2(
     AmpExecutionMode mode,
     AmpNodeMetrics *metrics
 );
+AMP_CAPI int amp_wait_node_completion(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    void **state,
+    double **out_buffer,
+    int *out_channels,
+    AmpNodeMetrics *metrics
+);
 AMP_CAPI void amp_free(double *buffer);
 AMP_CAPI void amp_release_state(void *state);
 AMP_CAPI AmpGraphRuntime *amp_graph_runtime_create(

@@ -3693,6 +3693,69 @@ static int amp_run_node_impl(
     return rc;
 }
 
+static int amp_wait_node_completion_impl(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    void **state,
+    double **out_buffer,
+    int *out_channels,
+    AmpNodeMetrics *metrics
+) {
+    if (out_buffer == NULL || out_channels == NULL) {
+        return -1;
+    }
+    *out_buffer = NULL;
+    *out_channels = 0;
+    amp_reset_metrics(metrics);
+
+    node_state_t *node_state = NULL;
+    if (state != NULL && *state != NULL) {
+        node_state = (node_state_t *)(*state);
+    }
+    if (node_state == NULL) {
+        return AMP_E_PENDING;
+    }
+
+    node_kind_t kind = node_state->kind;
+    if (kind == NODE_KIND_UNKNOWN && descriptor != NULL) {
+        kind = determine_node_kind(descriptor);
+    }
+
+    switch (kind) {
+        case NODE_KIND_FFT_DIV:
+#if defined(__cplusplus)
+            return fftdiv_wait_for_completion(
+                descriptor,
+                inputs,
+                batches,
+                channels,
+                frames,
+                sample_rate,
+                node_state,
+                out_buffer,
+                out_channels,
+                metrics
+            );
+#else
+            (void)descriptor;
+            (void)inputs;
+            (void)batches;
+            (void)channels;
+            (void)frames;
+            (void)sample_rate;
+            (void)node_state;
+            (void)metrics;
+            return AMP_E_UNSUPPORTED;
+#endif
+        default:
+            return AMP_E_UNSUPPORTED;
+    }
+}
+
 AMP_CAPI int amp_run_node(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
@@ -3749,6 +3812,33 @@ AMP_CAPI int amp_run_node_v2(
         state,
         history,
         mode,
+        metrics
+    );
+}
+
+AMP_CAPI int amp_wait_node_completion(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    void **state,
+    double **out_buffer,
+    int *out_channels,
+    AmpNodeMetrics *metrics
+) {
+    AMP_LOG_NATIVE_CALL("amp_wait_node_completion", (size_t)batches, (size_t)frames);
+    return amp_wait_node_completion_impl(
+        descriptor,
+        inputs,
+        batches,
+        channels,
+        frames,
+        sample_rate,
+        state,
+        out_buffer,
+        out_channels,
         metrics
     );
 }

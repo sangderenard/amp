@@ -2015,6 +2015,129 @@ static void fftdiv_flush_with_zeroes(node_state_t *state) {
     (void)final_status;
 }
 
+static int fftdiv_wait_for_completion(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    node_state_t *state,
+    double **out_buffer,
+    int *out_channels,
+    AmpNodeMetrics *metrics
+) {
+    if (state == nullptr || out_buffer == nullptr || out_channels == nullptr) {
+        return -1;
+    }
+    *out_buffer = nullptr;
+    *out_channels = 0;
+    if (!fftdiv_has_pending_work(state)) {
+        return AMP_E_PENDING;
+    }
+
+    auto &fftdiv = state->u.fftdiv;
+    const EdgeRunnerNodeDescriptor *active_descriptor = descriptor;
+    if (active_descriptor == nullptr) {
+        active_descriptor = fftdiv.last_descriptor;
+    }
+    if (active_descriptor == nullptr) {
+        return -1;
+    }
+
+    int effective_batches = (batches > 0) ? batches : fftdiv.last_batches;
+    if (effective_batches <= 0) {
+        effective_batches = 1;
+    }
+    int effective_channels = (channels > 0) ? channels : fftdiv.last_channels;
+    if (effective_channels <= 0) {
+        effective_channels = 1;
+    }
+    int effective_frames = (frames > 0) ? frames : fftdiv.last_frames;
+    if (effective_frames <= 0) {
+        effective_frames = fftdiv.window_size > 0 ? fftdiv.window_size : 1;
+    }
+    int slot_count = effective_batches * effective_channels;
+    if (slot_count <= 0) {
+        slot_count = 1;
+    }
+
+    const double effective_sample_rate = (sample_rate > 0.0)
+        ? sample_rate
+        : (fftdiv.last_sample_rate > 0.0 ? fftdiv.last_sample_rate : fftdiv.sample_rate_hint);
+
+    std::vector<double> zeros(static_cast<size_t>(slot_count) * static_cast<size_t>(effective_frames), 0.0);
+
+    EdgeRunnerAudioView audio{};
+    audio.has_audio = 1;
+    audio.batches = static_cast<uint32_t>(effective_batches);
+    audio.channels = static_cast<uint32_t>(effective_channels);
+    audio.frames = static_cast<uint32_t>(effective_frames);
+    audio.data = zeros.data();
+
+    EdgeRunnerParamSet params{};
+    EdgeRunnerNodeInputs flush_inputs{};
+    flush_inputs.audio = audio;
+    if (inputs != nullptr) {
+        flush_inputs.params = inputs->params;
+        flush_inputs.taps = inputs->taps;
+    } else {
+        flush_inputs.params = params;
+        flush_inputs.taps.outputs.items = nullptr;
+        flush_inputs.taps.outputs.count = 0;
+        flush_inputs.taps.status.items = nullptr;
+        flush_inputs.taps.status.count = 0;
+    }
+
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        if (!fftdiv_has_pending_work(state)) {
+            break;
+        }
+        double *buffer = nullptr;
+        int produced_channels = 0;
+        int status = fftdiv_execute_block(
+            active_descriptor,
+            &flush_inputs,
+            effective_batches,
+            effective_channels,
+            effective_frames,
+            effective_sample_rate,
+            &buffer,
+            &produced_channels,
+            state,
+            metrics,
+            AMP_FFT_STREAM_FLUSH_PARTIAL
+        );
+        if (status != AMP_E_PENDING || buffer != nullptr) {
+            *out_buffer = buffer;
+            *out_channels = produced_channels;
+            return status;
+        }
+        if (buffer != nullptr) {
+            free(buffer);
+        }
+    }
+
+    double *final_buffer = nullptr;
+    int final_channels = 0;
+    int final_status = fftdiv_execute_block(
+        active_descriptor,
+        &flush_inputs,
+        effective_batches,
+        effective_channels,
+        effective_frames,
+        effective_sample_rate,
+        &final_buffer,
+        &final_channels,
+        state,
+        metrics,
+        AMP_FFT_STREAM_FLUSH_FINAL
+    );
+    *out_buffer = final_buffer;
+    *out_channels = final_channels;
+    return final_status;
+}
+
 static void fftdiv_worker_main(node_state_t *state) {
     if (state == nullptr) {
         return;
