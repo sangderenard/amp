@@ -21,6 +21,9 @@ constexpr double kSampleRate = 48000.0;
 constexpr double kTolerance = 1e-9;
 constexpr size_t kStreamingFrames = 4096;
 constexpr size_t kStreamingChunk = 64;
+constexpr size_t kForwardIterationMultiplier = 256;
+constexpr size_t kStreamingIterationMultiplier = 64;
+constexpr size_t kMinIterationBudget = 1024;
 
 bool g_failed = false;
 
@@ -132,10 +135,13 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     bool delay_initialized = false;
 
     const size_t total_frames = signal.size();
-    const size_t max_iterations = total_frames * 8U;
+    const size_t max_iterations = std::max(total_frames * kForwardIterationMultiplier, kMinIterationBudget);
     size_t iteration = 0U;
 
-    while (produced_frames < total_frames && iteration < max_iterations) {
+    while (produced_frames < total_frames) {
+        if (iteration >= max_iterations) {
+            break;
+        }
         iteration += 1U;
 
         EdgeRunnerAudioView audio{};
@@ -317,11 +323,15 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     std::vector<uint8_t> frame_filled(total_frames, 0U);
     int delay_frames = kWindowSize - 1;
     bool delay_initialized = false;
-    const size_t max_iterations = (total_frames / chunk_frames + 1U) * 8U;
+    const size_t chunk_groups = (total_frames + chunk_frames - 1U) / chunk_frames;
+    const size_t max_iterations = std::max((chunk_groups + 1U) * kStreamingIterationMultiplier, kMinIterationBudget);
     size_t iteration = 0U;
 
     size_t offset = 0U;
-    while (produced_frames < total_frames && iteration < max_iterations) {
+    while (produced_frames < total_frames) {
+        if (iteration >= max_iterations) {
+            break;
+        }
         const size_t call_index = iteration;
         iteration += 1U;
 
@@ -843,4 +853,3 @@ int main() {
     std::printf("test_fft_division_node: PASS\n");
     return 0;
 }
-
