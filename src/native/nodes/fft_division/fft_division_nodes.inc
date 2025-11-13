@@ -185,15 +185,6 @@ static void tap_buffer_write_row(
     }
 }
 
-static void zero_spectral_buffer(double *spectral_real, double *spectral_imag, int window_size) {
-    if (spectral_real != NULL) {
-        memset(spectral_real, 0, (size_t)window_size * sizeof(double));
-    }
-    if (spectral_imag != NULL) {
-        memset(spectral_imag, 0, (size_t)window_size * sizeof(double));
-    }
-}
-
 static void zero_tensor_slice(
     FftWorkingTensor *tensor,
     int tensor_page,
@@ -861,7 +852,7 @@ static void fftdiv_prepare_lane_plan(
 }
 #endif
 
-static int run_fft_division_node(
+static int fftdiv_execute_block(
     const EdgeRunnerNodeDescriptor *descriptor,
     const EdgeRunnerNodeInputs *inputs,
     int batches,
@@ -871,12 +862,17 @@ static int run_fft_division_node(
     double **out_buffer,
     int *out_channels,
     node_state_t *state,
-    AmpNodeMetrics *metrics
+    AmpNodeMetrics *metrics,
+    int flush_mode
 ) {
     (void)sample_rate;
     if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
         return -1;
     }
+    if (flush_mode < AMP_FFT_STREAM_FLUSH_NONE || flush_mode > AMP_FFT_STREAM_FLUSH_FINAL) {
+        flush_mode = AMP_FFT_STREAM_FLUSH_NONE;
+    }
+    const bool flush_request = (flush_mode != AMP_FFT_STREAM_FLUSH_NONE);
     if (frames <= 0) {
         frames = 1;
     }
@@ -1114,13 +1110,7 @@ static int run_fft_division_node(
     if (buffer == NULL) {
         return -1;
     }
-
     const double *audio_base = (inputs->audio.has_audio && inputs->audio.data != NULL) ? inputs->audio.data : NULL;
-    if (audio_base != NULL) {
-        memcpy(buffer, audio_base, total_samples * sizeof(double));
-    } else {
-        memset(buffer, 0, total_samples * sizeof(double));
-    }
     const EdgeRunnerParamView *spectral_input_real_view = find_param(inputs, "spectral_input_real");
     const EdgeRunnerParamView *spectral_input_imag_view = find_param(inputs, "spectral_input_imag");
     const EdgeRunnerTapBuffer *spectral_real_tap = find_tap_buffer(&inputs->taps, "spectral_real");
@@ -1186,6 +1176,16 @@ static int run_fft_division_node(
         binding.active = lane.active;
     }
 
+    size_t pcm_expected_samples = 0U;
+    for (const auto &lane_meta : state->u.fftdiv.lane_plan) {
+        if (lane_meta.active && lane_meta.enable_pcm_out) {
+            pcm_expected_samples += static_cast<size_t>(frames);
+        }
+    }
+
+    bool made_progress = false;
+    size_t pcm_written_samples = 0U;
+
     int active_lane_count = 0;
     for (const auto &lane_meta : state->u.fftdiv.lane_plan) {
         if (lane_meta.active) {
@@ -1231,11 +1231,6 @@ static int run_fft_division_node(
             const int scratch_bins = fftdiv_spectral_scratch_bins(state);
 
             if (!lane.active) {
-                if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
-                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
-                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
-                }
-                slot_state.inverse_queue.clear();
                 continue;
             }
 
@@ -1331,7 +1326,7 @@ static int run_fft_division_node(
                             slot_spectral_real,
                             slot_spectral_imag,
                             stage_capacity_frames,
-                            AMP_FFT_STREAM_FLUSH_NONE);
+                            flush_mode);
                         if (frames_emitted > 0) {
                             fftdiv_ring_append_frames(
                                 state,
@@ -1397,9 +1392,7 @@ static int run_fft_division_node(
             slot_state.forward_frames_ready = slot_state.forward_ring_filled;
             if (frames_emitted > 0) {
                 slot_state.warmup_complete = true;
-                if (!warmup_was_complete) {
-                    slot_state.drop_first_inverse_sample = true;
-                }
+                made_progress = true;
             }
             if (!slot_state.warmup_complete) {
 #if FFTDIV_TRACE_ENABLED
@@ -1412,24 +1405,9 @@ static int run_fft_division_node(
 #endif
                 continue;
             }
-            if (frames_emitted == 0) {
-#if FFTDIV_TRACE_ENABLED
-                FFTDIV_TRACE(
-                    "[fftdiv] zero-spectrum slot=%d frame=%d queue=%zu",
-                    slot,
-                    frame_index_int,
-                    (size_t)slot_state.inverse_queue.size());
-#endif
-                zero_spectral_buffer(slot_spectral_real, slot_spectral_imag, window_size);
-                if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
-                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
-                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
-                }
-            }
-
             int spectral_ready = (frames_emitted > 0) ? 1 : 0;
-            const int reset_spectral_buffer = spectral_ready ? 0 : 1;
-            const int reset_scratch_slice = state->u.fftdiv.preserve_tensor_on_ingest ? 0 : reset_spectral_buffer;
+            const int reset_spectral_buffer = 0;
+            const int reset_scratch_slice = 0;
 
             if (scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
                 if (frames_emitted > 0) {
@@ -1440,9 +1418,6 @@ static int run_fft_division_node(
                         memset(scratch_real + scratch_copy_bins, 0, (size_t)(scratch_bins - scratch_copy_bins) * sizeof(double));
                         memset(scratch_imag + scratch_copy_bins, 0, (size_t)(scratch_bins - scratch_copy_bins) * sizeof(double));
                     }
-                } else if (reset_spectral_buffer && !state->u.fftdiv.preserve_tensor_on_ingest) {
-                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
-                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
                 }
             }
 
@@ -1471,13 +1446,6 @@ static int run_fft_division_node(
                     (size_t)slot_state.inverse_queue.size(),
                     slot_state.warmup_complete ? 1 : 0);
 #endif
-                if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
-                    memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
-                    memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
-                }
-                if (!lane.enable_pcm_out) {
-                    slot_state.inverse_queue.clear();
-                }
                 continue;
             }
         }
@@ -1817,10 +1785,9 @@ static int run_fft_division_node(
                             window_size,
                             slot_state.inverse_scratch.data(),
                             slot_state.inverse_scratch.size(),
-                            AMP_FFT_STREAM_FLUSH_NONE);
-                        if (slot_state.drop_first_inverse_sample && produced_pcm > 0 && !slot_state.inverse_scratch.empty()) {
-                            slot_state.inverse_scratch[0] = slot_state.last_pcm_output;
-                            slot_state.drop_first_inverse_sample = false;
+                            flush_mode);
+                        if (produced_pcm > 0) {
+                            made_progress = true;
                         }
 #if FFTDIV_TRACE_ENABLED
                         FFTDIV_TRACE(
@@ -1839,8 +1806,6 @@ static int run_fft_division_node(
                             (long long)slice.frame_index,
                             (size_t)slot_state.inverse_queue.size());
 #endif
-                    } else if (!lane.enable_pcm_out) {
-                        slot_state.inverse_queue.clear();
                     }
 
                     if (lane.enable_pcm_out && !slot_state.inverse_queue.empty()) {
@@ -1849,10 +1814,8 @@ static int run_fft_division_node(
                         *buffer_ptr = output_value;
                         slot_state.last_pcm_output = output_value;
                         wrote_output = true;
-                    } else if (!lane.enable_pcm_out) {
-                        slot_state.last_pcm_output = 0.0;
-                        *buffer_ptr = 0.0;
-                        wrote_output = true;
+                        pcm_written_samples += 1U;
+                        made_progress = true;
                     }
 
                     if (slot_state.forward_ring_filled > 0U && slot_state.forward_ring_capacity_frames > 0U) {
@@ -1864,25 +1827,11 @@ static int run_fft_division_node(
                         }
                     }
                 } else {
-                    if (!lane.enable_pcm_out) {
-                        slot_state.inverse_queue.clear();
-                    }
-                    if (lane_snapshot.frame_ready && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
-                        zero_spectral_buffer(slot_spectral_real, slot_spectral_imag, window_size);
-                        if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
-                            memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
-                            memset(scratch_imag, 0, (size_t)scratch_bins * sizeof(double));
-                        }
-                    }
                     if (lane.enable_pcm_out && !slot_state.inverse_queue.empty()) {
                         const double output_value = slot_state.inverse_queue.front();
                         slot_state.inverse_queue.pop_front();
                         *buffer_ptr = output_value;
                         slot_state.last_pcm_output = output_value;
-                        wrote_output = true;
-                    } else if (!lane.enable_pcm_out) {
-                        slot_state.last_pcm_output = 0.0;
-                        *buffer_ptr = 0.0;
                         wrote_output = true;
                     }
                 }
@@ -1908,6 +1857,16 @@ static int run_fft_division_node(
         state->u.fftdiv.timeline_seconds = timeline_cursor;
     }
 #endif /* defined(__cplusplus) */
+
+#if defined(__cplusplus)
+    if (!made_progress || (pcm_expected_samples > 0U && pcm_written_samples < pcm_expected_samples)) {
+        free(buffer);
+        *out_buffer = NULL;
+        *out_channels = 0;
+        amp_last_alloc_count = 0;
+        return AMP_E_PENDING;
+    }
+#endif
 
 #if !defined(__cplusplus)
         for (int slot = 0; slot < slot_count; ++slot) {
@@ -1947,6 +1906,311 @@ static int run_fft_division_node(
     }
 
     return 0;
+}
+
+#if defined(__cplusplus)
+
+static bool fftdiv_has_pending_work(const node_state_t *state) {
+    if (state == nullptr) {
+        return false;
+    }
+    for (const auto &slot : state->u.fftdiv.stream_slots) {
+        if (slot.forward_ring_filled > 0U) {
+            return true;
+        }
+        if (!slot.inverse_queue.empty()) {
+            return true;
+        }
+        if (slot.inverse_handle != nullptr &&
+            amp_fft_backend_stream_pending_pcm(slot.inverse_handle) > 0U) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void fftdiv_flush_with_zeroes(node_state_t *state) {
+    if (state == nullptr) {
+        return;
+    }
+    auto &fftdiv = state->u.fftdiv;
+    const EdgeRunnerNodeDescriptor *descriptor = fftdiv.last_descriptor;
+    if (descriptor == nullptr || fftdiv.stream_slots.empty()) {
+        return;
+    }
+    int batches = fftdiv.last_batches > 0 ? fftdiv.last_batches : 1;
+    int channels = fftdiv.last_channels > 0 ? fftdiv.last_channels : 1;
+    int frames = fftdiv.last_frames > 0 ? fftdiv.last_frames : fftdiv.window_size;
+    if (frames <= 0) {
+        frames = 1;
+    }
+    int slot_count = fftdiv.last_slot_count > 0 ? fftdiv.last_slot_count : batches * channels;
+    if (slot_count <= 0) {
+        slot_count = 1;
+    }
+    const double sample_rate = (fftdiv.last_sample_rate > 0.0)
+        ? fftdiv.last_sample_rate
+        : fftdiv.sample_rate_hint;
+
+    std::vector<double> zeros(static_cast<size_t>(slot_count) * static_cast<size_t>(frames), 0.0);
+
+    EdgeRunnerAudioView audio{};
+    audio.has_audio = 1;
+    audio.batches = static_cast<uint32_t>(batches);
+    audio.channels = static_cast<uint32_t>(channels);
+    audio.frames = frames;
+    audio.data = zeros.data();
+
+    EdgeRunnerParamSet params{};
+    EdgeRunnerNodeInputs flush_inputs{};
+    flush_inputs.audio = audio;
+    flush_inputs.params = params;
+    flush_inputs.taps.outputs.items = nullptr;
+    flush_inputs.taps.outputs.count = 0;
+    flush_inputs.taps.status.items = nullptr;
+    flush_inputs.taps.status.count = 0;
+
+    for (int iteration = 0; iteration < 8 && fftdiv_has_pending_work(state); ++iteration) {
+        double *buffer = nullptr;
+        int out_channels = 0;
+        int status = fftdiv_execute_block(
+            descriptor,
+            &flush_inputs,
+            batches,
+            channels,
+            frames,
+            sample_rate,
+            &buffer,
+            &out_channels,
+            state,
+            nullptr,
+            AMP_FFT_STREAM_FLUSH_PARTIAL
+        );
+        if (buffer != nullptr) {
+            free(buffer);
+        }
+        if (status != 0 && status != AMP_E_PENDING) {
+            break;
+        }
+    }
+
+    double *final_buffer = nullptr;
+    int final_channels = 0;
+    int final_status = fftdiv_execute_block(
+        descriptor,
+        &flush_inputs,
+        batches,
+        channels,
+        frames,
+        sample_rate,
+        &final_buffer,
+        &final_channels,
+        state,
+        nullptr,
+        AMP_FFT_STREAM_FLUSH_FINAL
+    );
+    if (final_buffer != nullptr) {
+        free(final_buffer);
+    }
+    (void)final_status;
+}
+
+static void fftdiv_worker_main(node_state_t *state) {
+    if (state == nullptr) {
+        return;
+    }
+    auto &worker = state->u.fftdiv.worker;
+    std::unique_lock<std::mutex> lock(worker.mutex);
+    while (true) {
+        worker.cv_request.wait(lock, [&worker]() {
+            return worker.stop_requested || worker.task_pending;
+        });
+        if (worker.stop_requested && !worker.task_pending) {
+            const bool flush_on_stop = worker.flush_on_stop;
+            lock.unlock();
+            if (flush_on_stop) {
+                fftdiv_flush_with_zeroes(state);
+            }
+            lock.lock();
+            break;
+        }
+        FftDivTask task = worker.task;
+        worker.task_pending = false;
+        lock.unlock();
+
+        FftDivTask result = task;
+        double *buffer = nullptr;
+        int out_channels = 0;
+        result.status = fftdiv_execute_block(
+            task.descriptor,
+            task.inputs,
+            task.batches,
+            task.channels,
+            task.frames,
+            task.sample_rate,
+            &buffer,
+            &out_channels,
+            state,
+            task.metrics,
+            task.flush_mode
+        );
+        result.result_buffer = buffer;
+        result.result_channels = out_channels;
+
+        if (task.flush_mode == AMP_FFT_STREAM_FLUSH_NONE) {
+            state->u.fftdiv.last_descriptor = task.descriptor;
+            state->u.fftdiv.last_batches = task.batches;
+            state->u.fftdiv.last_channels = task.channels;
+            state->u.fftdiv.last_frames = task.frames;
+            state->u.fftdiv.last_slot_count = task.slot_count;
+            state->u.fftdiv.last_sample_rate = task.sample_rate;
+        }
+
+        lock.lock();
+        worker.task = result;
+        worker.task_completed = true;
+        worker.cv_response.notify_all();
+    }
+    worker.task_pending = false;
+    worker.task_completed = true;
+    worker.thread_started = false;
+    worker.cv_response.notify_all();
+}
+
+static int fftdiv_start_worker(node_state_t *state) {
+    if (state == nullptr) {
+        return -1;
+    }
+    auto &worker = state->u.fftdiv.worker;
+    if (worker.thread_started) {
+        return 0;
+    }
+    worker.stop_requested = false;
+    worker.flush_on_stop = true;
+    worker.task_pending = false;
+    worker.task_completed = false;
+    try {
+        worker.thread = std::thread(fftdiv_worker_main, state);
+    } catch (...) {
+        worker.thread_started = false;
+        return -1;
+    }
+    worker.thread_started = true;
+    return 0;
+}
+
+static void fftdiv_stop_worker(node_state_t *state, bool flush) {
+    if (state == nullptr) {
+        return;
+    }
+    auto &worker = state->u.fftdiv.worker;
+    if (!worker.thread_started) {
+        worker.flush_on_stop = flush;
+        worker.stop_requested = false;
+        worker.task_pending = false;
+        worker.task_completed = false;
+        return;
+    }
+    {
+        std::unique_lock<std::mutex> lock(worker.mutex);
+        worker.stop_requested = true;
+        worker.flush_on_stop = flush;
+        worker.cv_request.notify_one();
+    }
+    if (worker.thread.joinable()) {
+        worker.thread.join();
+    }
+    worker.thread_started = false;
+    worker.stop_requested = false;
+    worker.task_pending = false;
+    worker.task_completed = false;
+}
+
+#endif
+
+static int run_fft_division_node(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    double **out_buffer,
+    int *out_channels,
+    node_state_t *state,
+    AmpNodeMetrics *metrics
+) {
+#if defined(__cplusplus)
+    if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
+        return -1;
+    }
+    *out_buffer = NULL;
+    *out_channels = 0;
+
+    if (fftdiv_start_worker(state) != 0) {
+        return -1;
+    }
+
+    FftDivTask task{};
+    task.descriptor = descriptor;
+    task.inputs = inputs;
+    task.batches = (batches > 0) ? batches : 1;
+    task.frames = frames;
+    task.sample_rate = sample_rate;
+    task.metrics = metrics;
+    task.flush_mode = AMP_FFT_STREAM_FLUSH_NONE;
+
+    int effective_channels = channels;
+    if (effective_channels <= 0) {
+        effective_channels = (inputs->audio.channels > 0U)
+            ? (int)inputs->audio.channels
+            : 1;
+    }
+    task.channels = effective_channels;
+    task.slot_count = task.batches * effective_channels;
+    if (task.slot_count <= 0) {
+        task.slot_count = 1;
+    }
+
+    auto &worker = state->u.fftdiv.worker;
+    {
+        std::unique_lock<std::mutex> lock(worker.mutex);
+        worker.cv_response.wait(lock, [&worker]() {
+            return !worker.task_pending;
+        });
+        worker.task = task;
+        worker.task_pending = true;
+        worker.task_completed = false;
+        worker.cv_request.notify_one();
+        worker.cv_response.wait(lock, [&worker]() {
+            return worker.task_completed;
+        });
+        task = worker.task;
+        worker.task_completed = false;
+    }
+
+    if (out_buffer != NULL) {
+        *out_buffer = task.result_buffer;
+    }
+    if (out_channels != NULL) {
+        *out_channels = task.result_channels;
+    }
+    return task.status;
+#else
+    return fftdiv_execute_block(
+        descriptor,
+        inputs,
+        batches,
+        channels,
+        frames,
+        sample_rate,
+        out_buffer,
+        out_channels,
+        state,
+        metrics,
+        AMP_FFT_STREAM_FLUSH_NONE
+    );
+#endif
 }
 
 static int run_fft_division_node_backward(

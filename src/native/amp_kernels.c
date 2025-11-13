@@ -28,9 +28,12 @@
 
 #if defined(__cplusplus)
 #include <complex>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <thread>
 #include <vector>
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
@@ -1470,6 +1473,21 @@ struct FftDivSpectralScratch {
     std::vector<double> real;
     std::vector<double> imag;
 };
+
+struct FftDivTask {
+    const EdgeRunnerNodeDescriptor *descriptor{nullptr};
+    const EdgeRunnerNodeInputs *inputs{nullptr};
+    int batches{0};
+    int channels{0};
+    int frames{0};
+    int slot_count{0};
+    double sample_rate{0.0};
+    double *result_buffer{nullptr};
+    int result_channels{0};
+    AmpNodeMetrics *metrics{nullptr};
+    int status{0};
+    int flush_mode{AMP_FFT_STREAM_FLUSH_NONE};
+};
 #endif
 
 typedef struct {
@@ -1589,7 +1607,6 @@ typedef struct {
                 std::vector<double> inverse_scratch;
                 std::deque<double> inverse_queue;
                 bool warmup_complete{false};
-                bool drop_first_inverse_sample{false};
                 double last_pcm_output{0.0};
             };
             std::vector<StreamSlot> stream_slots;
@@ -1627,6 +1644,25 @@ typedef struct {
             };
             std::vector<OperatorTensorEntry> operator_arena;
             std::vector<OperatorStep> operator_steps;
+            struct WorkerState {
+                std::thread thread;
+                std::mutex mutex;
+                std::condition_variable cv_request;
+                std::condition_variable cv_response;
+                bool thread_started{false};
+                bool stop_requested{false};
+                bool flush_on_stop{true};
+                bool task_pending{false};
+                bool task_completed{false};
+                FftDivTask task;
+            };
+            WorkerState worker;
+            const EdgeRunnerNodeDescriptor *last_descriptor{nullptr};
+            int last_batches{0};
+            int last_channels{0};
+            int last_frames{0};
+            int last_slot_count{0};
+            double last_sample_rate{0.0};
 #endif
             size_t stream_max_pcm_block;
             size_t stream_max_fft_frames;
@@ -1709,6 +1745,9 @@ static int parse_driver_mode(const char *json, size_t json_len, int default_mode
     return DRIVER_MODE_QUARTZ;
 }
 
+#if defined(__cplusplus)
+static void fftdiv_stop_worker(node_state_t *state, bool flush);
+#endif
 static void fft_state_free_buffers(node_state_t *state);
 
 static void release_node_state(node_state_t *state) {
@@ -2849,7 +2888,6 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.inverse_scratch.clear();
         slot.inverse_queue.clear();
         slot.warmup_complete = false;
-        slot.drop_first_inverse_sample = false;
         slot.last_pcm_output = 0.0;
     }
     state->u.fftdiv.stream_slots.clear();
@@ -2951,7 +2989,6 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
             slot.inverse_queue.clear();
             slot.warmup_complete = false;
-            slot.drop_first_inverse_sample = false;
             slot.last_pcm_output = 0.0;
         }
     } catch (...) {
@@ -2977,6 +3014,9 @@ static void fft_state_free_buffers(node_state_t *state) {
     if (state == NULL) {
         return;
     }
+#if defined(__cplusplus)
+    fftdiv_stop_worker(state, true);
+#endif
     state->u.fftdiv.window_size = 0;
     state->u.fftdiv.window_kind = -1;
     state->u.fftdiv.preserve_tensor_on_ingest = 0;
@@ -3010,6 +3050,17 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.wheel_frame_counter = 0;
     state->u.fftdiv.sample_rate_hint = 0.0;
     state->u.fftdiv.timeline_seconds = 0.0;
+    state->u.fftdiv.last_descriptor = nullptr;
+    state->u.fftdiv.last_batches = 0;
+    state->u.fftdiv.last_channels = 0;
+    state->u.fftdiv.last_frames = 0;
+    state->u.fftdiv.last_slot_count = 0;
+    state->u.fftdiv.last_sample_rate = 0.0;
+    state->u.fftdiv.worker.task = FftDivTask{};
+    state->u.fftdiv.worker.task_pending = false;
+    state->u.fftdiv.worker.task_completed = false;
+    state->u.fftdiv.worker.stop_requested = false;
+    state->u.fftdiv.worker.flush_on_stop = true;
 #endif
 }
 

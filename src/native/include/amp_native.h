@@ -333,6 +333,7 @@ typedef struct {
 } AmpGraphRuntimeErrorInfo;
 
 #define AMP_E_UNSUPPORTED (-4)
+#define AMP_E_PENDING (-5)
 
 #define AMP_GRAPH_NODE_MAX_TAPS 8
 
