@@ -1658,15 +1658,15 @@ bool FftDivWorkerCommand::prepare(
 }
 #endif
 
-typedef struct {
-    node_kind_t kind;
-    AmpMailbox mailbox;
+typedef struct node_state_t node_state_t;
+
 #if defined(__cplusplus)
-    std::mutex mailbox_mutex;
-    std::condition_variable mailbox_cv;
-    bool mailbox_shutdown{false};
+union node_state_payload {
+    node_state_payload() {}
+    ~node_state_payload() {}
+#else
+typedef union {
 #endif
-    union {
         struct {
             double value;
             int channels;
@@ -1861,8 +1861,35 @@ typedef struct {
             uint32_t channels;
             uint32_t batches;
         } resampler;
-    } u;
-} node_state_t;
+#if defined(__cplusplus)
+};
+#else
+} node_state_payload;
+#endif
+
+struct node_state_t {
+    node_kind_t kind;
+    AmpMailbox mailbox;
+#if defined(__cplusplus)
+    std::mutex mailbox_mutex;
+    std::condition_variable mailbox_cv;
+    bool mailbox_shutdown;
+#endif
+    node_state_payload u;
+#if defined(__cplusplus)
+    node_state_t();
+    ~node_state_t();
+#endif
+};
+
+#if defined(__cplusplus)
+node_state_t::node_state_t()
+    : kind(NODE_KIND_UNKNOWN), mailbox_shutdown(false) {
+    amp_mailbox_init(&mailbox);
+}
+
+node_state_t::~node_state_t() = default;
+#endif
 
 #if defined(__cplusplus)
 node_state_t::node_state_t() : kind(NODE_KIND_UNKNOWN) {
@@ -3793,11 +3820,19 @@ static int amp_run_node_impl(
         if (node_state == NULL) {
             return -1;
         }
+        amp_mailbox_init(&node_state->mailbox);
 #endif
-        node_state->kind = kind;
-        if (state != NULL) {
-            *state = node_state;
-        }
+        node_state->kind = NODE_KIND_UNKNOWN;
+    }
+    if (node_state->kind == NODE_KIND_UNKNOWN) {
+#if defined(__cplusplus)
+        node_state->mailbox_shutdown = false;
+#endif
+        amp_mailbox_init(&node_state->mailbox);
+    }
+    node_state->kind = kind;
+    if (state != NULL) {
+        *state = node_state;
     }
 
     int rc = 0;
