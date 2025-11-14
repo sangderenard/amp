@@ -80,11 +80,11 @@ This document tracks the implementation plan for a native-only KPN demo that:
 
 ```powershell
 # from repo root (Windows / PowerShell)
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
+cmake -S src/native -B build/native -G "Visual Studio 17 2022" -A x64
+cmake --build build/native --config Release --target amp_native test_fft_division_node
 ```
 
-- After successful build, the Python native loader should be able to find the `amp_native` DLL (or the built artifact). The demo script will attempt to load the native ABI and, if it fails, will print the above instructions.
+- After successful build, the Python native loader should be able to find the `amp_native` DLL (or the built artifact). The demo script will attempt to load the native ABI and, if it fails, will print the above instructions. Building `test_fft_division_node` alongside the library keeps the regression harnesses ready to run (`ctest --test-dir build/native -R test_fft_division_node` or run the binary directly).
 
 ## AGENTS.md / policy
 

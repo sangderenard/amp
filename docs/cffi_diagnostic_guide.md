@@ -14,10 +14,14 @@ treated as hard failures rather than silently falling back to Python.
    `src/native/graph_runtime.cpp` contain the DSP kernels and the Kahn process
    network runtime.  The shared library (`libamp_native.*`) is produced by the
    CMake project in `src/native/` and can be built entirely outside Python.
-   Initialise the `third_party/eigen` submodule before configuring the build;
-   the project refuses to compile if the headers are missing.  Python only
-   drives the build when no binary is available (or when an override requests a
-   rebuild) and never falls back to a Python executor.
+   Configure from the repository root with `cmake -S src/native -B build/native
+   -DCMAKE_BUILD_TYPE=Release`, then build the desired targets (for example,
+   `cmake --build build/native --target amp_native test_fft_division_node`).
+   The project now fetches Eigen and the FFT harness sources automatically via
+   `FetchContent`, so the build succeeds without manually initialising
+   third-party submodules.  Python only drives the build when no binary is
+   available (or when an override requests a rebuild) and never falls back to a
+   Python executor.
 2. **Graph specialisation** – `AudioGraph.render_block` serialises the Python
    graph into descriptors (`serialize_node_descriptors`) and a compiled plan
    (`serialize_compiled_plan`).  These blobs describe the node ordering,
