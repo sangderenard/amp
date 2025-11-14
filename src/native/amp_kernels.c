@@ -35,6 +35,7 @@
 #include <new>
 #include <thread>
 #include <vector>
+#include <cstring>
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
 using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>;
@@ -1483,27 +1484,189 @@ struct FftDivTask {
     int frames{0};
     int slot_count{0};
     double sample_rate{0.0};
-    double *result_buffer{nullptr};
-    int result_channels{0};
-    AmpNodeMetrics *metrics{nullptr};
-    int status{0};
     int flush_mode{AMP_FFT_STREAM_FLUSH_NONE};
 };
 
-struct FftDivWorkerTicket {
+struct FftDivWorkerCommand {
     FftDivTask task;
-    double *result_buffer{nullptr};
-    int result_channels{0};
-    int status{AMP_E_PENDING};
-    bool completed{false};
-    std::condition_variable cv;
+    EdgeRunnerNodeInputs inputs{};
+    EdgeRunnerAudioView audio_view{};
+    std::vector<double> audio_data;
+    std::vector<EdgeRunnerParamView> param_views;
+    std::vector<std::vector<double>> param_storage;
+    EdgeRunnerParamSet param_set{};
+    std::vector<EdgeRunnerTapBuffer> tap_buffers;
+    std::vector<std::vector<double>> tap_buffer_storage;
+    EdgeRunnerTapBufferSet tap_buffer_set{};
+    std::vector<EdgeRunnerTapStatus> tap_statuses;
+    EdgeRunnerTapStatusSet tap_status_set{};
+    EdgeRunnerTapContext tap_context{};
+    bool want_metrics{false};
+    AmpNodeMetrics metrics_storage{};
+    int expected_frames{0};
+
+    bool prepare(const EdgeRunnerNodeInputs *src_inputs, int batches, int channels, int frames, int slot_count);
 };
+
+bool FftDivWorkerCommand::prepare(
+    const EdgeRunnerNodeInputs *src_inputs,
+    int batches,
+    int channels,
+    int frames,
+    int slot_count
+) {
+    expected_frames = (frames > 0) ? frames : 1;
+    if (expected_frames <= 0) {
+        expected_frames = 1;
+    }
+    int effective_batches = (batches > 0) ? batches : 1;
+    int effective_channels = (channels > 0) ? channels : 1;
+    int effective_slot_count = (slot_count > 0) ? slot_count : (effective_batches * effective_channels);
+    if (effective_slot_count <= 0) {
+        effective_slot_count = effective_batches * effective_channels;
+    }
+    if (effective_slot_count <= 0) {
+        effective_slot_count = 1;
+    }
+
+    audio_data.clear();
+    audio_view = {};
+    if (src_inputs != NULL && src_inputs->audio.has_audio) {
+        audio_view.has_audio = 1U;
+        audio_view.batches = src_inputs->audio.batches > 0U
+            ? src_inputs->audio.batches
+            : static_cast<uint32_t>(effective_batches);
+        audio_view.channels = src_inputs->audio.channels > 0U
+            ? src_inputs->audio.channels
+            : static_cast<uint32_t>(effective_channels);
+        audio_view.frames = src_inputs->audio.frames > 0U
+            ? src_inputs->audio.frames
+            : static_cast<uint32_t>(expected_frames);
+        size_t frame_count = audio_view.frames > 0U
+            ? static_cast<size_t>(audio_view.frames)
+            : static_cast<size_t>(expected_frames);
+        size_t sample_count = static_cast<size_t>(effective_slot_count) * frame_count;
+        if (sample_count > 0U) {
+            audio_data.resize(sample_count, 0.0);
+            if (src_inputs->audio.data != NULL) {
+                std::memcpy(audio_data.data(), src_inputs->audio.data, sample_count * sizeof(double));
+            }
+            audio_view.data = audio_data.data();
+        } else {
+            audio_view.data = nullptr;
+        }
+    } else {
+        audio_view.has_audio = 0U;
+        audio_view.batches = static_cast<uint32_t>(effective_batches);
+        audio_view.channels = static_cast<uint32_t>(effective_channels);
+        audio_view.frames = static_cast<uint32_t>(expected_frames);
+        audio_view.data = nullptr;
+    }
+
+    param_views.clear();
+    param_storage.clear();
+    param_set.count = 0U;
+    param_set.items = nullptr;
+    if (src_inputs != NULL && src_inputs->params.count > 0U && src_inputs->params.items != NULL) {
+        param_views.reserve(src_inputs->params.count);
+        param_storage.reserve(src_inputs->params.count);
+        for (uint32_t i = 0; i < src_inputs->params.count; ++i) {
+            const EdgeRunnerParamView &source_view = src_inputs->params.items[i];
+            EdgeRunnerParamView view = source_view;
+            size_t batches_view = view.batches > 0U ? view.batches : 1U;
+            size_t channels_view = view.channels > 0U ? view.channels : 1U;
+            size_t frames_view = view.frames > 0U ? view.frames : 1U;
+            size_t total = batches_view * channels_view * frames_view;
+            if (total > 0U && source_view.data != NULL) {
+                param_storage.emplace_back();
+                param_storage.back().assign(source_view.data, source_view.data + total);
+                view.data = param_storage.back().data();
+            } else if (total > 0U) {
+                param_storage.emplace_back(total, 0.0);
+                view.data = param_storage.back().data();
+            } else {
+                param_storage.emplace_back();
+                view.data = nullptr;
+            }
+            param_views.push_back(view);
+        }
+        if (!param_views.empty()) {
+            param_set.count = static_cast<uint32_t>(param_views.size());
+            param_set.items = param_views.data();
+        }
+    }
+
+    tap_buffers.clear();
+    tap_buffer_storage.clear();
+    tap_buffer_set.count = 0U;
+    tap_buffer_set.items = nullptr;
+    if (src_inputs != NULL && src_inputs->taps.outputs.count > 0U && src_inputs->taps.outputs.items != NULL) {
+        tap_buffers.reserve(src_inputs->taps.outputs.count);
+        tap_buffer_storage.reserve(src_inputs->taps.outputs.count);
+        for (uint32_t i = 0; i < src_inputs->taps.outputs.count; ++i) {
+            const EdgeRunnerTapBuffer &source_buffer = src_inputs->taps.outputs.items[i];
+            EdgeRunnerTapBuffer buffer = source_buffer;
+            uint32_t frames_view = buffer.shape.frames > 0U
+                ? buffer.shape.frames
+                : static_cast<uint32_t>(expected_frames);
+            size_t stride = buffer.frame_stride > 0U
+                ? buffer.frame_stride
+                : static_cast<size_t>((buffer.shape.batches > 0U ? buffer.shape.batches : 1U)
+                    * (buffer.shape.channels > 0U ? buffer.shape.channels : 1U));
+            size_t total = static_cast<size_t>(frames_view) * stride;
+            if (total > 0U && source_buffer.data != NULL) {
+                tap_buffer_storage.emplace_back();
+                tap_buffer_storage.back().assign(source_buffer.data, source_buffer.data + total);
+                buffer.data = tap_buffer_storage.back().data();
+            } else if (total > 0U) {
+                tap_buffer_storage.emplace_back(total, 0.0);
+                buffer.data = tap_buffer_storage.back().data();
+            } else {
+                tap_buffer_storage.emplace_back();
+                buffer.data = source_buffer.data;
+            }
+            tap_buffers.push_back(buffer);
+        }
+        if (!tap_buffers.empty()) {
+            tap_buffer_set.count = static_cast<uint32_t>(tap_buffers.size());
+            tap_buffer_set.items = tap_buffers.data();
+        }
+    }
+
+    tap_statuses.clear();
+    tap_status_set.count = 0U;
+    tap_status_set.items = nullptr;
+    if (src_inputs != NULL && src_inputs->taps.status.count > 0U && src_inputs->taps.status.items != NULL) {
+        tap_statuses.reserve(src_inputs->taps.status.count);
+        for (uint32_t i = 0; i < src_inputs->taps.status.count; ++i) {
+            tap_statuses.push_back(src_inputs->taps.status.items[i]);
+        }
+        if (!tap_statuses.empty()) {
+            tap_status_set.count = static_cast<uint32_t>(tap_statuses.size());
+            tap_status_set.items = tap_statuses.data();
+        }
+    }
+
+    tap_context.outputs = tap_buffer_set;
+    tap_context.status = tap_status_set;
+
+    inputs.audio = audio_view;
+    inputs.params = param_set;
+    inputs.taps = tap_context;
+    task.inputs = &inputs;
+    return true;
+}
 #endif
 
-typedef struct {
-    node_kind_t kind;
-    AmpMailbox mailbox;
-    union {
+typedef struct node_state_t node_state_t;
+
+#if defined(__cplusplus)
+union node_state_payload {
+    node_state_payload() {}
+    ~node_state_payload() {}
+#else
+typedef union {
+#endif
         struct {
             double value;
             int channels;
@@ -1662,7 +1825,7 @@ typedef struct {
                 bool thread_started{false};
                 bool stop_requested{false};
                 bool flush_on_stop{true};
-                std::deque<std::shared_ptr<FftDivWorkerTicket>> pending_tickets;
+                std::deque<std::shared_ptr<FftDivWorkerCommand>> pending_commands;
             };
             WorkerState worker;
             const EdgeRunnerNodeDescriptor *last_descriptor{nullptr};
@@ -1698,8 +1861,35 @@ typedef struct {
             uint32_t channels;
             uint32_t batches;
         } resampler;
-    } u;
-} node_state_t;
+#if defined(__cplusplus)
+};
+#else
+} node_state_payload;
+#endif
+
+struct node_state_t {
+    node_kind_t kind;
+    AmpMailbox mailbox;
+#if defined(__cplusplus)
+    std::mutex mailbox_mutex;
+    std::condition_variable mailbox_cv;
+    bool mailbox_shutdown;
+#endif
+    node_state_payload u;
+#if defined(__cplusplus)
+    node_state_t();
+    ~node_state_t();
+#endif
+};
+
+#if defined(__cplusplus)
+node_state_t::node_state_t()
+    : kind(NODE_KIND_UNKNOWN), mailbox_shutdown(false) {
+    amp_mailbox_init(&mailbox);
+}
+
+node_state_t::~node_state_t() = default;
+#endif
 
 typedef enum {
     OSC_MODE_POLYBLEP = 0,
@@ -1885,8 +2075,19 @@ static void release_node_state(node_state_t *state) {
     if (state->kind == NODE_KIND_FFT_DIV) {
         fft_state_free_buffers(state);
     }
+#if defined(__cplusplus)
+    {
+        std::lock_guard<std::mutex> lock(state->mailbox_mutex);
+        state->mailbox_shutdown = true;
+    }
+    state->mailbox_cv.notify_all();
+#endif
     amp_node_mailbox_clear(state);
+#if defined(__cplusplus)
+    delete state;
+#else
     free(state);
+#endif
 }
 
 AMP_CAPI AmpMailboxEntry *amp_node_mailbox_pop(void *state) {
@@ -1894,6 +2095,9 @@ AMP_CAPI AmpMailboxEntry *amp_node_mailbox_pop(void *state) {
         return NULL;
     }
     node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+#endif
     return amp_mailbox_pop(&node_state->mailbox);
 }
 
@@ -1903,7 +2107,19 @@ AMP_CAPI void amp_node_mailbox_push(void *state, AmpMailboxEntry *entry) {
         return;
     }
     node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    {
+        std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+        if (node_state->mailbox_shutdown) {
+            amp_mailbox_entry_release(entry);
+            return;
+        }
+        amp_mailbox_push(&node_state->mailbox, entry);
+    }
+    node_state->mailbox_cv.notify_all();
+#else
     amp_mailbox_push(&node_state->mailbox, entry);
+#endif
 }
 
 AMP_CAPI void amp_node_mailbox_clear(void *state) {
@@ -1911,6 +2127,9 @@ AMP_CAPI void amp_node_mailbox_clear(void *state) {
         return;
     }
     node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+#endif
     AmpMailboxEntry *entry = amp_mailbox_pop(&node_state->mailbox);
     while (entry != NULL) {
         amp_mailbox_entry_release(entry);
@@ -3094,7 +3313,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.last_frames = 0;
     state->u.fftdiv.last_slot_count = 0;
     state->u.fftdiv.last_sample_rate = 0.0;
-    state->u.fftdiv.worker.pending_tickets.clear();
+    state->u.fftdiv.worker.pending_commands.clear();
     state->u.fftdiv.worker.stop_requested = false;
     state->u.fftdiv.worker.flush_on_stop = true;
 #endif
@@ -3584,14 +3803,29 @@ static int amp_run_node_impl(
         }
     }
     if (node_state == NULL) {
+#if defined(__cplusplus)
+        node_state = new (std::nothrow) node_state_t();
+        if (node_state == nullptr) {
+            return -1;
+        }
+#else
         node_state = (node_state_t *)calloc(1, sizeof(node_state_t));
         if (node_state == NULL) {
             return -1;
         }
-        node_state->kind = kind;
-        if (state != NULL) {
-            *state = node_state;
-        }
+        amp_mailbox_init(&node_state->mailbox);
+#endif
+        node_state->kind = NODE_KIND_UNKNOWN;
+    }
+    if (node_state->kind == NODE_KIND_UNKNOWN) {
+#if defined(__cplusplus)
+        node_state->mailbox_shutdown = false;
+#endif
+        amp_mailbox_init(&node_state->mailbox);
+    }
+    node_state->kind = kind;
+    if (state != NULL) {
+        *state = node_state;
     }
 
     int rc = 0;
@@ -3764,18 +3998,24 @@ static int amp_wait_node_completion_impl(
     switch (kind) {
         case NODE_KIND_FFT_DIV:
 #if defined(__cplusplus)
-            return fftdiv_wait_for_completion(
-                descriptor,
-                inputs,
-                batches,
-                channels,
-                frames,
-                sample_rate,
-                node_state,
-                out_buffer,
-                out_channels,
-                metrics
-            );
+            {
+                AmpMailboxEntry *entry = amp_node_mailbox_pop(node_state);
+                if (entry == NULL) {
+                    return AMP_E_PENDING;
+                }
+                if (out_channels != NULL) {
+                    *out_channels = entry->channels > 0 ? entry->channels : 1;
+                }
+                if (out_buffer != NULL) {
+                    *out_buffer = entry->buffer;
+                }
+                if (metrics != NULL) {
+                    *metrics = entry->metrics;
+                }
+                int status = entry->status;
+                amp_mailbox_entry_release(entry);
+                return status;
+            }
 #else
             (void)descriptor;
             (void)inputs;
