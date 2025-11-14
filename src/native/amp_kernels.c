@@ -1874,9 +1874,28 @@ struct node_state_t {
     std::mutex mailbox_mutex;
     std::condition_variable mailbox_cv;
     bool mailbox_shutdown{false};
+    bool fftdiv_constructed{false};
 #endif
     node_state_payload u;
 };
+
+#if defined(__cplusplus)
+static void fftdiv_construct_state(node_state_t *state) {
+    if (state == nullptr || state->fftdiv_constructed) {
+        return;
+    }
+    new (&state->u.fftdiv) decltype(state->u.fftdiv)();
+    state->fftdiv_constructed = true;
+}
+
+static void fftdiv_destroy_state(node_state_t *state) {
+    if (state == nullptr || !state->fftdiv_constructed) {
+        return;
+    }
+    std::destroy_at(&state->u.fftdiv);
+    state->fftdiv_constructed = false;
+}
+#endif
 
 typedef enum {
     OSC_MODE_POLYBLEP = 0,
@@ -2060,7 +2079,14 @@ static void release_node_state(node_state_t *state) {
         state->u.resampler.batches = 0;
     }
     if (state->kind == NODE_KIND_FFT_DIV) {
+#if defined(__cplusplus)
+        if (state->fftdiv_constructed) {
+            fft_state_free_buffers(state);
+            fftdiv_destroy_state(state);
+        }
+#else
         fft_state_free_buffers(state);
+#endif
     }
 #if defined(__cplusplus)
     {
@@ -3783,11 +3809,18 @@ static int amp_run_node_impl(
         node_state = (node_state_t *)(*state);
     }
     if (node_state != NULL && node_state->kind != kind) {
-        release_node_state(node_state);
-        node_state = NULL;
-        if (state != NULL) {
-            *state = NULL;
-        }
+        const char *descriptor_name = (descriptor != NULL && descriptor->name != NULL)
+            ? descriptor->name
+            : "<null>";
+        fprintf(
+            stderr,
+            "amp_run_node_impl: node state kind mismatch (cached=%d descriptor=%d name=%s)\n",
+            (int)node_state->kind,
+            (int)kind,
+            descriptor_name
+        );
+        fflush(stderr);
+        abort();
     }
     if (node_state == NULL) {
 #if defined(__cplusplus)
@@ -3810,6 +3843,11 @@ static int amp_run_node_impl(
 #endif
         amp_mailbox_init(&node_state->mailbox);
     }
+#if defined(__cplusplus)
+    if (kind == NODE_KIND_FFT_DIV) {
+        fftdiv_construct_state(node_state);
+    }
+#endif
     node_state->kind = kind;
     if (state != NULL) {
         *state = node_state;
