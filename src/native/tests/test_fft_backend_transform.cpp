@@ -7,7 +7,13 @@
 #include <utility>
 #include <vector>
 
-#include "../fftfree/fft_cffi.hpp"
+#if __has_include("fftfree/fft_cffi.hpp")
+#include "fftfree/fft_cffi.hpp"
+#elif __has_include(<fft_cffi.hpp>)
+#include <fft_cffi.hpp>
+#else
+#error "fft_cffi.hpp header not found; ensure fftfree is available"
+#endif
 
 #define AMP_NATIVE_USE_FFTFREE 1
 #include "../fft_backend.cpp"
