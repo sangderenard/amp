@@ -1877,6 +1877,28 @@ static int fftdiv_execute_block(
             pcm_expected_samples,
             queue_drains_without_emission);
 #endif
+        {
+            AmpMailboxEntry *existing_entry = amp_node_mailbox_pop(state);
+            if (existing_entry != NULL) {
+                free(buffer);
+                buffer = NULL;
+                amp_last_alloc_count = 0;
+                if (out_channels != NULL) {
+                    *out_channels = existing_entry->channels > 0
+                        ? existing_entry->channels
+                        : input_channels;
+                }
+                if (out_buffer != NULL) {
+                    *out_buffer = existing_entry->buffer;
+                }
+                if (metrics != NULL) {
+                    *metrics = existing_entry->metrics;
+                }
+                int mailbox_status = existing_entry->status;
+                amp_mailbox_entry_release(existing_entry);
+                return mailbox_status;
+            }
+        }
         free(buffer);
         *out_buffer = NULL;
         *out_channels = 0;
