@@ -32,11 +32,66 @@ if (NOT TARGET Eigen3::Eigen)
     set_target_properties(Eigen3::Eigen PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
 endif()
 
-set(FFTFREE_BUILD_SHARED OFF CACHE BOOL "Build fft_cffi as a shared library" FORCE)
-set(FFTFREE_BUILD_APPS OFF CACHE BOOL "Build fftfree standalone demos and tools" FORCE)
-set(FFTFREE_BUILD_TESTS OFF CACHE BOOL "Build fftfree test executables" FORCE)
-set(FFTFREE_OPENMP OFF CACHE BOOL "Enable OpenMP in fftfree" FORCE)
-add_subdirectory(fftfree)
+set(_FFTFREE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fftfree")
+set(_FFTFREE_TARGET "")
+set(_FFTFREE_INCLUDE_DIRS "")
+
+set(_FFTFREE_FETCHED FALSE)
+set(_FFTFREE_EXTERNAL_SOURCE "")
+set(_FFTFREE_EXTERNAL_BINARY "")
+
+if (EXISTS "${_FFTFREE_SOURCE_DIR}/CMakeLists.txt")
+    set(_FFTFREE_EXTERNAL_SOURCE "${_FFTFREE_SOURCE_DIR}")
+elseif(NOT DEFINED fftfree_FOUND)
+    # Avoid redundant work if a caller already pulled fftfree in via FetchContent
+    find_package(fftfree CONFIG QUIET)
+    if (fftfree_FOUND)
+        if (TARGET fftfree::fft_cffi)
+            set(_FFTFREE_TARGET fftfree::fft_cffi)
+        elseif (TARGET fft_cffi)
+            set(_FFTFREE_TARGET fft_cffi)
+        else()
+            message(FATAL_ERROR "fftfree package located but no fft_cffi target was exported")
+        endif()
+        get_target_property(_FFTFREE_INCLUDE_DIRS ${_FFTFREE_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
+        if (NOT _FFTFREE_INCLUDE_DIRS OR _FFTFREE_INCLUDE_DIRS STREQUAL "_FFTFREE_INCLUDE_DIRS-NOTFOUND")
+            set(_FFTFREE_INCLUDE_DIRS "")
+        endif()
+    endif()
+endif()
+
+if (NOT _FFTFREE_TARGET AND NOT _FFTFREE_EXTERNAL_SOURCE)
+    include(FetchContent)
+    message(STATUS "fftfree sources missing; fetching from upstream repository")
+    FetchContent_Declare(
+        fftfree_external
+        GIT_REPOSITORY https://github.com/sangderenard/fftfree.git
+        GIT_TAG 9e875520f2c1fc2eda067f125595af21f1355364
+    )
+    FetchContent_GetProperties(fftfree_external)
+    if (NOT fftfree_external_POPULATED)
+        FetchContent_Populate(fftfree_external)
+    endif()
+    set(_FFTFREE_EXTERNAL_SOURCE "${fftfree_external_SOURCE_DIR}")
+    set(_FFTFREE_EXTERNAL_BINARY "${fftfree_external_BINARY_DIR}")
+    set(_FFTFREE_FETCHED TRUE)
+endif()
+
+if (_FFTFREE_EXTERNAL_SOURCE)
+    set(FFTFREE_BUILD_SHARED OFF CACHE BOOL "Build fft_cffi as a shared library" FORCE)
+    set(FFTFREE_BUILD_APPS OFF CACHE BOOL "Build fftfree standalone demos and tools" FORCE)
+    set(FFTFREE_BUILD_TESTS OFF CACHE BOOL "Build fftfree test executables" FORCE)
+    set(FFTFREE_OPENMP OFF CACHE BOOL "Enable OpenMP in fftfree" FORCE)
+    if (_FFTFREE_FETCHED)
+        add_subdirectory("${_FFTFREE_EXTERNAL_SOURCE}" "${_FFTFREE_EXTERNAL_BINARY}")
+    else()
+        add_subdirectory(fftfree)
+    endif()
+    set(_FFTFREE_TARGET fft_cffi)
+    list(APPEND _FFTFREE_INCLUDE_DIRS "${_FFTFREE_EXTERNAL_SOURCE}")
+elseif(NOT _FFTFREE_TARGET)
+    message(FATAL_ERROR "fftfree sources not present. Either initialise the submodule, install the fftfree package, or allow FetchContent to download it.")
+endif()
 
 # Ensure consistent output directories for multi-config generators (Visual Studio)
 if(CMAKE_CONFIGURATION_TYPES)
@@ -72,11 +127,11 @@ target_include_directories(amp_native
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${EIGEN3_INCLUDE_DIR}
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/fftfree
+        ${_FFTFREE_INCLUDE_DIRS}
 )
 
 target_compile_definitions(amp_native PRIVATE AMP_NATIVE_BUILD AMP_NATIVE_USE_FFTFREE)
-target_link_libraries(amp_native PRIVATE Threads::Threads fft_cffi)
+target_link_libraries(amp_native PRIVATE Threads::Threads ${_FFTFREE_TARGET})
 
 add_executable(demo_kpn_native
     demo_kpn_native.cpp
@@ -221,8 +276,9 @@ if (AMP_NATIVE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${EIGEN3_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${_FFTFREE_INCLUDE_DIRS}
     )
-    target_link_libraries(test_fft_backend_compare PRIVATE amp_native fft_cffi)
+    target_link_libraries(test_fft_backend_compare PRIVATE amp_native ${_FFTFREE_TARGET})
     add_test(NAME test_fft_backend_compare COMMAND test_fft_backend_compare)
 
     add_executable(test_fft_backend_transform
@@ -233,8 +289,9 @@ if (AMP_NATIVE_BUILD_TESTS)
         ${EIGEN3_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${_FFTFREE_INCLUDE_DIRS}
     )
-    target_link_libraries(test_fft_backend_transform PRIVATE fft_cffi)
+    target_link_libraries(test_fft_backend_transform PRIVATE ${_FFTFREE_TARGET})
     add_test(NAME test_fft_backend_transform COMMAND test_fft_backend_transform)
 
     add_executable(test_fft_backend_stream
@@ -245,8 +302,9 @@ if (AMP_NATIVE_BUILD_TESTS)
         ${EIGEN3_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${_FFTFREE_INCLUDE_DIRS}
     )
-    target_link_libraries(test_fft_backend_stream PRIVATE fft_cffi)
+    target_link_libraries(test_fft_backend_stream PRIVATE ${_FFTFREE_TARGET})
     add_test(NAME test_fft_backend_stream COMMAND test_fft_backend_stream)
 
     add_executable(test_pitch_shift_node

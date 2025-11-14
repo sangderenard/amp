@@ -13,6 +13,9 @@ from typing import Optional
 import io
 import filecmp
 import os
+import shlex
+import subprocess
+import sys
 
 import numpy as np
 import shutil
@@ -80,6 +83,70 @@ def _stage_cffi_source(source: Path, target_name: str) -> Path:
         return target
     except OSError as exc:
         raise RuntimeError(f"Failed to stage {source.name} for CFFI build: {exc}") from exc
+
+
+def _discover_fftfree_with_cmake() -> tuple[list[str], list[str], list[str]] | None:
+    """Best-effort discovery of installed fftfree package metadata."""
+
+    cmake = shutil.which("cmake")
+    if not cmake:
+        return None
+
+    env = native_build.command_environment()
+
+    def _run(mode: str) -> list[str] | None:
+        try:
+            result = subprocess.run(
+                [
+                    cmake,
+                    "--find-package",
+                    "-DNAME=fftfree",
+                    "-DCOMPILER_ID=GNU",
+                    "-DLANGUAGE=CXX",
+                    f"-DMODE={mode}",
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        output = result.stdout.strip()
+        if not output:
+            return []
+        return shlex.split(output)
+
+    compile_tokens = _run("COMPILE")
+    if compile_tokens is None:
+        return None
+    link_tokens = _run("LINK")
+    if link_tokens is None:
+        return None
+
+    include_dirs: list[str] = []
+    compile_args: list[str] = []
+
+    idx = 0
+    while idx < len(compile_tokens):
+        token = compile_tokens[idx]
+        if token.startswith("-I"):
+            if token == "-I":
+                idx += 1
+                if idx < len(compile_tokens):
+                    include_dirs.append(compile_tokens[idx])
+            else:
+                include_dirs.append(token[2:])
+        elif token == "-isystem":
+            idx += 1
+            if idx < len(compile_tokens):
+                include_dirs.append(compile_tokens[idx])
+        else:
+            compile_args.append(token)
+        idx += 1
+
+    return include_dirs, compile_args, link_tokens
 
 
 try:
@@ -262,24 +329,47 @@ try:
             str(debug_alloc_cxx),
             str(native_dir / "fft_backend.cpp"),
         ]
-        if os.environ.get("AMP_NATIVE_USE_FFTFREE", "").strip():
-            sources.append(str(native_dir / "fftfree" / "fft_cffi.cpp"))
-            # When compiling the fft_cffi implementation into this module we
-            # must ensure the header's export macro resolves to an export (or
-            # at least not dllimport). The upstream CMake build defines
-            # FFT_CFFI_EXPORTS for the fft_cffi target; replicate that here
-            # so the translation unit defines symbols correctly instead of
-            # being declared as __declspec(dllimport) which causes C2491.
-            if sys.platform == "win32":
-                _EXTRA_COMPILE_ARGS.append("/DFFT_CFFI_EXPORTS")
+        include_paths = [str(include_dir), str(eigen_dir), str(native_dir)]
+        use_fftfree = os.environ.get("AMP_NATIVE_USE_FFTFREE", "").strip()
+        if use_fftfree:
+            fft_source = native_dir / "fftfree" / "fft_cffi.cpp"
+            if fft_source.exists():
+                sources.append(str(fft_source))
+                local_include = str(native_dir / "fftfree")
+                if local_include not in include_paths:
+                    include_paths.append(local_include)
+                # When compiling the fft_cffi implementation into this module we
+                # must ensure the header's export macro resolves to an export (or
+                # at least not dllimport). The upstream CMake build defines
+                # FFT_CFFI_EXPORTS for the fft_cffi target; replicate that here
+                # so the translation unit defines symbols correctly instead of
+                # being declared as __declspec(dllimport) which causes C2491.
+                if sys.platform == "win32":
+                    _EXTRA_COMPILE_ARGS.append("/DFFT_CFFI_EXPORTS")
+                else:
+                    _EXTRA_COMPILE_ARGS.append("-DFFT_CFFI_EXPORTS")
             else:
-                _EXTRA_COMPILE_ARGS.append("-DFFT_CFFI_EXPORTS")
+                discovery = _discover_fftfree_with_cmake()
+                if discovery is None:
+                    raise RuntimeError(
+                        "AMP_NATIVE_USE_FFTFREE is set but fftfree sources are unavailable and an installed package could not be located."
+                    )
+                discovered_includes, discovered_compile_args, discovered_link_args = discovery
+                for path in discovered_includes:
+                    if path and path not in include_paths:
+                        include_paths.append(path)
+                for arg in discovered_compile_args:
+                    if arg and arg not in _EXTRA_COMPILE_ARGS:
+                        _EXTRA_COMPILE_ARGS.append(arg)
+                for arg in discovered_link_args:
+                    if arg and arg not in _EXTRA_LINK_ARGS:
+                        _EXTRA_LINK_ARGS.append(arg)
 
         ffi.set_source(
             "_amp_ckernels_cffi",
             '#include "amp_native.h"\n',
             sources=sources,
-            include_dirs=[str(include_dir), str(eigen_dir), str(native_dir)],
+            include_dirs=include_paths,
             extra_compile_args=_EXTRA_COMPILE_ARGS,
             extra_link_args=_EXTRA_LINK_ARGS,
             source_extension=".cc",
