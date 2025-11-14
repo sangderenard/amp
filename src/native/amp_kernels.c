@@ -1873,30 +1873,10 @@ struct node_state_t {
 #if defined(__cplusplus)
     std::mutex mailbox_mutex;
     std::condition_variable mailbox_cv;
-    bool mailbox_shutdown;
+    bool mailbox_shutdown{false};
 #endif
     node_state_payload u;
-#if defined(__cplusplus)
-    node_state_t();
-    ~node_state_t();
-#endif
 };
-
-#if defined(__cplusplus)
-node_state_t::node_state_t()
-    : kind(NODE_KIND_UNKNOWN), mailbox_shutdown(false) {
-    amp_mailbox_init(&mailbox);
-}
-
-node_state_t::~node_state_t() = default;
-#endif
-
-#if defined(__cplusplus)
-node_state_t::node_state_t() : kind(NODE_KIND_UNKNOWN) {
-    amp_mailbox_init(&mailbox);
-    mailbox_shutdown = false;
-}
-#endif
 
 typedef enum {
     OSC_MODE_POLYBLEP = 0,
