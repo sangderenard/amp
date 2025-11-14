@@ -31,9 +31,8 @@ AMP_CAPI int amp_fft_backend_transform_many(
 /* Extended variant: pass STFT framing/window instructions. This is optional
    and callers may use the legacy amp_fft_backend_transform_many if they don't
    need STFT framing. When provided, `window` and `hop` describe the analysis
-   window and hop parameters to be used by the backend's batched helpers; if
-   `stft_mode` is non-zero the backend will initialize an STFT-capable
-   context. Returns 1 on success, 0 on error. */
+   window and hop parameters to be used by the backend's batched helpers.
+   Streaming mode is now always enabled. Returns 1 on success, 0 on error. */
 /* Window kind constants mirror fftfree's FFT_WINDOW_* values. */
 #define AMP_FFT_WINDOW_RECT 0
 #define AMP_FFT_WINDOW_HANN 1
@@ -56,7 +55,6 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
     int inverse,
     int window,
     int hop,
-    int stft_mode,
     int apply_windows,
     int analysis_window_kind,
     int synthesis_window_kind

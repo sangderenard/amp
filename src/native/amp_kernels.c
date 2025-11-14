@@ -3179,17 +3179,27 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
         window_kind = FFT_WINDOW_RECTANGULAR;
     }
 
+    // Determine per-stage frame capacity (how many spectral frames we can process in one push)
+    size_t stage_frames = state->u.fftdiv.stream_max_fft_frames;
+    if (stage_frames == 0U) {
+        // Default: window_size provides enough capacity for W overlapping frames with H=1
+        // This ensures we can hold a full window worth of spectral frames
+        stage_frames = (window_size > 0) ? (size_t)window_size : 1U;
+    }
+
+    // Ensure the spectral ring capacity is at least as large as the stage capacity,
+    // so that all emitted frames can be queued without immediate loss.
     size_t ring_frames = state->u.fftdiv.spectral_ring_capacity_frames;
     if (ring_frames == 0U) {
         ring_frames = state->u.fftdiv.stream_max_fft_frames;
     }
     if (ring_frames == 0U) {
-        ring_frames = 1U;
+        ring_frames = stage_frames; // default ring to stage capacity if unspecified
+    } else if (ring_frames < stage_frames) {
+        ring_frames = stage_frames;
     }
-    size_t stage_frames = state->u.fftdiv.stream_max_fft_frames;
-    if (stage_frames == 0U) {
-        stage_frames = 1U;
-    }
+    // Persist the enlarged ring capacity back to state for future calls
+    state->u.fftdiv.spectral_ring_capacity_frames = ring_frames;
     const size_t spectral_capacity = ring_frames * (size_t)window_size;
     const size_t stage_capacity = stage_frames * (size_t)window_size;
 

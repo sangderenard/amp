@@ -72,7 +72,6 @@ fft_context *get_context(int n, bool inverse) {
         2,   /* pad_mode = never */
         n,
         n,
-        0,   /* stft_mode */
         FFT_TRANSFORM_C2C,
         0,
         0,
@@ -301,19 +300,12 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
     int inverse,
     int window,
     int hop,
-    int stft_mode,
     int apply_windows,
     int analysis_window_kind,
     int synthesis_window_kind
 ) {
     if (n <= 0 || batch <= 0 || out_real == nullptr || out_imag == nullptr || in_real == nullptr) {
         return 0;
-    }
-
-    // If caller requests default behaviour (no STFT framing) and window==n/hop==n,
-    // delegate to the cached/path-optimized implementation.
-    if (stft_mode == 0 && window == n && hop == n && apply_windows == 0) {
-        return run_fftfree_many(in_real, in_imag, out_real, out_imag, n, batch, inverse != 0);
     }
 
     if (window <= 0) {
@@ -342,7 +334,6 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
         2,   /* pad_mode = never */
         window,
         hop,
-        stft_mode,
         FFT_TRANSFORM_C2C,
         0,
         0,
@@ -494,7 +485,6 @@ AMP_CAPI void *amp_fft_backend_stream_create(
         2,
         window,
         hop,
-        2, /* streaming mode */
         FFT_TRANSFORM_C2C,
         0,
         0,
@@ -603,7 +593,6 @@ AMP_CAPI void *amp_fft_backend_stream_create_inverse(
         2,
         window,
         hop,
-        2,
         FFT_TRANSFORM_C2C,
         0,
         0,

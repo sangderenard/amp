@@ -706,8 +706,11 @@ static void stage_emit_spectral(
     int tensor_slice,
     int tensor_freq_bins
 ) {
-    int have_real_target = (spectral_real_tap != NULL && spectral_real_tap->data != NULL);
-    int have_imag_target = (spectral_imag_tap != NULL && spectral_imag_tap->data != NULL);
+        if (spectral_real_tap == NULL || spectral_imag_tap == NULL) {
+            return;
+        }
+        int have_real_target = (spectral_real_tap->data != NULL);
+        int have_imag_target = (spectral_imag_tap->data != NULL);
     if (!have_real_target && !have_imag_target) {
         return;
     }
@@ -865,8 +868,7 @@ static int fftdiv_execute_block(
     AmpNodeMetrics *metrics,
     int flush_mode
 ) {
-    (void)sample_rate;
-    if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL) {
+        if (descriptor == NULL || inputs == NULL || out_buffer == NULL || out_channels == NULL || state == NULL || frames <= 0) {
         return -1;
     }
     if (flush_mode < AMP_FFT_STREAM_FLUSH_NONE || flush_mode > AMP_FFT_STREAM_FLUSH_FINAL) {
@@ -1179,7 +1181,13 @@ static int fftdiv_execute_block(
     size_t pcm_expected_samples = 0U;
     for (const auto &lane_meta : state->u.fftdiv.lane_plan) {
         if (lane_meta.active && lane_meta.enable_pcm_out) {
-            pcm_expected_samples += static_cast<size_t>(frames);
+            // Account for STFT latency: with window W, we get (W-1) samples delay
+            // So for N input frames, expect max(0, N - (W-1)) output samples in steady state
+            const int latency_samples = (window_size > 1) ? (window_size - 1) : 0;
+            const size_t expected_for_lane = (frames > latency_samples) 
+                ? static_cast<size_t>(frames - latency_samples)
+                : 0U;
+            pcm_expected_samples += expected_for_lane;
         }
     }
 
@@ -1255,6 +1263,14 @@ static int fftdiv_execute_block(
                     if (stage_capacity_frames == 0U) {
                         stage_capacity_frames = 1U;
                     }
+                    // Ensure capacity is at least large enough for current input with W=window_size, H=1
+                    // Max frames from N samples: (N - W) + 1
+                    const size_t min_capacity = (frames >= window_size) 
+                        ? (size_t)(frames - window_size + 1)
+                        : 1U;
+                    if (stage_capacity_frames < min_capacity) {
+                        stage_capacity_frames = min_capacity;
+                    }
                     const size_t stage_capacity = stage_capacity_frames * (size_t)window_size;
                     if (slot_state.forward_stage_real.size() != stage_capacity) {
                         try {
@@ -1291,6 +1307,8 @@ static int fftdiv_execute_block(
                     slot_state.forward_frame_capacity = stage_capacity_frames;
                     slot_spectral_real = slot_state.forward_stage_real.empty() ? NULL : slot_state.forward_stage_real.data();
                     slot_spectral_imag = slot_state.forward_stage_imag.empty() ? NULL : slot_state.forward_stage_imag.data();
+                    fprintf(stderr, "[STAGE1-INPUT] slot=%d frames=%d pcm[0]=%.6f handle=%p\n", 
+                            slot, frames, pcm_cursor[0], (void*)slot_state.forward_handle);
 #if FFTDIV_TRACE_ENABLED
                     const int pcm_trace_limit = 16;
                     const int pcm_values_to_log = (frames < pcm_trace_limit) ? frames : pcm_trace_limit;
@@ -1319,6 +1337,8 @@ static int fftdiv_execute_block(
                         stage_capacity_frames);
 #endif
                     if (slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                        fprintf(stderr, "[STAGE2-PRE-FFT] slot=%d input_frames=%d stage_capacity=%zu\n", 
+                                slot, frames, stage_capacity_frames);
                         frames_emitted = amp_fft_backend_stream_push(
                             slot_state.forward_handle,
                             pcm_cursor,
@@ -1328,6 +1348,7 @@ static int fftdiv_execute_block(
                             slot_spectral_imag,
                             stage_capacity_frames,
                             flush_mode);
+                        fprintf(stderr, "[STAGE2-FFT] slot=%d frames_emitted=%zu\n", slot, frames_emitted);
                         if (frames_emitted > 0) {
                             fftdiv_ring_append_frames(
                                 state,
@@ -1546,18 +1567,37 @@ static int fftdiv_execute_block(
                     continue;
                 }
 
+                /* Stage 2 (Spectral In): summarize a few nonzero bins from the ring frame */
+                {
+                    int hits = 0;
+                    const int max_hits = 8;
+                    for (int f = 0; f < window_size && hits < max_hits; ++f) {
+                        const double re = slot_spectral_real[f];
+                        const double im = slot_spectral_imag[f];
+                        if (re != 0.0 || im != 0.0) {
+                            fprintf(stderr, "[STAGE2-SPEC-IN] slot=%d slice=%d bin=%d re=%.6g im=%.6g\n", slot, tensor_slice_iter, f, re, im);
+                            ++hits;
+                        }
+                    }
+                    if (hits == 0) {
+                        fprintf(stderr, "[STAGE2-SPEC-IN] slot=%d slice=%d all-zero\n", slot, tensor_slice_iter);
+                    }
+                }
+
                 const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
                 double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice_iter);
                 double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, tensor_lane, scratch_slice_iter);
                 const int scratch_bins = fftdiv_spectral_scratch_bins(state);
 
-                const double *commit_real = scratch_real;
-                const double *commit_imag = scratch_imag;
-                int commit_bins = scratch_bins;
-                if (commit_real == NULL || commit_imag == NULL || commit_bins <= 0) {
-                    commit_real = slot_spectral_real;
-                    commit_imag = slot_spectral_imag;
-                    commit_bins = window_size;
+                /* Prefer ring frame as source unless operator wrote to scratch */
+                const double *commit_real = slot_spectral_real;
+                const double *commit_imag = slot_spectral_imag;
+                int commit_bins = window_size;
+                if (!state->u.fftdiv.operator_steps.empty() &&
+                    scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
+                    commit_real = scratch_real;
+                    commit_imag = scratch_imag;
+                    commit_bins = scratch_bins;
                 }
 
                 fftdiv_copy_spectrum_to_working(
@@ -1672,6 +1712,37 @@ static int fftdiv_execute_block(
                 slice.view_filled_override);
 
             if (active_window_view.valid()) {
+                /* Stage 3 (OP): list nonzero content in active window */
+                {
+                    const int tspan = active_window_view.window_span;
+                    const int lanes = active_window_view.lanes;
+                    const int bins = active_window_view.freq_bins;
+                    const size_t lane_stride = active_window_view.lane_stride();
+                    const size_t freq_stride = active_window_view.freq_stride();
+                    /* Limit output per slice to avoid flooding */
+                    const int max_hits_per_slice = 12;
+                    for (int t = 0; t < tspan; ++t) {
+                        std::complex<double> *tbase = active_window_view.time_slice(t);
+                        if (tbase == nullptr) {
+                            continue;
+                        }
+                        int hits = 0;
+                        for (int lane = 0; lane < lanes && hits < max_hits_per_slice; ++lane) {
+                            for (int f = 0; f < bins && hits < max_hits_per_slice; ++f) {
+                                std::complex<double> *ptr = tbase + (size_t)lane * lane_stride + (size_t)f * freq_stride;
+                                const double re = ptr->real();
+                                const double im = ptr->imag();
+                                if (re != 0.0 || im != 0.0) {
+                                    fprintf(stderr, "[STAGE3-OP] t=%d lane=%d bin=%d re=%.6g im=%.6g\n", t, lane, f, re, im);
+                                    ++hits;
+                                }
+                            }
+                        }
+                        if (hits == 0) {
+                            fprintf(stderr, "[STAGE3-OP] t=%d no-nonzero\n", t);
+                        }
+                    }
+                }
                 FftDivOperatorContext operator_context;
                 operator_context.window = active_window_view;
                 operator_context.lanes = operator_lane_bindings.empty()
@@ -1767,6 +1838,8 @@ static int fftdiv_execute_block(
                             tensor_lane,
                             tensor_slice_iter,
                             tensor_freq_bins);
+                        /* Stage 4 (Spectral Out): we just emitted a row to taps for this frame */
+                        fprintf(stderr, "[STAGE4-SPEC-OUT] slot=%d frame=%lld bins=%d\n", slot, (long long)slice.frame_index, window_size);
                     }
 
                     if (lane.enable_pcm_out && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
@@ -1787,6 +1860,7 @@ static int fftdiv_execute_block(
                             slot_state.inverse_scratch.data(),
                             slot_state.inverse_scratch.size(),
                             flush_mode);
+                        fprintf(stderr, "[STAGE3-INVERSE] slot=%d produced_pcm=%zu\n", slot, produced_pcm);
                         if (produced_pcm > 0) {
                             made_progress = true;
                         }
@@ -1817,6 +1891,8 @@ static int fftdiv_execute_block(
                         wrote_output = true;
                         pcm_written_samples += 1U;
                         made_progress = true;
+                        /* Stage 5 (PCM Out): published one sample to the output buffer */
+                        fprintf(stderr, "[STAGE5-PCM] slot=%d sample_idx=%lld value=%.6g\n", slot, (long long)(slice.pcm_sample_index + (int64_t)slot), output_value);
                     }
 
                     if (slot_state.forward_ring_filled > 0U && slot_state.forward_ring_capacity_frames > 0U) {
@@ -1834,6 +1910,7 @@ static int fftdiv_execute_block(
                         *buffer_ptr = output_value;
                         slot_state.last_pcm_output = output_value;
                         wrote_output = true;
+                        fprintf(stderr, "[STAGE5-PCM] slot=%d sample_idx=%lld value=%.6g\n", slot, (long long)(slice.pcm_sample_index + (int64_t)slot), output_value);
                     }
                 }
                 if (wrote_output) {
@@ -1868,7 +1945,10 @@ static int fftdiv_execute_block(
 #endif /* defined(__cplusplus) */
 
 #if defined(__cplusplus)
+    fprintf(stderr, "[STAGE4-CHECK] made_progress=%d pcm_written=%zu expected=%zu\n",
+            made_progress ? 1 : 0, pcm_written_samples, pcm_expected_samples);
     if (!made_progress || (pcm_expected_samples > 0U && pcm_written_samples < pcm_expected_samples)) {
+        fprintf(stderr, "[STAGE4-INSUFFICIENT] Freeing buffer and returning AMP_E_PENDING\n");
 #if FFTDIV_TRACE_ENABLED
         FFTDIV_TRACE(
             "[fftdiv] pending progress=%d pcm_written=%zu expected=%zu queue_misses=%zu",
@@ -1928,6 +2008,8 @@ static int fftdiv_execute_block(
 
     *out_buffer = buffer;
     *out_channels = input_channels;
+    fprintf(stderr, "[STAGE4-OUTPUT] buffer=%p channels=%d first_sample=%.6f\n", 
+            (void*)buffer, input_channels, buffer ? buffer[0] : 0.0);
 
     if (metrics != NULL) {
         metrics->measured_delay_frames = (uint32_t)((window_size > 0) ? (window_size - 1) : 0);
@@ -2228,6 +2310,7 @@ static void fftdiv_worker_process_command(
 
     double *buffer = nullptr;
     int out_channels = 0;
+    fprintf(stderr, "[STAGE0-WORKER] Processing command frames=%d\n", command->task.frames);
     int status = fftdiv_execute_block(
         command->task.descriptor,
         command->task.inputs,
@@ -2241,6 +2324,8 @@ static void fftdiv_worker_process_command(
         command->want_metrics ? metrics_ptr : nullptr,
         command->task.flush_mode
     );
+    fprintf(stderr, "[STAGE5-MAILBOX] status=%d buffer=%p channels=%d\n", 
+            status, (void*)buffer, out_channels);
 
     if (command->task.flush_mode == AMP_FFT_STREAM_FLUSH_NONE) {
         state->u.fftdiv.last_descriptor = command->task.descriptor;

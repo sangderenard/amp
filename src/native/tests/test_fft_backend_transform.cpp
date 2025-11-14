@@ -40,7 +40,7 @@ bool compare_buffers(const std::vector<double> &lhs, const std::vector<double> &
 
 class FftfreeContext {
 public:
-    FftfreeContext(int n, bool inverse, int window, int hop, int stft_mode, bool apply_windows, int analysis_window, int synthesis_window)
+    FftfreeContext(int n, bool inverse, int window, int hop, bool apply_windows, int analysis_window, int synthesis_window)
         : n_(n) {
         if (n_ <= 0) {
             return;
@@ -63,7 +63,6 @@ public:
             2,
             window,
             hop,
-            stft_mode,
             FFT_TRANSFORM_C2C,
             0,
             0,
@@ -109,7 +108,7 @@ public:
     }
 
     static FftfreeContext MakeTransform(int n, bool inverse) {
-        return FftfreeContext(n, inverse, n, n, 0, false, FFT_WINDOW_RECT, FFT_WINDOW_RECT);
+        return FftfreeContext(n, inverse, n, n, false, FFT_WINDOW_RECT, FFT_WINDOW_RECT);
     }
 
     int n() const { return n_; }

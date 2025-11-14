@@ -61,7 +61,6 @@ public:
             2,
             window,
             hop,
-            2,
             FFT_TRANSFORM_C2C,
             0,
             0,
