@@ -82,6 +82,56 @@ struct SimulationResult {
     std::vector<double> spectral_imag;
 };
 
+struct NodeOutputPacket {
+    int status{AMP_E_PENDING};
+    double *buffer{nullptr};
+    int channels{0};
+    AmpNodeMetrics metrics{};
+};
+
+bool drain_node_output(
+    const EdgeRunnerNodeDescriptor *descriptor,
+    const EdgeRunnerNodeInputs *inputs,
+    int batches,
+    int channels,
+    int frames,
+    double sample_rate,
+    void **state,
+    size_t max_attempts,
+    NodeOutputPacket &packet
+) {
+    for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
+        double *buffer = nullptr;
+        int out_channels = 0;
+        AmpNodeMetrics metrics{};
+        int status = amp_wait_node_completion(
+            descriptor,
+            inputs,
+            batches,
+            channels,
+            frames,
+            sample_rate,
+            state,
+            &buffer,
+            &out_channels,
+            &metrics
+        );
+        if (status == AMP_E_PENDING && (buffer == nullptr || out_channels == 0)) {
+            continue;
+        }
+        packet.status = status;
+        packet.buffer = buffer;
+        packet.channels = out_channels;
+        packet.metrics = metrics;
+        return true;
+    }
+    packet.status = AMP_E_PENDING;
+    packet.buffer = nullptr;
+    packet.channels = 0;
+    packet.metrics = AmpNodeMetrics{};
+    return false;
+}
+
 std::vector<std::pair<size_t, size_t>> compute_pending_ranges(const std::vector<uint8_t> &frames_filled) {
     std::vector<std::pair<size_t, size_t>> ranges;
     if (frames_filled.empty()) {
@@ -404,35 +454,28 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         inputs.params = params;
         inputs.taps = tap_context;
 
-        double *out_buffer = nullptr;
-        int out_channels = 0;
-        AmpNodeMetrics metrics{};
-
-    int rc = amp_run_node_v2(
+        NodeOutputPacket packet{};
+        packet.status = amp_run_node_v2(
             &descriptor,
             &inputs,
             1,
             1,
             static_cast<int>(audio.frames),
             kSampleRate,
-            &out_buffer,
-            &out_channels,
+            &packet.buffer,
+            &packet.channels,
             &state,
             nullptr,
             AMP_EXECUTION_MODE_FORWARD,
-            &metrics
+            &packet.metrics
         );
 
-        if (rc == AMP_E_PENDING) {
-            if (out_buffer != nullptr) {
-                amp_free(out_buffer);
-                out_buffer = nullptr;
+        if (packet.status == AMP_E_PENDING && (packet.buffer == nullptr || packet.channels != 1)) {
+            if (packet.buffer != nullptr) {
+                amp_free(packet.buffer);
+                packet.buffer = nullptr;
             }
-            if (consumed_frames >= total_frames) {
-                double *flush_buffer = nullptr;
-                int flush_channels = 0;
-                AmpNodeMetrics flush_metrics{};
-                int flush_rc = amp_wait_node_completion(
+            if (!drain_node_output(
                     &descriptor,
                     &inputs,
                     1,
@@ -440,79 +483,81 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
                     static_cast<int>(audio.frames),
                     kSampleRate,
                     &state,
-                    &flush_buffer,
-                    &flush_channels,
-                    &flush_metrics
-                );
-                if (flush_rc == 0 && flush_buffer != nullptr && flush_channels == 1) {
-                    out_buffer = flush_buffer;
-                    out_channels = flush_channels;
-                    metrics = flush_metrics;
-                    rc = 0;
-                } else {
-                    if (flush_buffer != nullptr) {
-                        amp_free(flush_buffer);
-                    }
-                    continue;
-                }
-            } else {
+                    kMinIterationBudget,
+                    packet)) {
+                record_failure("amp_wait_node_completion timed out waiting for forward output");
+                break;
+            }
+        }
+
+        if (packet.status != 0 && packet.status != AMP_E_PENDING) {
+            record_failure(
+                "fft_division_node forward returned status %d (channels=%d)",
+                packet.status,
+                packet.channels
+            );
+            if (packet.buffer != nullptr) {
+                amp_free(packet.buffer);
+            }
+            continue;
+        }
+
+        if (packet.buffer == nullptr || packet.channels != 1) {
+            if (packet.buffer != nullptr) {
+                amp_free(packet.buffer);
+            }
+            if (packet.status == AMP_E_PENDING) {
                 continue;
             }
-        }
-
-        if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
             record_failure(
-                "amp_run_node_v2 forward failed rc=%d buffer=%p channels=%d",
-                rc,
-                static_cast<void *>(out_buffer),
-                out_channels
+                "fft_division_node forward produced no buffer (channels=%d status=%d)",
+                packet.channels,
+                packet.status
             );
-        } else {
-            if (!delay_initialized) {
-                delay_frames = static_cast<int>(metrics.measured_delay_frames);
-                delay_initialized = true;
-            }
-
-            const size_t frames_emitted = static_cast<size_t>(audio.frames);
-            for (size_t frame = 0; frame < frames_emitted; ++frame) {
-                const int64_t input_index = static_cast<int64_t>(consumed_before)
-                    + static_cast<int64_t>(frame)
-                    - static_cast<int64_t>(delay_frames);
-                if (input_index < 0) {
-                    continue;
-                }
-                if (input_index >= static_cast<int64_t>(signal.size())) {
-                    continue;
-                }
-
-                const size_t target_index = static_cast<size_t>(input_index);
-                if (frame_filled[target_index]) {
-                    record_failure(
-                        "amp_run_node_v2 produced duplicate output for frame %zu",
-                        target_index
-                    );
-                    continue;
-                }
-
-                result.pcm[target_index] = out_buffer[frame];
-
-                double *dest_real = result.spectral_real.data() + target_index * kWindowSize;
-                double *dest_imag = result.spectral_imag.data() + target_index * kWindowSize;
-                const double *src_real = spectral_real_frame.data() + frame * kWindowSize;
-                const double *src_imag = spectral_imag_frame.data() + frame * kWindowSize;
-                std::copy(src_real, src_real + kWindowSize, dest_real);
-                std::copy(src_imag, src_imag + kWindowSize, dest_imag);
-
-                frame_filled[target_index] = 1U;
-                produced_frames += 1U;
-            }
-
-            last_metrics = metrics;
+            continue;
         }
 
-        if (out_buffer != nullptr) {
-            amp_free(out_buffer);
+        if (!delay_initialized) {
+            delay_frames = static_cast<int>(packet.metrics.measured_delay_frames);
+            delay_initialized = true;
         }
+
+        const size_t frames_emitted = static_cast<size_t>(audio.frames);
+        for (size_t frame = 0; frame < frames_emitted; ++frame) {
+            const int64_t input_index = static_cast<int64_t>(consumed_before)
+                + static_cast<int64_t>(frame)
+                - static_cast<int64_t>(delay_frames);
+            if (input_index < 0) {
+                continue;
+            }
+            if (input_index >= static_cast<int64_t>(signal.size())) {
+                continue;
+            }
+
+            const size_t target_index = static_cast<size_t>(input_index);
+            if (frame_filled[target_index]) {
+                record_failure(
+                    "amp_run_node_v2 produced duplicate output for frame %zu",
+                    target_index
+                );
+                continue;
+            }
+
+            result.pcm[target_index] = packet.buffer[frame];
+
+            double *dest_real = result.spectral_real.data() + target_index * kWindowSize;
+            double *dest_imag = result.spectral_imag.data() + target_index * kWindowSize;
+            const double *src_real = spectral_real_frame.data() + frame * kWindowSize;
+            const double *src_imag = spectral_imag_frame.data() + frame * kWindowSize;
+            std::copy(src_real, src_real + kWindowSize, dest_real);
+            std::copy(src_imag, src_imag + kWindowSize, dest_imag);
+
+            frame_filled[target_index] = 1U;
+            produced_frames += 1U;
+        }
+
+        last_metrics = packet.metrics;
+        amp_free(packet.buffer);
 
         if (produced_frames == produced_before_iteration && consumed_frames >= total_frames) {
             break;
@@ -641,38 +686,31 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         inputs.params = params;
         inputs.taps = tap_context;
 
-        double *out_buffer = nullptr;
-        int out_channels = 0;
-        AmpNodeMetrics metrics{};
-
-    int rc = amp_run_node_v2(
+        NodeOutputPacket packet{};
+        packet.status = amp_run_node_v2(
             &descriptor,
             &inputs,
             1,
             1,
             static_cast<int>(frames),
             kSampleRate,
-            &out_buffer,
-            &out_channels,
+            &packet.buffer,
+            &packet.channels,
             &state,
             nullptr,
             AMP_EXECUTION_MODE_FORWARD,
-            &metrics
+            &packet.metrics
         );
 
-        result.metrics_per_call.push_back(metrics);
+        result.metrics_per_call.push_back(packet.metrics);
         result.call_count += 1;
 
-        if (rc == AMP_E_PENDING) {
-            if (out_buffer != nullptr) {
-                amp_free(out_buffer);
-                out_buffer = nullptr;
+        if (packet.status == AMP_E_PENDING && (packet.buffer == nullptr || packet.channels != 1)) {
+            if (packet.buffer != nullptr) {
+                amp_free(packet.buffer);
+                packet.buffer = nullptr;
             }
-            if (offset >= total_frames) {
-                double *flush_buffer = nullptr;
-                int flush_channels = 0;
-                AmpNodeMetrics flush_metrics{};
-                int flush_rc = amp_wait_node_completion(
+            if (!drain_node_output(
                     &descriptor,
                     &inputs,
                     1,
@@ -680,81 +718,86 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
                     static_cast<int>(frames),
                     kSampleRate,
                     &state,
-                    &flush_buffer,
-                    &flush_channels,
-                    &flush_metrics
-                );
-                if (flush_rc == 0 && flush_buffer != nullptr && flush_channels == 1) {
-                    out_buffer = flush_buffer;
-                    out_channels = flush_channels;
-                    metrics = flush_metrics;
-                    if (!result.metrics_per_call.empty()) {
-                        result.metrics_per_call.back() = metrics;
-                    }
-                    rc = 0;
-                } else {
-                    if (flush_buffer != nullptr) {
-                        amp_free(flush_buffer);
-                    }
-                    continue;
-                }
+                    kMinIterationBudget,
+                    packet)) {
+                record_failure("streaming call %zu timed out waiting for output", call_index);
+                continue;
             }
-        } else if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
+        }
+
+        if (packet.status != 0 && packet.status != AMP_E_PENDING) {
             record_failure(
                 "streaming call %zu failed rc=%d buffer=%p channels=%d",
                 call_index,
-                rc,
-                static_cast<void *>(out_buffer),
-                out_channels
+                packet.status,
+                static_cast<void *>(packet.buffer),
+                packet.channels
             );
-            if (out_buffer != nullptr) {
-                amp_free(out_buffer);
+            if (packet.buffer != nullptr) {
+                amp_free(packet.buffer);
             }
-        } else {
-            if (!delay_initialized) {
-                delay_frames = static_cast<int>(metrics.measured_delay_frames);
-                delay_initialized = true;
-            }
-
-            const size_t frames_emitted = frames;
-
-            for (size_t frame = 0; frame < frames_emitted; ++frame) {
-                const int64_t input_index = static_cast<int64_t>(consumed_before)
-                    + static_cast<int64_t>(frame)
-                    - static_cast<int64_t>(delay_frames);
-                if (input_index < 0) {
-                    continue;
-                }
-                if (input_index >= static_cast<int64_t>(total_frames)) {
-                    continue;
-                }
-                const size_t target_index = static_cast<size_t>(input_index);
-                if (frame_filled[target_index]) {
-                    record_failure(
-                        "streaming call %zu produced duplicate output for frame %zu",
-                        call_index,
-                        target_index
-                    );
-                    continue;
-                }
-
-                result.pcm[target_index] = out_buffer[frame];
-
-                double *dest_real = result.spectral_real.data() + target_index * kWindowSize;
-                double *dest_imag = result.spectral_imag.data() + target_index * kWindowSize;
-                const double *src_real = spectral_real_chunk.data() + frame * kWindowSize;
-                const double *src_imag = spectral_imag_chunk.data() + frame * kWindowSize;
-                std::copy(src_real, src_real + kWindowSize, dest_real);
-                std::copy(src_imag, src_imag + kWindowSize, dest_imag);
-
-                frame_filled[target_index] = 1U;
-                produced_frames += 1U;
-            }
-
-            if (out_buffer != nullptr) {
-                amp_free(out_buffer);
-            }
+            continue;
         }
+
+        if (packet.buffer == nullptr || packet.channels != 1) {
+            if (packet.buffer != nullptr) {
+                amp_free(packet.buffer);
+            }
+            if (packet.status == AMP_E_PENDING) {
+                continue;
+            }
+            record_failure(
+                "streaming call %zu produced no output buffer",
+                call_index
+            );
+            continue;
+        }
+
+        if (!result.metrics_per_call.empty()) {
+            result.metrics_per_call.back() = packet.metrics;
+        }
+
+        if (!delay_initialized) {
+            delay_frames = static_cast<int>(packet.metrics.measured_delay_frames);
+            delay_initialized = true;
+        }
+
+        const size_t frames_emitted = frames;
+
+        for (size_t frame = 0; frame < frames_emitted; ++frame) {
+            const int64_t input_index = static_cast<int64_t>(consumed_before)
+                + static_cast<int64_t>(frame)
+                - static_cast<int64_t>(delay_frames);
+            if (input_index < 0) {
+                continue;
+            }
+            if (input_index >= static_cast<int64_t>(total_frames)) {
+                continue;
+            }
+            const size_t target_index = static_cast<size_t>(input_index);
+            if (frame_filled[target_index]) {
+                record_failure(
+                    "streaming call %zu produced duplicate output for frame %zu",
+                    call_index,
+                    target_index
+                );
+                continue;
+            }
+
+            result.pcm[target_index] = packet.buffer[frame];
+
+            double *dest_real = result.spectral_real.data() + target_index * kWindowSize;
+            double *dest_imag = result.spectral_imag.data() + target_index * kWindowSize;
+            const double *src_real = spectral_real_chunk.data() + frame * kWindowSize;
+            const double *src_imag = spectral_imag_chunk.data() + frame * kWindowSize;
+            std::copy(src_real, src_real + kWindowSize, dest_real);
+            std::copy(src_imag, src_imag + kWindowSize, dest_imag);
+
+            frame_filled[target_index] = 1U;
+            produced_frames += 1U;
+        }
+
+        amp_free(packet.buffer);
 
         if (state == nullptr) {
             record_failure("streaming call %zu did not return persistent state", call_index);
