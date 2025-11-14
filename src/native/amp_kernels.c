@@ -1891,6 +1891,13 @@ node_state_t::node_state_t()
 node_state_t::~node_state_t() = default;
 #endif
 
+#if defined(__cplusplus)
+node_state_t::node_state_t() : kind(NODE_KIND_UNKNOWN) {
+    amp_mailbox_init(&mailbox);
+    mailbox_shutdown = false;
+}
+#endif
+
 typedef enum {
     OSC_MODE_POLYBLEP = 0,
     OSC_MODE_INTEGRATOR = 1,
