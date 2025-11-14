@@ -47,6 +47,7 @@ struct FftDivOperatorLaneBinding;
 #include "amp_native.h"
 #include "amp_fft_backend.h"
 #include "amp_debug_alloc.h"
+#include "mailbox.h"
 
 #ifndef M_LN2
 #define M_LN2 0.693147180559945309417232121458176568
@@ -1488,10 +1489,20 @@ struct FftDivTask {
     int status{0};
     int flush_mode{AMP_FFT_STREAM_FLUSH_NONE};
 };
+
+struct FftDivWorkerTicket {
+    FftDivTask task;
+    double *result_buffer{nullptr};
+    int result_channels{0};
+    int status{AMP_E_PENDING};
+    bool completed{false};
+    std::condition_variable cv;
+};
 #endif
 
 typedef struct {
     node_kind_t kind;
+    AmpMailbox mailbox;
     union {
         struct {
             double value;
@@ -1648,13 +1659,10 @@ typedef struct {
                 std::thread thread;
                 std::mutex mutex;
                 std::condition_variable cv_request;
-                std::condition_variable cv_response;
                 bool thread_started{false};
                 bool stop_requested{false};
                 bool flush_on_stop{true};
-                bool task_pending{false};
-                bool task_completed{false};
-                FftDivTask task;
+                std::deque<std::shared_ptr<FftDivWorkerTicket>> pending_tickets;
             };
             WorkerState worker;
             const EdgeRunnerNodeDescriptor *last_descriptor{nullptr};
@@ -1877,7 +1885,37 @@ static void release_node_state(node_state_t *state) {
     if (state->kind == NODE_KIND_FFT_DIV) {
         fft_state_free_buffers(state);
     }
+    amp_node_mailbox_clear(state);
     free(state);
+}
+
+AMP_CAPI AmpMailboxEntry *amp_node_mailbox_pop(void *state) {
+    if (state == NULL) {
+        return NULL;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+    return amp_mailbox_pop(&node_state->mailbox);
+}
+
+AMP_CAPI void amp_node_mailbox_push(void *state, AmpMailboxEntry *entry) {
+    if (state == NULL) {
+        amp_mailbox_entry_release(entry);
+        return;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+    amp_mailbox_push(&node_state->mailbox, entry);
+}
+
+AMP_CAPI void amp_node_mailbox_clear(void *state) {
+    if (state == NULL) {
+        return;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+    AmpMailboxEntry *entry = amp_mailbox_pop(&node_state->mailbox);
+    while (entry != NULL) {
+        amp_mailbox_entry_release(entry);
+        entry = amp_mailbox_pop(&node_state->mailbox);
+    }
 }
 
 static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descriptor) {
@@ -3056,9 +3094,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.last_frames = 0;
     state->u.fftdiv.last_slot_count = 0;
     state->u.fftdiv.last_sample_rate = 0.0;
-    state->u.fftdiv.worker.task = FftDivTask{};
-    state->u.fftdiv.worker.task_pending = false;
-    state->u.fftdiv.worker.task_completed = false;
+    state->u.fftdiv.worker.pending_tickets.clear();
     state->u.fftdiv.worker.stop_requested = false;
     state->u.fftdiv.worker.flush_on_stop = true;
 #endif

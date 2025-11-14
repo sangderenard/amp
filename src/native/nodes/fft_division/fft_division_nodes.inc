@@ -1185,6 +1185,7 @@ static int fftdiv_execute_block(
 
     bool made_progress = false;
     size_t pcm_written_samples = 0U;
+    size_t queue_drains_without_emission = 0U;
 
     int active_lane_count = 0;
     for (const auto &lane_meta : state->u.fftdiv.lane_plan) {
@@ -1844,6 +1845,14 @@ static int fftdiv_execute_block(
                         *buffer_ptr,
                         (size_t)slot_state.inverse_queue.size());
 #endif
+                } else if (lane.enable_pcm_out && slot_state.inverse_queue.empty()) {
+                    queue_drains_without_emission += 1U;
+#if FFTDIV_TRACE_ENABLED
+                    FFTDIV_TRACE(
+                        "[fftdiv] buffer-miss slot=%d frame=%lld queue_empty",
+                        slot,
+                        (long long)slice.frame_index);
+#endif
                 }
             }
 
@@ -1860,6 +1869,14 @@ static int fftdiv_execute_block(
 
 #if defined(__cplusplus)
     if (!made_progress || (pcm_expected_samples > 0U && pcm_written_samples < pcm_expected_samples)) {
+#if FFTDIV_TRACE_ENABLED
+        FFTDIV_TRACE(
+            "[fftdiv] pending progress=%d pcm_written=%zu expected=%zu queue_misses=%zu",
+            made_progress ? 1 : 0,
+            pcm_written_samples,
+            pcm_expected_samples,
+            queue_drains_without_emission);
+#endif
         free(buffer);
         *out_buffer = NULL;
         *out_channels = 0;
@@ -2146,9 +2163,9 @@ static void fftdiv_worker_main(node_state_t *state) {
     std::unique_lock<std::mutex> lock(worker.mutex);
     while (true) {
         worker.cv_request.wait(lock, [&worker]() {
-            return worker.stop_requested || worker.task_pending;
+            return worker.stop_requested || !worker.pending_tickets.empty();
         });
-        if (worker.stop_requested && !worker.task_pending) {
+        if (worker.stop_requested && worker.pending_tickets.empty()) {
             const bool flush_on_stop = worker.flush_on_stop;
             lock.unlock();
             if (flush_on_stop) {
@@ -2157,47 +2174,67 @@ static void fftdiv_worker_main(node_state_t *state) {
             lock.lock();
             break;
         }
-        FftDivTask task = worker.task;
-        worker.task_pending = false;
+        if (worker.pending_tickets.empty()) {
+            continue;
+        }
+        std::shared_ptr<FftDivWorkerTicket> ticket = worker.pending_tickets.front();
+        worker.pending_tickets.pop_front();
         lock.unlock();
 
-        FftDivTask result = task;
         double *buffer = nullptr;
         int out_channels = 0;
-        result.status = fftdiv_execute_block(
-            task.descriptor,
-            task.inputs,
-            task.batches,
-            task.channels,
-            task.frames,
-            task.sample_rate,
-            &buffer,
-            &out_channels,
-            state,
-            task.metrics,
-            task.flush_mode
-        );
-        result.result_buffer = buffer;
-        result.result_channels = out_channels;
-
-        if (task.flush_mode == AMP_FFT_STREAM_FLUSH_NONE) {
-            state->u.fftdiv.last_descriptor = task.descriptor;
-            state->u.fftdiv.last_batches = task.batches;
-            state->u.fftdiv.last_channels = task.channels;
-            state->u.fftdiv.last_frames = task.frames;
-            state->u.fftdiv.last_slot_count = task.slot_count;
-            state->u.fftdiv.last_sample_rate = task.sample_rate;
+        int status = AMP_E_PENDING;
+        if (ticket) {
+            const auto &task = ticket->task;
+            status = fftdiv_execute_block(
+                task.descriptor,
+                task.inputs,
+                task.batches,
+                task.channels,
+                task.frames,
+                task.sample_rate,
+                &buffer,
+                &out_channels,
+                state,
+                task.metrics,
+                task.flush_mode
+            );
+            if (task.flush_mode == AMP_FFT_STREAM_FLUSH_NONE) {
+                state->u.fftdiv.last_descriptor = task.descriptor;
+                state->u.fftdiv.last_batches = task.batches;
+                state->u.fftdiv.last_channels = task.channels;
+                state->u.fftdiv.last_frames = task.frames;
+                state->u.fftdiv.last_slot_count = task.slot_count;
+                state->u.fftdiv.last_sample_rate = task.sample_rate;
+            }
         }
 
         lock.lock();
-        worker.task = result;
-        worker.task_completed = true;
-        worker.cv_response.notify_all();
+        if (ticket) {
+            ticket->result_buffer = buffer;
+            ticket->result_channels = out_channels;
+            ticket->status = status;
+            ticket->completed = true;
+            ticket->cv.notify_all();
+        } else {
+            if (buffer != nullptr) {
+                free(buffer);
+            }
+        }
     }
-    worker.task_pending = false;
-    worker.task_completed = true;
+
+    for (auto &pending_ticket : worker.pending_tickets) {
+        if (!pending_ticket) {
+            continue;
+        }
+        pending_ticket->result_buffer = nullptr;
+        pending_ticket->result_channels = 0;
+        pending_ticket->status = AMP_E_PENDING;
+        pending_ticket->completed = true;
+        pending_ticket->cv.notify_all();
+    }
+    worker.pending_tickets.clear();
     worker.thread_started = false;
-    worker.cv_response.notify_all();
 }
 
 static int fftdiv_start_worker(node_state_t *state) {
@@ -2210,8 +2247,7 @@ static int fftdiv_start_worker(node_state_t *state) {
     }
     worker.stop_requested = false;
     worker.flush_on_stop = true;
-    worker.task_pending = false;
-    worker.task_completed = false;
+    worker.pending_tickets.clear();
     try {
         worker.thread = std::thread(fftdiv_worker_main, state);
     } catch (...) {
@@ -2230,8 +2266,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
     if (!worker.thread_started) {
         worker.flush_on_stop = flush;
         worker.stop_requested = false;
-        worker.task_pending = false;
-        worker.task_completed = false;
+        worker.pending_tickets.clear();
         return;
     }
     {
@@ -2245,8 +2280,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
     }
     worker.thread_started = false;
     worker.stop_requested = false;
-    worker.task_pending = false;
-    worker.task_completed = false;
+    worker.pending_tickets.clear();
 }
 
 #endif
@@ -2295,30 +2329,26 @@ static int run_fft_division_node(
         task.slot_count = 1;
     }
 
+    std::shared_ptr<FftDivWorkerTicket> ticket = std::make_shared<FftDivWorkerTicket>();
+    ticket->task = task;
+
     auto &worker = state->u.fftdiv.worker;
     {
         std::unique_lock<std::mutex> lock(worker.mutex);
-        worker.cv_response.wait(lock, [&worker]() {
-            return !worker.task_pending;
-        });
-        worker.task = task;
-        worker.task_pending = true;
-        worker.task_completed = false;
+        worker.pending_tickets.push_back(ticket);
         worker.cv_request.notify_one();
-        worker.cv_response.wait(lock, [&worker]() {
-            return worker.task_completed;
+        ticket->cv.wait(lock, [ticket]() {
+            return ticket->completed;
         });
-        task = worker.task;
-        worker.task_completed = false;
     }
 
     if (out_buffer != NULL) {
-        *out_buffer = task.result_buffer;
+        *out_buffer = ticket->result_buffer;
     }
     if (out_channels != NULL) {
-        *out_channels = task.result_channels;
+        *out_channels = ticket->result_channels;
     }
-    return task.status;
+    return ticket->status;
 #else
     return fftdiv_execute_block(
         descriptor,

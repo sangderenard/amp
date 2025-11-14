@@ -2,10 +2,12 @@
 #include <array>
 #include <cmath>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -26,10 +28,22 @@ constexpr size_t kStreamingIterationMultiplier = 64;
 constexpr size_t kMinIterationBudget = 1024;
 
 bool g_failed = false;
+bool g_emitted_diagnostics = false;
 
 void record_failure(const char *fmt, ...) {
     g_failed = true;
     std::fprintf(stderr, "[fft_division_node] ");
+
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    std::fprintf(stderr, "\n");
+}
+
+void write_diagnostic(const char *fmt, ...) {
+    std::fprintf(stderr, "[fft_division_node][diag] ");
 
     va_list args;
     va_start(args, fmt);
@@ -57,6 +71,9 @@ struct StreamingRunResult {
     std::vector<AmpNodeMetrics> metrics_per_call;
     size_t call_count{0};
     bool state_allocated{false};
+    size_t frames_produced{0};
+    size_t frames_pending{0};
+    std::vector<uint8_t> frames_filled;
 };
 
 struct SimulationResult {
@@ -64,6 +81,206 @@ struct SimulationResult {
     std::vector<double> spectral_real;
     std::vector<double> spectral_imag;
 };
+
+std::vector<std::pair<size_t, size_t>> compute_pending_ranges(const std::vector<uint8_t> &frames_filled) {
+    std::vector<std::pair<size_t, size_t>> ranges;
+    if (frames_filled.empty()) {
+        return ranges;
+    }
+
+    const size_t sentinel = frames_filled.size();
+    size_t range_start = sentinel;
+    for (size_t i = 0; i < frames_filled.size(); ++i) {
+        if (frames_filled[i] == 0U) {
+            if (range_start == sentinel) {
+                range_start = i;
+            }
+        } else if (range_start != sentinel) {
+            ranges.emplace_back(range_start, i - 1);
+            range_start = sentinel;
+        }
+    }
+
+    if (range_start != sentinel) {
+        ranges.emplace_back(range_start, frames_filled.size() - 1U);
+    }
+
+    return ranges;
+}
+
+void dump_vector_with_expected(
+    const char *label,
+    const std::vector<double> &actual,
+    const std::vector<double> &expected,
+    size_t bins_per_frame
+) {
+    const size_t per_frame = (bins_per_frame == 0U) ? 1U : bins_per_frame;
+    const size_t count = std::min(actual.size(), expected.size());
+
+    write_diagnostic(
+        "%s entries=%zu actual_size=%zu expected_size=%zu",
+        label,
+        count,
+        actual.size(),
+        expected.size()
+    );
+
+    for (size_t i = 0; i < count; ++i) {
+        const size_t frame = (bins_per_frame == 0U) ? i : (i / per_frame);
+        const size_t bin = (bins_per_frame == 0U) ? 0U : (i % per_frame);
+        const double value_actual = actual[i];
+        const double value_expected = expected[i];
+        const double diff = value_actual - value_expected;
+        if (bins_per_frame == 0U) {
+            write_diagnostic(
+                "%s[%04zu] actual=% .12f expected=% .12f diff=% .12f",
+                label,
+                frame,
+                value_actual,
+                value_expected,
+                diff
+            );
+        } else {
+            write_diagnostic(
+                "%s frame=%04zu bin=%02zu actual=% .12f expected=% .12f diff=% .12f",
+                label,
+                frame,
+                bin,
+                value_actual,
+                value_expected,
+                diff
+            );
+        }
+    }
+
+    if (actual.size() != expected.size()) {
+        write_diagnostic(
+            "%s size mismatch prevents full comparison",
+            label
+        );
+    }
+}
+
+void dump_metrics_table(const std::vector<AmpNodeMetrics> &metrics) {
+    if (metrics.empty()) {
+        write_diagnostic("no per-call metrics captured");
+        return;
+    }
+
+    for (size_t i = 0; i < metrics.size(); ++i) {
+        const AmpNodeMetrics &m = metrics[i];
+        write_diagnostic(
+            "metrics[%04zu] delay=%u heat=% .6f processing=% .9f logging=% .9f total=% .9f cpu=% .9f",
+            i,
+            m.measured_delay_frames,
+            static_cast<double>(m.accumulated_heat),
+            m.processing_time_seconds,
+            m.logging_time_seconds,
+            m.total_time_seconds,
+            m.thread_cpu_time_seconds
+        );
+    }
+}
+
+void dump_failure_diagnostics(
+    const std::vector<double> &signal,
+    const RunResult &first,
+    const RunResult &second,
+    const SimulationResult &expected,
+    const StreamingRunResult &streaming_result,
+    const SimulationResult &streaming_expected
+) {
+    if (g_emitted_diagnostics) {
+        return;
+    }
+    g_emitted_diagnostics = true;
+
+    write_diagnostic("--- failure diagnostics begin ---");
+    write_diagnostic("input_signal_length=%zu", signal.size());
+
+    dump_vector_with_expected("forward_pcm", first.pcm, expected.pcm, 0U);
+    dump_vector_with_expected(
+        "forward_spectral_real",
+        first.spectral_real,
+        expected.spectral_real,
+        kWindowSize
+    );
+    dump_vector_with_expected(
+        "forward_spectral_imag",
+        first.spectral_imag,
+        expected.spectral_imag,
+        kWindowSize
+    );
+
+    dump_vector_with_expected("repeat_pcm", second.pcm, first.pcm, 0U);
+    dump_vector_with_expected(
+        "repeat_spectral_real",
+        second.spectral_real,
+        first.spectral_real,
+        kWindowSize
+    );
+    dump_vector_with_expected(
+        "repeat_spectral_imag",
+        second.spectral_imag,
+        first.spectral_imag,
+        kWindowSize
+    );
+
+    write_diagnostic(
+        "forward_metrics delay=%u heat=% .6f processing=% .9f logging=% .9f total=% .9f cpu=% .9f",
+        first.metrics.measured_delay_frames,
+        static_cast<double>(first.metrics.accumulated_heat),
+        first.metrics.processing_time_seconds,
+        first.metrics.logging_time_seconds,
+        first.metrics.total_time_seconds,
+        first.metrics.thread_cpu_time_seconds
+    );
+    write_diagnostic(
+        "repeat_metrics delay=%u heat=% .6f processing=% .9f logging=% .9f total=% .9f cpu=% .9f",
+        second.metrics.measured_delay_frames,
+        static_cast<double>(second.metrics.accumulated_heat),
+        second.metrics.processing_time_seconds,
+        second.metrics.logging_time_seconds,
+        second.metrics.total_time_seconds,
+        second.metrics.thread_cpu_time_seconds
+    );
+
+    write_diagnostic(
+        "streaming_frames_produced=%zu expected=%zu pending=%zu",
+        streaming_result.frames_produced,
+        streaming_expected.pcm.size(),
+        streaming_result.frames_pending
+    );
+
+    const auto ranges = compute_pending_ranges(streaming_result.frames_filled);
+    if (!ranges.empty()) {
+        for (const auto &range : ranges) {
+            write_diagnostic(
+                "streaming_pending_range=%zu-%zu count=%zu",
+                range.first,
+                range.second,
+                range.second - range.first + 1U
+            );
+        }
+    }
+
+    dump_vector_with_expected("streaming_pcm", streaming_result.pcm, streaming_expected.pcm, 0U);
+    dump_vector_with_expected(
+        "streaming_spectral_real",
+        streaming_result.spectral_real,
+        streaming_expected.spectral_real,
+        kWindowSize
+    );
+    dump_vector_with_expected(
+        "streaming_spectral_imag",
+        streaming_result.spectral_imag,
+        streaming_expected.spectral_imag,
+        kWindowSize
+    );
+
+    dump_metrics_table(streaming_result.metrics_per_call);
+    write_diagnostic("--- failure diagnostics end ---");
+}
 
 std::string build_params_json() {
     char buffer[256];
@@ -135,14 +352,9 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     bool delay_initialized = false;
 
     const size_t total_frames = signal.size();
-    const size_t max_iterations = std::max(total_frames * kForwardIterationMultiplier, kMinIterationBudget);
-    size_t iteration = 0U;
 
     while (produced_frames < total_frames) {
-        if (iteration >= max_iterations) {
-            break;
-        }
-        iteration += 1U;
+        const size_t produced_before_iteration = produced_frames;
 
         EdgeRunnerAudioView audio{};
         if (consumed_frames < total_frames) {
@@ -196,7 +408,7 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         int out_channels = 0;
         AmpNodeMetrics metrics{};
 
-        const int rc = amp_run_node_v2(
+    int rc = amp_run_node_v2(
             &descriptor,
             &inputs,
             1,
@@ -301,14 +513,17 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         if (out_buffer != nullptr) {
             amp_free(out_buffer);
         }
+
+        if (produced_frames == produced_before_iteration && consumed_frames >= total_frames) {
+            break;
+        }
     }
 
     if (produced_frames < total_frames) {
         record_failure(
-            "amp_run_node_v2 forward produced %zu of %zu frames after %zu iterations",
+            "amp_run_node_v2 forward produced %zu of %zu frames",
             produced_frames,
-            total_frames,
-            iteration
+            total_frames
         );
     }
 
@@ -317,9 +532,16 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         state = nullptr;
     }
 
-    for (size_t i = 0; i < frame_filled.size(); ++i) {
-        if (frame_filled[i] == 0U) {
-            record_failure("amp_run_node_v2 forward left frame %zu pending", i);
+    const auto single_pending = compute_pending_ranges(frame_filled);
+    for (const auto &range : single_pending) {
+        if (range.first == range.second) {
+            record_failure("amp_run_node_v2 forward left frame %zu pending", range.first);
+        } else {
+            record_failure(
+                "amp_run_node_v2 forward left frames %zu-%zu pending",
+                range.first,
+                range.second
+            );
         }
     }
 
@@ -423,7 +645,7 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         int out_channels = 0;
         AmpNodeMetrics metrics{};
 
-        const int rc = amp_run_node_v2(
+    int rc = amp_run_node_v2(
             &descriptor,
             &inputs,
             1,
@@ -561,11 +783,24 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         record_failure("streaming run never produced node state");
     }
 
-    for (size_t i = 0; i < frame_filled.size(); ++i) {
-        if (frame_filled[i] == 0U) {
-            record_failure("streaming run left frame %zu pending", i);
+    const auto pending_ranges = compute_pending_ranges(frame_filled);
+    for (const auto &range : pending_ranges) {
+        if (range.first == range.second) {
+            record_failure("streaming run left frame %zu pending", range.first);
+        } else {
+            record_failure(
+                "streaming run left frames %zu-%zu pending",
+                range.first,
+                range.second
+            );
         }
     }
+
+    result.frames_produced = produced_frames;
+    result.frames_pending = (produced_frames < total_frames)
+        ? (total_frames - produced_frames)
+        : 0U;
+    result.frames_filled = frame_filled;
 
     return result;
 }
@@ -906,6 +1141,17 @@ int main() {
     }
 
     require_backward_unsupported(signal, first.pcm);
+
+    if (g_failed) {
+        dump_failure_diagnostics(
+            signal,
+            first,
+            second,
+            expected,
+            streaming_result,
+            streaming_expected
+        );
+    }
 
     if (g_failed) {
         std::printf("test_fft_division_node: FAIL\n");

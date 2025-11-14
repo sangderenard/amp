@@ -35,6 +35,7 @@
 
 extern "C" {
 #include "amp_native.h"
+#include "mailbox.h"
 #include "amp_debug_alloc.h"
 }
 
@@ -3284,16 +3285,52 @@ static int execute_runtime_with_history_impl(
             if (v2_status == AMP_E_UNSUPPORTED) {
                 node.supports_v2 = false;
                 node.has_latest_metrics = false;
-            } else if (v2_status != 0) {
-                if (frame_buffer) amp_free(frame_buffer);
-                runtime_set_error(runtime, v2_status, "run_node_v2", &node,
-                                  std::string("amp_run_node_v2 returned status ") + std::to_string(v2_status));
-                return -1;
             } else {
                 used_v2 = true;
-                node.has_latest_metrics = true;
-                node.latest_metrics = frame_metrics;
-                node.total_heat_accumulated += static_cast<double>(frame_metrics.accumulated_heat);
+                AmpMailboxEntry *mail_entry = (state_arg != NULL)
+                    ? amp_node_mailbox_pop(state_arg)
+                    : nullptr;
+                if (mail_entry != nullptr) {
+                    if (frame_buffer != nullptr && frame_buffer != mail_entry->buffer) {
+                        amp_free(frame_buffer);
+                    }
+                    frame_buffer = mail_entry->buffer;
+                    out_channels = mail_entry->channels > 0 ? mail_entry->channels : 1;
+                    node.latest_metrics = mail_entry->metrics;
+                    node.has_latest_metrics = true;
+                    node.total_heat_accumulated += static_cast<double>(mail_entry->metrics.accumulated_heat);
+                    const int mailbox_status = mail_entry->status;
+                    amp_mailbox_entry_release(mail_entry);
+                    if (mailbox_status != 0) {
+                        if (frame_buffer != nullptr) {
+                            amp_free(frame_buffer);
+                            frame_buffer = nullptr;
+                        }
+                        runtime_set_error(
+                            runtime,
+                            mailbox_status,
+                            "run_node_v2",
+                            &node,
+                            std::string("mailbox entry returned status ") + std::to_string(mailbox_status));
+                        return -1;
+                    }
+                } else {
+                    node.has_latest_metrics = false;
+                    node.latest_metrics = frame_metrics;
+                    if (v2_status == 0 && frame_buffer != nullptr) {
+                        node.has_latest_metrics = true;
+                    }
+                    node.total_heat_accumulated += static_cast<double>(frame_metrics.accumulated_heat);
+                    if (v2_status != 0) {
+                        std::string detail = std::string("amp_run_node_v2 returned status ") + std::to_string(v2_status);
+                        if (frame_buffer != nullptr) {
+                            amp_free(frame_buffer);
+                            frame_buffer = nullptr;
+                        }
+                        runtime_set_error(runtime, v2_status, "run_node_v2", &node, std::move(detail));
+                        return -1;
+                    }
+                }
             }
         }
 
