@@ -3266,6 +3266,7 @@ static int execute_runtime_with_history_impl(
         void *state_arg = node.state;
         bool used_v2 = false;
 
+        bool skip_node_output = false;
         if (node.supports_v2) {
             AmpNodeMetrics frame_metrics{};
             int v2_status = amp_run_node_v2(
@@ -3300,12 +3301,14 @@ static int execute_runtime_with_history_impl(
                     node.has_latest_metrics = true;
                     node.total_heat_accumulated += static_cast<double>(mail_entry->metrics.accumulated_heat);
                     const int mailbox_status = mail_entry->status;
-                    amp_mailbox_entry_release(mail_entry);
-                    if (mailbox_status != 0) {
+                    if (mailbox_status == AMP_E_PENDING && frame_buffer == nullptr) {
+                        skip_node_output = true;
+                    } else if (mailbox_status != 0 && mailbox_status != AMP_E_PENDING) {
                         if (frame_buffer != nullptr) {
                             amp_free(frame_buffer);
                             frame_buffer = nullptr;
                         }
+                        amp_mailbox_entry_release(mail_entry);
                         runtime_set_error(
                             runtime,
                             mailbox_status,
@@ -3314,6 +3317,7 @@ static int execute_runtime_with_history_impl(
                             std::string("mailbox entry returned status ") + std::to_string(mailbox_status));
                         return -1;
                     }
+                    amp_mailbox_entry_release(mail_entry);
                 } else {
                     node.has_latest_metrics = false;
                     node.latest_metrics = frame_metrics;
@@ -3321,7 +3325,7 @@ static int execute_runtime_with_history_impl(
                         node.has_latest_metrics = true;
                     }
                     node.total_heat_accumulated += static_cast<double>(frame_metrics.accumulated_heat);
-                    if (v2_status != 0) {
+                    if (v2_status != 0 && v2_status != AMP_E_PENDING) {
                         std::string detail = std::string("amp_run_node_v2 returned status ") + std::to_string(v2_status);
                         if (frame_buffer != nullptr) {
                             amp_free(frame_buffer);
@@ -3329,6 +3333,9 @@ static int execute_runtime_with_history_impl(
                         }
                         runtime_set_error(runtime, v2_status, "run_node_v2", &node, std::move(detail));
                         return -1;
+                    }
+                    if (v2_status == AMP_E_PENDING && frame_buffer == nullptr) {
+                        skip_node_output = true;
                     }
                 }
             }
@@ -3362,6 +3369,14 @@ static int execute_runtime_with_history_impl(
             }
             node.has_latest_metrics = false;
         } else if (!frame_buffer) {
+            if (skip_node_output) {
+                if (node.state != state_arg) {
+                    if (node.state) amp_release_state(node.state);
+                }
+                node.state = state_arg;
+                node.has_latest_metrics = false;
+                continue;
+            }
             runtime_set_error(runtime, -1, "run_node_v2", &node, "amp_run_node_v2 returned null buffer");
             return -1;
         }

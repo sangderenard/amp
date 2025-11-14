@@ -2155,85 +2155,200 @@ static int fftdiv_wait_for_completion(
     return final_status;
 }
 
+static void fftdiv_worker_publish_entry(
+    node_state_t *state,
+    double *buffer,
+    int channels,
+    int frames,
+    int status,
+    const AmpNodeMetrics *metrics
+) {
+    if (state == nullptr) {
+        if (buffer != nullptr) {
+            amp_free(buffer);
+        }
+        return;
+    }
+    size_t frame_count = frames > 0 ? static_cast<size_t>(frames) : 0U;
+    AmpMailboxEntry *entry = amp_mailbox_entry_create(
+        buffer,
+        channels,
+        frame_count,
+        status,
+        metrics,
+        nullptr,
+        nullptr
+    );
+    if (entry == nullptr) {
+        if (buffer != nullptr) {
+            amp_free(buffer);
+        }
+        return;
+    }
+    amp_node_mailbox_push(state, entry);
+}
+
+static void fftdiv_worker_process_command(
+    node_state_t *state,
+    const std::shared_ptr<FftDivWorkerCommand> &command
+) {
+    if (!state || !command) {
+        return;
+    }
+    AmpNodeMetrics local_metrics{};
+    AmpNodeMetrics *metrics_ptr = command->want_metrics ? &command->metrics_storage : &local_metrics;
+    if (command->want_metrics) {
+        command->metrics_storage = AmpNodeMetrics{};
+    } else {
+        local_metrics = AmpNodeMetrics{};
+        metrics_ptr = &local_metrics;
+    }
+
+    double *buffer = nullptr;
+    int out_channels = 0;
+    int status = fftdiv_execute_block(
+        command->task.descriptor,
+        command->task.inputs,
+        command->task.batches,
+        command->task.channels,
+        command->task.frames,
+        command->task.sample_rate,
+        &buffer,
+        &out_channels,
+        state,
+        command->want_metrics ? metrics_ptr : nullptr,
+        command->task.flush_mode
+    );
+
+    if (command->task.flush_mode == AMP_FFT_STREAM_FLUSH_NONE) {
+        state->u.fftdiv.last_descriptor = command->task.descriptor;
+        state->u.fftdiv.last_batches = command->task.batches;
+        state->u.fftdiv.last_channels = command->task.channels;
+        state->u.fftdiv.last_frames = command->task.frames;
+        state->u.fftdiv.last_slot_count = command->task.slot_count;
+        state->u.fftdiv.last_sample_rate = command->task.sample_rate;
+    }
+
+    bool emit_entry = (buffer != nullptr) || (status != AMP_E_PENDING);
+    if (emit_entry) {
+        int frames = command->expected_frames > 0 ? command->expected_frames : command->task.frames;
+        if (frames <= 0) {
+            frames = state->u.fftdiv.last_frames > 0
+                ? state->u.fftdiv.last_frames
+                : state->u.fftdiv.window_size;
+            if (frames <= 0) {
+                frames = 1;
+            }
+        }
+        const AmpNodeMetrics *metrics_to_send = command->want_metrics ? metrics_ptr : nullptr;
+        if (!command->want_metrics) {
+            command->metrics_storage = *metrics_ptr;
+            metrics_to_send = &command->metrics_storage;
+        }
+        fftdiv_worker_publish_entry(state, buffer, out_channels, frames, status, metrics_to_send);
+    } else if (buffer != nullptr) {
+        fftdiv_worker_publish_entry(state, buffer, out_channels, command->expected_frames, status, command->want_metrics ? metrics_ptr : nullptr);
+    }
+}
+
+static bool fftdiv_worker_flush_pending(node_state_t *state) {
+    if (state == nullptr) {
+        return false;
+    }
+    bool emitted = false;
+    while (true) {
+        double *buffer = nullptr;
+        int out_channels = 0;
+        AmpNodeMetrics metrics{};
+        int status = fftdiv_wait_for_completion(
+            nullptr,
+            nullptr,
+            0,
+            0,
+            0,
+            0.0,
+            state,
+            &buffer,
+            &out_channels,
+            &metrics
+        );
+        if (status == AMP_E_PENDING && buffer == nullptr) {
+            break;
+        }
+        int frames = state->u.fftdiv.last_frames > 0
+            ? state->u.fftdiv.last_frames
+            : state->u.fftdiv.window_size;
+        if (frames <= 0) {
+            frames = 1;
+        }
+        fftdiv_worker_publish_entry(state, buffer, out_channels, frames, status, &metrics);
+        emitted = true;
+        if (status != 0 && status != AMP_E_PENDING) {
+            break;
+        }
+    }
+    return emitted;
+}
+
 static void fftdiv_worker_main(node_state_t *state) {
     if (state == nullptr) {
         return;
     }
+    // The FFT division worker is intended to be a "live" stage scheduler that
+    // keeps all five pipeline stages moving as long as there is outstanding
+    // work anywhere in the internal queues.  Each pass through the loop pulls a
+    // pending command (if any) and then repeatedly calls
+    // `fftdiv_worker_flush_pending`, which walks the stage chain via
+    // `fftdiv_wait_for_completion` until the node reports that every stage is
+    // empty.  Only when no command was executed *and* the flush step observes
+    // an empty pipeline do we yield back to the condition variable.  This keeps
+    // the worker advancing previously-submitted input even if the runtime stops
+    // issuing new `amp_run_node_v2` calls, satisfying the always-running worker
+    // requirement for the FFT division node.
     auto &worker = state->u.fftdiv.worker;
     std::unique_lock<std::mutex> lock(worker.mutex);
     while (true) {
-        worker.cv_request.wait(lock, [&worker]() {
-            return worker.stop_requested || !worker.pending_tickets.empty();
-        });
-        if (worker.stop_requested && worker.pending_tickets.empty()) {
-            const bool flush_on_stop = worker.flush_on_stop;
+        while (!worker.stop_requested) {
+            std::shared_ptr<FftDivWorkerCommand> command;
+            if (!worker.pending_commands.empty()) {
+                command = worker.pending_commands.front();
+                worker.pending_commands.pop_front();
+            }
+            lock.unlock();
+            bool did_work = false;
+            if (command) {
+                fftdiv_worker_process_command(state, command);
+                did_work = true;
+            }
+            if (fftdiv_worker_flush_pending(state)) {
+                did_work = true;
+            }
+            lock.lock();
+            if (!did_work) {
+                break;
+            }
+        }
+        if (worker.stop_requested) {
+            bool flush_on_stop = worker.flush_on_stop;
             lock.unlock();
             if (flush_on_stop) {
                 fftdiv_flush_with_zeroes(state);
+                fftdiv_worker_flush_pending(state);
             }
             lock.lock();
             break;
         }
-        if (worker.pending_tickets.empty()) {
-            continue;
-        }
-        std::shared_ptr<FftDivWorkerTicket> ticket = worker.pending_tickets.front();
-        worker.pending_tickets.pop_front();
-        lock.unlock();
-
-        double *buffer = nullptr;
-        int out_channels = 0;
-        int status = AMP_E_PENDING;
-        if (ticket) {
-            const auto &task = ticket->task;
-            status = fftdiv_execute_block(
-                task.descriptor,
-                task.inputs,
-                task.batches,
-                task.channels,
-                task.frames,
-                task.sample_rate,
-                &buffer,
-                &out_channels,
-                state,
-                task.metrics,
-                task.flush_mode
-            );
-            if (task.flush_mode == AMP_FFT_STREAM_FLUSH_NONE) {
-                state->u.fftdiv.last_descriptor = task.descriptor;
-                state->u.fftdiv.last_batches = task.batches;
-                state->u.fftdiv.last_channels = task.channels;
-                state->u.fftdiv.last_frames = task.frames;
-                state->u.fftdiv.last_slot_count = task.slot_count;
-                state->u.fftdiv.last_sample_rate = task.sample_rate;
+        worker.cv_request.wait(lock, [&worker, state]() {
+            if (worker.stop_requested) {
+                return true;
             }
-        }
-
-        lock.lock();
-        if (ticket) {
-            ticket->result_buffer = buffer;
-            ticket->result_channels = out_channels;
-            ticket->status = status;
-            ticket->completed = true;
-            ticket->cv.notify_all();
-        } else {
-            if (buffer != nullptr) {
-                free(buffer);
+            if (!worker.pending_commands.empty()) {
+                return true;
             }
-        }
+            return fftdiv_has_pending_work(state);
+        });
     }
-
-    for (auto &pending_ticket : worker.pending_tickets) {
-        if (!pending_ticket) {
-            continue;
-        }
-        pending_ticket->result_buffer = nullptr;
-        pending_ticket->result_channels = 0;
-        pending_ticket->status = AMP_E_PENDING;
-        pending_ticket->completed = true;
-        pending_ticket->cv.notify_all();
-    }
-    worker.pending_tickets.clear();
+    worker.pending_commands.clear();
     worker.thread_started = false;
 }
 
@@ -2247,7 +2362,7 @@ static int fftdiv_start_worker(node_state_t *state) {
     }
     worker.stop_requested = false;
     worker.flush_on_stop = true;
-    worker.pending_tickets.clear();
+    worker.pending_commands.clear();
     try {
         worker.thread = std::thread(fftdiv_worker_main, state);
     } catch (...) {
@@ -2266,7 +2381,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
     if (!worker.thread_started) {
         worker.flush_on_stop = flush;
         worker.stop_requested = false;
-        worker.pending_tickets.clear();
+        worker.pending_commands.clear();
         return;
     }
     {
@@ -2280,7 +2395,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
     }
     worker.thread_started = false;
     worker.stop_requested = false;
-    worker.pending_tickets.clear();
+    worker.pending_commands.clear();
 }
 
 #endif
@@ -2308,47 +2423,55 @@ static int run_fft_division_node(
         return -1;
     }
 
-    FftDivTask task{};
-    task.descriptor = descriptor;
-    task.inputs = inputs;
-    task.batches = (batches > 0) ? batches : 1;
-    task.frames = frames;
-    task.sample_rate = sample_rate;
-    task.metrics = metrics;
-    task.flush_mode = AMP_FFT_STREAM_FLUSH_NONE;
-
+    int effective_batches = (batches > 0) ? batches : 1;
     int effective_channels = channels;
     if (effective_channels <= 0) {
         effective_channels = (inputs->audio.channels > 0U)
             ? (int)inputs->audio.channels
             : 1;
     }
-    task.channels = effective_channels;
-    task.slot_count = task.batches * effective_channels;
-    if (task.slot_count <= 0) {
-        task.slot_count = 1;
+    int slot_count = effective_batches * effective_channels;
+    if (slot_count <= 0) {
+        slot_count = 1;
     }
 
-    std::shared_ptr<FftDivWorkerTicket> ticket = std::make_shared<FftDivWorkerTicket>();
-    ticket->task = task;
+    std::shared_ptr<FftDivWorkerCommand> command = std::make_shared<FftDivWorkerCommand>();
+    command->task.descriptor = descriptor;
+    command->task.batches = effective_batches;
+    command->task.channels = effective_channels;
+    command->task.frames = frames;
+    command->task.slot_count = slot_count;
+    command->task.sample_rate = sample_rate;
+    command->task.flush_mode = AMP_FFT_STREAM_FLUSH_NONE;
+    command->want_metrics = (metrics != NULL);
+    if (!command->prepare(inputs, effective_batches, effective_channels, frames, slot_count)) {
+        return -1;
+    }
 
     auto &worker = state->u.fftdiv.worker;
     {
-        std::unique_lock<std::mutex> lock(worker.mutex);
-        worker.pending_tickets.push_back(ticket);
-        worker.cv_request.notify_one();
-        ticket->cv.wait(lock, [ticket]() {
-            return ticket->completed;
-        });
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        worker.pending_commands.push_back(command);
+    }
+    worker.cv_request.notify_one();
+
+    AmpMailboxEntry *entry = amp_node_mailbox_pop(state);
+    if (entry == nullptr) {
+        return AMP_E_PENDING;
     }
 
-    if (out_buffer != NULL) {
-        *out_buffer = ticket->result_buffer;
-    }
     if (out_channels != NULL) {
-        *out_channels = ticket->result_channels;
+        *out_channels = entry->channels > 0 ? entry->channels : effective_channels;
     }
-    return ticket->status;
+    if (out_buffer != NULL) {
+        *out_buffer = entry->buffer;
+    }
+    if (metrics != NULL) {
+        *metrics = entry->metrics;
+    }
+    int status = entry->status;
+    amp_mailbox_entry_release(entry);
+    return status;
 #else
     return fftdiv_execute_block(
         descriptor,
