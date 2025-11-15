@@ -178,7 +178,13 @@ static void tap_buffer_write_row(
     }
     double *frame_ptr = buffer->data + (size_t)frame_index * stride;
     double *batch_ptr = frame_ptr + (size_t)batch * channels;
-    memcpy(batch_ptr, src, copy * sizeof(double));
+        fprintf(stderr, "[TAP-WRITE] buf=%p frames=%u chans=%u stride=%zu batch=%d frame=%d dst=%p copy=%zu src=%p\n",
+            (void*)buffer->data, buffer->shape.frames, buffer->shape.channels, stride, batch, frame_index, (void*)batch_ptr, (size_t)(value_count <= (int)channels ? value_count : channels), (const void*)src);
+        double before0 = batch_ptr[0];
+        memcpy(batch_ptr, src, copy * sizeof(double));
+        double after0 = batch_ptr[0];
+        fprintf(stderr, "[TAP-WRITE-VERIFY] frame=%d dst[0] before=%.6g after=%.6g src0=%.6g\n",
+            frame_index, before0, after0, src[0]);
     if (copy < channels) {
         size_t remaining = channels - copy;
         memset(batch_ptr + copy, 0, remaining * sizeof(double));
@@ -693,11 +699,10 @@ static void fftdiv_run_operator_stack(
 #endif
 
 static void stage_emit_spectral(
+    node_state_t *state,
     double *spectral_real,
     double *spectral_imag,
     int window_size,
-    const EdgeRunnerTapBuffer *spectral_real_tap,
-    const EdgeRunnerTapBuffer *spectral_imag_tap,
     int tap_slot,
     int frame_index,
     FftWorkingTensor *tensor,
@@ -706,28 +711,37 @@ static void stage_emit_spectral(
     int tensor_slice,
     int tensor_freq_bins
 ) {
-        if (spectral_real_tap == NULL || spectral_imag_tap == NULL) {
-            return;
-        }
-        int have_real_target = (spectral_real_tap->data != NULL);
-        int have_imag_target = (spectral_imag_tap->data != NULL);
-    if (!have_real_target && !have_imag_target) {
-        return;
-    }
+    fprintf(stderr, "[STAGE4-EMIT-PRE] frame=%d slot=%d before_copy re[0]=%.6g im[0]=%.6g\n",
+            frame_index, tap_slot, spectral_real[0], spectral_imag[0]);
     if (tensor != NULL && tensor_freq_bins > 0) {
         const int copy_bins = tensor_freq_bins < window_size ? tensor_freq_bins : window_size;
+        fprintf(stderr, "[STAGE4-EMIT-TENSOR] frame=%d slot=%d tensor=%p bins=%d page=%d lane=%d slice=%d\n",
+                frame_index, tap_slot, (void*)tensor, copy_bins, tensor_page, tensor_lane, tensor_slice);
         for (int bin = 0; bin < copy_bins; ++bin) {
             const std::complex<double> value = (*tensor)(tensor_page, tensor_lane, bin, tensor_slice);
             spectral_real[bin] = value.real();
             spectral_imag[bin] = value.imag();
+            if (bin < 4) {
+                fprintf(stderr, "[STAGE4-EMIT-COPY] frame=%d slot=%d bin=%d tensor_re=%.6g tensor_im=%.6g\n",
+                        frame_index, tap_slot, bin, value.real(), value.imag());
+            }
         }
         for (int bin = copy_bins; bin < window_size; ++bin) {
             spectral_real[bin] = 0.0;
             spectral_imag[bin] = 0.0;
         }
     }
-    tap_buffer_write_row(spectral_real_tap, tap_slot, frame_index, spectral_real, window_size);
-    tap_buffer_write_row(spectral_imag_tap, tap_slot, frame_index, spectral_imag, window_size);
+    fprintf(stderr, "[STAGE4-EMIT-POST] frame=%d slot=%d after_copy re[0]=%.6g im[0]=%.6g\n",
+            frame_index, tap_slot, spectral_real[0], spectral_imag[0]);
+    
+    // Push spectral data to mailbox
+    AmpSpectralMailboxEntry *entry = amp_spectral_mailbox_entry_create(
+        tap_slot, frame_index, window_size, spectral_real, spectral_imag);
+    if (entry != NULL) {
+        amp_node_spectral_mailbox_push(state, entry);
+        fprintf(stderr, "[STAGE4-MAILBOX-PUSH] frame=%d slot=%d window_size=%d pushed to spectral mailbox\n",
+                frame_index, tap_slot, window_size);
+    }
 }
 
 #if defined(__cplusplus)
@@ -802,9 +816,8 @@ static void fftdiv_prepare_lane_plan(
         plan.resize(static_cast<size_t>(slot_count));
     }
 
-    const bool spectral_out_available =
-        (spectral_real_tap != nullptr && spectral_real_tap->data != nullptr) ||
-        (spectral_imag_tap != nullptr && spectral_imag_tap->data != nullptr);
+    // Spectral output is always available via mailbox
+    const bool spectral_out_available = true;
 
     const bool pcm_input_connected =
         inputs != nullptr &&
@@ -1122,10 +1135,6 @@ static int fftdiv_execute_block(
     const EdgeRunnerParamView *spectral_input_imag_view = find_param(inputs, "spectral_input_imag");
     const EdgeRunnerTapBuffer *spectral_real_tap = find_tap_buffer(&inputs->taps, "spectral_real");
     const EdgeRunnerTapBuffer *spectral_imag_tap = find_tap_buffer(&inputs->taps, "spectral_imag");
-    if (spectral_real_tap == NULL || spectral_imag_tap == NULL) {
-        free(buffer);
-        return AMP_E_UNSUPPORTED;
-    }
 
     FftWorkingTensor *working_tensor = state->u.fftdiv.working_tensor;
     const int tensor_time_slices = state->u.fftdiv.working_tensor_time_slices > 0
@@ -1679,16 +1688,18 @@ static int fftdiv_execute_block(
         timeline_cursor += hop_seconds;
 
         if (wheel_length > 0) {
+            /* Spectral emission index must advance by 1 per output frame,
+               independent of any working-hop used by Stage 3 operators. */
             const bool wheel_was_full_iter = (wheel_filled_cursor >= wheel_length);
-            wheel_head_cursor = (wheel_head_cursor + wheel_hop) % wheel_length;
+            wheel_head_cursor = (wheel_head_cursor + 1) % wheel_length;
             if (!wheel_was_full_iter) {
-                wheel_filled_cursor += wheel_hop;
+                wheel_filled_cursor += 1;
                 if (wheel_filled_cursor > wheel_length) {
                     wheel_filled_cursor = wheel_length;
                 }
             } else {
                 wheel_filled_cursor = wheel_length;
-                wheel_tail_cursor = (wheel_tail_cursor + wheel_hop) % wheel_length;
+                wheel_tail_cursor = (wheel_tail_cursor + 1) % wheel_length;
             }
         }
 
@@ -1843,21 +1854,22 @@ static int fftdiv_execute_block(
                     }
 
                     if (lane.enable_spectral_out) {
+                        /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
+                        const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
                         stage_emit_spectral(
+                            state,
                             slot_spectral_real,
                             slot_spectral_imag,
                             window_size,
-                            spectral_real_tap,
-                            spectral_imag_tap,
                             slot,
-                            (int)slice.frame_index,
+                            emit_frame_index,
                             working_tensor,
                             tensor_page,
                             tensor_lane,
                             tensor_slice_iter,
                             tensor_freq_bins);
-                        /* Stage 4 (Spectral Out): we just emitted a row to taps for this frame */
-                        fprintf(stderr, "[STAGE4-SPEC-OUT] slot=%d frame=%lld bins=%d\n", slot, (long long)slice.frame_index, window_size);
+                        /* Stage 4 (Spectral Out): we just emitted to spectral mailbox for this frame */
+                        fprintf(stderr, "[STAGE4-SPEC-OUT] slot=%d frame=%lld emit_row=%d bins=%d\n", slot, (long long)slice.frame_index, emit_frame_index, window_size);
                     }
 
                     if (lane.enable_pcm_out) {

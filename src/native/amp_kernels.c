@@ -1875,6 +1875,7 @@ typedef union {
 struct node_state_t {
     node_kind_t kind;
     AmpMailbox mailbox;
+    AmpSpectralMailbox spectral_mailbox;
 #if defined(__cplusplus)
     std::mutex mailbox_mutex;
     std::condition_variable mailbox_cv;
@@ -2101,6 +2102,7 @@ static void release_node_state(node_state_t *state) {
     state->mailbox_cv.notify_all();
 #endif
     amp_node_mailbox_clear(state);
+    amp_node_spectral_mailbox_clear(state);
 #if defined(__cplusplus)
     delete state;
 #else
@@ -2152,6 +2154,53 @@ AMP_CAPI void amp_node_mailbox_clear(void *state) {
     while (entry != NULL) {
         amp_mailbox_entry_release(entry);
         entry = amp_mailbox_pop(&node_state->mailbox);
+    }
+}
+
+AMP_CAPI AmpSpectralMailboxEntry *amp_node_spectral_mailbox_pop(void *state) {
+    if (state == NULL) {
+        return NULL;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+#endif
+    return amp_spectral_mailbox_pop(&node_state->spectral_mailbox);
+}
+
+AMP_CAPI void amp_node_spectral_mailbox_push(void *state, AmpSpectralMailboxEntry *entry) {
+    if (state == NULL) {
+        amp_spectral_mailbox_entry_release(entry);
+        return;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    {
+        std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+        if (node_state->mailbox_shutdown) {
+            amp_spectral_mailbox_entry_release(entry);
+            return;
+        }
+        amp_spectral_mailbox_push(&node_state->spectral_mailbox, entry);
+    }
+    node_state->mailbox_cv.notify_all();
+#else
+    amp_spectral_mailbox_push(&node_state->spectral_mailbox, entry);
+#endif
+}
+
+AMP_CAPI void amp_node_spectral_mailbox_clear(void *state) {
+    if (state == NULL) {
+        return;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+#endif
+    AmpSpectralMailboxEntry *entry = amp_spectral_mailbox_pop(&node_state->spectral_mailbox);
+    while (entry != NULL) {
+        amp_spectral_mailbox_entry_release(entry);
+        entry = amp_spectral_mailbox_pop(&node_state->spectral_mailbox);
     }
 }
 
@@ -3849,6 +3898,7 @@ static int amp_run_node_impl(
             return -1;
         }
         amp_mailbox_init(&node_state->mailbox);
+        amp_spectral_mailbox_init(&node_state->spectral_mailbox);
 #endif
         node_state->kind = NODE_KIND_UNKNOWN;
     }
@@ -3857,6 +3907,7 @@ static int amp_run_node_impl(
         node_state->mailbox_shutdown = false;
 #endif
         amp_mailbox_init(&node_state->mailbox);
+        amp_spectral_mailbox_init(&node_state->spectral_mailbox);
     }
 #if defined(__cplusplus)
     if (kind == NODE_KIND_FFT_DIV) {

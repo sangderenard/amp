@@ -12,6 +12,7 @@
 extern "C" {
 #include "amp_fft_backend.h"
 #include "amp_native.h"
+#include "mailbox.h"
 }
 
 namespace {
@@ -199,24 +200,9 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     params.count = 0U;
     params.items = nullptr;
 
-    EdgeRunnerTapBuffer tap_buffers[2]{};
-    tap_buffers[0].tap_name = "spectral_real";
-    tap_buffers[0].buffer_class = nullptr;
-    tap_buffers[0].shape.batches = 1U;
-    tap_buffers[0].shape.channels = kWindowSize;
-    tap_buffers[0].shape.frames = audio.frames;
-    tap_buffers[0].frame_stride = kWindowSize;
-    tap_buffers[0].data = result.spectral_real.data();
-
-    tap_buffers[1].tap_name = "spectral_imag";
-    tap_buffers[1].buffer_class = nullptr;
-    tap_buffers[1].shape = tap_buffers[0].shape;
-    tap_buffers[1].frame_stride = kWindowSize;
-    tap_buffers[1].data = result.spectral_imag.data();
-
     EdgeRunnerTapBufferSet tap_set{};
-    tap_set.items = tap_buffers;
-    tap_set.count = 2U;
+    tap_set.items = nullptr;
+    tap_set.count = 0U;
 
     EdgeRunnerTapStatusSet status_set{};
     status_set.items = nullptr;
@@ -275,6 +261,21 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         );
     } else {
         result.pcm.assign(out_buffer, out_buffer + signal.size());
+    }
+
+    // Drain spectral mailbox entries and populate result arrays
+    if (state != nullptr) {
+        AmpSpectralMailboxEntry *entry = nullptr;
+        while ((entry = amp_node_spectral_mailbox_pop(state)) != nullptr) {
+            const int frame_offset = entry->frame_index * kWindowSize;
+            if (frame_offset >= 0 && frame_offset + entry->window_size <= static_cast<int>(result.spectral_real.size())) {
+                for (int bin = 0; bin < entry->window_size; ++bin) {
+                    result.spectral_real[frame_offset + bin] = entry->spectral_real[bin];
+                    result.spectral_imag[frame_offset + bin] = entry->spectral_imag[bin];
+                }
+            }
+            amp_spectral_mailbox_entry_release(entry);
+        }
     }
 
     if (out_buffer != nullptr) {
