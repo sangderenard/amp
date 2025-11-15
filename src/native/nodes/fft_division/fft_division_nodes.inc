@@ -962,11 +962,13 @@ static int fftdiv_execute_block(
     state->u.fftdiv.window_kind = default_window_kind;
     state->u.fftdiv.window_size = window_size;
 
+    // Default working frequency bins should follow the effective window_size
+    // so the tensor's bin dimension matches the STFT output bins unless explicitly overridden.
     int working_freq_bins = json_get_int(
         descriptor->params_json,
         descriptor->params_len,
         "working_ft_frequency_bins",
-        (default_freq_bins > 0) ? default_freq_bins : window_size
+        window_size
     );
     if (working_freq_bins <= 0) {
         working_freq_bins = window_size;
@@ -984,11 +986,14 @@ static int fftdiv_execute_block(
     if (working_time_slices <= 0) {
         working_time_slices = 1;
     }
+    // Derive default working hop from the effective window_size, not the earlier default_hop.
+    // This ensures tensor slice advancement matches the configured window and avoids misalignment
+    // when a preset or earlier defaults set default_hop from a different window size.
     int working_hop = json_get_int(
         descriptor->params_json,
         descriptor->params_len,
         "working_ft_hop",
-        default_hop > 0 ? default_hop : (window_size > 1 ? window_size / 2 : 1)
+        (window_size > 1 ? window_size / 2 : 1)
     );
     if (working_hop <= 0) {
         working_hop = 1;
@@ -1770,6 +1775,21 @@ static int fftdiv_execute_block(
 
         std::vector<size_t> lane_frames_consumed(static_cast<size_t>(slot_count), 0U);
         for (const auto &slice : filled_slices) {
+            /* Debug: correlate Stage2 slice index with Stage3 window span and offsets */
+            {
+                fprintf(stderr,
+                        "[STAGE3-CONTEXT] tensor_slice=%d view_filled=%d wheel(head=%d tail=%d len=%d hop=%d) frame=%lld\n",
+                        slice.tensor_slice,
+                        slice.view_filled_override,
+                        slice.wheel_head,
+                        slice.wheel_tail,
+                        wheel_length,
+                        wheel_hop,
+                        (long long)slice.frame_index);
+                if (!slice.lane_frame_offsets.empty()) {
+                    fprintf(stderr, "[STAGE3-CONTEXT] lane0 assigned_offset=%zu\n", slice.lane_frame_offsets[0]);
+                }
+            }
             const int tensor_slice_iter = slice.tensor_slice;
             const int scratch_slice_iter = slice.scratch_slice;
             const int64_t frame_index_iter = slice.frame_index;
@@ -1806,8 +1826,6 @@ static int fftdiv_execute_block(
                 double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice_iter);
                 double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, tensor_lane, scratch_slice_iter);
                 const int scratch_bins = fftdiv_spectral_scratch_bins(state);
-                double *buffer_ptr = buffer + data_idx;
-                bool wrote_output = false;
 
                 if (lane_snapshot.frame_ready && lane.active && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
                     if ((lane.enable_pcm_out || lane.enable_spectral_out) &&
@@ -1842,57 +1860,18 @@ static int fftdiv_execute_block(
                         fprintf(stderr, "[STAGE4-SPEC-OUT] slot=%d frame=%lld bins=%d\n", slot, (long long)slice.frame_index, window_size);
                     }
 
-                    if (lane.enable_pcm_out && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
-#if FFTDIV_TRACE_ENABLED
-                        FFTDIV_TRACE(
-                            "[fftdiv] inverse-pre slot=%d frame=%lld queue_before=%zu scratch=%zu",
-                            slot,
-                            (long long)slice.frame_index,
-                            (size_t)slot_state.inverse_queue.size(),
-                            slot_state.inverse_scratch.size());
-#endif
-                        const size_t produced_pcm = amp_fft_backend_stream_push_spectrum(
-                            slot_state.inverse_handle,
-                            slot_spectral_real,
-                            slot_spectral_imag,
-                            1,
-                            window_size,
-                            slot_state.inverse_scratch.data(),
-                            slot_state.inverse_scratch.size(),
-                            flush_mode);
-                        fprintf(stderr, "[STAGE3-INVERSE] slot=%d produced_pcm=%zu\n", slot, produced_pcm);
-                        if (produced_pcm > 0) {
-                            made_progress = true;
+                    if (lane.enable_pcm_out) {
+                        // Stage 3 enqueues spectrum for deferred inverse in Stage 5
+                        if (slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                            decltype(slot_state.pending_spectra)::value_type pending;
+                            try {
+                                pending.real.assign(slot_spectral_real, slot_spectral_real + (size_t)window_size);
+                                pending.imag.assign(slot_spectral_imag, slot_spectral_imag + (size_t)window_size);
+                                slot_state.pending_spectra.push_back(std::move(pending));
+                            } catch (...) {
+                                // Allocation failure: drop this frame; Stage 5 will still drain what exists
+                            }
                         }
-#if FFTDIV_TRACE_ENABLED
-                        FFTDIV_TRACE(
-                            "[fftdiv] inverse-produce slot=%d frame=%lld produced=%zu",
-                            slot,
-                            (long long)slice.frame_index,
-                            produced_pcm);
-#endif
-                        for (size_t i = 0; i < produced_pcm && i < slot_state.inverse_scratch.size(); ++i) {
-                            slot_state.inverse_queue.push_back(slot_state.inverse_scratch[i]);
-                        }
-#if FFTDIV_TRACE_ENABLED
-                        FFTDIV_TRACE(
-                            "[fftdiv] inverse-post slot=%d frame=%lld queue_after=%zu",
-                            slot,
-                            (long long)slice.frame_index,
-                            (size_t)slot_state.inverse_queue.size());
-#endif
-                    }
-
-                    if (lane.enable_pcm_out && !slot_state.inverse_queue.empty()) {
-                        const double output_value = slot_state.inverse_queue.front();
-                        slot_state.inverse_queue.pop_front();
-                        *buffer_ptr = output_value;
-                        slot_state.last_pcm_output = output_value;
-                        wrote_output = true;
-                        pcm_written_samples += 1U;
-                        made_progress = true;
-                        /* Stage 5 (PCM Out): published one sample to the output buffer */
-                        fprintf(stderr, "[STAGE5-PCM] slot=%d sample_idx=%lld value=%.6g\n", slot, (long long)(slice.pcm_sample_index + (int64_t)slot), output_value);
                     }
 
                     if (slot_state.forward_ring_filled > 0U && slot_state.forward_ring_capacity_frames > 0U) {
@@ -1903,33 +1882,6 @@ static int fftdiv_execute_block(
                             lane_frames_consumed[(size_t)slot] += 1U;
                         }
                     }
-                } else {
-                    if (lane.enable_pcm_out && !slot_state.inverse_queue.empty()) {
-                        const double output_value = slot_state.inverse_queue.front();
-                        slot_state.inverse_queue.pop_front();
-                        *buffer_ptr = output_value;
-                        slot_state.last_pcm_output = output_value;
-                        wrote_output = true;
-                        fprintf(stderr, "[STAGE5-PCM] slot=%d sample_idx=%lld value=%.6g\n", slot, (long long)(slice.pcm_sample_index + (int64_t)slot), output_value);
-                    }
-                }
-                if (wrote_output) {
-#if FFTDIV_TRACE_ENABLED
-                    FFTDIV_TRACE(
-                        "[fftdiv] buffer slot=%d frame=%lld value=%f queue_after=%zu",
-                        slot,
-                        (long long)slice.frame_index,
-                        *buffer_ptr,
-                        (size_t)slot_state.inverse_queue.size());
-#endif
-                } else if (lane.enable_pcm_out && slot_state.inverse_queue.empty()) {
-                    queue_drains_without_emission += 1U;
-#if FFTDIV_TRACE_ENABLED
-                    FFTDIV_TRACE(
-                        "[fftdiv] buffer-miss slot=%d frame=%lld queue_empty",
-                        slot,
-                        (long long)slice.frame_index);
-#endif
                 }
             }
 
@@ -1945,46 +1897,41 @@ static int fftdiv_execute_block(
 #endif /* defined(__cplusplus) */
 
 #if defined(__cplusplus)
-    fprintf(stderr, "[STAGE4-CHECK] made_progress=%d pcm_written=%zu expected=%zu\n",
-            made_progress ? 1 : 0, pcm_written_samples, pcm_expected_samples);
-    if (!made_progress || (pcm_expected_samples > 0U && pcm_written_samples < pcm_expected_samples)) {
-        fprintf(stderr, "[STAGE4-INSUFFICIENT] Freeing buffer and returning AMP_E_PENDING\n");
-#if FFTDIV_TRACE_ENABLED
-        FFTDIV_TRACE(
-            "[fftdiv] pending progress=%d pcm_written=%zu expected=%zu queue_misses=%zu",
-            made_progress ? 1 : 0,
-            pcm_written_samples,
-            pcm_expected_samples,
-            queue_drains_without_emission);
-#endif
-        {
-            AmpMailboxEntry *existing_entry = amp_node_mailbox_pop(state);
-            if (existing_entry != NULL) {
-                free(buffer);
-                buffer = NULL;
-                amp_last_alloc_count = 0;
-                if (out_channels != NULL) {
-                    *out_channels = existing_entry->channels > 0
-                        ? existing_entry->channels
-                        : input_channels;
-                }
-                if (out_buffer != NULL) {
-                    *out_buffer = existing_entry->buffer;
-                }
-                if (metrics != NULL) {
-                    *metrics = existing_entry->metrics;
-                }
-                int mailbox_status = existing_entry->status;
-                amp_mailbox_entry_release(existing_entry);
-                return mailbox_status;
+    // Stage 5: Perform inverse on any pending spectra, then drain inverse_queue into output buffer for mailbox
+    size_t buffer_offset = 0;
+    for (int slot = 0; slot < slot_count; ++slot) {
+        auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
+        // First, run inverse on spectra accumulated by Stage 3
+        while (!slot_state.pending_spectra.empty() && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
+            auto &pending = slot_state.pending_spectra.front();
+            const size_t produced_pcm = amp_fft_backend_stream_push_spectrum(
+                slot_state.inverse_handle,
+                pending.real.empty() ? NULL : pending.real.data(),
+                pending.imag.empty() ? NULL : pending.imag.data(),
+                1,
+                window_size,
+                slot_state.inverse_scratch.data(),
+                slot_state.inverse_scratch.size(),
+                flush_mode);
+            fprintf(stderr, "[STAGE5-INVERSE] slot=%d produced_pcm=%zu\n", slot, produced_pcm);
+            if (produced_pcm > 0) {
+                made_progress = true;
             }
+            for (size_t i = 0; i < produced_pcm && i < slot_state.inverse_scratch.size(); ++i) {
+                slot_state.inverse_queue.push_back(slot_state.inverse_scratch[i]);
+            }
+            slot_state.pending_spectra.pop_front();
         }
-        free(buffer);
-        *out_buffer = NULL;
-        *out_channels = 0;
-        amp_last_alloc_count = 0;
-        return AMP_E_PENDING;
+        while (!slot_state.inverse_queue.empty() && buffer_offset < total_samples) {
+            buffer[buffer_offset] = slot_state.inverse_queue.front();
+            slot_state.inverse_queue.pop_front();
+            fprintf(stderr, "[STAGE5-PCM] slot=%d buffer_idx=%zu value=%.6g queue_remaining=%zu\n",
+                    slot, buffer_offset, buffer[buffer_offset], slot_state.inverse_queue.size());
+            buffer_offset++;
+            pcm_written_samples++;
+        }
     }
+
 #endif
 
 #if !defined(__cplusplus)
@@ -2006,11 +1953,7 @@ static int fftdiv_execute_block(
     state->u.fftdiv.spectral_scratch.time_cursor = scratch_time_cursor;
 #endif
 
-    *out_buffer = buffer;
-    *out_channels = input_channels;
-    fprintf(stderr, "[STAGE4-OUTPUT] buffer=%p channels=%d first_sample=%.6f\n", 
-            (void*)buffer, input_channels, buffer ? buffer[0] : 0.0);
-
+    // Push buffer to mailbox instead of direct return
     if (metrics != NULL) {
         metrics->measured_delay_frames = (uint32_t)((window_size > 0) ? (window_size - 1) : 0);
         metrics->accumulated_heat = 0.0f;
@@ -2025,8 +1968,32 @@ static int fftdiv_execute_block(
         metrics->reserved[4] = (double)window_size;
         metrics->reserved[5] = (double)default_algorithm;
     }
-
-    return 0;
+    
+    AmpMailboxEntry *entry = amp_mailbox_entry_create(
+        buffer,
+        input_channels,
+#if defined(__cplusplus)
+        pcm_written_samples > 0 ? pcm_written_samples : (size_t)frames,
+#else
+        (size_t)frames,
+#endif
+        0,
+        metrics,
+        NULL,
+        NULL
+    );
+    
+    if (entry != NULL) {
+        amp_node_mailbox_push(state, entry);
+        fprintf(stderr, "[STAGE5-MAILBOX-PUSH] buffer=%p channels=%d frames=%d\n",
+                (void*)buffer, input_channels, frames);
+    } else {
+        free(buffer);
+    }
+    
+    *out_buffer = NULL;
+    *out_channels = 0;
+    return AMP_E_PENDING;
 }
 
 #if defined(__cplusplus)

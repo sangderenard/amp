@@ -1780,6 +1780,11 @@ typedef union {
                 std::size_t forward_frames_ready{0U};
                 std::vector<double> inverse_scratch;
                 std::deque<double> inverse_queue;
+                struct PendingSpectrum {
+                    std::vector<double> real;
+                    std::vector<double> imag;
+                };
+                std::deque<PendingSpectrum> pending_spectra;
                 bool warmup_complete{false};
                 double last_pcm_output{0.0};
             };

@@ -307,6 +307,19 @@ if (AMP_NATIVE_BUILD_TESTS)
     target_link_libraries(test_fft_backend_stream PRIVATE ${_FFTFREE_TARGET})
     add_test(NAME test_fft_backend_stream COMMAND test_fft_backend_stream)
 
+    add_executable(test_fft_windowing_roundtrip
+        tests/test_fft_windowing_roundtrip.cpp
+    )
+    target_include_directories(test_fft_windowing_roundtrip PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${_FFTFREE_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_fft_windowing_roundtrip PRIVATE amp_native ${_FFTFREE_TARGET})
+    add_test(NAME test_fft_windowing_roundtrip COMMAND test_fft_windowing_roundtrip)
+
     add_executable(test_pitch_shift_node
         tests/test_pitch_shift_node.cpp
     )
@@ -328,6 +341,7 @@ if (AMP_NATIVE_BUILD_TESTS)
         test_fft_backend_compare
         test_fft_backend_transform
         test_fft_backend_stream
+        test_fft_windowing_roundtrip
         test_pitch_shift_node
     )
 

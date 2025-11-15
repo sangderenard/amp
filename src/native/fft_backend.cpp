@@ -603,7 +603,7 @@ AMP_CAPI void *amp_fft_backend_stream_create_inverse(
         0,
         1,
         1,
-        1,
+        0,  // apply_ola = 0: handle OLA manually in streaming code
         synthesis_window_kind,
         0.0f,
         0.0f,
