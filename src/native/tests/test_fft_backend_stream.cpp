@@ -19,6 +19,7 @@
 namespace {
 
 constexpr double kEpsilon = 1e-5;
+constexpr int kStftModeStreaming = 2;
 
 bool nearly_equal(double a, double b, double eps = kEpsilon) {
     return std::fabs(a - b) <= eps;
