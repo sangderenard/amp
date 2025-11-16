@@ -18,6 +18,10 @@
 #include <string.h>
 #include <time.h>
 
+#if !defined(_WIN32) && !defined(_WIN64)
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #endif
