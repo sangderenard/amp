@@ -1659,6 +1659,7 @@ bool FftDivWorkerCommand::prepare(
 #endif
 
 typedef struct node_state_t node_state_t;
+static void fftdiv_flush_with_zeroes(node_state_t *state);
 
 #if defined(__cplusplus)
 union node_state_payload {
@@ -1900,6 +1901,44 @@ static void fftdiv_destroy_state(node_state_t *state) {
     }
     std::destroy_at(&state->u.fftdiv);
     state->fftdiv_constructed = false;
+}
+
+static size_t fftdiv_declared_latency_frames(const node_state_t *state) {
+    if (state == nullptr || state->kind != NODE_KIND_FFT_DIV || !state->fftdiv_constructed) {
+        fprintf(
+            stderr,
+            "[FFT-LATENCY] unavailable state=%p kind=%d constructed=%d\n",
+            (const void *)state,
+            state != nullptr ? state->kind : NODE_KIND_UNKNOWN,
+            (state != nullptr && state->fftdiv_constructed) ? 1 : 0
+        );
+        return 0;
+    }
+    const auto &fftdiv = state->u.fftdiv;
+    if (fftdiv.window_size > 1) {
+        fprintf(
+            stderr,
+            "[FFT-LATENCY] window_size=%d latency=%d\n",
+            fftdiv.window_size,
+            fftdiv.window_size - 1
+        );
+        return static_cast<size_t>(fftdiv.window_size - 1);
+    }
+    fprintf(stderr, "[FFT-LATENCY] window_size=%d < 2\n", fftdiv.window_size);
+    return 0;
+}
+
+static void fftdiv_request_latency_tail(node_state_t *state) {
+    if (state == nullptr || state->kind != NODE_KIND_FFT_DIV) {
+        return;
+    }
+    fprintf(stderr, "[FFT-LATENCY-FLUSH-REQUEST] state=%p window=%d batches=%d channels=%d frames=%d\n",
+        (void *)state,
+        state->u.fftdiv.window_size,
+        state->u.fftdiv.last_batches,
+        state->u.fftdiv.last_channels,
+        state->u.fftdiv.last_frames);
+    fftdiv_flush_with_zeroes(state);
 }
 #endif
 
@@ -4086,26 +4125,148 @@ static int amp_wait_node_completion_impl(
         kind = determine_node_kind(descriptor);
     }
 
+    const size_t expected_frames = (frames > 0) ? (size_t)frames : 0;
+#if defined(__cplusplus)
+    size_t latency_frames = 0;
+    bool latency_ready = false;
+#endif
+
     switch (kind) {
         case NODE_KIND_FFT_DIV:
 #if defined(__cplusplus)
             {
-                AmpMailboxEntry *entry = amp_node_mailbox_pop(node_state);
-                if (entry == NULL) {
+                // Keep accumulating until we reach expected frame count
+                AmpMailboxEntry *entries[256];
+                size_t entry_count = 0;
+                size_t total_frames = 0;
+                int result_channels = 0;
+                int final_status = 0;
+                bool tail_requested = false;
+                
+                // Poll and accumulate entries until we have enough frames
+                const int max_poll_attempts = 10000;
+                int poll_attempts = 0;
+                
+                while (total_frames < expected_frames && poll_attempts < max_poll_attempts) {
+                    if (!latency_ready) {
+                        size_t observed_latency = fftdiv_declared_latency_frames(node_state);
+                        if (observed_latency > 0) {
+                            latency_frames = observed_latency;
+                            latency_ready = true;
+                        }
+                    }
+                    AmpMailboxEntry *entry = amp_node_mailbox_pop(node_state);
+                    if (entry == NULL) {
+                        size_t remaining = expected_frames > total_frames
+                            ? (expected_frames - total_frames)
+                            : 0;
+                        fprintf(
+                            stderr,
+                            "[FFT-WAIT] remaining=%zu latency=%zu tail_requested=%d poll=%d/%d\n",
+                            remaining,
+                            latency_ready ? latency_frames : 0,
+                            tail_requested ? 1 : 0,
+                            poll_attempts,
+                            max_poll_attempts
+                        );
+                        if (latency_ready && !tail_requested && expected_frames > 0 && latency_frames > 0) {
+                            if (remaining > 0 && remaining <= latency_frames) {
+                                fftdiv_request_latency_tail(node_state);
+                                tail_requested = true;
+                                poll_attempts = 0;
+                                continue;
+                            }
+                        }
+                        // No entry available yet, wait and retry
+                        poll_attempts++;
+                        if (entry_count == 0 && poll_attempts >= max_poll_attempts) {
+                            fprintf(
+                                stderr,
+                                "[FFT-WAIT] max-poll exceeded without entries expected=%zu latency=%zu\n",
+                                expected_frames,
+                                latency_frames
+                            );
+                            return AMP_E_PENDING;
+                        }
+                        // Sleep briefly to allow async processing to continue
+#if defined(_WIN32)
+                        Sleep(1);
+#else
+                        usleep(1000);
+#endif
+                        continue;
+                    }
+                    
+                    if (entry_count == 0) {
+                        result_channels = entry->channels > 0 ? entry->channels : 1;
+                    }
+                    
+                    if (entry_count < 256) {
+                        entries[entry_count++] = entry;
+                        total_frames += entry->frames;
+                        if (entry->status != 0 && entry->status != AMP_E_PENDING) {
+                            final_status = entry->status;
+                        }
+                    } else {
+                        amp_mailbox_entry_release(entry);
+                        break;
+                    }
+                }
+                
+                if (entry_count == 0) {
                     return AMP_E_PENDING;
                 }
+                
+                size_t output_frames = total_frames;
+                if (expected_frames > output_frames) {
+                    output_frames = expected_frames;
+                }
+
+                // Allocate accumulated buffer
+                double *accumulated_buffer = (double *)malloc(output_frames * result_channels * sizeof(double));
+                if (accumulated_buffer == NULL) {
+                    for (size_t i = 0; i < entry_count; ++i) {
+                        amp_mailbox_entry_release(entries[i]);
+                    }
+                    return -1;
+                }
+                
+                // Copy all frames into accumulated buffer
+                size_t offset = 0;
+                for (size_t i = 0; i < entry_count; ++i) {
+                    AmpMailboxEntry *entry = entries[i];
+                    size_t entry_samples = entry->frames * result_channels;
+                    memcpy(accumulated_buffer + offset, entry->buffer, entry_samples * sizeof(double));
+                    offset += entry_samples;
+                    
+                    // Accumulate metrics from first entry only (or implement proper accumulation)
+                    if (i == 0 && metrics != NULL) {
+                        *metrics = entry->metrics;
+                    }
+                    
+                    amp_mailbox_entry_release(entry);
+                }
+
+                if (output_frames > total_frames) {
+                    size_t missing_samples = (output_frames - total_frames) * result_channels;
+                    std::memset(
+                        accumulated_buffer + total_frames * result_channels,
+                        0,
+                        missing_samples * sizeof(double)
+                    );
+                }
+                
                 if (out_channels != NULL) {
-                    *out_channels = entry->channels > 0 ? entry->channels : 1;
+                    *out_channels = result_channels;
                 }
                 if (out_buffer != NULL) {
-                    *out_buffer = entry->buffer;
+                    *out_buffer = accumulated_buffer;
                 }
-                if (metrics != NULL) {
-                    *metrics = entry->metrics;
-                }
-                int status = entry->status;
-                amp_mailbox_entry_release(entry);
-                return status;
+                
+                fprintf(stderr, "[amp_wait_node_completion] accumulated %zu/%zu frames from %zu mailbox entries (latency=%zu)\n", 
+                    output_frames, expected_frames, entry_count, latency_frames);
+                
+                return final_status;
             }
 #else
             (void)descriptor;

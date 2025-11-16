@@ -1685,8 +1685,24 @@ static int kpn_execute_node_block(
             execution_status = v2_status;
         } else {
             used_v2 = true;
+            // Check mailbox for actual output
+            AmpMailboxEntry *mail_entry = (state_arg != NULL)
+                ? amp_node_mailbox_pop(state_arg)
+                : nullptr;
+            if (mail_entry != nullptr) {
+                if (frame_buffer != nullptr && frame_buffer != mail_entry->buffer) {
+                    amp_free(frame_buffer);
+                }
+                frame_buffer = mail_entry->buffer;
+                out_channels = mail_entry->channels > 0 ? mail_entry->channels : out_channels;
+                // Override frames with actual mailbox entry frame count
+                if (mail_entry->frames > 0 && mail_entry->frames != frames) {
+                    frames = static_cast<uint32_t>(mail_entry->frames);
+                }
+                node.latest_metrics = mail_entry->metrics;
+                amp_mailbox_entry_release(mail_entry);
+            }
             node.has_latest_metrics = true;
-            node.latest_metrics = metrics;
             node.total_heat_accumulated += static_cast<double>(metrics.accumulated_heat);
         }
     }
@@ -3297,6 +3313,10 @@ static int execute_runtime_with_history_impl(
                     }
                     frame_buffer = mail_entry->buffer;
                     out_channels = mail_entry->channels > 0 ? mail_entry->channels : 1;
+                    // Override frames with actual mailbox entry frame count
+                    if (mail_entry->frames > 0 && mail_entry->frames != frames) {
+                        frames = static_cast<uint32_t>(mail_entry->frames);
+                    }
                     node.latest_metrics = mail_entry->metrics;
                     node.has_latest_metrics = true;
                     node.total_heat_accumulated += static_cast<double>(mail_entry->metrics.accumulated_heat);

@@ -1981,27 +1981,36 @@ static int fftdiv_execute_block(
         metrics->reserved[5] = (double)default_algorithm;
     }
     
-    AmpMailboxEntry *entry = amp_mailbox_entry_create(
-        buffer,
-        input_channels,
-#if defined(__cplusplus)
-        pcm_written_samples > 0 ? pcm_written_samples : (size_t)frames,
-#else
-        (size_t)frames,
-#endif
-        0,
-        metrics,
-        NULL,
-        NULL
-    );
-    
-    if (entry != NULL) {
-        amp_node_mailbox_push(state, entry);
-        fprintf(stderr, "[STAGE5-MAILBOX-PUSH] buffer=%p channels=%d frames=%d\n",
-                (void*)buffer, input_channels, frames);
-    } else {
-        free(buffer);
+    // Push one mailbox entry per frame
+    size_t frames_to_push = pcm_written_samples > 0 ? pcm_written_samples : (size_t)frames;
+    for (size_t i = 0; i < frames_to_push; ++i) {
+        double *frame_buffer = (double *)malloc(input_channels * sizeof(double));
+        if (frame_buffer == NULL) {
+            free(buffer);
+            return -1;
+        }
+        for (int ch = 0; ch < input_channels; ++ch) {
+            frame_buffer[ch] = buffer[i * input_channels + ch];
+        }
+        AmpMailboxEntry *entry = amp_mailbox_entry_create(
+            frame_buffer,
+            input_channels,
+            1,  // One frame per entry
+            0,
+            metrics,
+            NULL,
+            NULL
+        );
+        if (entry != NULL) {
+            amp_node_mailbox_push(state, entry);
+        } else {
+            free(frame_buffer);
+            free(buffer);
+            return -1;
+        }
     }
+    fprintf(stderr, "[STAGE5-MAILBOX-PUSH] pushed %zu individual frame entries\n", frames_to_push);
+    free(buffer);
     
     *out_buffer = NULL;
     *out_channels = 0;
@@ -2031,16 +2040,32 @@ static bool fftdiv_has_pending_work(const node_state_t *state) {
 
 static void fftdiv_flush_with_zeroes(node_state_t *state) {
     if (state == nullptr) {
+        fprintf(stderr, "[FFT-LATENCY-FLUSH] skip state=null reason=null-state\n");
         return;
     }
     auto &fftdiv = state->u.fftdiv;
     const EdgeRunnerNodeDescriptor *descriptor = fftdiv.last_descriptor;
-    if (descriptor == nullptr || fftdiv.stream_slots.empty()) {
+    if (descriptor == nullptr) {
+        fprintf(
+            stderr,
+            "[FFT-LATENCY-FLUSH] skip state=%p reason=no-descriptor slots=%zu\n",
+            (void *)state,
+            static_cast<size_t>(fftdiv.stream_slots.size())
+        );
+        return;
+    }
+    if (fftdiv.stream_slots.empty()) {
+        fprintf(
+            stderr,
+            "[FFT-LATENCY-FLUSH] skip state=%p reason=no-slots descriptor=%s\n",
+            (void *)state,
+            descriptor->name != nullptr ? descriptor->name : "<unnamed>"
+        );
         return;
     }
     int batches = fftdiv.last_batches > 0 ? fftdiv.last_batches : 1;
     int channels = fftdiv.last_channels > 0 ? fftdiv.last_channels : 1;
-    int frames = fftdiv.last_frames > 0 ? fftdiv.last_frames : fftdiv.window_size;
+    int frames = (fftdiv.window_size > 0) ? (fftdiv.window_size - 1) : 0;
     if (frames <= 0) {
         frames = 1;
     }
@@ -2052,7 +2077,19 @@ static void fftdiv_flush_with_zeroes(node_state_t *state) {
         ? fftdiv.last_sample_rate
         : fftdiv.sample_rate_hint;
 
-    std::vector<double> zeros(static_cast<size_t>(slot_count) * static_cast<size_t>(frames), 0.0);
+    std::vector<double> zeros(
+        static_cast<size_t>(slot_count) * static_cast<size_t>(frames),
+        0.0
+    );
+
+    fprintf(
+        stderr,
+        "[FFT-LATENCY-FLUSH] start state=%p slots=%zu frames=%d pending=%s\n",
+        (void *)state,
+        static_cast<size_t>(fftdiv.stream_slots.size()),
+        frames,
+        fftdiv_has_pending_work(state) ? "yes" : "no"
+    );
 
     EdgeRunnerAudioView audio{};
     audio.has_audio = 1;
@@ -2112,6 +2149,13 @@ static void fftdiv_flush_with_zeroes(node_state_t *state) {
     if (final_buffer != nullptr) {
         free(final_buffer);
     }
+    fprintf(
+        stderr,
+        "[FFT-LATENCY-FLUSH] final state=%p status=%d pending=%s\n",
+        (void *)state,
+        final_status,
+        fftdiv_has_pending_work(state) ? "yes" : "no"
+    );
     (void)final_status;
 }
 
