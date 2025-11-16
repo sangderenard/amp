@@ -287,12 +287,15 @@ size_t drain_spectral_mailbox_rows(
     while ((entry = amp_node_spectral_mailbox_pop(state)) != nullptr) {
         const int slot = entry->slot;
         const int frame_index = entry->frame_index;
+        const int window_size = entry->window_size;
+        const int latency = (window_size > 0) ? (window_size - 1) : 0;  // remove declared FFT delay so indices start at zero
+        const int aligned_frame_index = frame_index - latency;
         const bool slot_in_range = slot >= 0 && static_cast<uint32_t>(slot) < spectral_real_tap.shape.batches;
-        if (slot_in_range && frame_index >= 0 && static_cast<uint32_t>(frame_index) < tap_frames) {
-            const size_t row_index = static_cast<size_t>(slot) * frame_count + static_cast<size_t>(frame_index);
+        if (slot_in_range && aligned_frame_index >= 0 && static_cast<uint32_t>(aligned_frame_index) < tap_frames) {
+            const size_t row_index = static_cast<size_t>(slot) * frame_count + static_cast<size_t>(aligned_frame_index);
             if (row_index < spectral_row_written.size() && spectral_row_written[row_index] == 0U) {
-                write_tap_row(spectral_real_tap, slot, frame_index, entry->spectral_real, entry->window_size);
-                write_tap_row(spectral_imag_tap, slot, frame_index, entry->spectral_imag, entry->window_size);
+                write_tap_row(spectral_real_tap, slot, aligned_frame_index, entry->spectral_real, entry->window_size);
+                write_tap_row(spectral_imag_tap, slot, aligned_frame_index, entry->spectral_imag, entry->window_size);
                 spectral_row_written[row_index] = 1U;
                 spectral_rows_captured += 1U;
             }
@@ -1093,20 +1096,14 @@ int main(int argc, char **argv) {
 
     const size_t expected_spectral_frames = expected_spec.spectral_real.size() /
         static_cast<size_t>(g_config.window_size);
-    const size_t spectral_delay = (g_config.window_size > 0)
-        ? static_cast<size_t>(g_config.window_size - 1)
-        : 0U;
-    const size_t actual_frame_offset = std::min(spectral_delay, expected_spectral_frames);
     const size_t spectral_frames_to_check = std::min(first.spectral_rows_committed, expected_spectral_frames);
     const size_t spectral_values_to_check = spectral_frames_to_check *
         static_cast<size_t>(g_config.window_size);
     if (spectral_frames_to_check == 0) {
         record_failure("spectral_frames_to_check is zero");
     } else {
-        const double *actual_real_ptr = first.spectral_real.data() + actual_frame_offset *
-            static_cast<size_t>(g_config.window_size);
-        const double *actual_imag_ptr = first.spectral_imag.data() + actual_frame_offset *
-            static_cast<size_t>(g_config.window_size);
+        const double *actual_real_ptr = first.spectral_real.data();
+        const double *actual_imag_ptr = first.spectral_imag.data();
         const double *expected_real_ptr = expected_spec.spectral_real.data();
         const double *expected_imag_ptr = expected_spec.spectral_imag.data();
         verify_close(
@@ -1123,14 +1120,11 @@ int main(int argc, char **argv) {
             spectral_values_to_check,
             g_config.tolerance
         );
-        const size_t expected_frames_committed = expected_spectral_frames;
-        if (first.spectral_rows_committed + actual_frame_offset != expected_frames_committed) {
+        if (first.spectral_rows_committed != expected_spectral_frames) {
             emit_diagnostic(
-                "spectral rows committed %zu != expected %zu (frames=%zu offset=%zu)",
+                "spectral rows committed %zu != expected %zu",
                 first.spectral_rows_committed,
-                expected_frames_committed,
-                expected_spectral_frames,
-                actual_frame_offset
+                expected_spectral_frames
             );
         }
     }
