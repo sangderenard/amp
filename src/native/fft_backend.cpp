@@ -23,6 +23,10 @@
 
 namespace {
 
+constexpr int kStftModeLegacy = 0;
+constexpr int kStftModeBatched = 1;
+constexpr int kStftModeStreaming = 2;
+
 struct fft_handle_deleter {
     void operator()(void *handle) const noexcept {
         if (handle != nullptr) {
@@ -72,6 +76,7 @@ fft_context *get_context(int n, bool inverse) {
         2,   /* pad_mode = never */
         n,
         n,
+        kStftModeLegacy,
         FFT_TRANSFORM_C2C,
         0,
         0,
@@ -334,6 +339,7 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
         2,   /* pad_mode = never */
         window,
         hop,
+        kStftModeBatched,
         FFT_TRANSFORM_C2C,
         0,
         0,
@@ -485,6 +491,7 @@ AMP_CAPI void *amp_fft_backend_stream_create(
         2,
         window,
         hop,
+        kStftModeStreaming,
         FFT_TRANSFORM_C2C,
         0,
         0,
@@ -494,8 +501,8 @@ AMP_CAPI void *amp_fft_backend_stream_create(
         0,
         0,
         1,
-    1, /* apply_windows */
-    0, /* apply_ola */
+        1, /* apply_windows */
+        0, /* apply_ola */
         analysis_window_kind,
         0.0f,
         0.0f,
@@ -593,6 +600,7 @@ AMP_CAPI void *amp_fft_backend_stream_create_inverse(
         2,
         window,
         hop,
+        kStftModeStreaming,
         FFT_TRANSFORM_C2C,
         0,
         0,
