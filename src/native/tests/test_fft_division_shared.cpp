@@ -12,6 +12,7 @@
 #include <deque>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <cstdlib>
 
@@ -214,6 +215,65 @@ struct SimulationResult {
     std::vector<double> spectral_imag;
 };
 
+struct TapDescriptor {
+    std::string name;
+    std::string buffer_class;
+    EdgeRunnerTensorShape shape{};
+    uint32_t hop_size{1U};
+
+    size_t ValueCount() const {
+        const size_t batches = std::max<uint32_t>(1U, shape.batches);
+        const size_t channels = std::max<uint32_t>(1U, shape.channels);
+        const size_t frames = std::max<uint32_t>(1U, shape.frames);
+        return batches * channels * frames;
+    }
+};
+
+TapDescriptor BuildPcmTapDescriptor(
+    uint32_t window_size,
+    uint32_t hop_count,
+    size_t total_frames,
+    uint32_t channels = 1U
+) {
+    TapDescriptor descriptor{};
+    descriptor.name = "pcm";
+    descriptor.buffer_class = "pcm";
+    descriptor.hop_size = hop_count > 0U ? hop_count : 1U;
+    descriptor.shape.batches = 1U;
+    descriptor.shape.channels = std::max<uint32_t>(1U, channels);
+    descriptor.shape.frames = static_cast<uint32_t>(total_frames);
+    (void)window_size;  // window size does not influence PCM layout yet but remains for symmetry.
+    return descriptor;
+}
+
+static uint32_t ComputeFrameCount(size_t total_frames, uint32_t hop_count) {
+    if (hop_count == 0U) {
+        hop_count = 1U;
+    }
+    if (total_frames == 0U) {
+        return 0U;
+    }
+    const size_t frames = (total_frames + static_cast<size_t>(hop_count) - 1U) /
+        static_cast<size_t>(hop_count);
+    return static_cast<uint32_t>(frames);
+}
+
+TapDescriptor BuildSpectralTapDescriptor(
+    uint32_t window_size,
+    uint32_t hop_count,
+    size_t total_frames,
+    uint32_t spectral_lanes = 1U
+) {
+    TapDescriptor descriptor{};
+    descriptor.name = "spectral";
+    descriptor.buffer_class = "spectrum";
+    descriptor.hop_size = hop_count > 0U ? hop_count : 1U;
+    descriptor.shape.batches = std::max<uint32_t>(1U, spectral_lanes);
+    descriptor.shape.channels = std::max<uint32_t>(1U, window_size);
+    descriptor.shape.frames = ComputeFrameCount(total_frames, descriptor.hop_size);
+    return descriptor;
+}
+
 EdgeRunnerTapBuffer make_tap_buffer(
     const char *name,
     const char *buffer_class,
@@ -233,6 +293,163 @@ EdgeRunnerTapBuffer make_tap_buffer(
     tap.frame_stride = computed_stride;
     tap.data = data;
     return tap;
+}
+
+EdgeRunnerTapBuffer InstantiateTapBuffer(const TapDescriptor &descriptor, double *data) {
+    return make_tap_buffer(
+        descriptor.name.c_str(),
+        descriptor.buffer_class.c_str(),
+        descriptor.shape.batches,
+        descriptor.shape.channels,
+        descriptor.shape.frames,
+        data
+    );
+}
+
+static size_t SafeDim(uint32_t value) {
+    return (value > 0U) ? static_cast<size_t>(value) : 1U;
+}
+
+static size_t ComputeFrameStride(const EdgeRunnerTapBuffer &buffer) {
+    if (buffer.frame_stride > 0U) {
+        return buffer.frame_stride;
+    }
+    return SafeDim(buffer.shape.batches) * SafeDim(buffer.shape.channels);
+}
+
+std::vector<float> DecodeTapTensor(const EdgeRunnerTapBuffer &buffer) {
+    const size_t frames = SafeDim(buffer.shape.frames);
+    const size_t batches = SafeDim(buffer.shape.batches);
+    const size_t channels = SafeDim(buffer.shape.channels);
+    const size_t total = frames * batches * channels;
+    std::vector<float> decoded(total, 0.0f);
+    if (buffer.data == nullptr || total == 0U) {
+        return decoded;
+    }
+    const size_t frame_stride = ComputeFrameStride(buffer);
+    for (size_t frame = 0; frame < frames; ++frame) {
+        const double *frame_ptr = buffer.data + frame * frame_stride;
+        for (size_t batch = 0; batch < batches; ++batch) {
+            const double *batch_ptr = frame_ptr + batch * channels;
+            const size_t base = frame * batches * channels + batch * channels;
+            for (size_t channel = 0; channel < channels; ++channel) {
+                decoded[base + channel] = static_cast<float>(batch_ptr[channel]);
+            }
+        }
+    }
+    return decoded;
+}
+
+static std::string DeriveTapName(const EdgeRunnerTapBuffer &buffer, size_t ordinal) {
+    if (buffer.tap_name != nullptr && buffer.tap_name[0] != '\0') {
+        return std::string(buffer.tap_name);
+    }
+    char generated[32];
+    std::snprintf(generated, sizeof(generated), "tap_%zu", ordinal);
+    return std::string(generated);
+}
+
+std::unordered_map<std::string, std::vector<float>> DecodeTapBuffers(const EdgeRunnerTapBufferSet &set) {
+    std::unordered_map<std::string, std::vector<float>> decoded;
+    if (set.items == nullptr || set.count == 0U) {
+        return decoded;
+    }
+    for (uint32_t i = 0; i < set.count; ++i) {
+        const EdgeRunnerTapBuffer &buffer = set.items[i];
+        decoded.emplace(DeriveTapName(buffer, i), DecodeTapTensor(buffer));
+    }
+    return decoded;
+}
+
+void run_shared_helper_unit_tests() {
+    const uint32_t window_size = 8U;
+    const uint32_t hop_count = 4U;
+    const size_t total_frames = 32U;
+    TapDescriptor pcm_descriptor = BuildPcmTapDescriptor(window_size, hop_count, total_frames, 2U);
+    TapDescriptor spectral_descriptor = BuildSpectralTapDescriptor(window_size, hop_count, total_frames, 3U);
+
+    std::vector<double> pcm_storage(pcm_descriptor.ValueCount(), 0.0);
+    std::vector<double> spectral_storage(spectral_descriptor.ValueCount(), 0.0);
+    for (size_t i = 0; i < pcm_storage.size(); ++i) {
+        pcm_storage[i] = 0.25 * static_cast<double>(i + 1);
+    }
+    for (size_t i = 0; i < spectral_storage.size(); ++i) {
+        spectral_storage[i] = 0.125 * static_cast<double>(i + 1);
+    }
+
+    EdgeRunnerTapBuffer pcm_buffer = InstantiateTapBuffer(pcm_descriptor, pcm_storage.data());
+    EdgeRunnerTapBuffer spectral_buffer = InstantiateTapBuffer(spectral_descriptor, spectral_storage.data());
+
+    const auto pcm_decoded = DecodeTapTensor(pcm_buffer);
+    const auto spectral_decoded = DecodeTapTensor(spectral_buffer);
+    if (pcm_decoded.size() != pcm_storage.size()) {
+        record_failure(
+            "pcm helper decode size mismatch got=%zu expected=%zu",
+            pcm_decoded.size(),
+            pcm_storage.size()
+        );
+        return;
+    }
+    if (spectral_decoded.size() != spectral_storage.size()) {
+        record_failure(
+            "spectral helper decode size mismatch got=%zu expected=%zu",
+            spectral_decoded.size(),
+            spectral_storage.size()
+        );
+        return;
+    }
+
+    constexpr double kFloatTolerance = 1e-6;
+    for (size_t i = 0; i < pcm_storage.size(); ++i) {
+        const double expected = pcm_storage[i];
+        const double actual = pcm_decoded[i];
+        if (std::fabs(actual - expected) > kFloatTolerance) {
+            record_failure(
+                "pcm helper decode mismatch index=%zu got=%g expected=%g",
+                i,
+                actual,
+                expected
+            );
+            return;
+        }
+    }
+    for (size_t i = 0; i < spectral_storage.size(); ++i) {
+        const double expected = spectral_storage[i];
+        const double actual = spectral_decoded[i];
+        if (std::fabs(actual - expected) > kFloatTolerance) {
+            record_failure(
+                "spectral helper decode mismatch index=%zu got=%g expected=%g",
+                i,
+                actual,
+                expected
+            );
+            return;
+        }
+    }
+
+    std::array<EdgeRunnerTapBuffer, 2> buffers{spectral_buffer, pcm_buffer};
+    EdgeRunnerTapBufferSet set{};
+    set.items = buffers.data();
+    set.count = static_cast<uint32_t>(buffers.size());
+    const auto decoded_map = DecodeTapBuffers(set);
+    auto pcm_it = decoded_map.find(pcm_descriptor.name);
+    auto spectral_it = decoded_map.find(spectral_descriptor.name);
+    if (pcm_it == decoded_map.end()) {
+        record_failure("decoded_map missing pcm entry");
+        return;
+    }
+    if (spectral_it == decoded_map.end()) {
+        record_failure("decoded_map missing spectral entry");
+        return;
+    }
+    if (pcm_it->second != pcm_decoded) {
+        record_failure("decoded_map pcm values mismatch");
+        return;
+    }
+    if (spectral_it->second != spectral_decoded) {
+        record_failure("decoded_map spectral values mismatch");
+        return;
+    }
 }
 
 void write_tap_row(
@@ -1030,6 +1247,7 @@ void require_backward_unsupported(const std::vector<double> &signal, const std::
 
 int RunShared(int argc, char **argv) {
     configure_from_args(argc, argv);
+    run_shared_helper_unit_tests();
     // Generate a test signal by starting with an arbitrary waveform,
     // then pre-conditioning it through a forward+inverse FFT roundtrip.
     // This ensures the signal is "well-behaved" and can be perfectly
