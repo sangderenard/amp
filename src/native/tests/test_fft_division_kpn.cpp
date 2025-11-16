@@ -9,13 +9,20 @@ extern "C" {
 #include "amp_native.h"
 }
 
+#include "fft_division_test_helpers.h"
+
 namespace {
 
 constexpr uint32_t kBatches = 1;
 constexpr uint32_t kChannels = 1;
 constexpr uint32_t kFrames = 8;
+constexpr uint32_t kHopSize = 1;
 constexpr int kWindowSize = 4;
 constexpr double kTolerance = 1e-9;
+
+using amp::tests::fft_division_shared::BuildPcmTapDescriptor;
+using amp::tests::fft_division_shared::BuildSpectralTapDescriptor;
+using amp::tests::fft_division_shared::TapDescriptor;
 
 struct ParamDescriptor {
     std::string name;
@@ -89,13 +96,20 @@ static void append_node(
     append_string(buffer, params_json);
 }
 
-static std::vector<uint8_t> build_descriptor(const std::vector<double> &signal) {
-    std::vector<uint8_t> descriptor;
-    descriptor.reserve(1024);
-    append_u32(descriptor, 3U);
+struct GraphDescriptor {
+    std::vector<uint8_t> blob;
+    TapDescriptor pcm_sink;
+    TapDescriptor spectral_real_sink;
+    TapDescriptor spectral_imag_sink;
+};
+
+static GraphDescriptor build_descriptor(const std::vector<double> &signal) {
+    GraphDescriptor result{};
+    result.blob.reserve(1024);
+    append_u32(result.blob, 3U);
 
     append_node(
-        descriptor,
+        result.blob,
         "carrier",
         "ConstantNode",
         {},
@@ -104,7 +118,7 @@ static std::vector<uint8_t> build_descriptor(const std::vector<double> &signal) 
     );
 
     append_node(
-        descriptor,
+        result.blob,
         "signal",
         "GainNode",
         {"carrier"},
@@ -118,13 +132,13 @@ static std::vector<uint8_t> build_descriptor(const std::vector<double> &signal) 
         sizeof(params_buffer),
         "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\",\"supports_v2\":true,"
         "\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1,"
-        "\"backend_hop\":1}",
+        "\"backend_hop\":1,\"enable_spectrum_taps\":true}",
         kWindowSize,
         kWindowSize - 1
     );
 
     append_node(
-        descriptor,
+        result.blob,
         "fft_divider",
         "FFTDivisionNode",
         {"signal"},
@@ -132,7 +146,13 @@ static std::vector<uint8_t> build_descriptor(const std::vector<double> &signal) 
         {}
     );
 
-    return descriptor;
+    result.pcm_sink = BuildPcmTapDescriptor(kWindowSize, kHopSize, signal.size(), kChannels);
+    result.spectral_real_sink = BuildSpectralTapDescriptor(kWindowSize, kHopSize, signal.size(), kBatches);
+    result.spectral_real_sink.name = "spectral_real";
+    result.spectral_imag_sink = result.spectral_real_sink;
+    result.spectral_imag_sink.name = "spectral_imag";
+
+    return result;
 }
 
 static bool compare_frames(const std::vector<double> &reference, const std::vector<double> &candidate) {
@@ -169,9 +189,33 @@ int main() {
         -0.0078125
     };
 
-    std::vector<uint8_t> descriptor = build_descriptor(signal);
+    GraphDescriptor descriptor = build_descriptor(signal);
 
-    AmpGraphRuntime *runtime = amp_graph_runtime_create(descriptor.data(), descriptor.size(), nullptr, 0U);
+    if (descriptor.pcm_sink.shape.channels != kChannels) {
+        std::fprintf(
+            stderr,
+            "test_fft_division_kpn: pcm sink channel count mismatch %u vs %u\n",
+            descriptor.pcm_sink.shape.channels,
+            kChannels
+        );
+        return 2;
+    }
+    if (descriptor.spectral_real_sink.shape.channels != static_cast<uint32_t>(kWindowSize) ||
+        descriptor.spectral_imag_sink.shape.channels != static_cast<uint32_t>(kWindowSize)) {
+        std::fprintf(
+            stderr,
+            "test_fft_division_kpn: spectral sink channel count mismatch vs window size %d\n",
+            kWindowSize
+        );
+        return 2;
+    }
+
+    AmpGraphRuntime *runtime = amp_graph_runtime_create(
+        descriptor.blob.data(),
+        descriptor.blob.size(),
+        nullptr,
+        0U
+    );
     if (runtime == nullptr) {
         std::fprintf(stderr, "test_fft_division_kpn: runtime create failed\n");
         return 2;
@@ -217,7 +261,9 @@ int main() {
     amp_graph_runtime_buffer_free(out_buffer);
     amp_graph_runtime_destroy(runtime);
 
-    if (out_batches != kBatches || out_channels != kChannels || out_frames != kFrames) {
+    if (out_batches != descriptor.pcm_sink.shape.batches ||
+        out_channels != descriptor.pcm_sink.shape.channels ||
+        out_frames != descriptor.pcm_sink.shape.frames) {
         std::fprintf(
             stderr,
             "test_fft_division_kpn: unexpected output shape %u x %u x %u\n",
