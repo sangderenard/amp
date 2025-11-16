@@ -16,12 +16,112 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <type_traits>
+#include <utility>
 
 #ifndef AMP_NATIVE_USE_FFTFREE
 #error "AMP_NATIVE_USE_FFTFREE must be defined; fftfree backend is mandatory"
 #endif
 
 namespace {
+
+constexpr bool kFftInitSupportsStftMode = std::is_invocable_r_v<
+    void *,
+    decltype(&fft_init_full_v2),
+    std::size_t,
+    int,
+    int,
+    int,
+    int,
+    int,
+    const int *,
+    std::size_t,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    float,
+    float,
+    int,
+    float,
+    float,
+    int,
+    int>;
+
+template <typename... Args>
+void *fft_init_full_dispatch(
+    std::size_t n,
+    int threads,
+    int lanes,
+    int inverse,
+    int kernel,
+    int radix,
+    const int *radix_pattern,
+    std::size_t radix_pattern_len,
+    int pad_mode,
+    int window,
+    int hop,
+    int stft_mode,
+    Args... args) {
+    if constexpr (std::is_invocable_r_v<
+                      void *,
+                      decltype(&fft_init_full_v2),
+                      std::size_t,
+                      int,
+                      int,
+                      int,
+                      int,
+                      int,
+                      const int *,
+                      std::size_t,
+                      int,
+                      int,
+                      int,
+                      int,
+                      Args...>) {
+        return fft_init_full_v2(
+            n,
+            threads,
+            lanes,
+            inverse,
+            kernel,
+            radix,
+            radix_pattern,
+            radix_pattern_len,
+            pad_mode,
+            window,
+            hop,
+            stft_mode,
+            args...);
+    } else {
+        (void)stft_mode;
+        return fft_init_full_v2(
+            n,
+            threads,
+            lanes,
+            inverse,
+            kernel,
+            radix,
+            radix_pattern,
+            radix_pattern_len,
+            pad_mode,
+            window,
+            hop,
+            args...);
+    }
+}
 
 constexpr int kStftModeLegacy = 0;
 constexpr int kStftModeBatched = 1;
@@ -64,16 +164,16 @@ fft_context *get_context(int n, bool inverse) {
         }
     }
 
-    void *handle = fft_init_full_v2(
+    void *handle = fft_init_full_dispatch(
         static_cast<std::size_t>(n),
-        0,   /* threads: auto */
-        1,   /* lanes */
+        0,
+        1,
         inverse ? 1 : 0,
         FFT_KERNEL_COOLEYTUKEY,
-        0,   /* radix */
+        0,
         nullptr,
         0,
-        2,   /* pad_mode = never */
+        2,
         n,
         n,
         kStftModeLegacy,
@@ -85,9 +185,9 @@ fft_context *get_context(int n, bool inverse) {
         0,
         0,
         0,
-        1,   /* silent_crash_reports */
-        0,   /* apply_windows */
-        0,   /* apply_ola */
+        1,
+        0,
+        0,
         FFT_WINDOW_RECT,
         0.0f,
         0.0f,
@@ -327,16 +427,16 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
     }
 
     // Create a temporary fftfree context configured with STFT/window params.
-    void *handle = fft_init_full_v2(
+    void *handle = fft_init_full_dispatch(
         static_cast<std::size_t>(n),
-        0,   /* threads: auto */
-        1,   /* lanes */
+        0,
+        1,
         inverse ? 1 : 0,
         FFT_KERNEL_COOLEYTUKEY,
-        0,   /* radix */
+        0,
         nullptr,
         0,
-        2,   /* pad_mode = never */
+        2,
         window,
         hop,
         kStftModeBatched,
@@ -348,9 +448,9 @@ AMP_CAPI int amp_fft_backend_transform_many_ex(
         0,
         0,
         0,
-        1,   /* silent_crash_reports */
+        1,
         apply_windows ? 1 : 0,
-        0,   /* apply_ola */
+        0,
         analysis_window_kind,
         0.0f,
         0.0f,
@@ -479,7 +579,7 @@ AMP_CAPI void *amp_fft_backend_stream_create(
     if (analysis_window_kind < 0) {
         analysis_window_kind = FFT_WINDOW_RECT;
     }
-    return fft_init_full_v2(
+    return fft_init_full_dispatch(
         static_cast<std::size_t>(n),
         0,
         1,
@@ -501,8 +601,8 @@ AMP_CAPI void *amp_fft_backend_stream_create(
         0,
         0,
         1,
-        1, /* apply_windows */
-        0, /* apply_ola */
+        1,
+        0,
         analysis_window_kind,
         0.0f,
         0.0f,
@@ -588,7 +688,7 @@ AMP_CAPI void *amp_fft_backend_stream_create_inverse(
     if (synthesis_window_kind < 0) {
         synthesis_window_kind = FFT_WINDOW_RECT;
     }
-    return fft_init_full_v2(
+    return fft_init_full_dispatch(
         static_cast<std::size_t>(n),
         0,
         1,
@@ -611,7 +711,7 @@ AMP_CAPI void *amp_fft_backend_stream_create_inverse(
         0,
         1,
         1,
-        0,  // apply_ola = 0: handle OLA manually in streaming code
+        0,
         synthesis_window_kind,
         0.0f,
         0.0f,
