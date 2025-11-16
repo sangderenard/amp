@@ -18,10 +18,17 @@ extern "C" {
 #include "mailbox.h"
 }
 
+#include "fft_division_test_helpers.h"
+
 namespace {
 
 constexpr double kSampleRate = 48000.0;
 void emit_diagnostic(const char *fmt, ...);
+
+using amp::tests::fft_division_shared::BuildPcmTapDescriptor;
+using amp::tests::fft_division_shared::BuildSpectralTapDescriptor;
+using amp::tests::fft_division_shared::InstantiateTapBuffer;
+using amp::tests::fft_division_shared::TapDescriptor;
 
 struct TestConfig {
     int window_size;
@@ -210,27 +217,6 @@ struct SimulationResult {
     std::vector<double> spectral_imag;
 };
 
-EdgeRunnerTapBuffer make_tap_buffer(
-    const char *name,
-    const char *buffer_class,
-    uint32_t batches,
-    uint32_t channels,
-    uint32_t frames,
-    double *data
-) {
-    EdgeRunnerTapBuffer tap{};
-    tap.tap_name = name;
-    tap.buffer_class = buffer_class;
-    tap.shape.batches = batches;
-    tap.shape.channels = channels;
-    tap.shape.frames = frames;
-    const size_t computed_stride = static_cast<size_t>(
-        std::max<uint32_t>(1U, batches) * std::max<uint32_t>(1U, channels));
-    tap.frame_stride = computed_stride;
-    tap.data = data;
-    return tap;
-}
-
 void write_tap_row(
     const EdgeRunnerTapBuffer &buffer,
     int batch,
@@ -360,27 +346,24 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     result.spectral_imag.assign(signal.size() * g_config.window_size, 0.0);
     const uint32_t frame_count = static_cast<uint32_t>(signal.size());
     std::array<EdgeRunnerTapBuffer, 3> tap_buffers{};
-    tap_buffers[0] = make_tap_buffer(
-        "spectral_real",
-        "spectrum",
+    TapDescriptor spectral_descriptor = BuildSpectralTapDescriptor(
+        static_cast<uint32_t>(g_config.window_size),
         1U,
-        g_config.window_size,
-        frame_count,
-        result.spectral_real.data());
-    tap_buffers[1] = make_tap_buffer(
-        "spectral_imag",
-        "spectrum",
+        signal.size()
+    );
+    auto spectral_real_descriptor = spectral_descriptor;
+    spectral_real_descriptor.name = "spectral_real";
+    auto spectral_imag_descriptor = spectral_descriptor;
+    spectral_imag_descriptor.name = "spectral_imag";
+    TapDescriptor pcm_descriptor = BuildPcmTapDescriptor(
+        static_cast<uint32_t>(g_config.window_size),
         1U,
-        g_config.window_size,
-        frame_count,
-        result.spectral_imag.data());
-    tap_buffers[2] = make_tap_buffer(
-        "pcm",
-        "pcm",
-        1U,
-        1U,
-        frame_count,
-        result.pcm.data());
+        signal.size()
+    );
+
+    tap_buffers[0] = InstantiateTapBuffer(spectral_real_descriptor, result.spectral_real.data());
+    tap_buffers[1] = InstantiateTapBuffer(spectral_imag_descriptor, result.spectral_imag.data());
+    tap_buffers[2] = InstantiateTapBuffer(pcm_descriptor, result.pcm.data());
 
     const size_t spectral_lane_count = tap_buffers[0].shape.batches > 0U
         ? tap_buffers[0].shape.batches
@@ -529,27 +512,24 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     params.items = nullptr;
 
     std::array<EdgeRunnerTapBuffer, 3> tap_buffers{};
-    tap_buffers[0] = make_tap_buffer(
-        "spectral_real",
-        "spectrum",
+    TapDescriptor streaming_spectral_descriptor = BuildSpectralTapDescriptor(
+        static_cast<uint32_t>(g_config.window_size),
         1U,
-        g_config.window_size,
-        static_cast<uint32_t>(total_frames),
-        result.spectral_real.data());
-    tap_buffers[1] = make_tap_buffer(
-        "spectral_imag",
-        "spectrum",
+        total_frames
+    );
+    auto streaming_real_descriptor = streaming_spectral_descriptor;
+    streaming_real_descriptor.name = "spectral_real";
+    auto streaming_imag_descriptor = streaming_spectral_descriptor;
+    streaming_imag_descriptor.name = "spectral_imag";
+    TapDescriptor streaming_pcm_descriptor = BuildPcmTapDescriptor(
+        static_cast<uint32_t>(g_config.window_size),
         1U,
-        g_config.window_size,
-        static_cast<uint32_t>(total_frames),
-        result.spectral_imag.data());
-    tap_buffers[2] = make_tap_buffer(
-        "pcm",
-        "pcm",
-        1U,
-        1U,
-        static_cast<uint32_t>(total_frames),
-        result.pcm.data());
+        total_frames
+    );
+
+    tap_buffers[0] = InstantiateTapBuffer(streaming_real_descriptor, result.spectral_real.data());
+    tap_buffers[1] = InstantiateTapBuffer(streaming_imag_descriptor, result.spectral_imag.data());
+    tap_buffers[2] = InstantiateTapBuffer(streaming_pcm_descriptor, result.pcm.data());
 
     const size_t spectral_lane_count = tap_buffers[0].shape.batches > 0U
         ? tap_buffers[0].shape.batches
