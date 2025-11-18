@@ -3107,6 +3107,9 @@ static void fftdiv_worker_main(node_state_t *state) {
         if (worker.stop_requested) {
             return true;
         }
+        if (worker.active_command) {
+            return true;
+        }
         if (!worker.pending_commands.empty()) {
             return true;
         }
@@ -3152,6 +3155,7 @@ static void fftdiv_worker_main(node_state_t *state) {
 
         lock_guard.lock();
         if (command_finished) {
+            worker.shared_command = command;
             worker.active_command.reset();
         }
         return did_work;
@@ -3192,7 +3196,6 @@ static void fftdiv_worker_main(node_state_t *state) {
         }
     }
 
-    worker.pending_commands.clear();
     worker.active_command.reset();
     worker.thread_started = false;
 }
@@ -3222,6 +3225,39 @@ static int fftdiv_start_worker(node_state_t *state) {
     return 0;
 }
 
+static std::shared_ptr<FftDivWorkerCommand> fftdiv_worker_ensure_shared_command(
+    node_state_t *state,
+    const EdgeRunnerNodeDescriptor *descriptor,
+    int batches,
+    int channels,
+    int frames,
+    int slot_count,
+    double sample_rate,
+    bool want_metrics
+) {
+    if (state == nullptr) {
+        return nullptr;
+    }
+    auto &worker = state->u.fftdiv.worker;
+    std::shared_ptr<FftDivWorkerCommand> command;
+    if (worker.shared_command) {
+        command = worker.shared_command;
+        worker.shared_command.reset();
+    } else {
+        command = std::make_shared<FftDivWorkerCommand>();
+    }
+    command->task.descriptor = descriptor;
+    command->task.batches = batches;
+    command->task.channels = channels;
+    command->task.frames = frames;
+    command->task.slot_count = slot_count;
+    command->task.sample_rate = sample_rate;
+    command->task.flush_mode = AMP_FFT_STREAM_FLUSH_NONE;
+    command->task.final_delivery = false;
+    command->want_metrics = want_metrics;
+    return command;
+}
+
 static void fftdiv_stop_worker(node_state_t *state, bool flush) {
     if (state == nullptr) {
         return;
@@ -3233,8 +3269,12 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         worker.flush_on_stop = flush;
         if (!worker.thread_started) {
             worker.stop_requested = false;
-            worker.pending_commands.clear();
             worker.active_command.reset();
+            worker.pending_commands.clear();
+            worker.shared_command.reset();
+            worker.mailbox_expected_entries = 0;
+            worker.mailbox_popped_entries = 0;
+            worker.append_invocations = 0;
             return;
         }
         worker.stop_requested = true;
@@ -3248,8 +3288,12 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         worker.thread_started = false;
         worker.stop_requested = false;
-        worker.pending_commands.clear();
         worker.active_command.reset();
+        worker.pending_commands.clear();
+        worker.shared_command.reset();
+        worker.mailbox_expected_entries = 0;
+        worker.mailbox_popped_entries = 0;
+        worker.append_invocations = 0;
     }
 }
 
@@ -3292,30 +3336,44 @@ static int run_fft_division_node(
         slot_count = 1;
     }
 
-    std::shared_ptr<FftDivWorkerCommand> command = std::make_shared<FftDivWorkerCommand>();
-    command->task.descriptor = descriptor;
-    command->task.batches = effective_batches;
-    command->task.channels = effective_channels;
-    command->task.frames = frames;
-    command->task.slot_count = slot_count;
-    command->task.sample_rate = sample_rate;
-    command->task.flush_mode = AMP_FFT_STREAM_FLUSH_NONE;
-    command->task.final_delivery = (inputs->audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_FINAL) != 0;
-    command->want_metrics = (metrics != NULL);
-    if (!command->prepare(inputs, effective_batches, effective_channels, frames, slot_count)) {
-        return -1;
-    }
-
     auto &worker = state->u.fftdiv.worker;
+    std::shared_ptr<FftDivWorkerCommand> command;
     {
         std::lock_guard<std::mutex> lock(worker.mutex);
+        command = fftdiv_worker_ensure_shared_command(
+            state,
+            descriptor,
+            effective_batches,
+            effective_channels,
+            frames,
+            slot_count,
+            sample_rate,
+            metrics != NULL
+        );
+        if (!command) {
+            return -1;
+        }
+        if (!command->append_inputs(inputs, effective_batches, effective_channels, frames, slot_count)) {
+            worker.shared_command = command;
+            return -1;
+        }
         worker.pending_commands.push_back(command);
+        worker.append_invocations++;
+        size_t expected = command->expected_frames > 0
+            ? static_cast<size_t>(command->expected_frames)
+            : 1U;
+        worker.mailbox_expected_entries += expected;
     }
     worker.cv_request.notify_one();
 
     AmpMailboxEntry *entry = amp_node_mailbox_pop(state);
     if (entry == nullptr) {
         return AMP_E_PENDING;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        worker.mailbox_popped_entries++;
     }
 
     if (out_channels != NULL) {

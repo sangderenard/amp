@@ -1513,6 +1513,7 @@ struct FftDivWorkerCommand {
     int expected_frames{0};
 
     bool prepare(const EdgeRunnerNodeInputs *src_inputs, int batches, int channels, int frames, int slot_count);
+    bool append_inputs(const EdgeRunnerNodeInputs *src_inputs, int batches, int channels, int frames, int slot_count);
 };
 
 bool FftDivWorkerCommand::prepare(
@@ -1663,6 +1664,36 @@ bool FftDivWorkerCommand::prepare(
     inputs.params = param_set;
     inputs.taps = tap_context;
     task.inputs = &inputs;
+    return true;
+}
+
+bool FftDivWorkerCommand::append_inputs(
+    const EdgeRunnerNodeInputs *src_inputs,
+    int batches,
+    int channels,
+    int frames,
+    int slot_count
+) {
+    const bool final_flag = (src_inputs != NULL)
+        && ((src_inputs->audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_FINAL) != 0U);
+    if (task.final_delivery && !final_flag) {
+        // Final delivery was already declared for this command; no new input is allowed.
+        return false;
+    }
+    if (!prepare(src_inputs, batches, channels, frames, slot_count)) {
+        return false;
+    }
+    int appended_frames = frames;
+    if (appended_frames <= 0) {
+        appended_frames = expected_frames;
+    }
+    if (appended_frames <= 0) {
+        appended_frames = 1;
+    }
+    expected_frames = appended_frames;
+    if (final_flag) {
+        task.final_delivery = true;
+    }
     return true;
 }
 #endif
@@ -1871,6 +1902,10 @@ typedef union {
                 bool flush_on_stop{true};
                 std::shared_ptr<FftDivWorkerCommand> active_command;
                 std::deque<std::shared_ptr<FftDivWorkerCommand>> pending_commands;
+                std::shared_ptr<FftDivWorkerCommand> shared_command;
+                size_t mailbox_expected_entries{0};
+                size_t mailbox_popped_entries{0};
+                size_t append_invocations{0};
             };
             WorkerState worker;
             const EdgeRunnerNodeDescriptor *last_descriptor{nullptr};
@@ -3553,9 +3588,13 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.last_frames = 0;
     state->u.fftdiv.last_slot_count = 0;
     state->u.fftdiv.last_sample_rate = 0.0;
-    state->u.fftdiv.worker.pending_commands.clear();
     state->u.fftdiv.worker.stop_requested = false;
     state->u.fftdiv.worker.flush_on_stop = true;
+    state->u.fftdiv.worker.active_command.reset();
+    state->u.fftdiv.worker.shared_command.reset();
+    state->u.fftdiv.worker.mailbox_expected_entries = 0;
+    state->u.fftdiv.worker.mailbox_popped_entries = 0;
+    state->u.fftdiv.worker.append_invocations = 0;
 #endif
 }
 
