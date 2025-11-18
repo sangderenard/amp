@@ -1869,6 +1869,7 @@ typedef union {
                 bool thread_started{false};
                 bool stop_requested{false};
                 bool flush_on_stop{true};
+                std::shared_ptr<FftDivWorkerCommand> active_command;
                 std::deque<std::shared_ptr<FftDivWorkerCommand>> pending_commands;
             };
             WorkerState worker;

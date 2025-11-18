@@ -7,6 +7,8 @@
 
 struct FftDivLaneFrameState {
     bool frame_ready{false};
+    std::vector<double> spectral_real;
+    std::vector<double> spectral_imag;
 };
 
 struct FftDivFilledSlice {

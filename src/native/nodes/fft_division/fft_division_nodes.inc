@@ -811,6 +811,32 @@ static FftDivActiveWindowView fftdiv_build_active_window_view(
     return fftdiv_build_active_window_view_internal(state, tensor, tensor_page, tensor_slice, -1);
 }
 
+static int fftdiv_last_hop_slice_from_read_cursor(
+    int read_cursor,
+    int wheel_length,
+    int hop_length,
+    int fallback_slice
+) {
+    if (wheel_length <= 0) {
+        return fallback_slice;
+    }
+    int normalized_read = read_cursor % wheel_length;
+    if (normalized_read < 0) {
+        normalized_read += wheel_length;
+    }
+    int effective_hop = (hop_length > 0) ? hop_length : 1;
+    if (effective_hop > wheel_length) {
+        effective_hop = wheel_length;
+    }
+    /* Read cursor names the start of data already eligible for release; advance by one hop
+       so Stage 3 emits the most recent hop-aligned slice. */
+    int slice = normalized_read + (effective_hop - 1);
+    if (slice >= wheel_length) {
+        slice %= wheel_length;
+    }
+    return slice;
+}
+
 struct FftDivOperatorLaneBinding {
     int slot_index{-1};
     int tensor_lane{-1};
@@ -1087,6 +1113,7 @@ struct FftDivStageLockSnapshot {
     bool stage4_ready{false};
     bool stage5_ready{false};
 };
+static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *state);
 #endif
 #if defined(__cplusplus)
 static void fftdiv_prepare_lane_plan(
@@ -1603,10 +1630,26 @@ static int fftdiv_execute_block(
     std::vector<size_t> lane_frames_emitted(static_cast<size_t>(slot_count), 0U);
     std::vector<double> lane_pcm_batch(static_cast<size_t>(slot_count) * static_cast<size_t>(frames), 0.0);
 
-    const bool stage1_unlocked = (stage_locks == nullptr) || stage_locks->stage1_ready;
-    const bool stage2_unlocked = (stage_locks == nullptr) || stage_locks->stage2_ready;
-    const bool stage3_unlocked = (stage_locks == nullptr) || stage_locks->stage3_ready;
-    const bool stage4_unlocked = (stage_locks == nullptr) || stage_locks->stage4_ready;
+    FftDivStageLockSnapshot live_stage_locks{};
+    const FftDivStageLockSnapshot *locks_for_stage = stage_locks;
+    if (state != nullptr) {
+        live_stage_locks = fftdiv_snapshot_stage_locks(state);
+        const bool incoming_pcm_available =
+            inputs != nullptr &&
+            inputs->audio.has_audio &&
+            inputs->audio.data != nullptr &&
+            frames > 0;
+        if (incoming_pcm_available) {
+            live_stage_locks.stage1_ready = true;
+        }
+        locks_for_stage = &live_stage_locks;
+    }
+
+    const bool stage1_unlocked = (locks_for_stage == nullptr) || locks_for_stage->stage1_ready;
+    const bool stage2_unlocked = (locks_for_stage == nullptr) || locks_for_stage->stage2_ready;
+    const bool stage3_unlocked = (locks_for_stage == nullptr) || locks_for_stage->stage3_ready;
+    const bool stage4_unlocked = (locks_for_stage == nullptr) || locks_for_stage->stage4_ready;
+    const bool stage5_unlocked = (locks_for_stage == nullptr) || locks_for_stage->stage5_ready;
 
     if (stage1_unlocked) {
         for (int slot = 0; slot < slot_count; ++slot) {
@@ -2228,12 +2271,12 @@ static int fftdiv_execute_block(
     if (filled_slices.empty() || !stage3_unlocked) {
         metrics_window_span = 0;
     } else {
-        for (const auto *slice_ptr : filled_slices) {
+        for (auto *slice_ptr : filled_slices) {
             if (slice_ptr == nullptr || !slice_ptr->working_tensor_updated) {
                 metrics_window_span = 0;
                 continue;
             }
-            const auto &slice = *slice_ptr;
+            auto &slice = *slice_ptr;
 
             FftDivActiveWindowView active_window_view = fftdiv_build_active_window_view_internal(
                 state,
@@ -2297,6 +2340,40 @@ static int fftdiv_execute_block(
                 operator_context.hop_seconds = hop_seconds;
                 fftdiv_run_operator_stack(state, operator_context);
                 metrics_window_span = active_window_view.window_span;
+
+                const int release_tensor_slice = fftdiv_last_hop_slice_from_read_cursor(
+                    slice.wheel_tail,
+                    wheel_length,
+                    wheel_hop,
+                    slice.tensor_slice);
+
+                for (int slot = 0; slot < slot_count; ++slot) {
+                    auto &lane_meta = state->u.fftdiv.lane_plan[(size_t)slot];
+                    auto &lane_snapshot = slice.lanes[(size_t)slot];
+                    if (!lane_meta.active || !lane_snapshot.frame_ready) {
+                        lane_snapshot.spectral_real.clear();
+                        lane_snapshot.spectral_imag.clear();
+                        continue;
+                    }
+                    const int tensor_lane = (lane_meta.tensor_lane >= 0) ? lane_meta.tensor_lane : slot;
+                    try {
+                        lane_snapshot.spectral_real.assign((size_t)window_size, 0.0);
+                        lane_snapshot.spectral_imag.assign((size_t)window_size, 0.0);
+                    } catch (...) {
+                        lane_snapshot.spectral_real.clear();
+                        lane_snapshot.spectral_imag.clear();
+                        continue;
+                    }
+                    fftdiv_copy_working_to_slot_buffer(
+                        working_tensor,
+                        tensor_page,
+                        tensor_lane,
+                        release_tensor_slice,
+                        tensor_freq_bins,
+                        lane_snapshot.spectral_real.data(),
+                        lane_snapshot.spectral_imag.data(),
+                        window_size);
+                }
             } else {
                 metrics_window_span = 0;
             }
@@ -2310,6 +2387,12 @@ static int fftdiv_execute_block(
                 continue;
             }
             auto &slice = *slice_ptr;
+            if (!slice.working_tensor_updated) {
+                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                           "[STAGE4-SKIP] tensor slice=%d pending operator update\n",
+                           slice.tensor_slice);
+                continue;
+            }
             /* Debug: correlate Stage2 slice index with Stage3 window span and offsets */
             if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
@@ -2349,43 +2432,24 @@ static int fftdiv_execute_block(
                 const size_t relative_offset = (assigned_offset >= consumed_so_far)
                     ? (assigned_offset - consumed_so_far)
                     : 0U;
-                const double *ring_real = fftdiv_ring_frame_real(slot_state, relative_offset, window_size);
-                const double *ring_imag = fftdiv_ring_frame_imag(slot_state, relative_offset, window_size);
-                double *slot_spectral_real = (ring_real != NULL)
-                    ? const_cast<double *>(ring_real)
-                    : slot_state.forward_real.data();
-                double *slot_spectral_imag = (ring_imag != NULL)
-                    ? const_cast<double *>(ring_imag)
-                    : slot_state.forward_imag.data();
                 auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
-                const auto &lane_snapshot = slice.lanes[(size_t)slot];
+                auto &lane_snapshot = slice.lanes[(size_t)slot];
                 const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
-                double *scratch_real = fftdiv_spectral_scratch_real_ptr(state, tensor_lane, scratch_slice_iter);
-                double *scratch_imag = fftdiv_spectral_scratch_imag_ptr(state, tensor_lane, scratch_slice_iter);
-                const int scratch_bins = fftdiv_spectral_scratch_bins(state);
+                const double *released_real = lane_snapshot.spectral_real.empty()
+                    ? nullptr
+                    : lane_snapshot.spectral_real.data();
+                const double *released_imag = lane_snapshot.spectral_imag.empty()
+                    ? nullptr
+                    : lane_snapshot.spectral_imag.data();
 
-                if (lane_snapshot.frame_ready && lane.active && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
-                    if ((lane.enable_pcm_out || lane.enable_spectral_out) &&
-                        working_tensor != NULL &&
-                        tensor_freq_bins > 0) {
-                        fftdiv_copy_working_to_slot_buffer(
-                            working_tensor,
-                            tensor_page,
-                            tensor_lane,
-                            tensor_slice_iter,
-                            tensor_freq_bins,
-                            slot_spectral_real,
-                            slot_spectral_imag,
-                            window_size);
-                    }
-
+                if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
                     if (lane.enable_spectral_out) {
                         /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
                         const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
                         stage_emit_spectral(
                             state,
-                            slot_spectral_real,
-                            slot_spectral_imag,
+                            const_cast<double *>(released_real),
+                            const_cast<double *>(released_imag),
                             window_size,
                             slot,
                             emit_frame_index,
@@ -2402,11 +2466,11 @@ static int fftdiv_execute_block(
 
                     if (lane.enable_pcm_out) {
                         // Stage 3 enqueues spectrum for deferred inverse in Stage 5
-                        if (slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                        if (released_real != nullptr && released_imag != nullptr) {
                             decltype(slot_state.pending_spectra)::value_type pending;
                             try {
-                                pending.real.assign(slot_spectral_real, slot_spectral_real + (size_t)window_size);
-                                pending.imag.assign(slot_spectral_imag, slot_spectral_imag + (size_t)window_size);
+                                pending.real.assign(released_real, released_real + (size_t)window_size);
+                                pending.imag.assign(released_imag, released_imag + (size_t)window_size);
                                 slot_state.pending_spectra.push_back(std::move(pending));
                             } catch (...) {
                                 // Allocation failure: drop this frame; Stage 5 will still drain what exists
@@ -2619,18 +2683,17 @@ static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *s
     const int window_size = (state->u.fftdiv.window_size > 0) ? state->u.fftdiv.window_size : 0;
     const auto &slots = state->u.fftdiv.stream_slots;
 
-    // Stage 1 (PCM -> FFT) : needs a full window of PCM and confirmation that the
-    // previous emission was accepted by Stage 2 (forward ring has headroom).
+    // Stage 1 (PCM -> FFT): requires either new PCM input or existing FFT frames to deliver,
+    // and only blocks when there is no downstream capacity.
     for (const auto &slot : slots) {
+        const bool ring_has_capacity = (slot.forward_ring_capacity_frames == 0U)
+            || (slot.forward_ring_filled < slot.forward_ring_capacity_frames);
         const size_t pending_samples = (slot.pcm_backlog.size() > slot.pcm_consumed_samples)
             ? (slot.pcm_backlog.size() - slot.pcm_consumed_samples)
             : 0U;
-        const bool ring_has_capacity = (slot.forward_ring_capacity_frames == 0U)
-            || (slot.forward_ring_filled < slot.forward_ring_capacity_frames);
-        if (slot.forward_handle != nullptr
-            && window_size > 0
-            && pending_samples >= static_cast<size_t>(window_size)
-            && ring_has_capacity) {
+        const bool has_fft_pending = slot.forward_ring_filled > 0U;
+        const bool has_input = (pending_samples > 0U) || has_fft_pending;
+        if (slot.forward_handle != nullptr && has_input && ring_has_capacity) {
             snapshot.stage1_ready = true;
             break;
         }
@@ -2903,12 +2966,13 @@ static void fftdiv_worker_publish_entry(
     amp_node_mailbox_push(state, entry);
 }
 
-static void fftdiv_worker_process_command(
+static bool fftdiv_worker_process_command(
     node_state_t *state,
-    const std::shared_ptr<FftDivWorkerCommand> &command
+    const std::shared_ptr<FftDivWorkerCommand> &command,
+    const FftDivStageLockSnapshot *stage_locks
 ) {
     if (!state || !command) {
-        return;
+        return true;
     }
     AmpNodeMetrics local_metrics{};
     AmpNodeMetrics *metrics_ptr = command->want_metrics ? &command->metrics_storage : &local_metrics;
@@ -2927,7 +2991,12 @@ static void fftdiv_worker_process_command(
     const size_t runtime_pcm_block = command->task.frames > 0
         ? static_cast<size_t>(command->task.frames)
         : 1U;
-    const auto stage_snapshot = fftdiv_snapshot_stage_locks(state);
+    const FftDivStageLockSnapshot *locks_to_use = stage_locks;
+    FftDivStageLockSnapshot local_snapshot{};
+    if (locks_to_use == nullptr) {
+        local_snapshot = fftdiv_snapshot_stage_locks(state);
+        locks_to_use = &local_snapshot;
+    }
     int status = fftdiv_execute_block(
         command->task.descriptor,
         command->task.inputs,
@@ -2935,7 +3004,7 @@ static void fftdiv_worker_process_command(
         command->task.channels,
         command->task.frames,
         runtime_pcm_block,
-        &stage_snapshot,
+        locks_to_use,
         command->task.sample_rate,
         &buffer,
         &out_channels,
@@ -2978,6 +3047,7 @@ static void fftdiv_worker_process_command(
     } else if (buffer != nullptr) {
         fftdiv_worker_publish_entry(state, buffer, out_channels, command->expected_frames, status, command->want_metrics ? metrics_ptr : nullptr);
     }
+    return status != AMP_E_PENDING;
 }
 
 static bool fftdiv_worker_drain_pending_outputs(node_state_t *state) {
@@ -3044,25 +3114,52 @@ static void fftdiv_worker_main(node_state_t *state) {
     };
 
     std::unique_lock<std::mutex> lock(worker.mutex);
-    while (true) {
-        while (!worker.stop_requested) {
-            std::shared_ptr<FftDivWorkerCommand> command;
-            if (!worker.pending_commands.empty()) {
-                command = worker.pending_commands.front();
-                worker.pending_commands.pop_front();
-            }
-            lock.unlock();
-            bool did_work = false;
-            if (command) {
-                fftdiv_worker_process_command(state, command);
+
+    auto process_ready_work = [&](std::unique_lock<std::mutex> &lock_guard) -> bool {
+        std::shared_ptr<FftDivWorkerCommand> command = worker.active_command;
+        if (!command && !worker.pending_commands.empty()) {
+            command = worker.pending_commands.front();
+            worker.pending_commands.pop_front();
+            worker.active_command = command;
+        }
+
+        lock_guard.unlock();
+
+        FftDivStageLockSnapshot stage_snapshot{};
+        stage_snapshot = fftdiv_snapshot_stage_locks(state);
+        const FftDivStageLockSnapshot *snapshot_ptr = &stage_snapshot;
+        bool did_work = fftdiv_stage_snapshot_any_ready(stage_snapshot);
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                       "[STAGE-LOCKS] s1=%d s2=%d s3=%d s4=%d s5=%d\n",
+                       snapshot_ptr->stage1_ready ? 1 : 0,
+                       snapshot_ptr->stage2_ready ? 1 : 0,
+                       snapshot_ptr->stage3_ready ? 1 : 0,
+                       snapshot_ptr->stage4_ready ? 1 : 0,
+                       snapshot_ptr->stage5_ready ? 1 : 0);
+        }
+
+        bool command_finished = false;
+        if (command) {
+            command_finished = fftdiv_worker_process_command(state, command, snapshot_ptr);
+            did_work = true;
+        }
+        if (snapshot_ptr->stage5_ready) {
+            if (fftdiv_worker_drain_pending_outputs(state)) {
                 did_work = true;
             }
-            if (fftdiv_snapshot_stage_locks(state).stage5_ready) {
-                if (fftdiv_worker_drain_pending_outputs(state)) {
-                    did_work = true;
-                }
-            }
-            lock.lock();
+        }
+
+        lock_guard.lock();
+        if (command_finished) {
+            worker.active_command.reset();
+        }
+        return did_work;
+    };
+
+    while (true) {
+        while (!worker.stop_requested) {
+            bool did_work = process_ready_work(lock);
             if (!did_work) {
                 if (fftdiv_pipeline_can_advance(state)) {
                     lock.unlock();
@@ -3089,30 +3186,14 @@ static void fftdiv_worker_main(node_state_t *state) {
             continue;
         }
 
-        std::shared_ptr<FftDivWorkerCommand> command;
-        if (!worker.pending_commands.empty()) {
-            command = worker.pending_commands.front();
-            worker.pending_commands.pop_front();
-        }
-
-        lock.unlock();
-        bool did_work = false;
-        if (command) {
-            fftdiv_worker_process_command(state, command);
-            did_work = true;
-        }
-        if (fftdiv_snapshot_stage_locks(state).stage5_ready) {
-            if (fftdiv_worker_drain_pending_outputs(state)) {
-                did_work = true;
-            }
-        }
+        bool did_work = process_ready_work(lock);
         if (!did_work && fftdiv_pipeline_can_advance(state)) {
             std::this_thread::yield();
         }
-        lock.lock();
     }
 
     worker.pending_commands.clear();
+    worker.active_command.reset();
     worker.thread_started = false;
 }
 
@@ -3153,6 +3234,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         if (!worker.thread_started) {
             worker.stop_requested = false;
             worker.pending_commands.clear();
+            worker.active_command.reset();
             return;
         }
         worker.stop_requested = true;
@@ -3167,6 +3249,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         worker.thread_started = false;
         worker.stop_requested = false;
         worker.pending_commands.clear();
+        worker.active_command.reset();
     }
 }
 
