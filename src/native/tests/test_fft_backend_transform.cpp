@@ -21,7 +21,6 @@
 namespace {
 
 constexpr double kEpsilon = 1e-5;
-constexpr int kStftModeBatched = 1;
 
 bool nearly_equal(double a, double b, double eps = kEpsilon) {
     return std::fabs(a - b) <= eps;
@@ -52,72 +51,37 @@ public:
         if (hop <= 0) {
             hop = window;
         }
-        if constexpr (kFftInitSupportsStftMode) {
-            handle_ = fft_init_full_v2(
-                static_cast<std::size_t>(n_),
-                0,
-                1,
-                inverse ? 1 : 0,
-                FFT_KERNEL_COOLEYTUKEY,
-                0,
-                nullptr,
-                0,
-                2,
-                window,
-                hop,
-                kStftModeBatched,
-                FFT_TRANSFORM_C2C,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                1,
-                apply_windows ? 1 : 0,
-                0,
-                analysis_window,
-                0.0f,
-                0.0f,
-                synthesis_window,
-                0.0f,
-                0.0f,
-                FFT_WINDOW_NORM_NONE,
-                FFT_COLA_OFF);
-        } else {
-            handle_ = fft_init_full_v2(
-                static_cast<std::size_t>(n_),
-                0,
-                1,
-                inverse ? 1 : 0,
-                FFT_KERNEL_COOLEYTUKEY,
-                0,
-                nullptr,
-                0,
-                2,
-                window,
-                hop,
-                FFT_TRANSFORM_C2C,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                1,
-                apply_windows ? 1 : 0,
-                0,
-                analysis_window,
-                0.0f,
-                0.0f,
-                synthesis_window,
-                0.0f,
-                0.0f,
-                FFT_WINDOW_NORM_NONE,
-                FFT_COLA_OFF);
-        }
+        handle_ = fft_init_full_v2(
+            static_cast<std::size_t>(n_),
+            0,
+            1,
+            inverse ? 1 : 0,
+            FFT_KERNEL_COOLEYTUKEY,
+            0,
+            nullptr,
+            0,
+            2,
+            window,
+            hop,
+            FFT_TRANSFORM_C2C,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            apply_windows ? 1 : 0,
+            0,
+            analysis_window,
+            0.0f,
+            0.0f,
+            synthesis_window,
+            0.0f,
+            0.0f,
+            FFT_WINDOW_NORM_NONE,
+            FFT_COLA_OFF);
     }
 
     FftfreeContext(FftfreeContext &&other) noexcept : handle_(other.handle_), n_(other.n_) {

@@ -25,7 +25,7 @@
    - Define the reversible API (`backward()`), slew-aware integrator hooks, delay reporting, and thermal side-channel in the node interface.
    - Audit existing nodes and retrofit them to satisfy the new contract, including vectorised execution paths.
    - Require every node to publish tap groups (`1a`, `1b`, etc.) to describe thematic bundles while keeping tap locks independent.
-   - Introduce an explicit completion handshake (`amp_wait_node_completion`) so threaded callers can block on pending frames without spinning; FFT-oriented nodes must raise completion once their internal wheels drain.
+   - Introduce an explicit completion handshake (`amp_wait_node_completion`) so threaded callers can block on pending frames without spinning; callers must opt into tail draining via `AMP_COMPLETION_DRAIN`, and FFT-oriented nodes must raise completion once their internal wheels drain without relying on implicit flushes.
 5. **Instrumentation and validation**
    - Wrap nodes with timing trackers to confirm the reported delays and scheduler honours.
    - Create integration tests that exercise delayed FIFO delivery, synchrony gates, thermal aggregation, and tap negotiation through the threaded KPN streamer.

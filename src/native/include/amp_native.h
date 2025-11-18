@@ -27,6 +27,9 @@ typedef struct {
     const double *data;
 } EdgeRunnerAudioView;
 
+#define EDGE_RUNNER_AUDIO_FLAG_HAS_DATA 0x1u
+#define EDGE_RUNNER_AUDIO_FLAG_FINAL    0x2u
+
 typedef struct {
     const char *name;
     uint32_t batches;
@@ -300,6 +303,11 @@ typedef enum {
     AMP_EXECUTION_MODE_BACKWARD = 1
 } AmpExecutionMode;
 
+typedef enum {
+    AMP_COMPLETION_POLL = 0,
+    AMP_COMPLETION_DRAIN = 1
+} AmpNodeCompletionMode;
+
 typedef struct {
     uint32_t measured_delay_frames;
     float accumulated_heat;
@@ -420,6 +428,7 @@ AMP_CAPI int amp_wait_node_completion(
     int channels,
     int frames,
     double sample_rate,
+    AmpNodeCompletionMode mode,
     void **state,
     double **out_buffer,
     int *out_channels,

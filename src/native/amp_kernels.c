@@ -46,11 +46,13 @@ using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>
 #endif
 
 #if defined(__cplusplus)
+#include "nodes/fft_division/fft_division_types.h"
 struct FftDivOperatorLaneBinding;
 #endif
 
 #include "amp_native.h"
 #include "amp_fft_backend.h"
+#include "fft_division_delay_math.h"
 #include "amp_debug_alloc.h"
 #include "mailbox.h"
 
@@ -1489,6 +1491,7 @@ struct FftDivTask {
     int slot_count{0};
     double sample_rate{0.0};
     int flush_mode{AMP_FFT_STREAM_FLUSH_NONE};
+    bool final_delivery{false};
 };
 
 struct FftDivWorkerCommand {
@@ -1535,8 +1538,10 @@ bool FftDivWorkerCommand::prepare(
 
     audio_data.clear();
     audio_view = {};
-    if (src_inputs != NULL && src_inputs->audio.has_audio) {
-        audio_view.has_audio = 1U;
+    const uint32_t audio_flags = (src_inputs != NULL) ? src_inputs->audio.has_audio : 0U;
+    const bool has_audio = (audio_flags & EDGE_RUNNER_AUDIO_FLAG_HAS_DATA) != 0;
+    if (has_audio) {
+        audio_view.has_audio = audio_flags;
         audio_view.batches = src_inputs->audio.batches > 0U
             ? src_inputs->audio.batches
             : static_cast<uint32_t>(effective_batches);
@@ -1790,8 +1795,15 @@ typedef union {
                     std::vector<double> imag;
                 };
                 std::deque<PendingSpectrum> pending_spectra;
+                std::vector<double> pcm_backlog;
+                std::size_t pcm_consumed_samples{0U};
                 bool warmup_complete{false};
                 double last_pcm_output{0.0};
+                std::size_t total_ingested_samples{0U};
+                std::size_t tail_injected_samples{0U};
+                bool zero_tail_enqueued{false};
+                bool ingest_finalized{false};
+                bool final_flag_observed{false};
             };
             std::vector<StreamSlot> stream_slots;
             struct LaneBinding {
@@ -1805,6 +1817,7 @@ typedef union {
                 bool frame_ready{false};
             };
             std::vector<LaneBinding> lane_plan;
+            std::vector<FftDivFilledSlice> wheel_slice_metadata;
             FftDivSpectralScratch spectral_scratch;
             struct OperatorTensorSpec {
                 int identifier{-1};
@@ -1828,6 +1841,27 @@ typedef union {
             };
             std::vector<OperatorTensorEntry> operator_arena;
             std::vector<OperatorStep> operator_steps;
+            struct ExecuteStateSnapshot {
+                int batches{0};
+                int channels{0};
+                int frames{0};
+                int slot_count{0};
+                double requested_sample_rate{0.0};
+                double effective_sample_rate{0.0};
+                int window_size{0};
+                int working_tensor_lanes{0};
+                int working_tensor_freq_bins{0};
+                int working_tensor_time_slices{0};
+                int wheel_length{0};
+                int wheel_head{0};
+                int wheel_tail{0};
+                int wheel_filled{0};
+                int wheel_hop{0};
+                int scratch_time_cursor{0};
+                int scratch_time_slices{0};
+                double hop_seconds{0.0};
+                double timeline_seconds{0.0};
+            } execute_snapshot;
             struct WorkerState {
                 std::thread thread;
                 std::mutex mutex;
@@ -1850,6 +1884,14 @@ typedef union {
             size_t spectral_ring_capacity_frames;
             size_t stream_backlog_cycles;
             int preserve_tensor_on_ingest;
+            int log_level;
+            int log_slice_bin_cap;
+            // Backend streaming configuration (hop and realized stream params)
+            int backend_mode;
+            int backend_hop;
+            int backend_stream_window_size;
+            int backend_stream_window_kind;
+            int backend_stream_hop;
             int64_t wheel_frame_counter;
             double sample_rate_hint;
             double timeline_seconds;
@@ -1891,11 +1933,41 @@ struct node_state_t {
 };
 
 #if defined(__cplusplus)
+static constexpr int kFftDivDefaultLogLevel = 2;
+static constexpr int kFftDivDefaultSliceLogCap = 12;
+
+static inline AmpNodeCompletionMode amp_completion_mode_normalize(AmpNodeCompletionMode mode) {
+    switch (mode) {
+        case AMP_COMPLETION_POLL:
+        case AMP_COMPLETION_DRAIN:
+            return mode;
+        default:
+            return AMP_COMPLETION_POLL;
+    }
+}
+
+static inline const char *amp_completion_mode_name(AmpNodeCompletionMode mode) {
+    switch (mode) {
+        case AMP_COMPLETION_POLL:
+            return "poll";
+        case AMP_COMPLETION_DRAIN:
+            return "drain";
+        default:
+            return "unknown";
+    }
+}
+
+static inline bool amp_completion_mode_requests_drain(AmpNodeCompletionMode mode) {
+    return amp_completion_mode_normalize(mode) == AMP_COMPLETION_DRAIN;
+}
+
 static void fftdiv_construct_state(node_state_t *state) {
     if (state == nullptr || state->fftdiv_constructed) {
         return;
     }
     new (&state->u.fftdiv) decltype(state->u.fftdiv)();
+    state->u.fftdiv.log_level = kFftDivDefaultLogLevel;
+    state->u.fftdiv.log_slice_bin_cap = kFftDivDefaultSliceLogCap;
     state->fftdiv_constructed = true;
 }
 
@@ -1919,17 +1991,29 @@ static size_t fftdiv_declared_latency_frames(const node_state_t *state) {
         return 0;
     }
     const auto &fftdiv = state->u.fftdiv;
-    if (fftdiv.window_size > 1) {
-        fprintf(
-            stderr,
-            "[FFT-LATENCY] window_size=%d latency=%d\n",
-            fftdiv.window_size,
-            fftdiv.window_size - 1
-        );
-        return static_cast<size_t>(fftdiv.window_size - 1);
-    }
-    fprintf(stderr, "[FFT-LATENCY] window_size=%d < 2\n", fftdiv.window_size);
-    return 0;
+    const int W_fft = (fftdiv.window_size > 0) ? fftdiv.window_size : 1;
+    const int H_fft = (fftdiv.backend_hop > 0) ? fftdiv.backend_hop : 1;
+    const int H_work = (fftdiv.wheel_hop > 0) ? fftdiv.wheel_hop : 1;
+    const int l_istft = -1; // auto-compute from configuration
+    const size_t delay = fftdiv_delay_frames_for_sample(
+        0U,
+        W_fft,
+        H_fft,
+        H_work,
+        W_fft,
+        l_istft
+    );
+
+    fprintf(
+        stderr,
+        "[FFT-LATENCY] sample=0 W_fft=%d H_fft=%d H_work=%d delay=%zu\n",
+        W_fft,
+        H_fft,
+        H_work,
+        delay
+    );
+
+    return delay;
 }
 
 static void fftdiv_request_latency_tail(node_state_t *state) {
@@ -3254,8 +3338,15 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.forward_frames_ready = 0U;
         slot.inverse_scratch.clear();
         slot.inverse_queue.clear();
+        slot.pcm_backlog.clear();
+        slot.pcm_consumed_samples = 0U;
         slot.warmup_complete = false;
         slot.last_pcm_output = 0.0;
+        slot.total_ingested_samples = 0U;
+        slot.tail_injected_samples = 0U;
+        slot.zero_tail_enqueued = false;
+        slot.ingest_finalized = false;
+        slot.final_flag_observed = false;
     }
     state->u.fftdiv.stream_slots.clear();
 }
@@ -3333,6 +3424,13 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
                 slot.forward_ring_filled = 0U;
                 slot.forward_ring_wrapped = false;
                 slot.forward_frames_ready = 0U;
+                slot.pcm_backlog.clear();
+                slot.pcm_consumed_samples = 0U;
+                slot.total_ingested_samples = 0U;
+                slot.tail_injected_samples = 0U;
+                slot.zero_tail_enqueued = false;
+                slot.ingest_finalized = false;
+                slot.final_flag_observed = false;
             }
         } catch (...) {
             return -1;
@@ -3344,11 +3442,20 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
     try {
         state->u.fftdiv.stream_slots.resize(static_cast<std::size_t>(slots));
         for (auto &slot : state->u.fftdiv.stream_slots) {
-            slot.forward_handle = amp_fft_backend_stream_create(window_size, window_size, 1, window_kind);
+            int hop = state->u.fftdiv.backend_hop > 0 ? state->u.fftdiv.backend_hop : 1;
+            if (hop > window_size) hop = window_size;
+            if (state->u.fftdiv.log_level >= 2) {
+                fprintf(stderr,
+                    "[FFT-STREAM-CREATE] slots=%d W=%d H=%d stage_frames=%zu ring_frames=%zu\n",
+                    slots, window_size, hop,
+                    state->u.fftdiv.stream_max_fft_frames,
+                    state->u.fftdiv.spectral_ring_capacity_frames);
+            }
+            slot.forward_handle = amp_fft_backend_stream_create(window_size, window_size, hop, window_kind);
             if (slot.forward_handle == nullptr) {
                 throw std::bad_alloc();
             }
-            slot.inverse_handle = amp_fft_backend_stream_create_inverse(window_size, window_size, 1, window_kind);
+            slot.inverse_handle = amp_fft_backend_stream_create_inverse(window_size, window_size, hop, window_kind);
             if (slot.inverse_handle == nullptr) {
                 throw std::bad_alloc();
             }
@@ -3365,8 +3472,15 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.forward_frames_ready = 0U;
             slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
             slot.inverse_queue.clear();
+            slot.pcm_backlog.clear();
+            slot.pcm_consumed_samples = 0U;
             slot.warmup_complete = false;
             slot.last_pcm_output = 0.0;
+            slot.total_ingested_samples = 0U;
+            slot.tail_injected_samples = 0U;
+            slot.zero_tail_enqueued = false;
+            slot.ingest_finalized = false;
+            slot.final_flag_observed = false;
         }
     } catch (...) {
         fftdiv_reset_stream_slots(state);
@@ -3375,6 +3489,10 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
 
     state->u.fftdiv.window_size = window_size;
     state->u.fftdiv.window_kind = window_kind;
+    // Track the effective backend stream parameters
+    state->u.fftdiv.backend_stream_window_size = window_size;
+    state->u.fftdiv.backend_stream_window_kind = window_kind;
+    state->u.fftdiv.backend_stream_hop = state->u.fftdiv.backend_hop > 0 ? state->u.fftdiv.backend_hop : 1;
     return 0;
 }
 #else
@@ -3416,6 +3534,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.default_lane_count = 0;
     fftdiv_reset_stream_slots(state);
     state->u.fftdiv.lane_plan.clear();
+    state->u.fftdiv.wheel_slice_metadata.clear();
     state->u.fftdiv.spectral_scratch.real.clear();
     state->u.fftdiv.spectral_scratch.imag.clear();
     state->u.fftdiv.spectral_scratch.lanes = 0;
@@ -3503,6 +3622,7 @@ static int ensure_fft_working_tensor(
     state->u.fftdiv.wheel_head = 0;
     state->u.fftdiv.wheel_tail = 0;
     state->u.fftdiv.wheel_filled_slices = 0;
+    state->u.fftdiv.wheel_slice_metadata.assign((size_t)time_slices, FftDivFilledSlice());
     if (state->u.fftdiv.wheel_hop <= 0 || state->u.fftdiv.wheel_hop > time_slices) {
         state->u.fftdiv.wheel_hop = (time_slices > 0) ? time_slices : 1;
     }
@@ -4104,6 +4224,7 @@ static int amp_wait_node_completion_impl(
     int channels,
     int frames,
     double sample_rate,
+    AmpNodeCompletionMode mode,
     void **state,
     double **out_buffer,
     int *out_channels,
@@ -4130,63 +4251,49 @@ static int amp_wait_node_completion_impl(
     }
 
     const size_t expected_frames = (frames > 0) ? (size_t)frames : 0;
-#if defined(__cplusplus)
-    size_t latency_frames = 0;
-    bool latency_ready = false;
-#endif
+
+    const AmpNodeCompletionMode completion_mode = amp_completion_mode_normalize(mode);
 
     switch (kind) {
         case NODE_KIND_FFT_DIV:
 #if defined(__cplusplus)
             {
                 // Keep accumulating until we reach expected frame count
-                AmpMailboxEntry *entries[256];
+                AmpMailboxEntry **entries = NULL;
+                size_t entries_capacity = 0;
                 size_t entry_count = 0;
                 size_t total_frames = 0;
                 int result_channels = 0;
                 int final_status = 0;
-                bool tail_requested = false;
                 
                 // Poll and accumulate entries until we have enough frames
                 const int max_poll_attempts = 10000;
                 int poll_attempts = 0;
                 
                 while (total_frames < expected_frames && poll_attempts < max_poll_attempts) {
-                    if (!latency_ready) {
-                        size_t observed_latency = fftdiv_declared_latency_frames(node_state);
-                        if (observed_latency > 0) {
-                            latency_frames = observed_latency;
-                            latency_ready = true;
-                        }
-                    }
                     AmpMailboxEntry *entry = amp_node_mailbox_pop(node_state);
                     if (entry == NULL) {
+                        const size_t latency_frames = fftdiv_declared_latency_frames(node_state);
                         size_t remaining = expected_frames > total_frames
                             ? (expected_frames - total_frames)
                             : 0;
                         fprintf(
                             stderr,
-                            "[FFT-WAIT] remaining=%zu latency=%zu tail_requested=%d poll=%d/%d\n",
+                            "[FFT-WAIT] mode=%s remaining=%zu latency=%zu poll=%d/%d\n",
+                            amp_completion_mode_name(completion_mode),
                             remaining,
-                            latency_ready ? latency_frames : 0,
-                            tail_requested ? 1 : 0,
+                            latency_frames,
                             poll_attempts,
                             max_poll_attempts
                         );
-                        if (latency_ready && !tail_requested && expected_frames > 0 && latency_frames > 0) {
-                            if (remaining > 0 && remaining <= latency_frames) {
-                                fftdiv_request_latency_tail(node_state);
-                                tail_requested = true;
-                                poll_attempts = 0;
-                                continue;
-                            }
-                        }
                         // No entry available yet, wait and retry
                         poll_attempts++;
                         if (entry_count == 0 && poll_attempts >= max_poll_attempts) {
+                            const size_t latency_frames = fftdiv_declared_latency_frames(node_state);
                             fprintf(
                                 stderr,
-                                "[FFT-WAIT] max-poll exceeded without entries expected=%zu latency=%zu\n",
+                                "[FFT-WAIT] mode=%s max-poll exceeded without entries expected=%zu latency=%zu\n",
+                                amp_completion_mode_name(completion_mode),
                                 expected_frames,
                                 latency_frames
                             );
@@ -4205,19 +4312,32 @@ static int amp_wait_node_completion_impl(
                         result_channels = entry->channels > 0 ? entry->channels : 1;
                     }
                     
-                    if (entry_count < 256) {
-                        entries[entry_count++] = entry;
-                        total_frames += entry->frames;
-                        if (entry->status != 0 && entry->status != AMP_E_PENDING) {
-                            final_status = entry->status;
+                    if (entry_count >= entries_capacity) {
+                        size_t new_capacity = (entries_capacity == 0) ? 256U : entries_capacity * 2U;
+                        AmpMailboxEntry **new_entries = (AmpMailboxEntry **)realloc(
+                            entries,
+                            new_capacity * sizeof(*new_entries)
+                        );
+                        if (new_entries == NULL) {
+                            amp_mailbox_entry_release(entry);
+                            for (size_t i = 0; i < entry_count; ++i) {
+                                amp_mailbox_entry_release(entries[i]);
+                            }
+                            free(entries);
+                            return -1;
                         }
-                    } else {
-                        amp_mailbox_entry_release(entry);
-                        break;
+                        entries = new_entries;
+                        entries_capacity = new_capacity;
+                    }
+                    entries[entry_count++] = entry;
+                    total_frames += entry->frames;
+                    if (entry->status != 0 && entry->status != AMP_E_PENDING) {
+                        final_status = entry->status;
                     }
                 }
                 
                 if (entry_count == 0) {
+                    free(entries);
                     return AMP_E_PENDING;
                 }
                 
@@ -4232,6 +4352,7 @@ static int amp_wait_node_completion_impl(
                     for (size_t i = 0; i < entry_count; ++i) {
                         amp_mailbox_entry_release(entries[i]);
                     }
+                    free(entries);
                     return -1;
                 }
                 
@@ -4250,6 +4371,7 @@ static int amp_wait_node_completion_impl(
                     
                     amp_mailbox_entry_release(entry);
                 }
+                free(entries);
 
                 if (output_frames > total_frames) {
                     size_t missing_samples = (output_frames - total_frames) * result_channels;
@@ -4267,8 +4389,9 @@ static int amp_wait_node_completion_impl(
                     *out_buffer = accumulated_buffer;
                 }
                 
-                fprintf(stderr, "[amp_wait_node_completion] accumulated %zu/%zu frames from %zu mailbox entries (latency=%zu)\n", 
-                    output_frames, expected_frames, entry_count, latency_frames);
+                const size_t latency_frames = fftdiv_declared_latency_frames(node_state);
+                fprintf(stderr, "[amp_wait_node_completion] mode=%s accumulated %zu/%zu frames from %zu mailbox entries (latency=%zu)\n", 
+                    amp_completion_mode_name(completion_mode), output_frames, expected_frames, entry_count, latency_frames);
                 
                 return final_status;
             }
@@ -4355,6 +4478,7 @@ AMP_CAPI int amp_wait_node_completion(
     int channels,
     int frames,
     double sample_rate,
+    AmpNodeCompletionMode mode,
     void **state,
     double **out_buffer,
     int *out_channels,
@@ -4368,6 +4492,7 @@ AMP_CAPI int amp_wait_node_completion(
         channels,
         frames,
         sample_rate,
+        mode,
         state,
         out_buffer,
         out_channels,

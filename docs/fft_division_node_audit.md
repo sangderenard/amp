@@ -146,10 +146,12 @@ The adjoint closely mirrors the forward pass:
 
 * Nodes that maintain internal streaming pipelines (FFTDivisionNode today) now expose
   `amp_wait_node_completion` as a blocking helper. Callers may provide the same `EdgeRunnerNodeInputs`
-  structure used for the triggering invocation—tap buffers included—and the runtime will inject zero
-  audio while draining the pipeline until either an output buffer materialises or the node reports it
-  is still pending. This allows harnesses to wait for frames instead of busy-spinning on repeated
-  `AMP_E_PENDING` returns.【F:src/native/include/amp_native.h†L406-L417】【F:src/native/amp_kernels.c†L3520-L3560】【F:src/native/nodes/fft_division/fft_division_nodes.inc†L1933-L2014】
+  structure used for the triggering invocation—tap buffers included—and must specify whether they are
+  merely polling (`AMP_COMPLETION_POLL`) or explicitly requesting a drain (`AMP_COMPLETION_DRAIN`). The
+  runtime injects zero audio only when drain mode is requested, keeping ordinary polls side-effect free
+  while draining the pipeline until either an output buffer materialises or the node reports it is still
+  pending. This allows harnesses to wait for frames instead of busy-spinning on repeated
+  `AMP_E_PENDING` returns.【F:src/native/include/amp_native.h†L406-L421】【F:src/native/amp_kernels.c†L3520-L3560】【F:src/native/nodes/fft_division/fft_division_nodes.inc†L1933-L2014】
 * `test_fft_division_node.cpp` demonstrates the pattern: once all stimulus frames are submitted it
   calls `amp_wait_node_completion` with the last tap buffers so spectral taps continue to capture the
   drain output without issuing additional `amp_run_node_v2` calls that would otherwise spin without a
