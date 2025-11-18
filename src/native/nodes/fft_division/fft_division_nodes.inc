@@ -2763,6 +2763,24 @@ static bool fftdiv_pipeline_can_advance(const node_state_t *state) {
     return fftdiv_stage_snapshot_any_ready(fftdiv_snapshot_stage_locks(state));
 }
 
+static bool fftdiv_stage1_zero_insertion_active(const node_state_t *state) {
+    if (state == nullptr) {
+        return false;
+    }
+    bool zero_tail_enqueued = false;
+    for (const auto &slot : state->u.fftdiv.stream_slots) {
+        if (slot.zero_tail_enqueued) {
+            zero_tail_enqueued = true;
+            break;
+        }
+    }
+    if (!zero_tail_enqueued) {
+        return false;
+    }
+    const FftDivStageLockSnapshot snapshot = fftdiv_snapshot_stage_locks(state);
+    return fftdiv_stage_snapshot_any_ready(snapshot);
+}
+
 
 static void fftdiv_flush_with_zeroes(node_state_t *state) {
     if (state == nullptr) {
@@ -3155,8 +3173,13 @@ static void fftdiv_worker_main(node_state_t *state) {
 
         lock_guard.lock();
         if (command_finished) {
-            worker.shared_command = command;
-            worker.active_command.reset();
+            if (fftdiv_stage1_zero_insertion_active(state)) {
+                // A zero-tail drain is still keeping at least one stage busy;
+                // hold the command open until every stage lock reports idle.
+            } else {
+                worker.shared_command = command;
+                worker.active_command.reset();
+            }
         }
         return did_work;
     };
