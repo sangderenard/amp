@@ -47,6 +47,7 @@ using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>
 
 #if defined(__cplusplus)
 #include "nodes/fft_division/fft_division_types.h"
+#include "nodes/fft_division/fft_division_stage_lock.h"
 struct FftDivOperatorLaneBinding;
 #endif
 
@@ -1819,6 +1820,7 @@ typedef union {
                 std::size_t forward_ring_filled{0U};
                 bool forward_ring_wrapped{false};
                 std::size_t forward_frames_ready{0U};
+                int wheel_filled_pre_reserve{-1};
                 std::vector<double> inverse_scratch;
                 std::deque<double> inverse_queue;
                 struct PendingSpectrum {
@@ -1906,6 +1908,8 @@ typedef union {
                 size_t mailbox_expected_entries{0};
                 size_t mailbox_popped_entries{0};
                 size_t append_invocations{0};
+                FftDivStageLockSnapshot cached_stage_locks{};
+                bool cached_stage_locks_valid{false};
             };
             WorkerState worker;
             const EdgeRunnerNodeDescriptor *last_descriptor{nullptr};

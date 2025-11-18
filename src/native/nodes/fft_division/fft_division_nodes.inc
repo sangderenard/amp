@@ -1103,18 +1103,8 @@ static void fftdiv_prepare_operator_frame(node_state_t *state) {
 }
 #endif
 
-#if !defined(__cplusplus)
-typedef struct FftDivStageLockSnapshot FftDivStageLockSnapshot;
-#else
-struct FftDivStageLockSnapshot {
-    bool stage1_ready{false};
-    bool stage2_ready{false};
-    bool stage3_ready{false};
-    bool stage4_ready{false};
-    bool stage5_ready{false};
-};
+#include "fft_division_stage_lock.h"
 static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *state);
-#endif
 #if defined(__cplusplus)
 static void fftdiv_prepare_lane_plan(
     node_state_t *state,
@@ -1630,18 +1620,16 @@ static int fftdiv_execute_block(
     std::vector<size_t> lane_frames_emitted(static_cast<size_t>(slot_count), 0U);
     std::vector<double> lane_pcm_batch(static_cast<size_t>(slot_count) * static_cast<size_t>(frames), 0.0);
 
-    FftDivStageLockSnapshot live_stage_locks{};
+    FftDivStageLockSnapshot live_stage_locks = {0};
     const FftDivStageLockSnapshot *locks_for_stage = stage_locks;
-    if (state != nullptr) {
-        live_stage_locks = fftdiv_snapshot_stage_locks(state);
-        const bool incoming_pcm_available =
-            inputs != nullptr &&
-            inputs->audio.has_audio &&
-            inputs->audio.data != nullptr &&
-            frames > 0;
-        if (incoming_pcm_available) {
-            live_stage_locks.stage1_ready = true;
-        }
+    const bool incoming_pcm_available =
+        inputs != nullptr &&
+        inputs->audio.has_audio &&
+        inputs->audio.data != nullptr &&
+        frames > 0;
+    if (locks_for_stage != nullptr && incoming_pcm_available) {
+        live_stage_locks = *locks_for_stage;
+        live_stage_locks.stage1_ready = true;
         locks_for_stage = &live_stage_locks;
     }
 
@@ -1969,14 +1957,6 @@ static int fftdiv_execute_block(
                     scratch_real,
                     scratch_imag,
                     scratch_bins);
-                // Stage 2: blend tap spectra with freshly produced FFT bins before the wheel window advances
-                fftdiv_window_reserve_leading_edge(
-                    state,
-                    slot,
-                    frame_index_int,
-                    wheel_length,
-                    &wheel_tail,
-                    &wheel_filled);
             }
 
             if (!spectral_ready) {
@@ -2102,6 +2082,20 @@ static int fftdiv_execute_block(
         const int tensor_slice_iter = wheel_head_cursor;
         const int scratch_slice_iter = scratch_cursor;
         const int64_t frame_index_iter = frame_counter + (int64_t)processed_passes;
+
+        if (wheel_length > 0) {
+            for (int slot = 0; slot < slot_count; ++slot) {
+                auto &slot_state_snapshot = state->u.fftdiv.stream_slots[(size_t)slot];
+                slot_state_snapshot.wheel_filled_pre_reserve = wheel_filled_cursor;
+            }
+            fftdiv_window_reserve_leading_edge(
+                state,
+                -1,
+                (int)frame_index_iter,
+                wheel_length,
+                &wheel_tail_cursor,
+                &wheel_filled_cursor);
+        }
 
         bool iteration_updated = false;
         int view_filled_override = wheel_filled_cursor;
@@ -2675,7 +2669,7 @@ static bool fftdiv_stage_snapshot_any_ready(const FftDivStageLockSnapshot &snaps
 }
 
 static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *state) {
-    FftDivStageLockSnapshot snapshot;
+    FftDivStageLockSnapshot snapshot = {0};
     if (state == nullptr) {
         return snapshot;
     }
@@ -2709,9 +2703,21 @@ static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *s
         wheel_length = 0;
     }
     const int active_span_limit = fftdiv_window_effective_span(state, wheel_length);
+    int wheel_filled_for_gate = state->u.fftdiv.wheel_filled_slices;
+#if defined(__cplusplus)
+    bool have_prereserve_snapshot = false;
+    for (const auto &slot : slots) {
+        if (slot.wheel_filled_pre_reserve >= 0) {
+            if (!have_prereserve_snapshot || slot.wheel_filled_pre_reserve < wheel_filled_for_gate) {
+                wheel_filled_for_gate = slot.wheel_filled_pre_reserve;
+            }
+            have_prereserve_snapshot = true;
+        }
+    }
+#endif
     const bool wheel_has_capacity = (wheel_length <= 0)
         || (active_span_limit <= 0)
-        || (state->u.fftdiv.wheel_filled_slices < active_span_limit);
+        || (wheel_filled_for_gate < active_span_limit);
 
     bool lanes_have_frames = true;
     int active_lane_count = 0;
@@ -3010,11 +3016,6 @@ static bool fftdiv_worker_process_command(
         ? static_cast<size_t>(command->task.frames)
         : 1U;
     const FftDivStageLockSnapshot *locks_to_use = stage_locks;
-    FftDivStageLockSnapshot local_snapshot{};
-    if (locks_to_use == nullptr) {
-        local_snapshot = fftdiv_snapshot_stage_locks(state);
-        locks_to_use = &local_snapshot;
-    }
     int status = fftdiv_execute_block(
         command->task.descriptor,
         command->task.inputs,
@@ -3143,35 +3144,41 @@ static void fftdiv_worker_main(node_state_t *state) {
             worker.pending_commands.pop_front();
             worker.active_command = command;
         }
+        const FftDivStageLockSnapshot *locks_for_command = nullptr;
+        if (worker.cached_stage_locks_valid) {
+            locks_for_command = &worker.cached_stage_locks;
+        }
 
         lock_guard.unlock();
 
-        FftDivStageLockSnapshot stage_snapshot{};
-        stage_snapshot = fftdiv_snapshot_stage_locks(state);
-        const FftDivStageLockSnapshot *snapshot_ptr = &stage_snapshot;
-        bool did_work = fftdiv_stage_snapshot_any_ready(stage_snapshot);
-        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
-            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
-                       "[STAGE-LOCKS] s1=%d s2=%d s3=%d s4=%d s5=%d\n",
-                       snapshot_ptr->stage1_ready ? 1 : 0,
-                       snapshot_ptr->stage2_ready ? 1 : 0,
-                       snapshot_ptr->stage3_ready ? 1 : 0,
-                       snapshot_ptr->stage4_ready ? 1 : 0,
-                       snapshot_ptr->stage5_ready ? 1 : 0);
-        }
+        bool did_work = false;
 
         bool command_finished = false;
         if (command) {
-            command_finished = fftdiv_worker_process_command(state, command, snapshot_ptr);
+            command_finished = fftdiv_worker_process_command(state, command, locks_for_command);
             did_work = true;
         }
-        if (snapshot_ptr->stage5_ready) {
-            if (fftdiv_worker_drain_pending_outputs(state)) {
-                did_work = true;
-            }
+        if (fftdiv_worker_drain_pending_outputs(state)) {
+            did_work = true;
+        }
+
+        FftDivStageLockSnapshot post_snapshot = fftdiv_snapshot_stage_locks(state);
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                       "[STAGE-LOCKS] s1=%d s2=%d s3=%d s4=%d s5=%d\n",
+                       post_snapshot.stage1_ready ? 1 : 0,
+                       post_snapshot.stage2_ready ? 1 : 0,
+                       post_snapshot.stage3_ready ? 1 : 0,
+                       post_snapshot.stage4_ready ? 1 : 0,
+                       post_snapshot.stage5_ready ? 1 : 0);
+        }
+        if (fftdiv_stage_snapshot_any_ready(post_snapshot)) {
+            did_work = true;
         }
 
         lock_guard.lock();
+        worker.cached_stage_locks = post_snapshot;
+        worker.cached_stage_locks_valid = true;
         if (command_finished) {
             if (fftdiv_stage1_zero_insertion_active(state)) {
                 // A zero-tail drain is still keeping at least one stage busy;
@@ -3232,6 +3239,8 @@ static int fftdiv_start_worker(node_state_t *state) {
     if (worker.thread_started) {
         return 0;
     }
+    worker.cached_stage_locks = FftDivStageLockSnapshot{0, 0, 0, 0, 0};
+    worker.cached_stage_locks_valid = false;
     worker.stop_requested = false;
     worker.flush_on_stop = true;
     try {
@@ -3298,6 +3307,8 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
             worker.mailbox_expected_entries = 0;
             worker.mailbox_popped_entries = 0;
             worker.append_invocations = 0;
+            worker.cached_stage_locks = FftDivStageLockSnapshot{0, 0, 0, 0, 0};
+            worker.cached_stage_locks_valid = false;
             return;
         }
         worker.stop_requested = true;
@@ -3317,6 +3328,8 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         worker.mailbox_expected_entries = 0;
         worker.mailbox_popped_entries = 0;
         worker.append_invocations = 0;
+        worker.cached_stage_locks = FftDivStageLockSnapshot{0, 0, 0, 0, 0};
+        worker.cached_stage_locks_valid = false;
     }
 }
 

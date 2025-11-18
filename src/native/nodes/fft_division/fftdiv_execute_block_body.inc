@@ -729,14 +729,6 @@
                     scratch_real,
                     scratch_imag,
                     scratch_bins);
-                // Stage 2: blend tap spectra with freshly produced FFT bins before the wheel window advances
-                fftdiv_window_reserve_leading_edge(
-                    state,
-                    slot,
-                    frame_index_int,
-                    wheel_length,
-                    &wheel_tail,
-                    &wheel_filled);
             }
 
             if (!spectral_ready) {
@@ -857,6 +849,20 @@
         const int tensor_slice_iter = wheel_head_cursor;
         const int scratch_slice_iter = scratch_cursor;
         const int64_t frame_index_iter = frame_counter + (int64_t)processed_passes;
+
+        if (wheel_length > 0) {
+            for (int slot = 0; slot < slot_count; ++slot) {
+                auto &slot_state_snapshot = state->u.fftdiv.stream_slots[(size_t)slot];
+                slot_state_snapshot.wheel_filled_pre_reserve = wheel_filled_cursor;
+            }
+            fftdiv_window_reserve_leading_edge(
+                state,
+                -1,
+                (int)frame_index_iter,
+                wheel_length,
+                &wheel_tail_cursor,
+                &wheel_filled_cursor);
+        }
 
         bool iteration_updated = false;
         int view_filled_override = wheel_filled_cursor;
