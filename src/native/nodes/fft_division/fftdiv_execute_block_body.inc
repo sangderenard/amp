@@ -462,6 +462,28 @@
                     }
                     slot_state.total_ingested_samples += backlog_growth;
                 }
+                // Append tail zeros immediately after input PCM, before calculating pending_samples
+                if (final_delivery && !slot_state.final_flag_observed) {
+                    slot_state.final_flag_observed = true;
+                    const size_t tail_frames = fftdiv_delay_frames_for_signal_length(
+                        slot_state.total_ingested_samples,
+                        final_tail_plan.window_size,
+                        final_tail_plan.backend_hop,
+                        final_tail_plan.working_hop,
+                        final_tail_plan.window_size,
+                        final_tail_plan.istft_tail_frames);
+                    if (tail_frames > 0U) {
+                        const bool already_enqueued = slot_state.zero_tail_enqueued;
+                        fftdiv_stage1_append_zero_tail(state, slot_state, tail_frames);
+                        if (!already_enqueued && slot_state.zero_tail_enqueued) {
+                            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+                                       "[STAGE1-ZERO-TAIL] slot=%d tail_frames=%zu total_ingested=%zu\n",
+                                       slot,
+                                       tail_frames,
+                                       slot_state.total_ingested_samples);
+                        }
+                    }
+                }
                 const size_t pending_samples = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
                     ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
                     : 0U;
@@ -521,8 +543,14 @@
                         ? NULL
                         : slot_state.pcm_backlog.data() + slot_state.pcm_consumed_samples;
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
-                               "[STAGE1-INPUT] slot=%d pending_samples=%zu handle=%p\n",
+                               "[STAGE1-INPUT] slot=%d\n"
+                               "  PCM calling code put into command: pcm_backlog.size()=%zu\n"
+                               "  PCM stage 1 actually put into backend: pcm_consumed_samples=%zu\n"
+                               "  Samples pending to push to backend: pending_samples=%zu\n"
+                               "  Forward handle: %p\n",
                                slot,
+                               slot_state.pcm_backlog.size(),
+                               slot_state.pcm_consumed_samples,
                                pending_samples,
                                (void*)slot_state.forward_handle);
                     if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE) && pending_samples > 0U && pcm_source != NULL) {
@@ -587,7 +615,12 @@
                             stage_capacity_frames,
                             flush_mode);
                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
-                                   "[STAGE1-FFT] slot=%d frames_emitted=%zu\n", slot, frames_emitted);
+                                   "[STAGE1-FFT] slot=%d\n"
+                                   "  Spectral data removed from backend: frames_emitted=%zu\n"
+                                   "  FFT waiting in ring for Stage 2: forward_ring_filled=%zu\n",
+                                   slot,
+                                   frames_emitted,
+                                   slot_state.forward_ring_filled);
                         if (frames_emitted > 0) {
                             fftdiv_ring_append_frames(
                                 state,
@@ -603,6 +636,11 @@
                                 slot_spectral_imag = const_cast<double *>(ring_imag);
                             }
                             slot_state.forward_frames_ready = slot_state.forward_ring_filled;
+                            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                                       "[STAGE1-READY] slot=%d\n"
+                                       "  Spectral data made ready for Stage 2: forward_frames_ready=%zu\n",
+                                       slot,
+                                       slot_state.forward_frames_ready);
                         }
 #if FFTDIV_TRACE_ENABLED
                         size_t inverse_pending_after = (slot_state.inverse_handle != NULL)
@@ -649,27 +687,6 @@
                     }
                     slot_state.pcm_consumed_samples = slot_state.pcm_backlog.size();
                     fftdiv_trim_pcm_backlog(state, slot_state.pcm_backlog, slot_state.pcm_consumed_samples, (size_t)window_size);
-                    if (final_delivery) {
-                        slot_state.final_flag_observed = true;
-                        const size_t tail_frames = fftdiv_delay_frames_for_signal_length(
-                            slot_state.total_ingested_samples,
-                            final_tail_plan.window_size,
-                            final_tail_plan.backend_hop,
-                            final_tail_plan.working_hop,
-                            final_tail_plan.window_size,
-                            final_tail_plan.istft_tail_frames);
-                        if (tail_frames > 0U) {
-                            const bool already_enqueued = slot_state.zero_tail_enqueued;
-                            fftdiv_stage1_append_zero_tail(state, slot_state, tail_frames);
-                            if (!already_enqueued && slot_state.zero_tail_enqueued) {
-                                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-                                           "[STAGE1-ZERO-TAIL] slot=%d tail_frames=%zu total_ingested=%zu\n",
-                                           slot,
-                                           tail_frames,
-                                           slot_state.total_ingested_samples);
-                            }
-                        }
-                    }
                 }
             }
             lane_frames_emitted[(size_t)slot] = frames_emitted;
@@ -1389,6 +1406,47 @@
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                "[STAGE5-PCM-EMIT] pushed %zu individual frame entries\n",
                frames_to_push);
+    // Per-round pipeline instrumentation: PCM emitted and queue depths across stages
+    {
+        int unemitted_slices = 0;
+        for (const auto &slice : state->u.fftdiv.wheel_slice_metadata) {
+            if (slice.valid && !slice.stage4_emitted) {
+                unemitted_slices += 1;
+            }
+        }
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[PIPELINE-ROUND] pcm_out=%zu wheel_filled=%d unemitted=%d\n",
+                   frames_to_push,
+                   state->u.fftdiv.wheel_filled_slices,
+                   unemitted_slices);
+        for (size_t s = 0; s < state->u.fftdiv.stream_slots.size(); ++s) {
+            const auto &slot = state->u.fftdiv.stream_slots[s];
+            const size_t pending_pcm = (slot.pcm_backlog.size() > slot.pcm_consumed_samples)
+                ? (slot.pcm_backlog.size() - slot.pcm_consumed_samples)
+                : 0U;
+            const size_t ring_filled = slot.forward_ring_filled;
+            const size_t spectra_pending = slot.pending_spectra.size();
+            const size_t pcm_queue = slot.inverse_queue.size();
+            size_t s34_unemitted = 0;
+            for (const auto &slice : state->u.fftdiv.wheel_slice_metadata) {
+                if (!slice.valid || slice.stage4_emitted) continue;
+                if (slice.lanes.size() > s) {
+                    const auto &lane_snap = slice.lanes[s];
+                    if (lane_snap.frame_ready) {
+                        s34_unemitted += 1;
+                    }
+                }
+            }
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                       "[PIPELINE-SLOT] idx=%zu s1_pcm=%zu s1_ring=%zu s34_unem=%zu s5_spec=%zu s5_pcmq=%zu\n",
+                       s,
+                       pending_pcm,
+                       ring_filled,
+                       s34_unemitted,
+                       spectra_pending,
+                       pcm_queue);
+        }
+    }
     free(buffer);
     
     *out_buffer = NULL;

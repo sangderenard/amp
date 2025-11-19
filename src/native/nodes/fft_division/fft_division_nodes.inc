@@ -1147,6 +1147,37 @@ static void fftdiv_prepare_lane_plan(
         : 0U;
 
     for (int slot = 0; slot < slot_count; ++slot) {
+        // Determine if this lane could still make forward progress anywhere in the pipeline
+        bool has_ring_data = false;
+        bool has_wheel_frame = false;
+        bool has_pcm_backlog = false;
+        bool has_pending_output = false;
+        if ((size_t)slot < state->u.fftdiv.stream_slots.size()) {
+            const auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
+            has_ring_data = (slot_state.forward_ring_filled > 0U);
+            has_pcm_backlog = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples);
+            if (!slot_state.pending_spectra.empty() || !slot_state.inverse_queue.empty() ||
+                (slot_state.inverse_handle != nullptr && amp_fft_backend_stream_pending_pcm(slot_state.inverse_handle) > 0U)) {
+                has_pending_output = true;
+            }
+            // Wheel: check for any unemitted slice where this lane has a ready frame
+            for (const auto &slice_meta : state->u.fftdiv.wheel_slice_metadata) {
+                if (!slice_meta.valid || slice_meta.stage4_emitted) continue;
+                if (slice_meta.lanes.size() > (size_t)slot && slice_meta.lanes[(size_t)slot].frame_ready) {
+                    has_wheel_frame = true;
+                    break;
+                }
+            }
+            fprintf(stderr,
+                    "[LANE-PLAN] slot=%d ring=%zu backlog=%zu wheel_ready=%d pending_out=%d\n",
+                    slot,
+                    (size_t)slot_state.forward_ring_filled,
+                    (size_t)(slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples
+                        ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
+                        : 0U),
+                    has_wheel_frame ? 1 : 0,
+                    has_pending_output ? 1 : 0);
+        }
         auto &lane = plan[(size_t)slot];
         lane.slot_index = slot;
         lane.tensor_lane = slot;
@@ -1160,10 +1191,12 @@ static void fftdiv_prepare_lane_plan(
             spectral_input_imag_view != nullptr &&
             spectral_input_imag_view->data != nullptr &&
             (imag_batches == 0U || (uint32_t)slot < imag_batches);
-        const bool has_spectral_in = spect_real_in || spect_imag_in;
+        const bool has_spectral_in = spect_real_in || spect_imag_in || has_wheel_frame;
 
-        const bool enable_pcm_in = has_pcm_feed || has_spectral_in;
-        const bool enable_pcm_out = enable_pcm_in || has_spectral_in;
+        // Lane should be active if there's anything left that could be used
+        const bool could_use_anything = has_pcm_feed || has_spectral_in || has_ring_data || has_wheel_frame || has_pcm_backlog || has_pending_output;
+        const bool enable_pcm_in = has_pcm_feed || has_spectral_in || has_ring_data || has_pcm_backlog;
+        const bool enable_pcm_out = could_use_anything;
 
         lane.enable_pcm_in = enable_pcm_in;
         lane.enable_pcm_out = enable_pcm_out;
@@ -1639,8 +1672,34 @@ static int fftdiv_execute_block(
     const bool stage4_unlocked = (locks_for_stage == nullptr) || locks_for_stage->stage4_ready;
     const bool stage5_unlocked = (locks_for_stage == nullptr) || locks_for_stage->stage5_ready;
 
+    // Per-round lock status report (restored): reflect snapshot gate statuses for all stages
+    if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[STAGE-LOCKS] frame_index=%d s1=%d s2=%d s3=%d s4=%d s5=%d\n",
+                   frame_index_int,
+                   stage1_unlocked ? 1 : 0,
+                   stage2_unlocked ? 1 : 0,
+                   stage3_unlocked ? 1 : 0,
+                   stage4_unlocked ? 1 : 0,
+                   stage5_unlocked ? 1 : 0);
+    }
+
     if (stage1_unlocked) {
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                "[STAGE1-START] frame_index=%d frames=%d slot_count=%d final_delivery=%d\n",
+                frame_index_int,
+                frames,
+                slot_count,
+                final_delivery ? 1 : 0);
+        }
         for (int slot = 0; slot < slot_count; ++slot) {
+            if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                    "[STAGE1-PROCESS] frame_index=%d slot=%d\n",
+                    frame_index_int,
+                    slot);
+            }
             size_t data_idx = base_index + (size_t)slot;
             auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
             const bool warmup_was_complete = slot_state.warmup_complete;
@@ -1680,7 +1739,8 @@ static int fftdiv_execute_block(
                         }
                     }
                     for (int frame_cursor = 0; frame_cursor < frames; ++frame_cursor) {
-                        const size_t audio_index = (size_t)frame_cursor * hop + (size_t)slot;
+                        const size_t source_frame = slot_state.input_frame_cursor + (size_t)frame_cursor;
+                        const size_t audio_index = source_frame * hop + (size_t)slot;
                         double input_sample = 0.0;
                         if (audio_index < (size_t)slot_count * (size_t)frames) {
                             input_sample = audio_base[audio_index];
@@ -1688,7 +1748,30 @@ static int fftdiv_execute_block(
                         pcm_cursor[frame_cursor] = input_sample;
                         slot_state.pcm_backlog.push_back(input_sample);
                     }
+                    slot_state.input_frame_cursor += (size_t)frames;
                     slot_state.total_ingested_samples += backlog_growth;
+                }
+                // Append tail zeros immediately after input PCM, before calculating pending_samples
+                if (final_delivery && !slot_state.final_flag_observed) {
+                    slot_state.final_flag_observed = true;
+                    const size_t tail_frames = fftdiv_delay_frames_for_signal_length(
+                        slot_state.total_ingested_samples,
+                        final_tail_plan.window_size,
+                        final_tail_plan.backend_hop,
+                        final_tail_plan.working_hop,
+                        final_tail_plan.window_size,
+                        final_tail_plan.istft_tail_frames);
+                    if (tail_frames > 0U) {
+                        const bool already_enqueued = slot_state.zero_tail_enqueued;
+                        fftdiv_stage1_append_zero_tail(state, slot_state, tail_frames);
+                        if (!already_enqueued && slot_state.zero_tail_enqueued) {
+                            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+                                       "[STAGE1-ZERO-TAIL] slot=%d tail_frames=%zu total_ingested=%zu\n",
+                                       slot,
+                                       tail_frames,
+                                       slot_state.total_ingested_samples);
+                        }
+                    }
                 }
                 const size_t pending_samples = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
                     ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
@@ -1749,8 +1832,14 @@ static int fftdiv_execute_block(
                         ? NULL
                         : slot_state.pcm_backlog.data() + slot_state.pcm_consumed_samples;
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
-                               "[STAGE1-INPUT] slot=%d pending_samples=%zu handle=%p\n",
+                               "[STAGE1-INPUT] slot=%d\n"
+                               "  PCM calling code put into command: pcm_backlog.size()=%zu\n"
+                               "  PCM stage 1 actually put into backend: pcm_consumed_samples=%zu\n"
+                               "  Samples pending to push to backend: pending_samples=%zu\n"
+                               "  Forward handle: %p\n",
                                slot,
+                               slot_state.pcm_backlog.size(),
+                               slot_state.pcm_consumed_samples,
                                pending_samples,
                                (void*)slot_state.forward_handle);
                     if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE) && pending_samples > 0U && pcm_source != NULL) {
@@ -1815,7 +1904,12 @@ static int fftdiv_execute_block(
                             stage_capacity_frames,
                             flush_mode);
                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
-                                   "[STAGE1-FFT] slot=%d frames_emitted=%zu\n", slot, frames_emitted);
+                                   "[STAGE1-FFT] slot=%d\n"
+                                   "  Spectral data removed from backend: frames_emitted=%zu\n"
+                                   "  FFT waiting in ring for Stage 2: forward_ring_filled=%zu\n",
+                                   slot,
+                                   frames_emitted,
+                                   slot_state.forward_ring_filled);
                         if (frames_emitted > 0) {
                             fftdiv_ring_append_frames(
                                 state,
@@ -1831,6 +1925,11 @@ static int fftdiv_execute_block(
                                 slot_spectral_imag = const_cast<double *>(ring_imag);
                             }
                             slot_state.forward_frames_ready = slot_state.forward_ring_filled;
+                            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                                       "[STAGE1-READY] slot=%d\n"
+                                       "  Spectral data made ready for Stage 2: forward_frames_ready=%zu\n",
+                                       slot,
+                                       slot_state.forward_frames_ready);
                         }
 #if FFTDIV_TRACE_ENABLED
                         size_t inverse_pending_after = (slot_state.inverse_handle != NULL)
@@ -1877,27 +1976,6 @@ static int fftdiv_execute_block(
                     }
                     slot_state.pcm_consumed_samples = slot_state.pcm_backlog.size();
                     fftdiv_trim_pcm_backlog(state, slot_state.pcm_backlog, slot_state.pcm_consumed_samples, (size_t)window_size);
-                    if (final_delivery) {
-                        slot_state.final_flag_observed = true;
-                        const size_t tail_frames = fftdiv_delay_frames_for_signal_length(
-                            slot_state.total_ingested_samples,
-                            final_tail_plan.window_size,
-                            final_tail_plan.backend_hop,
-                            final_tail_plan.working_hop,
-                            final_tail_plan.window_size,
-                            final_tail_plan.istft_tail_frames);
-                        if (tail_frames > 0U) {
-                            const bool already_enqueued = slot_state.zero_tail_enqueued;
-                            fftdiv_stage1_append_zero_tail(state, slot_state, tail_frames);
-                            if (!already_enqueued && slot_state.zero_tail_enqueued) {
-                                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-                                           "[STAGE1-ZERO-TAIL] slot=%d tail_frames=%zu total_ingested=%zu\n",
-                                           slot,
-                                           tail_frames,
-                                           slot_state.total_ingested_samples);
-                            }
-                        }
-                    }
                 }
             }
             lane_frames_emitted[(size_t)slot] = frames_emitted;
@@ -2030,6 +2108,16 @@ static int fftdiv_execute_block(
     const int active_span_limit = fftdiv_window_effective_span(state, wheel_length);
 
     if (stage2_unlocked) {
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                "[STAGE2-START] frame_index=%d wheel_head=%d wheel_tail=%d wheel_filled=%d wheel_len=%d active_span=%d\n",
+                frame_index_int,
+                wheel_head_cursor,
+                wheel_tail_cursor,
+                wheel_filled_cursor,
+                wheel_length,
+                active_span_limit);
+        }
         while (true) {
             if (wheel_length > 0 && active_span_limit > 0 && wheel_filled_cursor >= active_span_limit) {
                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
@@ -2044,6 +2132,12 @@ static int fftdiv_execute_block(
             int ready_lane_count_iter = 0;
 
         for (int slot = 0; slot < slot_count; ++slot) {
+            if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                           "[STAGE2-PROCESS] slot=%d frame=%lld\n",
+                           slot,
+                           (long long)(frame_counter + (int64_t)processed_passes));
+            }
             auto &slot_state_iter = state->u.fftdiv.stream_slots[(size_t)slot];
             auto &lane_iter = state->u.fftdiv.lane_plan[(size_t)slot];
 
@@ -2058,8 +2152,25 @@ static int fftdiv_execute_block(
                 if (ready_now) {
                     ready_lane_count_iter += 1;
                 }
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                               "[STAGE2-LANE] slot=%d active=%d ring_filled=%zu remaining=%zu frame_ready=%d\n",
+                               slot,
+                               lane_iter.active ? 1 : 0,
+                               (size_t)slot_state_iter.forward_ring_filled,
+                               remaining_frames,
+                               ready_now ? 1 : 0);
+                }
             }
 
+        }
+
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                       "[STAGE2-BARRIER] ready=%d active=%d satisfied=%d\n",
+                       ready_lane_count_iter,
+                       active_lane_count,
+                       (ready_lane_count_iter == active_lane_count) ? 1 : 0);
         }
 
         const bool barrier_satisfied = (active_lane_count == 0)
@@ -2221,6 +2332,19 @@ static int fftdiv_execute_block(
                     lane_frames_remaining[(size_t)slot] -= 1U;
                 }
                 lane_frame_offsets[(size_t)slot] += 1U;
+                // Stage 2: Consume from forward_ring when ingesting into wheel
+                auto &slot_state_consume = state->u.fftdiv.stream_slots[(size_t)slot];
+                if (slot_state_consume.forward_ring_filled > 0U && slot_state_consume.forward_ring_capacity_frames > 0U) {
+                    slot_state_consume.forward_ring_read =
+                        (slot_state_consume.forward_ring_read + 1U) % slot_state_consume.forward_ring_capacity_frames;
+                    slot_state_consume.forward_ring_filled -= 1U;
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE2-CONSUME] slot=%d read=%zu filled=%zu remaining=%zu\n",
+                               slot,
+                               (size_t)slot_state_consume.forward_ring_read,
+                               (size_t)slot_state_consume.forward_ring_filled,
+                               lane_frames_remaining[(size_t)slot]);
+                }
             }
         }
 
@@ -2262,11 +2386,53 @@ static int fftdiv_execute_block(
                    "[STAGE2-SKIP] snapshot locked, deferring wheel ingestion\n");
     }
 
-    if (filled_slices.empty() || !stage3_unlocked) {
+    if (!stage3_unlocked) {
         metrics_window_span = 0;
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                       "[STAGE3-SKIP] snapshot locked, deferring operator execution\n");
+        }
     } else {
-        for (auto *slice_ptr : filled_slices) {
-            if (slice_ptr == nullptr || !slice_ptr->working_tensor_updated) {
+        // Stage3: iterate wheel metadata in FIFO order from tail, stopping after one hop span
+        auto &meta = state->u.fftdiv.wheel_slice_metadata;
+        const int stop_count = (wheel_hop > 0) ? wheel_hop : 1;
+        int visited = 0;
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                       "[STAGE3-START] FIFO walk tail=%d hop=%d len=%d stop_count=%d\n",
+                       wheel_tail_cursor, wheel_hop, wheel_length, stop_count);
+        }
+        for (int i = 0; i < stop_count && wheel_length > 0; ++i) {
+            const int idx = (wheel_tail_cursor + i) % wheel_length;
+            if ((size_t)idx >= meta.size()) {
+                break;
+            }
+            FftDivFilledSlice *slice_ptr = meta[idx].valid ? &meta[idx] : nullptr;
+            visited += 1;
+            if (slice_ptr == nullptr) {
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE3-SKIP] idx=%d null entry\n",
+                               idx);
+                }
+                metrics_window_span = 0;
+                continue;
+            }
+            if (slice_ptr->stage4_emitted) {
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE3-SKIP] idx=%d already emitted\n",
+                               idx);
+                }
+                continue;
+            }
+            if (!slice_ptr->working_tensor_updated) {
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE3-SKIP] idx=%d tensor not updated (tensor_slice=%d)\n",
+                               idx,
+                               slice_ptr->tensor_slice);
+                }
                 metrics_window_span = 0;
                 continue;
             }
@@ -2369,22 +2535,61 @@ static int fftdiv_execute_block(
                         window_size);
                 }
             } else {
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE3-SKIP] idx=%d tensor_slice=%d invalid active window\n",
+                               idx,
+                               slice.tensor_slice);
+                }
                 metrics_window_span = 0;
             }
         }
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                       "[STAGE3-END] visited=%d\n",
+                       visited);
+        }
     }
 
-    if (!filled_slices.empty() && stage4_unlocked) {
+    if (stage4_unlocked) {
+        // Stage4: iterate wheel metadata in FIFO order from tail, stopping after one hop span
+        auto &meta = state->u.fftdiv.wheel_slice_metadata;
+        const int stop_count = (wheel_hop > 0) ? wheel_hop : 1;
+        int visited = 0;
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                       "[STAGE4-START] FIFO walk tail=%d hop=%d len=%d stop_count=%d\n",
+                       wheel_tail_cursor, wheel_hop, wheel_length, stop_count);
+        }
         std::vector<size_t> lane_frames_consumed(static_cast<size_t>(slot_count), 0U);
-        for (auto *slice_ptr : filled_slices) {
+        for (int i = 0; i < stop_count && wheel_length > 0; ++i) {
+            const int idx = (wheel_tail_cursor + i) % wheel_length;
+            if ((size_t)idx >= meta.size()) {
+                break;
+            }
+            FftDivFilledSlice *slice_ptr = meta[idx].valid ? &meta[idx] : nullptr;
+            visited += 1;
             if (slice_ptr == nullptr) {
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE4-SKIP] idx=%d null entry\n",
+                               idx);
+                }
                 continue;
             }
             auto &slice = *slice_ptr;
+            if (slice.stage4_emitted) {
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE4-SKIP] idx=%d already emitted\n",
+                               idx);
+                }
+                continue;
+            }
             if (!slice.working_tensor_updated) {
                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                           "[STAGE4-SKIP] tensor slice=%d pending operator update\n",
-                           slice.tensor_slice);
+                           "[STAGE4-SKIP] idx=%d tensor slice=%d pending operator update\n",
+                           idx, slice.tensor_slice);
                 continue;
             }
             /* Debug: correlate Stage2 slice index with Stage3 window span and offsets */
@@ -2436,6 +2641,24 @@ static int fftdiv_execute_block(
                     ? nullptr
                     : lane_snapshot.spectral_imag.data();
 
+                if (!(lane_snapshot.frame_ready && lane.active)) {
+                    if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                                   "[STAGE4-SKIP] idx=%d slot=%d frame_ready=%d lane_active=%d\n",
+                                   idx,
+                                   slot,
+                                   lane_snapshot.frame_ready ? 1 : 0,
+                                   lane.active ? 1 : 0);
+                    }
+                }
+                if (!(released_real != nullptr && released_imag != nullptr)) {
+                    if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                                   "[STAGE4-SKIP] idx=%d slot=%d missing spectral buffers\n",
+                                   idx,
+                                   slot);
+                    }
+                }
                 if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
                     if (lane.enable_spectral_out) {
                         /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
@@ -2471,28 +2694,6 @@ static int fftdiv_execute_block(
                             }
                         }
                     }
-
-                    if (slot_state.forward_ring_filled > 0U && slot_state.forward_ring_capacity_frames > 0U) {
-                        slot_state.forward_ring_read =
-                            (slot_state.forward_ring_read + 1U) % slot_state.forward_ring_capacity_frames;
-                        slot_state.forward_ring_filled -= 1U;
-                        if (lane_frames_consumed.size() > (size_t)slot) {
-                            lane_frames_consumed[(size_t)slot] += 1U;
-                        }
-                        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                            const size_t consumed_frames = (lane_frames_consumed.size() > (size_t)slot)
-                                ? lane_frames_consumed[(size_t)slot]
-                                : 0U;
-                            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                                       "[STAGE1-CONSUME] slot=%d read=%zu filled=%zu consumed=%zu assigned_offset=%zu relative_offset=%zu\n",
-                                       slot,
-                                       (size_t)slot_state.forward_ring_read,
-                                       (size_t)slot_state.forward_ring_filled,
-                                       consumed_frames,
-                                       assigned_offset,
-                                       relative_offset);
-                        }
-                    }
                 }
             }
             slice.stage4_emitted = true;
@@ -2503,9 +2704,24 @@ static int fftdiv_execute_block(
                     &wheel_tail_cursor,
                     &wheel_filled_cursor,
                     "stage4-inline");
+                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE4-TAIL] idx=%d new_tail=%d filled=%d\n",
+                               idx,
+                               wheel_tail_cursor,
+                               wheel_filled_cursor);
+                }
             }
         }
-    } else if (!filled_slices.empty()) {
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                       "[STAGE4-END] visited=%d\n",
+                       visited);
+        }
+        // Write back cursors to global state so Stage 2 sees the updated capacity on next pass
+        wheel_tail = wheel_tail_cursor;
+        wheel_filled = wheel_filled_cursor;
+    } else {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                    "[STAGE4-SKIP] snapshot locked, deferring spectral emission\n");
     }
@@ -2652,6 +2868,47 @@ static int fftdiv_execute_block(
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                "[STAGE5-PCM-EMIT] pushed %zu individual frame entries\n",
                frames_to_push);
+    // Per-round pipeline instrumentation: PCM emitted and queue depths across stages
+    {
+        int unemitted_slices = 0;
+        for (const auto &slice : state->u.fftdiv.wheel_slice_metadata) {
+            if (slice.valid && !slice.stage4_emitted) {
+                unemitted_slices += 1;
+            }
+        }
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[PIPELINE-ROUND] pcm_out=%zu wheel_filled=%d unemitted=%d\n",
+                   frames_to_push,
+                   state->u.fftdiv.wheel_filled_slices,
+                   unemitted_slices);
+        for (size_t s = 0; s < state->u.fftdiv.stream_slots.size(); ++s) {
+            const auto &slot = state->u.fftdiv.stream_slots[s];
+            const size_t pending_pcm = (slot.pcm_backlog.size() > slot.pcm_consumed_samples)
+                ? (slot.pcm_backlog.size() - slot.pcm_consumed_samples)
+                : 0U;
+            const size_t ring_filled = slot.forward_ring_filled;
+            const size_t spectra_pending = slot.pending_spectra.size();
+            const size_t pcm_queue = slot.inverse_queue.size();
+            size_t s34_unemitted = 0;
+            for (const auto &slice : state->u.fftdiv.wheel_slice_metadata) {
+                if (!slice.valid || slice.stage4_emitted) continue;
+                if (slice.lanes.size() > s) {
+                    const auto &lane_snap = slice.lanes[s];
+                    if (lane_snap.frame_ready) {
+                        s34_unemitted += 1;
+                    }
+                }
+            }
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                       "[PIPELINE-SLOT] idx=%zu s1_pcm=%zu s1_ring=%zu s34_unem=%zu s5_spec=%zu s5_pcmq=%zu\n",
+                       s,
+                       pending_pcm,
+                       ring_filled,
+                       s34_unemitted,
+                       spectra_pending,
+                       pcm_queue);
+        }
+    }
     free(buffer);
     
     *out_buffer = NULL;
@@ -2733,7 +2990,9 @@ static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *s
             break;
         }
     }
-    snapshot.stage2_ready = wheel_has_capacity && (active_lane_count == 0 || lanes_have_frames);
+    // Previous logic treated zero active lanes as "ready" which kept the worker loop
+    // reporting stage2 readiness after full drain. Require at least one active lane.
+    snapshot.stage2_ready = wheel_has_capacity && (active_lane_count > 0) && lanes_have_frames;
 
     // Stage 3/4 (operator and spectral emission) : ready while slices exist that
     // have not yet been emitted downstream.
@@ -3012,16 +3271,39 @@ static bool fftdiv_worker_process_command(
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE0-WORKER] Processing command frames=%d\n",
                command->task.frames);
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[STAGE0-WORKER] input.has_audio=0x%08x frames=%u data=%p\n",
+               (unsigned)(command->task.inputs && command->task.inputs->audio.has_audio ? command->task.inputs->audio.has_audio : 0U),
+               (unsigned)(command->task.inputs ? command->task.inputs->audio.frames : 0U),
+               (void*)(command->task.inputs ? command->task.inputs->audio.data : nullptr));
     const size_t runtime_pcm_block = command->task.frames > 0
         ? static_cast<size_t>(command->task.frames)
         : 1U;
     const FftDivStageLockSnapshot *locks_to_use = stage_locks;
+    const EdgeRunnerNodeInputs *inputs_arg = command->task.inputs;
+    EdgeRunnerNodeInputs inputs_copy{};
+    if (command->input_consumed_once && inputs_arg != nullptr) {
+        inputs_copy = *inputs_arg;
+        // Suppress audio on reuse but preserve frames (and thus the FINAL flag if present).
+        inputs_copy.audio.has_audio = 0U;
+        inputs_copy.audio.data = nullptr;
+        // Keep frames unchanged so Stage 1 sees zero-tail plan correctly.
+        inputs_arg = &inputs_copy;
+    }
+    // Always keep frames unchanged; suppressing audio via has_audio/data masking is sufficient.
+    int frames_arg = command->task.frames;
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[STAGE0-WORKER] input(has_audio=0x%08x, frames=%u, data=%p) consumed_once=%d\n",
+               (unsigned)(inputs_arg && inputs_arg->audio.has_audio ? inputs_arg->audio.has_audio : 0U),
+               (unsigned)(inputs_arg ? inputs_arg->audio.frames : 0U),
+               (void*)(inputs_arg ? inputs_arg->audio.data : nullptr),
+               command->input_consumed_once ? 1 : 0);
     int status = fftdiv_execute_block(
         command->task.descriptor,
-        command->task.inputs,
+        inputs_arg,
         command->task.batches,
         command->task.channels,
-        command->task.frames,
+        frames_arg,
         runtime_pcm_block,
         locks_to_use,
         command->task.sample_rate,
@@ -3066,6 +3348,11 @@ static bool fftdiv_worker_process_command(
     } else if (buffer != nullptr) {
         fftdiv_worker_publish_entry(state, buffer, out_channels, command->expected_frames, status, command->want_metrics ? metrics_ptr : nullptr);
     }
+    // After first execution of this command, suppress input on subsequent passes
+    // within the worker loop to avoid re-including the same buffer.
+    if (!command->input_consumed_once) {
+        command->input_consumed_once = true;
+    }
     return status != AMP_E_PENDING;
 }
 
@@ -3073,39 +3360,77 @@ static bool fftdiv_worker_drain_pending_outputs(node_state_t *state) {
     if (state == nullptr) {
         return false;
     }
-    bool emitted = false;
+    bool did_work = false;
     while (true) {
-        double *buffer = nullptr;
-        int out_channels = 0;
-        AmpNodeMetrics metrics{};
-        int status = fftdiv_wait_for_completion(
-            nullptr,
-            nullptr,
-            0,
-            0,
-            0,
-            0.0,
-            state,
-            &buffer,
-            &out_channels,
-            &metrics
-        );
-        if (status == AMP_E_PENDING && buffer == nullptr) {
+        const FftDivStageLockSnapshot snapshot = fftdiv_snapshot_stage_locks(state);
+        if (!fftdiv_stage_snapshot_any_ready(snapshot)) {
             break;
         }
-        int frames = state->u.fftdiv.last_frames > 0
-            ? state->u.fftdiv.last_frames
-            : state->u.fftdiv.window_size;
+
+        auto &fftdiv = state->u.fftdiv;
+        const EdgeRunnerNodeDescriptor *descriptor = fftdiv.last_descriptor;
+        if (descriptor == nullptr) {
+            break;
+        }
+
+        int batches = (fftdiv.last_batches > 0) ? fftdiv.last_batches : 1;
+        int channels = (fftdiv.last_channels > 0) ? fftdiv.last_channels : 1;
+        int frames = (fftdiv.last_frames > 0) ? fftdiv.last_frames
+                     : ((fftdiv.window_size > 0) ? fftdiv.window_size : 1);
         if (frames <= 0) {
             frames = 1;
         }
-        fftdiv_worker_publish_entry(state, buffer, out_channels, frames, status, &metrics);
-        emitted = true;
+
+        EdgeRunnerAudioView audio{};
+        audio.has_audio = 0; // No new PCM; advance existing pipeline only
+        audio.batches = (uint32_t)batches;
+        audio.channels = (uint32_t)channels;
+        audio.frames = (uint32_t)frames;
+        audio.data = nullptr;
+
+        EdgeRunnerParamSet params{};
+        EdgeRunnerNodeInputs inputs{};
+        inputs.audio = audio;
+        inputs.params = params;
+        inputs.taps.outputs.items = nullptr;
+        inputs.taps.outputs.count = 0;
+        inputs.taps.status.items = nullptr;
+        inputs.taps.status.count = 0;
+
+        double *buffer = nullptr;
+        int out_channels = 0;
+        const double sample_rate = (fftdiv.last_sample_rate > 0.0)
+            ? fftdiv.last_sample_rate
+            : fftdiv.sample_rate_hint;
+
+        // Advance one scheduler tick across all currently-ready stages.
+        int status = fftdiv_execute_block(
+            descriptor,
+            &inputs,
+            batches,
+            channels,
+            frames,
+            (size_t)frames,
+            &snapshot,
+            sample_rate,
+            &buffer,
+            &out_channels,
+            state,
+            nullptr,
+            AMP_FFT_STREAM_FLUSH_NONE
+        );
+
+        // Publish any produced output or terminal status
+        if (buffer != nullptr || status != AMP_E_PENDING) {
+            fftdiv_worker_publish_entry(state, buffer, out_channels, frames, status, nullptr);
+        }
+
+        did_work = true;
         if (status != 0 && status != AMP_E_PENDING) {
             break;
         }
     }
-    return emitted;
+    return did_work;
 }
 
 static void fftdiv_worker_main(node_state_t *state) {

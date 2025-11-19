@@ -1512,6 +1512,14 @@ struct FftDivWorkerCommand {
     bool want_metrics{false};
     AmpNodeMetrics metrics_storage{};
     int expected_frames{0};
+    // When reusing a shared command across runs, avoid re-including
+    // the same input audio buffer on each append. This flag tracks
+    // whether audio inputs have already been bound for this command.
+    bool inputs_bound{false};
+    // Track whether this command has already consumed its initial
+    // input once inside the worker loop; subsequent passes should
+    // not present audio again (frames=0, no final flag).
+    bool input_consumed_once{false};
 
     bool prepare(const EdgeRunnerNodeInputs *src_inputs, int batches, int channels, int frames, int slot_count);
     bool append_inputs(const EdgeRunnerNodeInputs *src_inputs, int batches, int channels, int frames, int slot_count);
@@ -1538,40 +1546,45 @@ bool FftDivWorkerCommand::prepare(
         effective_slot_count = 1;
     }
 
-    audio_data.clear();
-    audio_view = {};
-    const uint32_t audio_flags = (src_inputs != NULL) ? src_inputs->audio.has_audio : 0U;
-    const bool has_audio = (audio_flags & EDGE_RUNNER_AUDIO_FLAG_HAS_DATA) != 0;
-    if (has_audio) {
-        audio_view.has_audio = audio_flags;
-        audio_view.batches = src_inputs->audio.batches > 0U
-            ? src_inputs->audio.batches
-            : static_cast<uint32_t>(effective_batches);
-        audio_view.channels = src_inputs->audio.channels > 0U
-            ? src_inputs->audio.channels
-            : static_cast<uint32_t>(effective_channels);
-        audio_view.frames = src_inputs->audio.frames > 0U
-            ? src_inputs->audio.frames
-            : static_cast<uint32_t>(expected_frames);
-        size_t frame_count = audio_view.frames > 0U
-            ? static_cast<size_t>(audio_view.frames)
-            : static_cast<size_t>(expected_frames);
-        size_t sample_count = static_cast<size_t>(effective_slot_count) * frame_count;
-        if (sample_count > 0U) {
-            audio_data.resize(sample_count, 0.0);
-            if (src_inputs->audio.data != NULL) {
-                std::memcpy(audio_data.data(), src_inputs->audio.data, sample_count * sizeof(double));
+    // Only (re)bind audio inputs on first initialization for this command.
+    // When reusing the shared command, keep previously bound audio buffer
+    // to avoid re-appending identical PCM every call.
+    if (!inputs_bound) {
+        audio_data.clear();
+        audio_view = {};
+        const uint32_t audio_flags = (src_inputs != NULL) ? src_inputs->audio.has_audio : 0U;
+        const bool has_audio = (audio_flags & EDGE_RUNNER_AUDIO_FLAG_HAS_DATA) != 0;
+        if (has_audio) {
+            audio_view.has_audio = audio_flags;
+            audio_view.batches = src_inputs->audio.batches > 0U
+                ? src_inputs->audio.batches
+                : static_cast<uint32_t>(effective_batches);
+            audio_view.channels = src_inputs->audio.channels > 0U
+                ? src_inputs->audio.channels
+                : static_cast<uint32_t>(effective_channels);
+            audio_view.frames = src_inputs->audio.frames > 0U
+                ? src_inputs->audio.frames
+                : static_cast<uint32_t>(expected_frames);
+            size_t frame_count = audio_view.frames > 0U
+                ? static_cast<size_t>(audio_view.frames)
+                : static_cast<size_t>(expected_frames);
+            size_t sample_count = static_cast<size_t>(effective_slot_count) * frame_count;
+            if (sample_count > 0U) {
+                audio_data.resize(sample_count, 0.0);
+                if (src_inputs->audio.data != NULL) {
+                    std::memcpy(audio_data.data(), src_inputs->audio.data, sample_count * sizeof(double));
+                }
+                audio_view.data = audio_data.data();
+            } else {
+                audio_view.data = nullptr;
             }
-            audio_view.data = audio_data.data();
         } else {
+            audio_view.has_audio = 0U;
+            audio_view.batches = static_cast<uint32_t>(effective_batches);
+            audio_view.channels = static_cast<uint32_t>(effective_channels);
+            audio_view.frames = static_cast<uint32_t>(expected_frames);
             audio_view.data = nullptr;
         }
-    } else {
-        audio_view.has_audio = 0U;
-        audio_view.batches = static_cast<uint32_t>(effective_batches);
-        audio_view.channels = static_cast<uint32_t>(effective_channels);
-        audio_view.frames = static_cast<uint32_t>(expected_frames);
-        audio_view.data = nullptr;
     }
 
     param_views.clear();
@@ -1675,6 +1688,7 @@ bool FftDivWorkerCommand::append_inputs(
     int frames,
     int slot_count
 ) {
+    const bool already_bound = inputs_bound;
     const bool final_flag = (src_inputs != NULL)
         && ((src_inputs->audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_FINAL) != 0U);
     if (task.final_delivery && !final_flag) {
@@ -1684,6 +1698,9 @@ bool FftDivWorkerCommand::append_inputs(
     if (!prepare(src_inputs, batches, channels, frames, slot_count)) {
         return false;
     }
+    // Reset consumed flag for each new streaming chunk.
+    // This ensures subsequent chunks can be processed (not suppressed as already-consumed).
+    input_consumed_once = false;
     int appended_frames = frames;
     if (appended_frames <= 0) {
         appended_frames = expected_frames;
@@ -1692,9 +1709,19 @@ bool FftDivWorkerCommand::append_inputs(
         appended_frames = 1;
     }
     expected_frames = appended_frames;
+    // On reuse of the same shared command, do not include audio again.
+    // Clear audio flags/data for this call so Stage 1 does not re-append.
+    // Keep frames unchanged to preserve downstream expectations.
+    if (already_bound) {
+        inputs.audio.has_audio = 0U;
+        inputs.audio.data = nullptr;
+    }
     if (final_flag) {
         task.final_delivery = true;
     }
+    // Mark that audio inputs have been bound so subsequent reuses of this
+    // shared command do not re-include the same buffer.
+    inputs_bound = true;
     return true;
 }
 #endif
@@ -1830,6 +1857,7 @@ typedef union {
                 std::deque<PendingSpectrum> pending_spectra;
                 std::vector<double> pcm_backlog;
                 std::size_t pcm_consumed_samples{0U};
+                std::size_t input_frame_cursor{0U};
                 bool warmup_complete{false};
                 double last_pcm_output{0.0};
                 std::size_t total_ingested_samples{0U};
@@ -3380,6 +3408,7 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.inverse_queue.clear();
         slot.pcm_backlog.clear();
         slot.pcm_consumed_samples = 0U;
+        slot.input_frame_cursor = 0U;
         slot.warmup_complete = false;
         slot.last_pcm_output = 0.0;
         slot.total_ingested_samples = 0U;
@@ -3442,35 +3471,66 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
     if (!rebuild) {
         try {
             for (auto &slot : state->u.fftdiv.stream_slots) {
+                // Ensure buffer capacities without destroying live contents/state.
                 if (slot.forward_stage_real.size() != stage_capacity) {
-                    slot.forward_stage_real.assign(stage_capacity, 0.0);
+                    std::vector<double> tmp(stage_capacity, 0.0);
+                    const size_t copy = (tmp.size() < slot.forward_stage_real.size())
+                        ? tmp.size()
+                        : slot.forward_stage_real.size();
+                    if (copy > 0) memcpy(tmp.data(), slot.forward_stage_real.data(), copy * sizeof(double));
+                    slot.forward_stage_real.swap(tmp);
                 }
                 if (slot.forward_stage_imag.size() != stage_capacity) {
-                    slot.forward_stage_imag.assign(stage_capacity, 0.0);
+                    std::vector<double> tmp(stage_capacity, 0.0);
+                    const size_t copy = (tmp.size() < slot.forward_stage_imag.size())
+                        ? tmp.size()
+                        : slot.forward_stage_imag.size();
+                    if (copy > 0) memcpy(tmp.data(), slot.forward_stage_imag.data(), copy * sizeof(double));
+                    slot.forward_stage_imag.swap(tmp);
                 }
                 if (slot.forward_real.size() != spectral_capacity) {
-                    slot.forward_real.assign(spectral_capacity, 0.0);
+                    std::vector<double> tmp(spectral_capacity, 0.0);
+                    const size_t copy = (tmp.size() < slot.forward_real.size())
+                        ? tmp.size()
+                        : slot.forward_real.size();
+                    if (copy > 0) memcpy(tmp.data(), slot.forward_real.data(), copy * sizeof(double));
+                    slot.forward_real.swap(tmp);
                 }
                 if (slot.forward_imag.size() != spectral_capacity) {
-                    slot.forward_imag.assign(spectral_capacity, 0.0);
+                    std::vector<double> tmp(spectral_capacity, 0.0);
+                    const size_t copy = (tmp.size() < slot.forward_imag.size())
+                        ? tmp.size()
+                        : slot.forward_imag.size();
+                    if (copy > 0) memcpy(tmp.data(), slot.forward_imag.data(), copy * sizeof(double));
+                    slot.forward_imag.swap(tmp);
                 }
                 if (slot.inverse_scratch.size() != static_cast<std::size_t>(window_size)) {
-                    slot.inverse_scratch.assign(static_cast<std::size_t>(window_size), 0.0);
+                    std::vector<double> tmp(static_cast<std::size_t>(window_size), 0.0);
+                    const size_t copy = (tmp.size() < slot.inverse_scratch.size())
+                        ? tmp.size()
+                        : slot.inverse_scratch.size();
+                    if (copy > 0) memcpy(tmp.data(), slot.inverse_scratch.data(), copy * sizeof(double));
+                    slot.inverse_scratch.swap(tmp);
                 }
+                // Update capacities; do NOT reset indices or clear queues.
                 slot.forward_frame_capacity = stage_frames;
-                slot.forward_ring_capacity_frames = ring_frames;
-                slot.forward_ring_write = 0U;
-                slot.forward_ring_read = 0U;
-                slot.forward_ring_filled = 0U;
-                slot.forward_ring_wrapped = false;
-                slot.forward_frames_ready = 0U;
-                slot.pcm_backlog.clear();
-                slot.pcm_consumed_samples = 0U;
-                slot.total_ingested_samples = 0U;
-                slot.tail_injected_samples = 0U;
-                slot.zero_tail_enqueued = false;
-                slot.ingest_finalized = false;
-                slot.final_flag_observed = false;
+                // If ring capacity increased, keep indices and filled; if decreased, clamp safely.
+                if (slot.forward_ring_capacity_frames != ring_frames) {
+                    // Attempt to preserve circular indices; clamp filled if needed.
+                    slot.forward_ring_capacity_frames = ring_frames;
+                    if (slot.forward_ring_capacity_frames > 0U && slot.forward_ring_filled > slot.forward_ring_capacity_frames) {
+                        slot.forward_ring_filled = slot.forward_ring_capacity_frames;
+                        // Adjust read/write to remain in range
+                        if (slot.forward_ring_read >= slot.forward_ring_capacity_frames) {
+                            slot.forward_ring_read %= slot.forward_ring_capacity_frames;
+                        }
+                        if (slot.forward_ring_write >= slot.forward_ring_capacity_frames) {
+                            slot.forward_ring_write %= slot.forward_ring_capacity_frames;
+                        }
+                    }
+                }
+                // Preserve: forward_ring_write/read/filled, forward_frames_ready, pcm_backlog and consumed counters
+                // Preserve: input_frame_cursor, total_ingested_samples, zero-tail flags
             }
         } catch (...) {
             return -1;
@@ -3514,6 +3574,7 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.inverse_queue.clear();
             slot.pcm_backlog.clear();
             slot.pcm_consumed_samples = 0U;
+            slot.input_frame_cursor = 0U;
             slot.warmup_complete = false;
             slot.last_pcm_output = 0.0;
             slot.total_ingested_samples = 0U;
@@ -4311,7 +4372,7 @@ static int amp_wait_node_completion_impl(
                 int final_status = 0;
                 
                 // Poll and accumulate entries until we have enough frames
-                const int max_poll_attempts = 10000;
+                const int max_poll_attempts = 10;
                 int poll_attempts = 0;
                 
                 while (total_frames < expected_frames && poll_attempts < max_poll_attempts) {
