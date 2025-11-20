@@ -174,11 +174,33 @@ If you're in a restricted network environment:
 ## Recent Changes
 
 The recent fix addresses an issue where `io_mode="spectral"` was not properly honored:
-- Added `io_mode` field to fftdiv state structure
-- Parse `io_mode` from JSON parameters during initialization
-- Skip inverse FFT handle creation when `io_mode=1` (spectral)
-- Update lane planning to disable PCM output in spectral mode
-- Stage 5 (ISTFT) is now skipped when no inverse handle exists
+- Added `io_mode` field to fftdiv state structure (amp_kernels.c line ~1958)
+- Parse `io_mode` from JSON parameters during initialization (fft_division_nodes.inc line ~1472)
+- Skip inverse FFT handle creation when `io_mode=1` (spectral) (amp_kernels.c line ~3596)
+- Update lane planning to disable PCM output in spectral mode (fft_division_nodes.inc line ~1311)
+- Suppress ANOMALY log when zero PCM is expected in spectral mode (fft_division_nodes.inc line ~3032)
+- Stage 5 (ISTFT) is now skipped when no inverse handle exists (already checked at line ~2931)
+
+### Problem Statement
+
+The test `test_fft_division_node` was failing with repeated log messages:
+```
+[STAGE5-PCM-DISPATCH] pcm_written=0 frames_to_push=0 ANOMALY
+```
+
+This occurred because:
+1. The `io_mode="spectral"` parameter was being ignored
+2. Inverse FFT handles were created even in spectral-only mode
+3. Stage5 attempted to produce PCM output even when none was expected
+4. Zero PCM output was flagged as anomalous in all modes
+
+### Solution
+
+The fix implements proper `io_mode` handling through defense-in-depth:
+- **Prevention at creation**: Don't create inverse FFT handle in spectral mode
+- **Prevention at enqueue**: Don't queue spectra for ISTFT when `enable_pcm_out=false`
+- **Prevention at execution**: Stage5 checks for null inverse handle
+- **Proper logging**: Suppress false ANOMALY messages in spectral mode
 
 ## Contact & Resources
 
