@@ -3509,6 +3509,10 @@ static void fftdiv_worker_main(node_state_t *state) {
                 // A zero-tail drain is still keeping at least one stage busy;
                 // hold the command open until every stage lock reports idle.
             } else {
+                // Reset command state for reuse in next streaming chunk.
+                // This allows append_inputs to bind new audio data.
+                command->inputs_bound = false;
+                command->input_consumed_once = false;
                 worker.shared_command = command;
                 worker.active_command.reset();
             }
