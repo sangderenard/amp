@@ -207,6 +207,8 @@ static inline void amp_spectral_mailbox_entry_release(AmpSpectralMailboxEntry *e
 AMP_CAPI AmpMailboxEntry *amp_node_mailbox_pop(void *state);
 AMP_CAPI void amp_node_mailbox_push(void *state, AmpMailboxEntry *entry);
 AMP_CAPI void amp_node_mailbox_clear(void *state);
+AMP_CAPI AmpMailboxEntry *amp_node_mailbox_head(void *state);
+AMP_CAPI AmpMailboxEntry *amp_node_mailbox_tail(void *state);
 AMP_CAPI AmpSpectralMailboxEntry *amp_node_spectral_mailbox_pop(void *state);
 AMP_CAPI void amp_node_spectral_mailbox_push(void *state, AmpSpectralMailboxEntry *entry);
 AMP_CAPI void amp_node_spectral_mailbox_clear(void *state);

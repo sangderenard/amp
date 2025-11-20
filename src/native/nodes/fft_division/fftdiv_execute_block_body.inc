@@ -109,6 +109,22 @@
     }
     state->u.fftdiv.log_slice_bin_cap = configured_slice_cap;
 
+    int halt_on_zero_flag = json_get_bool(
+        descriptor->params_json,
+        descriptor->params_len,
+        "halt_on_zero_stage_output",
+        state->u.fftdiv.halt_on_zero_stage_output
+    );
+    state->u.fftdiv.halt_on_zero_stage_output = (halt_on_zero_flag != 0) ? 1 : 0;
+
+    int halt_stage5_flag = json_get_bool(
+        descriptor->params_json,
+        descriptor->params_len,
+        "halt_on_zero_stage5_pcm_output",
+        state->u.fftdiv.halt_on_zero_stage5_pcm_output
+    );
+    state->u.fftdiv.halt_on_zero_stage5_pcm_output = (halt_stage5_flag != 0) ? 1 : 0;
+
     // Default working frequency bins should follow the effective window_size
     // so the tensor's bin dimension matches the STFT output bins unless explicitly overridden.
     int working_freq_bins = json_get_int(

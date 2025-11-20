@@ -149,6 +149,117 @@ static int fftdiv_should_log(const node_state_t *state, int required_level) {
         }                                                                      \
     } while (0)
 
+static int fftdiv_stage_assert_enabled(const node_state_t *state) {
+    return (state != NULL && state->u.fftdiv.halt_on_zero_stage_output != 0);
+}
+
+static int fftdiv_block_has_signal(const double *values, size_t count) {
+    if (values == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (values[i] != 0.0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int fftdiv_complex_block_has_signal(const double *real, const double *imag, size_t count) {
+    if (real == NULL && imag == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const double re = (real != NULL) ? real[i] : 0.0;
+        const double im = (imag != NULL) ? imag[i] : 0.0;
+        if (re != 0.0 || im != 0.0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void fftdiv_stage_trigger_halt(
+    node_state_t *state,
+    const char *stage_name,
+    int slot,
+    const char *detail,
+    const double *probe_real,
+    const double *probe_imag,
+    size_t probe_count
+) {
+    if (stage_name == NULL) {
+        stage_name = "stage";
+    }
+    const char *reason = (detail != NULL) ? detail : "zero-output";
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[STAGE-HALT] stage=%s slot=%d reason=%s samples=%zu\n",
+               stage_name,
+               slot,
+               reason,
+               probe_count);
+    const size_t sample_cap = (probe_count < 4U) ? probe_count : 4U;
+    for (size_t i = 0; i < sample_cap; ++i) {
+        const double re = (probe_real != NULL) ? probe_real[i] : 0.0;
+        const double im = (probe_imag != NULL) ? probe_imag[i] : 0.0;
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+                   "[STAGE-HALT] sample[%zu]=%.6g%+.6gi\n",
+                   i,
+                   re,
+                   im);
+    }
+    fprintf(stderr,
+            "[fftdiv-stage-halt] stage=%s slot=%d reason=%s samples=%zu\n",
+            stage_name,
+            slot,
+            reason,
+            probe_count);
+    for (size_t i = 0; i < sample_cap; ++i) {
+        const double re = (probe_real != NULL) ? probe_real[i] : 0.0;
+        const double im = (probe_imag != NULL) ? probe_imag[i] : 0.0;
+        fprintf(stderr,
+                "[fftdiv-stage-halt] sample[%zu]=%.12g%+.12gi\n",
+                i,
+                re,
+                im);
+    }
+    fflush(stderr);
+    abort();
+}
+
+static void fftdiv_stage_assert_complex_output(
+    node_state_t *state,
+    const char *stage_name,
+    int slot,
+    const double *real,
+    const double *imag,
+    size_t value_count
+) {
+    if (!fftdiv_stage_assert_enabled(state) || value_count == 0) {
+        return;
+    }
+    if (fftdiv_complex_block_has_signal(real, imag, value_count)) {
+        return;
+    }
+    fftdiv_stage_trigger_halt(state, stage_name, slot, "complex-output-zero", real, imag, value_count);
+}
+
+static void fftdiv_stage_assert_real_output(
+    node_state_t *state,
+    const char *stage_name,
+    int slot,
+    const double *values,
+    size_t value_count
+) {
+    if (!fftdiv_stage_assert_enabled(state) || value_count == 0) {
+        return;
+    }
+    if (fftdiv_block_has_signal(values, value_count)) {
+        return;
+    }
+    fftdiv_stage_trigger_halt(state, stage_name, slot, "pcm-output-zero", values, NULL, value_count);
+}
+
 #if defined(__cplusplus)
 static int fftdiv_window_effective_span(const node_state_t *state, int wheel_length) {
     if (wheel_length <= 0) {
@@ -1350,6 +1461,14 @@ static int fftdiv_execute_block(
     }
     state->u.fftdiv.log_slice_bin_cap = configured_slice_cap;
 
+    int halt_on_zero_flag = json_get_bool(
+        descriptor->params_json,
+        descriptor->params_len,
+        "halt_on_zero_stage_output",
+        state->u.fftdiv.halt_on_zero_stage_output
+    );
+    state->u.fftdiv.halt_on_zero_stage_output = (halt_on_zero_flag != 0) ? 1 : 0;
+
     // Default working frequency bins should follow the effective window_size
     // so the tensor's bin dimension matches the STFT output bins unless explicitly overridden.
     int working_freq_bins = json_get_int(
@@ -1903,6 +2022,21 @@ static int fftdiv_execute_block(
                             slot_spectral_imag,
                             stage_capacity_frames,
                             flush_mode);
+                        if (frames_emitted > 0 && window_size > 0 && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
+                            if (fftdiv_stage_assert_enabled(state)) {
+                                const size_t frame_bins = (size_t)window_size;
+                                for (size_t emitted_index = 0; emitted_index < frames_emitted; ++emitted_index) {
+                                    const size_t base_offset = emitted_index * frame_bins;
+                                    fftdiv_stage_assert_complex_output(
+                                        state,
+                                        "stage1",
+                                        slot,
+                                        slot_spectral_real + base_offset,
+                                        slot_spectral_imag + base_offset,
+                                        frame_bins);
+                                }
+                            }
+                        }
                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                                    "[STAGE1-FFT] slot=%d\n"
                                    "  Spectral data removed from backend: frames_emitted=%zu\n"
@@ -2276,6 +2410,15 @@ static int fftdiv_execute_block(
                     commit_real,
                     commit_imag,
                     commit_bins);
+                if (commit_bins > 0) {
+                    fftdiv_stage_assert_complex_output(
+                        state,
+                        "stage2",
+                        slot,
+                        commit_real,
+                        commit_imag,
+                        (size_t)commit_bins);
+                }
                 /* TODO: introduce interpolation when tensor_freq_bins != commit_bins. */
                 if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
                     memset(scratch_real, 0, (size_t)scratch_bins * sizeof(double));
@@ -2533,6 +2676,13 @@ static int fftdiv_execute_block(
                         lane_snapshot.spectral_real.data(),
                         lane_snapshot.spectral_imag.data(),
                         window_size);
+                    fftdiv_stage_assert_complex_output(
+                        state,
+                        "stage3",
+                        slot,
+                        lane_snapshot.spectral_real.data(),
+                        lane_snapshot.spectral_imag.data(),
+                        (size_t)window_size);
                 }
             } else {
                 if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
@@ -2661,6 +2811,13 @@ static int fftdiv_execute_block(
                 }
                 if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
                     if (lane.enable_spectral_out) {
+                        fftdiv_stage_assert_complex_output(
+                            state,
+                            "stage4",
+                            slot,
+                            released_real,
+                            released_imag,
+                            (size_t)window_size);
                         /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
                         const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
                         stage_emit_spectral(
@@ -2738,44 +2895,57 @@ static int fftdiv_execute_block(
     // Stage 5: Owns spectral -> PCM conversion (ISTFT) plus overlap-add retention; logs must only mention PCM work
     
     size_t buffer_offset = 0;
-    for (int slot = 0; slot < slot_count; ++slot) {
-        auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
-        // First, run inverse on spectra accumulated by Stage 3
-        while (!slot_state.pending_spectra.empty() && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
-            auto &pending = slot_state.pending_spectra.front();
-            const size_t produced_pcm = amp_fft_backend_stream_push_spectrum(
-                slot_state.inverse_handle,
-                pending.real.empty() ? NULL : pending.real.data(),
-                pending.imag.empty() ? NULL : pending.imag.data(),
-                1,
-                window_size,
-                slot_state.inverse_scratch.data(),
-                slot_state.inverse_scratch.size(),
-                flush_mode);
-            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                       "[STAGE5-PCM-ISTFT] slot=%d produced_pcm=%zu\n",
-                       slot,
-                       produced_pcm);
-            if (produced_pcm > 0) {
-                made_progress = true;
+    const bool stage5_pcm_assert_enabled =
+        (state != nullptr && state->u.fftdiv.halt_on_zero_stage_output != 0 &&
+         state->u.fftdiv.halt_on_zero_stage5_pcm_output != 0);
+
+    if (stage5_unlocked) {
+        for (int slot = 0; slot < slot_count; ++slot) {
+            auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
+            // First, run inverse on spectra accumulated by Stage 3
+            while (!slot_state.pending_spectra.empty() && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
+                auto &pending = slot_state.pending_spectra.front();
+                const size_t produced_pcm = amp_fft_backend_stream_push_spectrum(
+                    slot_state.inverse_handle,
+                    pending.real.empty() ? NULL : pending.real.data(),
+                    pending.imag.empty() ? NULL : pending.imag.data(),
+                    1,
+                    window_size,
+                    slot_state.inverse_scratch.data(),
+                    slot_state.inverse_scratch.size(),
+                    flush_mode);
+                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                           "[STAGE5-PCM-ISTFT] slot=%d produced_pcm=%zu\n",
+                           slot,
+                           produced_pcm);
+                if (produced_pcm > 0) {
+                    made_progress = true;
+                }
+                for (size_t i = 0; i < produced_pcm && i < slot_state.inverse_scratch.size(); ++i) {
+                    slot_state.inverse_queue.push_back(slot_state.inverse_scratch[i]);
+                }
+                slot_state.pending_spectra.pop_front();
             }
-            for (size_t i = 0; i < produced_pcm && i < slot_state.inverse_scratch.size(); ++i) {
-                slot_state.inverse_queue.push_back(slot_state.inverse_scratch[i]);
+            while (!slot_state.inverse_queue.empty() && buffer_offset < total_samples) {
+                double sample_value = slot_state.inverse_queue.front();
+                if (stage5_pcm_assert_enabled) {
+                    fftdiv_stage_assert_real_output(state, "stage5", slot, &sample_value, 1U);
+                }
+                buffer[buffer_offset] = sample_value;
+                slot_state.inverse_queue.pop_front();
+                      FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                          "[STAGE5-PCM-QUEUE] slot=%d buffer_idx=%zu value=%.6g queue_remaining=%zu\n",
+                           slot,
+                           buffer_offset,
+                           buffer[buffer_offset],
+                           slot_state.inverse_queue.size());
+                buffer_offset++;
+                pcm_written_samples++;
             }
-            slot_state.pending_spectra.pop_front();
         }
-        while (!slot_state.inverse_queue.empty() && buffer_offset < total_samples) {
-            buffer[buffer_offset] = slot_state.inverse_queue.front();
-            slot_state.inverse_queue.pop_front();
-                  FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                      "[STAGE5-PCM-QUEUE] slot=%d buffer_idx=%zu value=%.6g queue_remaining=%zu\n",
-                       slot,
-                       buffer_offset,
-                       buffer[buffer_offset],
-                       slot_state.inverse_queue.size());
-            buffer_offset++;
-            pcm_written_samples++;
-        }
+    } else if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                   "[STAGE5-SKIP] snapshot locked, deferring ISTFT/PCM emit\n");
     }
 
     if (wheel_length > 0) {

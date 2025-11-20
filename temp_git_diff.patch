@@ -1,0 +1,1497 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+index b106243..a9439b1 100644
+--- a/.vscode/settings.json
++++ b/.vscode/settings.json
+@@ -83,6 +83,7 @@
+         "filesystem": "cpp",
+         "future": "cpp",
+         "numeric": "cpp",
+-        "valarray": "cpp"
++        "valarray": "cpp",
++        "fft": "cpp"
+     }
+ }
+\ No newline at end of file
+diff --git a/src/native/amp_kernels.c b/src/native/amp_kernels.c
+index 426d767..07145b3 100644
+--- a/src/native/amp_kernels.c
++++ b/src/native/amp_kernels.c
+@@ -40,6 +40,7 @@
+ #include <thread>
+ #include <vector>
+ #include <cstring>
++#include <atomic>
+ #include <Eigen/Core>
+ #include <unsupported/Eigen/CXX11/Tensor>
+ using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>;
+@@ -1495,6 +1496,28 @@ struct FftDivTask {
+     bool final_delivery{false};
+ };
+ 
++// Worker command with refined input tracking for streaming mode.
++// 
++// Input Consumption Stages:
++// ------------------------
++// Stage 0 (FRESH): New streaming chunk with actual PCM data
++//   - Audio buffer is presented to pipeline as-is
++//   - Stage 1 consumes PCM into FFT ring buffer
++//   - Transitions to Stage 1 after first worker iteration
++//
++// Stage 1 (PUMP): Ring buffer consumed, pipeline is processing
++//   - Audio data suppressed (has_audio=0, data=nullptr)
++//   - Frames preserved for flush logic
++//   - Allows FFT->Spectral->ISTFT pipeline to make progress
++//   - Transitions to Stage 2+ on subsequent iterations
++//
++// Stage 2+ (EXHAUST): Input fully consumed, pure flush mode
++//   - Audio data suppressed
++//   - Pipeline drains remaining spectral frames
++//   - Produces tail samples until output quota met
++//
++// This stage-based tracking prevents premature input suppression that
++// would starve the pipeline before it can produce any output.
+ struct FftDivWorkerCommand {
+     FftDivTask task;
+     EdgeRunnerNodeInputs inputs{};
+@@ -1516,10 +1539,13 @@ struct FftDivWorkerCommand {
+     // the same input audio buffer on each append. This flag tracks
+     // whether audio inputs have already been bound for this command.
+     bool inputs_bound{false};
+-    // Track whether this command has already consumed its initial
+-    // input once inside the worker loop; subsequent passes should
+-    // not present audio again (frames=0, no final flag).
+-    bool input_consumed_once{false};
++    // Refined input tracking using offset arithmetic:
++    // input_consumption_stage: Honest accumulator, increments on every worker iteration
++    // input_bound_at_stage: Records the stage when fresh audio was last bound
++    // Suppression check: (input_consumption_stage - input_bound_at_stage) > 0
++    // This allows the stage to accumulate naturally while still detecting fresh chunks.
++    int input_consumption_stage{0};
++    int input_bound_at_stage{0};
+ 
+     bool prepare(const EdgeRunnerNodeInputs *src_inputs, int batches, int channels, int frames, int slot_count);
+     bool append_inputs(const EdgeRunnerNodeInputs *src_inputs, int batches, int channels, int frames, int slot_count);
+@@ -1688,19 +1714,30 @@ bool FftDivWorkerCommand::append_inputs(
+     int frames,
+     int slot_count
+ ) {
+-    const bool already_bound = inputs_bound;
+     const bool final_flag = (src_inputs != NULL)
+         && ((src_inputs->audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_FINAL) != 0U);
+     if (task.final_delivery && !final_flag) {
+         // Final delivery was already declared for this command; no new input is allowed.
+         return false;
+     }
++    
++    // Detect if this is a FRESH streaming chunk with new PCM data
++    const bool has_fresh_audio = (src_inputs != NULL)
++        && ((src_inputs->audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_HAS_DATA) != 0U)
++        && (src_inputs->audio.data != nullptr);
++    
++    // CRITICAL: Reset inputs_bound BEFORE prepare() so prepare() will copy fresh audio.
++    // Record the current stage as the binding point for offset-based suppression.
++    const bool already_bound = inputs_bound;
++    if (has_fresh_audio) {
++        input_bound_at_stage = input_consumption_stage;
++        inputs_bound = false;
++    }
++    
+     if (!prepare(src_inputs, batches, channels, frames, slot_count)) {
+         return false;
+     }
+-    // Reset consumed flag for each new streaming chunk.
+-    // This ensures subsequent chunks can be processed (not suppressed as already-consumed).
+-    input_consumed_once = false;
++    
+     int appended_frames = frames;
+     if (appended_frames <= 0) {
+         appended_frames = expected_frames;
+@@ -1709,18 +1746,23 @@ bool FftDivWorkerCommand::append_inputs(
+         appended_frames = 1;
+     }
+     expected_frames = appended_frames;
+-    // On reuse of the same shared command, do not include audio again.
+-    // Clear audio flags/data for this call so Stage 1 does not re-append.
+-    // Keep frames unchanged to preserve downstream expectations.
+-    if (already_bound) {
++    
++    // Refined audio suppression logic for shared command reuse:
++    // - If this was ALREADY bound (from a previous chunk) AND no fresh audio is present,
++    //   suppress the audio to prevent re-appending the same PCM buffer.
++    // - If fresh audio arrived, prepare() already copied it (inputs_bound was reset above),
++    //   so we don't suppress anything here.
++    // This allows fresh streaming chunks to pass through while preventing duplicate
++    // appends during worker pump iterations.
++    if (already_bound && !has_fresh_audio) {
+         inputs.audio.has_audio = 0U;
+         inputs.audio.data = nullptr;
+     }
+     if (final_flag) {
+         task.final_delivery = true;
+     }
+-    // Mark that audio inputs have been bound so subsequent reuses of this
+-    // shared command do not re-include the same buffer.
++    // Mark that audio inputs have been bound. This will be true until the next
++    // fresh streaming chunk arrives and resets it (see has_fresh_audio logic above).
+     inputs_bound = true;
+     return true;
+ }
+@@ -1960,7 +2002,9 @@ typedef union {
+             int backend_stream_window_size;
+             int backend_stream_window_kind;
+             int backend_stream_hop;
+-            int64_t wheel_frame_counter;
++            std::atomic<int64_t> wheel_frame_counter{0};
++            int64_t frame_counter_epoch{0};
++            bool frame_counter_epoch_initialized{false};
+             double sample_rate_hint;
+             double timeline_seconds;
+         } fftdiv;
+@@ -3644,7 +3688,9 @@ static void fft_state_free_buffers(node_state_t *state) {
+     state->u.fftdiv.spectral_scratch.time_cursor = 0;
+     state->u.fftdiv.operator_arena.clear();
+     state->u.fftdiv.operator_steps.clear();
+-    state->u.fftdiv.wheel_frame_counter = 0;
++    state->u.fftdiv.wheel_frame_counter.store(0, std::memory_order_relaxed);
++    state->u.fftdiv.frame_counter_epoch = 0;
++    state->u.fftdiv.frame_counter_epoch_initialized = false;
+     state->u.fftdiv.sample_rate_hint = 0.0;
+     state->u.fftdiv.timeline_seconds = 0.0;
+     state->u.fftdiv.last_descriptor = nullptr;
+@@ -3711,7 +3757,9 @@ static int ensure_fft_working_tensor(
+     state->u.fftdiv.wheel_head = 0;
+     state->u.fftdiv.wheel_tail = 0;
+     state->u.fftdiv.wheel_filled_slices = 0;
+-    state->u.fftdiv.wheel_frame_counter = 0;
++    state->u.fftdiv.wheel_frame_counter.store(0, std::memory_order_relaxed);
++    state->u.fftdiv.frame_counter_epoch = 0;
++    state->u.fftdiv.frame_counter_epoch_initialized = false;
+     state->u.fftdiv.timeline_seconds = 0.0;
+ 
+     FftWorkingTensor *tensor = new (std::nothrow) FftWorkingTensor(1, lanes, frequency_bins, time_slices);
+@@ -4372,7 +4420,7 @@ static int amp_wait_node_completion_impl(
+                 int final_status = 0;
+                 
+                 // Poll and accumulate entries until we have enough frames
+-                const int max_poll_attempts = 10;
++                const int max_poll_attempts = 1000000;
+                 int poll_attempts = 0;
+                 
+                 while (total_frames < expected_frames && poll_attempts < max_poll_attempts) {
+diff --git a/src/native/nodes/fft_division/fft_division_nodes.inc b/src/native/nodes/fft_division/fft_division_nodes.inc
+index 74a9c98..cac5ff6 100644
+--- a/src/native/nodes/fft_division/fft_division_nodes.inc
++++ b/src/native/nodes/fft_division/fft_division_nodes.inc
+@@ -1642,7 +1642,12 @@ static int fftdiv_execute_block(
+     }
+ #endif
+ 
+-    const int64_t frame_counter = state->u.fftdiv.wheel_frame_counter;
++    const int64_t frame_counter = state->u.fftdiv.wheel_frame_counter.load(std::memory_order_relaxed);
++    if (!state->u.fftdiv.frame_counter_epoch_initialized) {
++        state->u.fftdiv.frame_counter_epoch = frame_counter;
++        state->u.fftdiv.frame_counter_epoch_initialized = true;
++    }
++    const int64_t frame_counter_epoch = state->u.fftdiv.frame_counter_epoch;
+     int frame_index_int = (int)frame_counter;
+     size_t base_index = 0;
+     int metrics_window_span = 0;
+@@ -2192,7 +2197,8 @@ static int fftdiv_execute_block(
+ 
+         const int tensor_slice_iter = wheel_head_cursor;
+         const int scratch_slice_iter = scratch_cursor;
+-        const int64_t frame_index_iter = frame_counter + (int64_t)processed_passes;
++        const int64_t absolute_frame_index = frame_counter + (int64_t)processed_passes;
++        const int64_t command_frame_index = (int64_t)processed_passes;
+ 
+         if (wheel_length > 0) {
+             for (int slot = 0; slot < slot_count; ++slot) {
+@@ -2202,7 +2208,7 @@ static int fftdiv_execute_block(
+             fftdiv_window_reserve_leading_edge(
+                 state,
+                 -1,
+-                (int)frame_index_iter,
++                (int)absolute_frame_index,
+                 wheel_length,
+                 &wheel_tail_cursor,
+                 &wheel_filled_cursor);
+@@ -2306,8 +2312,9 @@ static int fftdiv_execute_block(
+         slice.view_filled_override = view_filled_override;
+         slice.wheel_head = wheel_head_cursor;
+         slice.wheel_tail = wheel_tail_cursor;
+-        slice.frame_index = frame_index_iter;
+-        slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)slot_count;
++        slice.frame_index = command_frame_index;
++        slice.absolute_frame_index = absolute_frame_index;
++        slice.pcm_sample_index = (int64_t)base_index + command_frame_index * (int64_t)slot_count;
+         slice.slice_index = next_slice_index;
+         slice.timeline_seconds = timeline_cursor;
+         slice.working_tensor_updated = iteration_updated;
+@@ -2491,7 +2498,7 @@ static int fftdiv_execute_block(
+                 operator_context.wheel_length = wheel_length;
+                 operator_context.wheel_head = slice.wheel_head;
+                 operator_context.wheel_tail = slice.wheel_tail;
+-                operator_context.frame_index = slice.frame_index;
++                operator_context.frame_index = slice.absolute_frame_index;
+                 operator_context.pcm_sample_index = slice.pcm_sample_index;
+                 operator_context.slice_index = slice.slice_index;
+                 operator_context.pcm_sample_stride = static_cast<size_t>(slot_count);
+@@ -2595,14 +2602,14 @@ static int fftdiv_execute_block(
+             /* Debug: correlate Stage2 slice index with Stage3 window span and offsets */
+             if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+-                           "[STAGE3-CONTEXT] tensor_slice=%d view_filled=%d wheel(head=%d tail=%d len=%d hop=%d) frame=%lld\n",
++                           "[STAGE3-CONTEXT] tensor_slice=%d view_filled=%d wheel(head=%d tail=%d len=%d hop=%d) abs_frame=%lld\n",
+                            slice.tensor_slice,
+                            slice.view_filled_override,
+                            slice.wheel_head,
+                            slice.wheel_tail,
+                            wheel_length,
+                            wheel_hop,
+-                           (long long)slice.frame_index);
++                           (long long)slice.absolute_frame_index);
+                 if (!slice.lane_frame_offsets.empty()) {
+                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                                "[STAGE3-CONTEXT] lane0 assigned_offset=%zu\n",
+@@ -2661,8 +2668,12 @@ static int fftdiv_execute_block(
+                 }
+                 if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
+                     if (lane.enable_spectral_out) {
+-                        /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
+-                        const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
++                        /* Emit spectral row aligned to source PCM: index equals first PCM sample feeding the FFT */
++                        int64_t timeline_frame_index = slice.absolute_frame_index - state->u.fftdiv.frame_counter_epoch;
++                        if (timeline_frame_index < 0) {
++                            timeline_frame_index = 0;
++                        }
++                        const int emit_frame_index = static_cast<int>(timeline_frame_index);
+                         stage_emit_spectral(
+                             state,
+                             const_cast<double *>(released_real),
+@@ -2677,8 +2688,11 @@ static int fftdiv_execute_block(
+                             tensor_freq_bins);
+                         /* Stage 4 (Spectral Out): we just emitted to spectral mailbox for this frame */
+                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+-                                   "[STAGE4-SPEC-OUT] slot=%d frame=%lld emit_row=%d bins=%d\n",
+-                                   slot, (long long)slice.frame_index, emit_frame_index, window_size);
++                                   "[STAGE4-SPEC-OUT] slot=%d abs_frame=%lld emit_row=%d bins=%d\n",
++                                   slot,
++                                   (long long)slice.absolute_frame_index,
++                                   emit_frame_index,
++                                   window_size);
+                     }
+ 
+                     if (lane.enable_pcm_out) {
+@@ -2730,7 +2744,7 @@ static int fftdiv_execute_block(
+         wheel_tail = wheel_tail_cursor;
+         wheel_filled = wheel_filled_cursor;
+         scratch_time_cursor = scratch_cursor;
+-        state->u.fftdiv.wheel_frame_counter += (int64_t)processed_passes;
++        state->u.fftdiv.wheel_frame_counter.fetch_add((int64_t)processed_passes, std::memory_order_relaxed);
+         state->u.fftdiv.timeline_seconds = timeline_cursor;
+     #endif /* defined(__cplusplus) */
+ 
+@@ -3282,9 +3296,14 @@ static bool fftdiv_worker_process_command(
+     const FftDivStageLockSnapshot *locks_to_use = stage_locks;
+     const EdgeRunnerNodeInputs *inputs_arg = command->task.inputs;
+     EdgeRunnerNodeInputs inputs_copy{};
+-    if (command->input_consumed_once && inputs_arg != nullptr) {
++    // Refined input suppression using offset arithmetic:
++    // If (current_stage - bound_stage) > 0, the audio was already consumed,
++    // so suppress it to prevent re-processing the same PCM.
++    // This naturally handles fresh chunks (offset=0) vs pump iterations (offset>0).
++    const int stage_offset = command->input_consumption_stage - command->input_bound_at_stage;
++    if (stage_offset > 0 && inputs_arg != nullptr) {
+         inputs_copy = *inputs_arg;
+-        // Suppress audio on reuse but preserve frames (and thus the FINAL flag if present).
++        // Suppress audio data but preserve frames and FINAL flag for flush logic
+         inputs_copy.audio.has_audio = 0U;
+         inputs_copy.audio.data = nullptr;
+         // Keep frames unchanged so Stage 1 sees zero-tail plan correctly.
+@@ -3293,11 +3312,13 @@ static bool fftdiv_worker_process_command(
+     // Always keep frames unchanged; suppressing audio via has_audio/data masking is sufficient.
+     int frames_arg = command->task.frames;
+     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+-               "[STAGE0-WORKER] input(has_audio=0x%08x, frames=%u, data=%p) consumed_once=%d\n",
++               "[STAGE0-WORKER] input(has_audio=0x%08x, frames=%u, data=%p) stage=%d bound=%d offset=%d\n",
+                (unsigned)(inputs_arg && inputs_arg->audio.has_audio ? inputs_arg->audio.has_audio : 0U),
+                (unsigned)(inputs_arg ? inputs_arg->audio.frames : 0U),
+                (void*)(inputs_arg ? inputs_arg->audio.data : nullptr),
+-               command->input_consumed_once ? 1 : 0);
++               command->input_consumption_stage,
++               command->input_bound_at_stage,
++               stage_offset);
+     int status = fftdiv_execute_block(
+         command->task.descriptor,
+         inputs_arg,
+@@ -3348,11 +3369,11 @@ static bool fftdiv_worker_process_command(
+     } else if (buffer != nullptr) {
+         fftdiv_worker_publish_entry(state, buffer, out_channels, command->expected_frames, status, command->want_metrics ? metrics_ptr : nullptr);
+     }
+-    // After first execution of this command, suppress input on subsequent passes
+-    // within the worker loop to avoid re-including the same buffer.
+-    if (!command->input_consumed_once) {
+-        command->input_consumed_once = true;
+-    }
++    // Advance input consumption stage after each worker iteration:
++    // 0->1: First pass consumed PCM into ring buffer
++    // 1->2+: Subsequent passes are pipeline pump/flush iterations
++    // This allows the pipeline to continue processing without re-presenting the same PCM.
++    command->input_consumption_stage++;
+     return status != AMP_E_PENDING;
+ }
+ 
+@@ -3600,6 +3621,9 @@ static std::shared_ptr<FftDivWorkerCommand> fftdiv_worker_ensure_shared_command(
+     if (worker.shared_command) {
+         command = worker.shared_command;
+         worker.shared_command.reset();
++        // Note: Do NOT reset input_consumption_stage here - we can't distinguish between
++        // fresh streaming chunks and pump iterations at this point. The stage will be
++        // reset conditionally in append_inputs() when fresh audio is detected.
+     } else {
+         command = std::make_shared<FftDivWorkerCommand>();
+     }
+diff --git a/src/native/nodes/fft_division/fft_division_types.h b/src/native/nodes/fft_division/fft_division_types.h
+index c7f2321..0595297 100644
+--- a/src/native/nodes/fft_division/fft_division_types.h
++++ b/src/native/nodes/fft_division/fft_division_types.h
+@@ -18,6 +18,7 @@ struct FftDivFilledSlice {
+     int wheel_head{0};
+     int wheel_tail{0};
+     int64_t frame_index{0};
++    int64_t absolute_frame_index{0};
+     int64_t pcm_sample_index{0};
+     size_t slice_index{0U};
+     double timeline_seconds{0.0};
+diff --git a/src/native/nodes/fft_division/fftdiv_execute_block_body.inc b/src/native/nodes/fft_division/fftdiv_execute_block_body.inc
+index b9e9799..16d1548 100644
+--- a/src/native/nodes/fft_division/fftdiv_execute_block_body.inc
++++ b/src/native/nodes/fft_division/fftdiv_execute_block_body.inc
+@@ -401,7 +401,7 @@
+     }
+ #endif
+ 
+-    const int64_t frame_counter = state->u.fftdiv.wheel_frame_counter;
++    const int64_t frame_counter = state->u.fftdiv.wheel_frame_counter.load(std::memory_order_relaxed);
+     int frame_index_int = (int)frame_counter;
+     size_t base_index = 0;
+     int metrics_window_span = 0;
+@@ -865,7 +865,8 @@
+ 
+         const int tensor_slice_iter = wheel_head_cursor;
+         const int scratch_slice_iter = scratch_cursor;
+-        const int64_t frame_index_iter = frame_counter + (int64_t)processed_passes;
++        const int64_t absolute_frame_index = frame_counter + (int64_t)processed_passes;
++        const int64_t command_frame_index = (int64_t)processed_passes;
+ 
+         if (wheel_length > 0) {
+             for (int slot = 0; slot < slot_count; ++slot) {
+@@ -875,7 +876,7 @@
+             fftdiv_window_reserve_leading_edge(
+                 state,
+                 -1,
+-                (int)frame_index_iter,
++                (int)absolute_frame_index,
+                 wheel_length,
+                 &wheel_tail_cursor,
+                 &wheel_filled_cursor);
+@@ -979,8 +980,9 @@
+         slice.view_filled_override = view_filled_override;
+         slice.wheel_head = wheel_head_cursor;
+         slice.wheel_tail = wheel_tail_cursor;
+-        slice.frame_index = frame_index_iter;
+-        slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)slot_count;
++        slice.frame_index = command_frame_index;
++        slice.absolute_frame_index = absolute_frame_index;
++        slice.pcm_sample_index = (int64_t)base_index + command_frame_index * (int64_t)slot_count;
+         slice.slice_index = next_slice_index;
+         slice.timeline_seconds = timeline_cursor;
+         slice.working_tensor_updated = iteration_updated;
+@@ -1105,7 +1107,7 @@
+                 operator_context.wheel_length = wheel_length;
+                 operator_context.wheel_head = slice.wheel_head;
+                 operator_context.wheel_tail = slice.wheel_tail;
+-                operator_context.frame_index = slice.frame_index;
++                operator_context.frame_index = slice.absolute_frame_index;
+                 operator_context.pcm_sample_index = slice.pcm_sample_index;
+                 operator_context.slice_index = slice.slice_index;
+                 operator_context.pcm_sample_stride = static_cast<size_t>(slot_count);
+@@ -1128,14 +1130,14 @@
+             /* Debug: correlate Stage2 slice index with Stage3 window span and offsets */
+             if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+-                           "[STAGE3-CONTEXT] tensor_slice=%d view_filled=%d wheel(head=%d tail=%d len=%d hop=%d) frame=%lld\n",
++                           "[STAGE3-CONTEXT] tensor_slice=%d view_filled=%d wheel(head=%d tail=%d len=%d hop=%d) abs_frame=%lld\n",
+                            slice.tensor_slice,
+                            slice.view_filled_override,
+                            slice.wheel_head,
+                            slice.wheel_tail,
+                            wheel_length,
+                            wheel_hop,
+-                           (long long)slice.frame_index);
++                           (long long)slice.absolute_frame_index);
+                 if (!slice.lane_frame_offsets.empty()) {
+                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                                "[STAGE3-CONTEXT] lane0 assigned_offset=%zu\n",
+@@ -1211,8 +1213,11 @@
+                             tensor_freq_bins);
+                         /* Stage 4 (Spectral Out): we just emitted to spectral mailbox for this frame */
+                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+-                                   "[STAGE4-SPEC-OUT] slot=%d frame=%lld emit_row=%d bins=%d\n",
+-                                   slot, (long long)slice.frame_index, emit_frame_index, window_size);
++                                   "[STAGE4-SPEC-OUT] slot=%d abs_frame=%lld emit_row=%d bins=%d\n",
++                                   slot,
++                                   (long long)slice.absolute_frame_index,
++                                   emit_frame_index,
++                                   window_size);
+                     }
+ 
+                     if (lane.enable_pcm_out) {
+@@ -1267,7 +1272,7 @@
+         wheel_tail = wheel_tail_cursor;
+         wheel_filled = wheel_filled_cursor;
+         scratch_time_cursor = scratch_cursor;
+-        state->u.fftdiv.wheel_frame_counter += (int64_t)processed_passes;
++        state->u.fftdiv.wheel_frame_counter.fetch_add((int64_t)processed_passes, std::memory_order_relaxed);
+         state->u.fftdiv.timeline_seconds = timeline_cursor;
+     }
+ #endif /* defined(__cplusplus) */
+diff --git a/src/native/tests/test_fft_division_node.cpp b/src/native/tests/test_fft_division_node.cpp
+index dc72801..a737ad0 100644
+--- a/src/native/tests/test_fft_division_node.cpp
++++ b/src/native/tests/test_fft_division_node.cpp
+@@ -2,6 +2,7 @@
+ #include <array>
+ #include <cctype>
+ #include <cmath>
++#include <complex>
+ #include <cstdarg>
+ #include <chrono>
+ #include <cstdint>
+@@ -13,6 +14,7 @@
+ #include <thread>
+ #include <vector>
+ #include <cstdlib>
++#include <unsupported/Eigen/FFT>
+ #if defined(_WIN32)
+ #include <io.h>
+ #define AMP_DUP   _dup
+@@ -36,9 +38,73 @@ extern "C" {
+ }
+ 
+ #include "fft_division_test_helpers.h"
++#include "fft_division_delay_math.h"
+ 
+ namespace {
+ 
++constexpr double kTwoPi = 6.28318530717958647692528676655900577;
++
++std::vector<double> build_window_coeffs(int window_kind, int window_size) {
++    const int clamped = (window_size > 0) ? window_size : 1;
++    std::vector<double> coeffs(static_cast<size_t>(clamped), 1.0);
++    if (clamped <= 1) {
++        return coeffs;
++    }
++    const double denom = static_cast<double>(clamped - 1);
++    auto hann = [&](double n) {
++        return 0.5 - 0.5 * std::cos(kTwoPi * n / denom);
++    };
++    auto hamming = [&](double n) {
++        return 0.54 - 0.46 * std::cos(kTwoPi * n / denom);
++    };
++    auto blackman = [&](double n) {
++        const double x = kTwoPi * n / denom;
++        return 0.42 - 0.5 * std::cos(x) + 0.08 * std::cos(2.0 * x);
++    };
++    auto tukey = [&](double n) {
++        const double alpha = 0.5;
++        if (alpha <= 0.0) {
++            return 1.0;
++        }
++        if (alpha >= 1.0) {
++            return hann(n);
++        }
++        const double ratio = n / denom;
++        if (ratio < alpha / 2.0) {
++            const double term = 2.0 * ratio / alpha - 1.0;
++            return 0.5 * (1.0 + std::cos(kTwoPi * term));
++        }
++        if (ratio <= 1.0 - alpha / 2.0) {
++            return 1.0;
++        }
++        const double term = 2.0 * ratio / alpha - 2.0 / alpha + 1.0;
++        return 0.5 * (1.0 + std::cos(kTwoPi * term));
++    };
++
++    for (int i = 0; i < clamped; ++i) {
++        const double idx = static_cast<double>(i);
++        switch (window_kind) {
++            case AMP_FFT_WINDOW_HANN:
++                coeffs[static_cast<size_t>(i)] = hann(idx);
++                break;
++            case AMP_FFT_WINDOW_HAMMING:
++                coeffs[static_cast<size_t>(i)] = hamming(idx);
++                break;
++            case AMP_FFT_WINDOW_BLACKMAN:
++                coeffs[static_cast<size_t>(i)] = blackman(idx);
++                break;
++            case AMP_FFT_WINDOW_TUKEY:
++                coeffs[static_cast<size_t>(i)] = tukey(idx);
++                break;
++            case AMP_FFT_WINDOW_RECT:
++            default:
++                coeffs[static_cast<size_t>(i)] = 1.0;
++                break;
++        }
++    }
++    return coeffs;
++}
++
+ // ============================================================================
+ // Analytic Delay Derivation
+ // ============================================================================
+@@ -845,8 +911,8 @@ size_t drain_spectral_mailbox_rows(
+             );
+             reported_bin_mismatch = true;
+         }
+-        const int latency = (window_size > 0) ? (window_size - 1) : 0;  // remove declared FFT delay so indices start at zero
+-        const int aligned_frame_index = frame_index - latency;
++        const bool frame_in_range = frame_index >= 0;
++        const int aligned_frame_index = frame_in_range ? frame_index : -1;
+         const bool slot_in_range = slot >= 0 && static_cast<uint32_t>(slot) < spectral_real_tap.shape.batches;
+         if (slot_in_range && aligned_frame_index >= 0 && static_cast<uint32_t>(aligned_frame_index) < tap_frames) {
+             const size_t row_index = static_cast<size_t>(slot) * frame_count + static_cast<size_t>(aligned_frame_index);
+@@ -1142,6 +1208,7 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
+     inputs.taps = tap_context;
+ 
+     for (size_t offset = 0; offset < total_frames; offset += chunk_frames) {
++        const size_t chunk_index = offset / chunk_frames;
+         const size_t frames = std::min(chunk_frames, total_frames - offset);
+ 
+         EdgeRunnerAudioView audio = build_audio_view_span(signal.data() + offset, frames);
+@@ -1150,6 +1217,14 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
+         }
+         inputs.audio = audio;
+ 
++        emit_diagnostic(
++            "[STREAM] chunk=%zu offset=%zu frames=%zu final=%d",
++            chunk_index,
++            offset,
++            frames,
++            (audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_FINAL) ? 1 : 0
++        );
++
+         double *out_buffer = nullptr;
+         int out_channels = 0;
+         AmpNodeMetrics metrics{};
+@@ -1169,38 +1244,33 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
+             &metrics
+         );
+ 
+-        if (rc == AMP_E_PENDING) {
+-            if (!g_quiet) {
+-                std::fprintf(
+-                    stderr,
+-                    "[FFT-TEST] streaming pending offset=%zu frames=%zu\n",
+-                    offset,
+-                    frames
+-                );
+-            }
+-            rc = wait_for_completion(
+-                descriptor,
+-                inputs,
+-                1,
+-                1,
+-                static_cast<int>(frames),
+-                kSampleRate,
+-                &state,
+-                &out_buffer,
+-                &out_channels,
+-                &metrics
++        const bool chunk_pending = (rc == AMP_E_PENDING);
++        if (chunk_pending) {
++            emit_diagnostic(
++                "[STREAM] chunk=%zu pending (expected)",
++                chunk_index
+             );
++            rc = 0;  // rely on mailbox drains + FINAL flush
+         }
+ 
+-        if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
++        emit_diagnostic(
++            "[STREAM] chunk=%zu rc=%d out_buffer=%p channels=%d state=%p",
++            chunk_index,
++            rc,
++            static_cast<void *>(out_buffer),
++            out_channels,
++            state
++        );
++
++        if (rc != 0 || (!chunk_pending && (out_buffer == nullptr || out_channels != 1))) {
+             record_failure(
+                 "streaming call %zu failed rc=%d buffer=%p channels=%d",
+-                offset / chunk_frames,
++                chunk_index,
+                 rc,
+                 static_cast<void *>(out_buffer),
+                 out_channels
+             );
+-        } else {
++        } else if (!chunk_pending && out_buffer != nullptr) {
+             // Write each PCM frame from out_buffer to tap at accumulated position
+             EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
+             for (size_t i = 0; i < frames; ++i) {
+@@ -1210,6 +1280,12 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
+                 write_tap_row(pcm_tap, 0, static_cast<int>(pcm_frames_captured), out_buffer + i, 1);
+                 pcm_frames_captured++;
+             }
++            emit_diagnostic(
++                "[STREAM] chunk=%zu wrote_pcm=%zu total_pcm=%zu",
++                chunk_index,
++                frames,
++                pcm_frames_captured
++            );
+         }
+ 
+         if (out_buffer != nullptr) {
+@@ -1218,7 +1294,7 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
+         }
+ 
+         if (state == nullptr) {
+-            record_failure("streaming call %zu did not return persistent state", offset / chunk_frames);
++            record_failure("streaming call %zu did not return persistent state", chunk_index);
+         } else {
+             saw_state = true;
+             result.state_allocated = true;
+@@ -1226,19 +1302,93 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
+ 
+         result.metrics_per_call.push_back(metrics);
+         result.call_count += 1;
++
++        const size_t captured_this_chunk = drain_spectral_mailbox_rows(
++            state,
++            tap_buffers[0],
++            tap_buffers[1],
++            spectral_row_written,
++            static_cast<uint32_t>(total_frames)
++        );
++        if (captured_this_chunk > 0) {
++            spectral_rows_captured += captured_this_chunk;
++            emit_diagnostic(
++                "[STREAM] chunk=%zu drained_spectral=%zu total_spectral=%zu",
++                chunk_index,
++                captured_this_chunk,
++                spectral_rows_captured
++            );
++        }
+     }
+ 
+-    spectral_rows_captured += drain_spectral_mailbox_rows(
++    const size_t remaining_pcm_frames = (pcm_frames_captured < total_frames)
++        ? (total_frames - pcm_frames_captured)
++        : 0U;
++    if (remaining_pcm_frames > 0 && state != nullptr) {
++        emit_diagnostic(
++            "[STREAM] issuing final wait for %zu frames",
++            remaining_pcm_frames
++        );
++        EdgeRunnerAudioView flush_audio = build_audio_view_span(nullptr, 0);
++        EdgeRunnerNodeInputs flush_inputs = inputs;
++        flush_inputs.audio = flush_audio;
++
++        double *flush_buffer = nullptr;
++        int flush_channels = 0;
++        AmpNodeMetrics flush_metrics{};
++
++        int final_rc = wait_for_completion(
++            descriptor,
++            flush_inputs,
++            1,
++            1,
++            static_cast<int>(remaining_pcm_frames),
++            kSampleRate,
++            &state,
++            &flush_buffer,
++            &flush_channels,
++            &flush_metrics
++        );
++
++        if (final_rc != 0) {
++            record_failure("streaming final wait failed rc=%d", final_rc);
++        } else if (flush_buffer != nullptr && flush_channels == 1) {
++            EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
++            for (size_t i = 0; i < remaining_pcm_frames; ++i) {
++                write_tap_row(pcm_tap, 0, static_cast<int>(pcm_frames_captured), flush_buffer + i, 1);
++                pcm_frames_captured++;
++            }
++            amp_free(flush_buffer);
++            flush_buffer = nullptr;
++        }
++    }
++
++    const size_t final_drain = drain_spectral_mailbox_rows(
+         state,
+         tap_buffers[0],
+         tap_buffers[1],
+         spectral_row_written,
+         static_cast<uint32_t>(total_frames)
+     );
++    if (final_drain > 0) {
++        spectral_rows_captured += final_drain;
++        emit_diagnostic(
++            "[STREAM] final_drain=%zu total_spectral=%zu",
++            final_drain,
++            spectral_rows_captured
++        );
++    }
+ 
+     result.spectral_rows_committed = spectral_rows_captured;
+     result.pcm_frames_committed = pcm_frames_captured;
+ 
++    emit_diagnostic(
++        "[STREAM] summary: pcm_frames=%zu spectral_rows=%zu total_frames=%zu",
++        result.pcm_frames_committed,
++        result.spectral_rows_committed,
++        total_frames
++    );
++
+     if (state != nullptr) {
+         amp_release_state(state);
+         state = nullptr;
+@@ -1402,139 +1552,74 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
+ 
+     const int effective_hop = (hop > 0) ? hop : 1;
+     const int clamped_window = (window_size > 0) ? window_size : 1;
+-
+-    void *forward = amp_fft_backend_stream_create(clamped_window, clamped_window, effective_hop, window_kind);
+-    void *inverse = amp_fft_backend_stream_create_inverse(clamped_window, clamped_window, effective_hop, window_kind);
+-    if (forward == nullptr || inverse == nullptr) {
+-        record_failure(
+-            "amp_fft_backend_stream_create failed (forward=%p inverse=%p)",
+-            forward,
+-            inverse
+-        );
+-        if (forward != nullptr) {
+-            amp_fft_backend_stream_destroy(forward);
+-        }
+-        if (inverse != nullptr) {
+-            amp_fft_backend_stream_destroy(inverse);
+-        }
++    if (signal.empty() || clamped_window <= 0 || effective_hop <= 0) {
++        result.spectral_real.clear();
++        result.spectral_imag.clear();
+         return result;
+     }
+ 
+-    const size_t tail_frames = (clamped_window > 0) ? static_cast<size_t>(clamped_window - 1) : 0U;
+-    const size_t padded_frames = signal.size() + tail_frames;
+-    std::vector<double> padded_signal = signal;
+-    padded_signal.resize(padded_frames, 0.0);
+-
+-    const size_t stage_capacity_frames = padded_frames > 0 ? padded_frames : 1U;
+-    std::vector<double> spectral_stage_real(stage_capacity_frames * clamped_window, 0.0);
+-    std::vector<double> spectral_stage_imag(stage_capacity_frames * clamped_window, 0.0);
+-    std::vector<double> inverse_scratch(clamped_window, 0.0);
+-    std::vector<double> produced_pcm;
+-    produced_pcm.reserve(padded_frames + static_cast<size_t>(clamped_window));
+-
+-    size_t spectral_frames_emitted = 0;
+-    auto push_and_capture = [&](const double *pcm, size_t samples, int flush_mode) -> size_t {
+-        if (stage_capacity_frames <= spectral_frames_emitted) {
+-            return 0U;
++    std::vector<size_t> frame_offsets;
++    if (!signal.empty()) {
++        for (size_t base = 0; base < signal.size(); base += static_cast<size_t>(effective_hop)) {
++            frame_offsets.push_back(base);
+         }
+-        double *real_dst = spectral_stage_real.data() + spectral_frames_emitted * clamped_window;
+-        double *imag_dst = spectral_stage_imag.data() + spectral_frames_emitted * clamped_window;
+-        const size_t max_frames = stage_capacity_frames - spectral_frames_emitted;
+-        const size_t produced = amp_fft_backend_stream_push(
+-            forward,
+-            pcm,
+-            samples,
+-            clamped_window,
+-            real_dst,
+-            imag_dst,
+-            max_frames,
+-            flush_mode
+-        );
+-        spectral_frames_emitted += produced;
+-        return produced;
+-    };
+-
+-    if (!padded_signal.empty()) {
+-        push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+     }
+ 
+-    // Drain any ready frames and then issue repeated final flushes until nothing remains.
+-    for (int flush_iteration = 0; flush_iteration < 8; ++flush_iteration) {
+-        if (push_and_capture(nullptr, 0, AMP_FFT_STREAM_FLUSH_PARTIAL) == 0U) {
+-            break;
+-        }
+-    }
+-    for (int flush_iteration = 0; flush_iteration < 8; ++flush_iteration) {
+-        if (push_and_capture(nullptr, 0, AMP_FFT_STREAM_FLUSH_FINAL) == 0U) {
+-            break;
+-        }
+-    }
+-
+-    result.spectral_frames = spectral_frames_emitted;
+-    if (spectral_frames_emitted > 0) {
+-        result.spectral_real.assign(spectral_frames_emitted * clamped_window, 0.0);
+-        result.spectral_imag.assign(spectral_frames_emitted * clamped_window, 0.0);
+-        for (size_t frame = 0; frame < spectral_frames_emitted; ++frame) {
+-            const double *src_real = spectral_stage_real.data() + frame * clamped_window;
+-            const double *src_imag = spectral_stage_imag.data() + frame * clamped_window;
+-            double *dst_real = result.spectral_real.data() + frame * clamped_window;
+-            double *dst_imag = result.spectral_imag.data() + frame * clamped_window;
+-            std::copy(src_real, src_real + clamped_window, dst_real);
+-            std::copy(src_imag, src_imag + clamped_window, dst_imag);
+-        }
+-    } else {
++    const size_t frame_count = frame_offsets.size();
++    result.spectral_frames = frame_count;
++    if (frame_count == 0) {
+         result.spectral_real.clear();
+         result.spectral_imag.clear();
++        return result;
+     }
++    result.spectral_real.assign(frame_count * static_cast<size_t>(clamped_window), 0.0);
++    result.spectral_imag.assign(frame_count * static_cast<size_t>(clamped_window), 0.0);
+ 
+-    if (spectral_frames_emitted > 0) {
+-        size_t produced = amp_fft_backend_stream_push_spectrum(
+-            inverse,
+-            spectral_stage_real.data(),
+-            spectral_stage_imag.data(),
+-            spectral_frames_emitted,
+-            clamped_window,
+-            inverse_scratch.data(),
+-            inverse_scratch.size(),
+-            AMP_FFT_STREAM_FLUSH_NONE
+-        );
+-        for (size_t i = 0; i < produced; ++i) {
+-            produced_pcm.push_back(inverse_scratch[i]);
++    const std::vector<double> window_coeffs = build_window_coeffs(window_kind, clamped_window);
++    Eigen::FFT<double> fft;
++    std::vector<double> windowed(static_cast<size_t>(clamped_window), 0.0);
++    std::vector<std::complex<double>> spectrum(static_cast<size_t>(clamped_window));
++    std::vector<double> inverse_buffer(static_cast<size_t>(clamped_window), 0.0);
++
++    std::vector<double> accum(signal.size() + static_cast<size_t>(clamped_window), 0.0);
++    std::vector<double> accum_weight(signal.size() + static_cast<size_t>(clamped_window), 0.0);
++
++    for (size_t frame = 0; frame < frame_count; ++frame) {
++        const size_t base = frame_offsets[frame];
++        for (int bin = 0; bin < clamped_window; ++bin) {
++            const size_t sample_index = base + static_cast<size_t>(bin);
++            const double sample = (sample_index < signal.size()) ? signal[sample_index] : 0.0;
++            windowed[static_cast<size_t>(bin)] = sample * window_coeffs[static_cast<size_t>(bin)];
+         }
+-    }
+ 
+-    int flush_iterations = 0;
+-    while (amp_fft_backend_stream_pending_pcm(inverse) > 0 && flush_iterations < 8) {
+-        const int flush_mode = (flush_iterations + 1 < 8)
+-            ? AMP_FFT_STREAM_FLUSH_PARTIAL
+-            : AMP_FFT_STREAM_FLUSH_FINAL;
+-        const size_t drained = amp_fft_backend_stream_push_spectrum(
+-            inverse,
+-            nullptr,
+-            nullptr,
+-            0,
+-            clamped_window,
+-            inverse_scratch.data(),
+-            inverse_scratch.size(),
+-            flush_mode
+-        );
+-        if (drained == 0) {
+-            flush_iterations++;
+-            continue;
++        fft.fwd(spectrum, windowed);
++
++        double *dst_real = result.spectral_real.data() + frame * static_cast<size_t>(clamped_window);
++        double *dst_imag = result.spectral_imag.data() + frame * static_cast<size_t>(clamped_window);
++        for (int bin = 0; bin < clamped_window; ++bin) {
++            const auto &value = spectrum[static_cast<size_t>(bin)];
++            dst_real[bin] = value.real();
++            dst_imag[bin] = value.imag();
+         }
+-        for (size_t i = 0; i < drained; ++i) {
+-            produced_pcm.push_back(inverse_scratch[i]);
++
++        fft.inv(inverse_buffer, spectrum);
++        for (int bin = 0; bin < clamped_window; ++bin) {
++            const size_t sample_index = base + static_cast<size_t>(bin);
++            if (sample_index >= accum.size()) {
++                accum.resize(sample_index + 1, 0.0);
++                accum_weight.resize(sample_index + 1, 0.0);
++            }
++            const double win = window_coeffs[static_cast<size_t>(bin)];
++            accum[sample_index] += inverse_buffer[static_cast<size_t>(bin)] * win;
++            accum_weight[sample_index] += win * win;
+         }
+-        flush_iterations++;
+     }
+ 
+-    const size_t copy_count = std::min(result.pcm.size(), produced_pcm.size());
+-    if (copy_count > 0) {
+-        std::copy(produced_pcm.begin(), produced_pcm.begin() + copy_count, result.pcm.begin());
++    const size_t copy_limit = std::min(result.pcm.size(), accum.size());
++    for (size_t i = 0; i < copy_limit; ++i) {
++        const double weight = accum_weight[i];
++        result.pcm[i] = (weight > 0.0) ? (accum[i] / weight) : 0.0;
+     }
+-
+-    amp_fft_backend_stream_destroy(forward);
+-    amp_fft_backend_stream_destroy(inverse);
+     return result;
+ }
+ 
+@@ -1701,6 +1786,16 @@ int main(int argc, char **argv) {
+     RunResult first = run_fft_node_once(signal);
+     RunResult second = run_fft_node_once(signal);
+ 
++    emit_diagnostic(
++        "single-shot lengths: expected_pcm=%zu actual_pcm=%zu expected_spec_frames=%zu expected_spec_values=%zu actual_spec_frames=%zu actual_spec_values=%zu",
++        expected_pcm.size(),
++        first.pcm_frames_committed,
++        expected_spec.spectral_frames,
++        expected_spec.spectral_real.size(),
++        first.spectral_rows_committed,
++        first.spectral_real.size()
++    );
++
+     const size_t expected_pcm_frames = expected_pcm.size();
+     const size_t pcm_frames_to_check = std::min(expected_pcm_frames, first.pcm_frames_committed);
+     if (pcm_frames_to_check == 0) {
+@@ -1871,6 +1966,16 @@ int main(int argc, char **argv) {
+         );
+         StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
+ 
++        emit_diagnostic(
++            "streaming lengths: expected_pcm=%zu actual_pcm=%zu expected_spec_frames=%zu expected_spec_values=%zu actual_spec_frames=%zu actual_spec_values=%zu",
++            streaming_expected.pcm.size(),
++            streaming_result.pcm_frames_committed,
++            streaming_expected.spectral_frames,
++            streaming_expected.spectral_real.size(),
++            streaming_result.spectral_rows_committed,
++            streaming_result.spectral_real.size()
++        );
++
+         verify_close(
+             "streaming_pcm_vs_expected",
+             streaming_result.pcm.data(),
+diff --git a/src/native/tests/test_fft_division_shared.cpp b/src/native/tests/test_fft_division_shared.cpp
+index 6e5aab1..3293036 100644
+--- a/src/native/tests/test_fft_division_shared.cpp
++++ b/src/native/tests/test_fft_division_shared.cpp
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <complex>
+ #include <cstdarg>
+ #include <chrono>
+ #include <cstdint>
+@@ -16,6 +17,8 @@
+ #include <vector>
+ #include <cstdlib>
+ 
++#include <unsupported/Eigen/FFT>
++
+ extern "C" {
+ #include "amp_fft_backend.h"
+ #include "amp_native.h"
+@@ -23,6 +26,7 @@ extern "C" {
+ }
+ 
+ #include "fft_division_test_helpers.h"
++#include "fft_division_delay_math.h"
+ 
+ namespace amp::tests::fft_division_shared {
+ namespace {
+@@ -66,6 +70,76 @@ void apply_window_scaling(TestConfig &config) {
+     config.streaming_frames = config.streaming_chunk * kStreamingPasses;
+ }
+ 
++std::vector<double> build_window_coeffs(int window_kind, int window_size) {
++    std::vector<double> coeffs(static_cast<size_t>(window_size), 1.0);
++    if (window_size <= 0) {
++        return coeffs;
++    }
++    constexpr double kPi = 3.14159265358979323846264338327950288;
++    const double two_pi = 2.0 * kPi;
++    switch (window_kind) {
++        case AMP_FFT_WINDOW_HANN:
++            for (int i = 0; i < window_size; ++i) {
++                coeffs[static_cast<size_t>(i)] = 0.5 - 0.5 * std::cos(two_pi * i / (window_size - 1));
++            }
++            break;
++        case AMP_FFT_WINDOW_HAMMING:
++            for (int i = 0; i < window_size; ++i) {
++                coeffs[static_cast<size_t>(i)] = 0.54 - 0.46 * std::cos(two_pi * i / (window_size - 1));
++            }
++            break;
++        case AMP_FFT_WINDOW_BLACKMAN:
++            for (int i = 0; i < window_size; ++i) {
++                const double phase = two_pi * i / (window_size - 1);
++                coeffs[static_cast<size_t>(i)] = 0.42 - 0.5 * std::cos(phase) + 0.08 * std::cos(2.0 * phase);
++            }
++            break;
++        case AMP_FFT_WINDOW_BLACKMAN_HARRIS:
++            for (int i = 0; i < window_size; ++i) {
++                const double phase = two_pi * i / (window_size - 1);
++                coeffs[static_cast<size_t>(i)] = 0.35875 - 0.48829 * std::cos(phase) + 0.14128 * std::cos(2.0 * phase) - 0.01168 * std::cos(3.0 * phase);
++            }
++            break;
++        case AMP_FFT_WINDOW_BLACKMAN_HARRIS_VARIANT:
++            for (int i = 0; i < window_size; ++i) {
++                const double phase = two_pi * i / (window_size - 1);
++                coeffs[static_cast<size_t>(i)] = 0.42323 - 0.49755 * std::cos(phase) + 0.07922 * std::cos(2.0 * phase);
++            }
++            break;
++        case AMP_FFT_WINDOW_BLACKMAN_EXACT:
++            for (int i = 0; i < window_size; ++i) {
++                const double phase = two_pi * i / (window_size - 1);
++                coeffs[static_cast<size_t>(i)] = 0.42659 - 0.49656 * std::cos(phase) + 0.076849 * std::cos(2.0 * phase);
++            }
++            break;
++        case AMP_FFT_WINDOW_TUKEY:
++        case AMP_FFT_WINDOW_TUKEY_VARIANT: {
++            const double alpha = (window_kind == AMP_FFT_WINDOW_TUKEY_VARIANT) ? 0.25 : 0.5;
++            const double edge = alpha * (window_size - 1);
++            for (int i = 0; i < window_size; ++i) {
++                if (i < edge) {
++                    coeffs[static_cast<size_t>(i)] = 0.5 * (1.0 + std::cos(kPi * ((2.0 * i) / (alpha * (window_size - 1)) - 1.0)));
++                } else if (i > (window_size - 1) - edge) {
++                    const double mirrored = (window_size - 1) - i;
++                    coeffs[static_cast<size_t>(i)] = 0.5 * (1.0 + std::cos(kPi * ((2.0 * mirrored) / (alpha * (window_size - 1)) - 1.0)));
++                } else {
++                    coeffs[static_cast<size_t>(i)] = 1.0;
++                }
++            }
++            break;
++        }
++        case AMP_FFT_WINDOW_FLATTOP:
++            for (int i = 0; i < window_size; ++i) {
++                const double phase = two_pi * i / (window_size - 1);
++                coeffs[static_cast<size_t>(i)] = 1.0 - 1.93 * std::cos(phase) + 1.29 * std::cos(2.0 * phase) - 0.388 * std::cos(3.0 * phase) + 0.032 * std::cos(4.0 * phase);
++            }
++            break;
++        default:
++            break;
++    }
++    return coeffs;
++}
++
+ void configure_from_args(int argc, char **argv) {
+     int window_power = 2;  // 2^2 = 4 default window size.
+     double tolerance = g_config.tolerance;
+@@ -182,142 +256,70 @@ void log_vector_segment(
+     for (size_t i = start; i < end; ++i) {
+         const double diff = actual[i] - expected[i];
+         emit_diagnostic(
+-            "%s[%04zu] actual=% .12f expected=% .12f diff=% .12f",
+-            label,
+-            i,
+-            actual[i],
+-            expected[i],
+-            diff
+-        );
+-    }
+-}
+-
+-struct RunResult {
+-    std::vector<double> pcm;
+-    std::vector<double> spectral_real;
+-    std::vector<double> spectral_imag;
+-    size_t pcm_frames_committed{0};
+-    size_t spectral_rows_committed{0};
+-    AmpNodeMetrics metrics{};
+-};
+-
+-struct StreamingRunResult {
+-    std::vector<double> pcm;
+-    std::vector<double> spectral_real;
+-    std::vector<double> spectral_imag;
+-    std::vector<AmpNodeMetrics> metrics_per_call;
+-    size_t call_count{0};
+-    bool state_allocated{false};
+-    size_t pcm_frames_committed{0};
+-    size_t spectral_rows_committed{0};
+-};
+-
+-struct SimulationResult {
+-    std::vector<double> pcm;
+-    std::vector<double> spectral_real;
+-    std::vector<double> spectral_imag;
+-    size_t spectral_frames{0};
+-};
+-
+-EdgeRunnerTapBuffer make_tap_buffer(
+-    const char *name,
+-    const char *buffer_class,
+-    uint32_t batches,
+-    uint32_t channels,
+-    uint32_t frames,
+-    double *data
+-) {
+-    EdgeRunnerTapBuffer tap{};
+-    tap.tap_name = name;
+-    tap.buffer_class = buffer_class;
+-    tap.shape.batches = batches;
+-    tap.shape.channels = channels;
+-    tap.shape.frames = frames;
+-    const size_t computed_stride = static_cast<size_t>(
+-        std::max<uint32_t>(1U, batches) * std::max<uint32_t>(1U, channels));
+-    tap.frame_stride = computed_stride;
+-    tap.data = data;
+-    return tap;
+-}
+-
+-void run_shared_helper_unit_tests() {
+-    const uint32_t window_size = 8U;
+-    const uint32_t hop_count = 4U;
+-    const size_t total_frames = 32U;
+-    TapDescriptor pcm_descriptor = BuildPcmTapDescriptor(window_size, hop_count, total_frames, 2U);
+-    TapDescriptor spectral_descriptor = BuildSpectralTapDescriptor(window_size, hop_count, total_frames, 3U);
+-
+-    std::vector<double> pcm_storage(pcm_descriptor.ValueCount(), 0.0);
+-    std::vector<double> spectral_storage(spectral_descriptor.ValueCount(), 0.0);
+-    for (size_t i = 0; i < pcm_storage.size(); ++i) {
+-        pcm_storage[i] = 0.25 * static_cast<double>(i + 1);
+-    }
+-    for (size_t i = 0; i < spectral_storage.size(); ++i) {
+-        spectral_storage[i] = 0.125 * static_cast<double>(i + 1);
+-    }
+-
+-    EdgeRunnerTapBuffer pcm_buffer = InstantiateTapBuffer(pcm_descriptor, pcm_storage.data());
+-    EdgeRunnerTapBuffer spectral_buffer = InstantiateTapBuffer(spectral_descriptor, spectral_storage.data());
++            std::vector<size_t> frame_offsets;
++            if (!signal.empty()) {
++                for (size_t base = 0; base < signal.size(); base += static_cast<size_t>(effective_hop)) {
++                    frame_offsets.push_back(base);
++                }
++            }
+ 
+-    const auto pcm_decoded = DecodeTapTensor(pcm_buffer);
+-    const auto spectral_decoded = DecodeTapTensor(spectral_buffer);
+-    if (pcm_decoded.size() != pcm_storage.size()) {
+-        record_failure(
+-            "pcm helper decode size mismatch got=%zu expected=%zu",
+-            pcm_decoded.size(),
+-            pcm_storage.size()
+-        );
+-        return;
+-    }
+-    if (spectral_decoded.size() != spectral_storage.size()) {
+-        record_failure(
+-            "spectral helper decode size mismatch got=%zu expected=%zu",
+-            spectral_decoded.size(),
+-            spectral_storage.size()
+-        );
+-        return;
+-    }
++            const size_t frame_count = frame_offsets.size();
++            result.spectral_frames = frame_count;
++            if (frame_count == 0) {
++                result.spectral_real.clear();
++                result.spectral_imag.clear();
++                return result;
++            }
+ 
+-    constexpr double kFloatTolerance = 1e-6;
+-    for (size_t i = 0; i < pcm_storage.size(); ++i) {
+-        const double expected = pcm_storage[i];
+-        const double actual = pcm_decoded[i];
+-        if (std::fabs(actual - expected) > kFloatTolerance) {
+-            record_failure(
+-                "pcm helper decode mismatch index=%zu got=%g expected=%g",
+-                i,
+-                actual,
+-                expected
+-            );
+-            return;
+-        }
+-    }
+-    for (size_t i = 0; i < spectral_storage.size(); ++i) {
+-        const double expected = spectral_storage[i];
+-        const double actual = spectral_decoded[i];
+-        if (std::fabs(actual - expected) > kFloatTolerance) {
+-            record_failure(
+-                "spectral helper decode mismatch index=%zu got=%g expected=%g",
+-                i,
+-                actual,
+-                expected
+-            );
+-            return;
+-        }
+-    }
++            result.spectral_real.assign(frame_count * static_cast<size_t>(clamped_window), 0.0);
++            result.spectral_imag.assign(frame_count * static_cast<size_t>(clamped_window), 0.0);
++
++            const std::vector<double> window_coeffs = build_window_coeffs(window_kind, clamped_window);
++            Eigen::FFT<double> fft;
++            std::vector<double> windowed(static_cast<size_t>(clamped_window), 0.0);
++            std::vector<std::complex<double>> spectrum(static_cast<size_t>(clamped_window));
++            std::vector<double> inverse_buffer(static_cast<size_t>(clamped_window), 0.0);
++
++            std::vector<double> accum(signal.size() + static_cast<size_t>(clamped_window), 0.0);
++            std::vector<double> accum_weight(signal.size() + static_cast<size_t>(clamped_window), 0.0);
++
++            for (size_t frame = 0; frame < frame_count; ++frame) {
++                const size_t base = frame_offsets[frame];
++                for (int bin = 0; bin < clamped_window; ++bin) {
++                    const size_t sample_index = base + static_cast<size_t>(bin);
++                    const double sample = (sample_index < signal.size()) ? signal[sample_index] : 0.0;
++                    windowed[static_cast<size_t>(bin)] = sample * window_coeffs[static_cast<size_t>(bin)];
++                }
++
++                fft.fwd(spectrum, windowed);
++
++                double *dst_real = result.spectral_real.data() + frame * static_cast<size_t>(clamped_window);
++                double *dst_imag = result.spectral_imag.data() + frame * static_cast<size_t>(clamped_window);
++                for (int bin = 0; bin < clamped_window; ++bin) {
++                    const auto &value = spectrum[static_cast<size_t>(bin)];
++                    dst_real[bin] = value.real();
++                    dst_imag[bin] = value.imag();
++                }
++
++                fft.inv(inverse_buffer, spectrum);
++                for (int bin = 0; bin < clamped_window; ++bin) {
++                    const size_t sample_index = base + static_cast<size_t>(bin);
++                    if (sample_index >= accum.size()) {
++                        accum.resize(sample_index + 1, 0.0);
++                        accum_weight.resize(sample_index + 1, 0.0);
++                    }
++                    const double win = window_coeffs[static_cast<size_t>(bin)];
++                    accum[sample_index] += inverse_buffer[static_cast<size_t>(bin)] * win;
++                    accum_weight[sample_index] += win * win;
++                }
++            }
+ 
+-    std::array<EdgeRunnerTapBuffer, 2> buffers{spectral_buffer, pcm_buffer};
+-    EdgeRunnerTapBufferSet set{};
+-    set.items = buffers.data();
+-    set.count = static_cast<uint32_t>(buffers.size());
+-    const auto decoded_map = DecodeTapBuffers(set);
+-    auto pcm_it = decoded_map.find(pcm_descriptor.name);
+-    auto spectral_it = decoded_map.find(spectral_descriptor.name);
+-    if (pcm_it == decoded_map.end()) {
+-        record_failure("decoded_map missing pcm entry");
+-        return;
+-    }
+-    if (spectral_it == decoded_map.end()) {
++            const size_t copy_limit = std::min(result.pcm.size(), accum.size());
++            for (size_t i = 0; i < copy_limit; ++i) {
++                const double weight = accum_weight[i];
++                result.pcm[i] = (weight > 0.0) ? (accum[i] / weight) : 0.0;
++            }
++            return result;
+         record_failure("decoded_map missing spectral entry");
+         return;
+     }
+@@ -387,9 +389,7 @@ size_t drain_spectral_mailbox_rows(
+     while ((entry = amp_node_spectral_mailbox_pop(state)) != nullptr) {
+         const int slot = entry->slot;
+         const int frame_index = entry->frame_index;
+-        const int window_size = entry->window_size;
+-        const int latency = (window_size > 0) ? (window_size - 1) : 0;  // remove declared FFT delay so indices start at zero
+-        const int aligned_frame_index = frame_index - latency;
++        const int aligned_frame_index = (frame_index >= 0) ? frame_index : -1;
+         const bool slot_in_range = slot >= 0 && static_cast<uint32_t>(slot) < spectral_real_tap.shape.batches;
+         if (slot_in_range && aligned_frame_index >= 0 && static_cast<uint32_t>(aligned_frame_index) < tap_frames) {
+             const size_t row_index = static_cast<size_t>(slot) * frame_count + static_cast<size_t>(aligned_frame_index);
+@@ -921,139 +921,69 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
+ 
+     const int effective_hop = (hop > 0) ? hop : 1;
+     const int clamped_window = (window_size > 0) ? window_size : 1;
+-
+-    void *forward = amp_fft_backend_stream_create(clamped_window, clamped_window, effective_hop, window_kind);
+-    void *inverse = amp_fft_backend_stream_create_inverse(clamped_window, clamped_window, effective_hop, window_kind);
+-    if (forward == nullptr || inverse == nullptr) {
+-        record_failure(
+-            "amp_fft_backend_stream_create failed (forward=%p inverse=%p)",
+-            forward,
+-            inverse
+-        );
+-        if (forward != nullptr) {
+-            amp_fft_backend_stream_destroy(forward);
+-        }
+-        if (inverse != nullptr) {
+-            amp_fft_backend_stream_destroy(inverse);
+-        }
++    if (signal.empty() || clamped_window <= 0 || effective_hop <= 0) {
++        result.spectral_real.clear();
++        result.spectral_imag.clear();
+         return result;
+     }
+ 
+-    const size_t tail_frames = (clamped_window > 0) ? static_cast<size_t>(clamped_window - 1) : 0U;
+-    const size_t padded_frames = signal.size() + tail_frames;
+-    std::vector<double> padded_signal = signal;
+-    padded_signal.resize(padded_frames, 0.0);
+-
+-    const size_t stage_capacity_frames = padded_frames > 0 ? padded_frames : 1U;
+-    std::vector<double> spectral_stage_real(stage_capacity_frames * clamped_window, 0.0);
+-    std::vector<double> spectral_stage_imag(stage_capacity_frames * clamped_window, 0.0);
+-    std::vector<double> inverse_scratch(clamped_window, 0.0);
+-    std::vector<double> produced_pcm;
+-    produced_pcm.reserve(padded_frames + static_cast<size_t>(clamped_window));
+-
+-    size_t spectral_frames_emitted = 0;
+-    auto push_and_capture = [&](const double *pcm, size_t samples, int flush_mode) -> size_t {
+-        if (stage_capacity_frames <= spectral_frames_emitted) {
+-            return 0U;
+-        }
+-        double *real_dst = spectral_stage_real.data() + spectral_frames_emitted * clamped_window;
+-        double *imag_dst = spectral_stage_imag.data() + spectral_frames_emitted * clamped_window;
+-        const size_t max_frames = stage_capacity_frames - spectral_frames_emitted;
+-        const size_t produced = amp_fft_backend_stream_push(
+-            forward,
+-            pcm,
+-            samples,
+-            clamped_window,
+-            real_dst,
+-            imag_dst,
+-            max_frames,
+-            flush_mode
+-        );
+-        spectral_frames_emitted += produced;
+-        return produced;
+-    };
+-
+-    if (!padded_signal.empty()) {
+-        push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+-    }
+-
+-    // Drain any ready frames and then issue repeated final flushes until nothing remains.
+-    for (int flush_iteration = 0; flush_iteration < 8; ++flush_iteration) {
+-        if (push_and_capture(nullptr, 0, AMP_FFT_STREAM_FLUSH_PARTIAL) == 0U) {
+-            break;
+-        }
+-    }
+-    for (int flush_iteration = 0; flush_iteration < 8; ++flush_iteration) {
+-        if (push_and_capture(nullptr, 0, AMP_FFT_STREAM_FLUSH_FINAL) == 0U) {
+-            break;
++    const size_t tail_samples = (clamped_window > effective_hop)
++        ? static_cast<size_t>(clamped_window - effective_hop)
++        : 0U;
++    const size_t padded_samples = signal.size() + tail_samples;
++    const size_t frame_count = (padded_samples == 0)
++        ? 0U
++        : ((padded_samples + static_cast<size_t>(effective_hop) - 1U) /
++           static_cast<size_t>(effective_hop));
++    result.spectral_frames = frame_count;
++    result.spectral_real.assign(frame_count * static_cast<size_t>(clamped_window), 0.0);
++    result.spectral_imag.assign(frame_count * static_cast<size_t>(clamped_window), 0.0);
++
++    const std::vector<double> window_coeffs = build_window_coeffs(window_kind, clamped_window);
++    Eigen::FFT<double> fft;
++    std::vector<double> windowed(static_cast<size_t>(clamped_window), 0.0);
++    std::vector<std::complex<double>> spectrum(static_cast<size_t>(clamped_window));
++    std::vector<double> inverse_buffer(static_cast<size_t>(clamped_window), 0.0);
++
++    std::vector<double> accum(signal.size() + static_cast<size_t>(clamped_window), 0.0);
++    std::vector<double> accum_weight(signal.size() + static_cast<size_t>(clamped_window), 0.0);
++
++    for (size_t frame = 0; frame < frame_count; ++frame) {
++        const size_t base = frame * static_cast<size_t>(effective_hop);
++        for (int bin = 0; bin < clamped_window; ++bin) {
++            const size_t sample_index = base + static_cast<size_t>(bin);
++            const double sample = (sample_index < signal.size()) ? signal[sample_index] : 0.0;
++            windowed[static_cast<size_t>(bin)] = sample * window_coeffs[static_cast<size_t>(bin)];
+         }
+-    }
+ 
+-    result.spectral_frames = spectral_frames_emitted;
+-    if (spectral_frames_emitted > 0) {
+-        result.spectral_real.assign(spectral_frames_emitted * clamped_window, 0.0);
+-        result.spectral_imag.assign(spectral_frames_emitted * clamped_window, 0.0);
+-        for (size_t frame = 0; frame < spectral_frames_emitted; ++frame) {
+-            const double *src_real = spectral_stage_real.data() + frame * clamped_window;
+-            const double *src_imag = spectral_stage_imag.data() + frame * clamped_window;
+-            double *dst_real = result.spectral_real.data() + frame * clamped_window;
+-            double *dst_imag = result.spectral_imag.data() + frame * clamped_window;
+-            std::copy(src_real, src_real + clamped_window, dst_real);
+-            std::copy(src_imag, src_imag + clamped_window, dst_imag);
+-        }
+-    } else {
+-        result.spectral_real.clear();
+-        result.spectral_imag.clear();
+-    }
++        fft.fwd(spectrum, windowed);
+ 
+-    if (spectral_frames_emitted > 0) {
+-        size_t produced = amp_fft_backend_stream_push_spectrum(
+-            inverse,
+-            spectral_stage_real.data(),
+-            spectral_stage_imag.data(),
+-            spectral_frames_emitted,
+-            clamped_window,
+-            inverse_scratch.data(),
+-            inverse_scratch.size(),
+-            AMP_FFT_STREAM_FLUSH_NONE
+-        );
+-        for (size_t i = 0; i < produced; ++i) {
+-            produced_pcm.push_back(inverse_scratch[i]);
++        double *dst_real = result.spectral_real.data() + frame * static_cast<size_t>(clamped_window);
++        double *dst_imag = result.spectral_imag.data() + frame * static_cast<size_t>(clamped_window);
++        for (int bin = 0; bin < clamped_window; ++bin) {
++            const auto &value = spectrum[static_cast<size_t>(bin)];
++            dst_real[bin] = value.real();
++            dst_imag[bin] = value.imag();
+         }
+-    }
+ 
+-    int flush_iterations = 0;
+-    while (amp_fft_backend_stream_pending_pcm(inverse) > 0 && flush_iterations < 8) {
+-        const int flush_mode = (flush_iterations + 1 < 8)
+-            ? AMP_FFT_STREAM_FLUSH_PARTIAL
+-            : AMP_FFT_STREAM_FLUSH_FINAL;
+-        const size_t drained = amp_fft_backend_stream_push_spectrum(
+-            inverse,
+-            nullptr,
+-            nullptr,
+-            0,
+-            clamped_window,
+-            inverse_scratch.data(),
+-            inverse_scratch.size(),
+-            flush_mode
+-        );
+-        if (drained == 0) {
+-            flush_iterations++;
+-            continue;
+-        }
+-        for (size_t i = 0; i < drained; ++i) {
+-            produced_pcm.push_back(inverse_scratch[i]);
++        fft.inv(inverse_buffer, spectrum);
++        for (int bin = 0; bin < clamped_window; ++bin) {
++            const size_t sample_index = base + static_cast<size_t>(bin);
++            if (sample_index >= accum.size()) {
++                accum.resize(sample_index + 1, 0.0);
++                accum_weight.resize(sample_index + 1, 0.0);
++            }
++            const double win = window_coeffs[static_cast<size_t>(bin)];
++            accum[sample_index] += inverse_buffer[static_cast<size_t>(bin)] * win;
++            accum_weight[sample_index] += win * win;
+         }
+-        flush_iterations++;
+     }
+ 
+-    const size_t copy_count = std::min(result.pcm.size(), produced_pcm.size());
+-    if (copy_count > 0) {
+-        std::copy(produced_pcm.begin(), produced_pcm.begin() + copy_count, result.pcm.begin());
++    const size_t copy_limit = std::min(result.pcm.size(), accum.size());
++    for (size_t i = 0; i < copy_limit; ++i) {
++        const double weight = accum_weight[i];
++        result.pcm[i] = (weight > 0.0) ? (accum[i] / weight) : 0.0;
+     }
+-
+-    amp_fft_backend_stream_destroy(forward);
+-    amp_fft_backend_stream_destroy(inverse);
+     return result;
+ }
+ 

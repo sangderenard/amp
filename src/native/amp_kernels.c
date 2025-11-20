@@ -1952,6 +1952,8 @@ typedef union {
             size_t spectral_ring_capacity_frames;
             size_t stream_backlog_cycles;
             int preserve_tensor_on_ingest;
+            int halt_on_zero_stage_output;
+            int halt_on_zero_stage5_pcm_output;
             int log_level;
             int log_slice_bin_cap;
             // Backend streaming configuration (hop and realized stream params)
@@ -2036,6 +2038,8 @@ static void fftdiv_construct_state(node_state_t *state) {
     new (&state->u.fftdiv) decltype(state->u.fftdiv)();
     state->u.fftdiv.log_level = kFftDivDefaultLogLevel;
     state->u.fftdiv.log_slice_bin_cap = kFftDivDefaultSliceLogCap;
+    state->u.fftdiv.halt_on_zero_stage_output = 0;
+    state->u.fftdiv.halt_on_zero_stage5_pcm_output = 0;
     state->fftdiv_constructed = true;
 }
 
@@ -2352,6 +2356,28 @@ AMP_CAPI void amp_node_mailbox_clear(void *state) {
     }
 }
 
+AMP_CAPI AmpMailboxEntry *amp_node_mailbox_head(void *state) {
+    if (state == NULL) {
+        return NULL;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+#endif
+    return node_state->mailbox.head;
+}
+
+AMP_CAPI AmpMailboxEntry *amp_node_mailbox_tail(void *state) {
+    if (state == NULL) {
+        return NULL;
+    }
+    node_state_t *node_state = (node_state_t *)state;
+#if defined(__cplusplus)
+    std::lock_guard<std::mutex> lock(node_state->mailbox_mutex);
+#endif
+    return node_state->mailbox.tail;
+}
+
 AMP_CAPI AmpSpectralMailboxEntry *amp_node_spectral_mailbox_pop(void *state) {
     if (state == NULL) {
         return NULL;
@@ -2489,8 +2515,20 @@ static double json_get_double(const char *json, size_t json_len, const char *key
         if (*cursor == '\0') {
             break;
         }
+        const char *value_start = cursor;
+        if (strncmp(value_start, "true", 4) == 0) {
+            const unsigned char tail = (unsigned char)value_start[4];
+            if (tail == '\0' || tail == ',' || tail == '}' || tail == ']' || isspace(tail)) {
+                return 1.0;
+            }
+        } else if (strncmp(value_start, "false", 5) == 0) {
+            const unsigned char tail = (unsigned char)value_start[5];
+            if (tail == '\0' || tail == ',' || tail == '}' || tail == ']' || isspace(tail)) {
+                return 0.0;
+            }
+        }
         char *endptr = NULL;
-        double value = strtod(cursor, &endptr);
+        double value = strtod(value_start, &endptr);
         if (endptr == cursor) {
             cursor = endptr;
             continue;
@@ -4372,7 +4410,7 @@ static int amp_wait_node_completion_impl(
                 int final_status = 0;
                 
                 // Poll and accumulate entries until we have enough frames
-                const int max_poll_attempts = 10;
+                const int max_poll_attempts = 1000;
                 int poll_attempts = 0;
                 
                 while (total_frames < expected_frames && poll_attempts < max_poll_attempts) {

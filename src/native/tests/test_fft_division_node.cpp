@@ -874,6 +874,8 @@ std::string build_params_json() {
         "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\",\"supports_v2\":true,"
         "\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1,"
         "\"backend_hop\":%d,\"log_level\":%d,\"log_slice_bin_cap\":%d,"
+        "\"halt_on_zero_stage_output\":true,"
+        "\"halt_on_zero_stage5_pcm_output\":false,"
         "\"working_ft_duration_frames\":1,\"working_ft_hop\":1,\"io_mode\":\"spectral\"}",
         g_config.window_size,
         g_config.window_size - 1,
@@ -1121,6 +1123,7 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     std::vector<uint8_t> spectral_row_written(spectral_lane_count * total_frames, 0U);
     size_t spectral_rows_captured = 0U;
     size_t pcm_frames_captured = 0U;
+    AmpMailboxEntry *pcm_cursor_anchor = nullptr;
 
     EdgeRunnerTapBufferSet tap_set{};
     tap_set.items = tap_buffers.data();
@@ -1140,6 +1143,35 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     EdgeRunnerNodeInputs inputs{};
     inputs.params = params;
     inputs.taps = tap_context;
+
+    auto capture_pcm_entries = [&](EdgeRunnerTapBuffer &pcm_tap) -> size_t {
+        if (state == nullptr) {
+            return 0U;
+        }
+        const size_t before = pcm_frames_captured;
+        AmpMailboxEntry *cursor = (pcm_cursor_anchor == nullptr)
+            ? amp_node_mailbox_head(state)
+            : pcm_cursor_anchor->next;
+        while (cursor != nullptr && pcm_frames_captured < total_frames) {
+            const int entry_channels = (cursor->channels > 0) ? cursor->channels : 1;
+            const size_t entry_frames = (cursor->frames > 0U) ? cursor->frames : 0U;
+            const double *entry_buffer = cursor->buffer;
+            for (size_t frame = 0; frame < entry_frames && pcm_frames_captured < total_frames; ++frame) {
+                const double *src = entry_buffer + frame * (size_t)entry_channels;
+                write_tap_row(
+                    pcm_tap,
+                    0,
+                    static_cast<int>(pcm_frames_captured),
+                    src,
+                    entry_channels
+                );
+                pcm_frames_captured += 1U;
+            }
+            pcm_cursor_anchor = cursor;
+            cursor = cursor->next;
+        }
+        return pcm_frames_captured - before;
+    };
 
     for (size_t offset = 0; offset < total_frames; offset += chunk_frames) {
         const size_t frames = std::min(chunk_frames, total_frames - offset);
@@ -1169,45 +1201,25 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
             &metrics
         );
 
-        if (rc == AMP_E_PENDING) {
-            if (!g_quiet) {
-                std::fprintf(
-                    stderr,
-                    "[FFT-TEST] streaming pending offset=%zu frames=%zu\n",
-                    offset,
-                    frames
-                );
-            }
-            rc = wait_for_completion(
-                descriptor,
-                inputs,
-                1,
-                1,
-                static_cast<int>(frames),
-                kSampleRate,
-                &state,
-                &out_buffer,
-                &out_channels,
-                &metrics
+        if (rc != 0 && rc != AMP_E_PENDING) {
+            record_failure(
+                "streaming call %zu failed rc=%d",
+                offset / chunk_frames,
+                rc
             );
         }
 
-        if (rc != 0 || out_buffer == nullptr || out_channels != 1) {
-            record_failure(
-                "streaming call %zu failed rc=%d buffer=%p channels=%d",
-                offset / chunk_frames,
-                rc,
-                static_cast<void *>(out_buffer),
-                out_channels
-            );
-        } else {
-            // Write each PCM frame from out_buffer to tap at accumulated position
-            EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
-            for (size_t i = 0; i < frames; ++i) {
-                if (!g_quiet && pcm_frames_captured == 4105) {
-                    std::fprintf(stderr, "[FFT-TEST-WRITE] Writing to index 4105 value=%e from out_buffer[%zu]\n", out_buffer[i], i);
-                }
-                write_tap_row(pcm_tap, 0, static_cast<int>(pcm_frames_captured), out_buffer + i, 1);
+        EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
+        if (out_buffer != nullptr && out_channels == 1) {
+            const size_t frames_to_copy = std::min<size_t>(frames, total_frames - pcm_frames_captured);
+            for (size_t i = 0; i < frames_to_copy; ++i) {
+                write_tap_row(
+                    pcm_tap,
+                    0,
+                    static_cast<int>(pcm_frames_captured),
+                    out_buffer + i,
+                    1
+                );
                 pcm_frames_captured++;
             }
         }
@@ -1216,6 +1228,8 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
             amp_free(out_buffer);
             out_buffer = nullptr;
         }
+
+        capture_pcm_entries(pcm_tap);
 
         if (state == nullptr) {
             record_failure("streaming call %zu did not return persistent state", offset / chunk_frames);
@@ -1235,6 +1249,28 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         spectral_row_written,
         static_cast<uint32_t>(total_frames)
     );
+
+    const size_t target_pcm_frames = total_frames;
+    const int max_poll_attempts = 1000;
+    int poll_attempts = 0;
+    while (pcm_frames_captured < target_pcm_frames && poll_attempts < max_poll_attempts) {
+        size_t before = pcm_frames_captured;
+        capture_pcm_entries(tap_buffers[2]);
+        if (pcm_frames_captured == before) {
+            poll_attempts += 1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } else {
+            poll_attempts = 0;
+        }
+    }
+
+    if (pcm_frames_captured < target_pcm_frames) {
+        record_failure(
+            "streaming run captured %zu/%zu pcm frames",
+            pcm_frames_captured,
+            target_pcm_frames
+        );
+    }
 
     result.spectral_rows_committed = spectral_rows_captured;
     result.pcm_frames_committed = pcm_frames_captured;
