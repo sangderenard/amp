@@ -1956,6 +1956,7 @@ typedef union {
             int halt_on_zero_stage5_pcm_output;
             int log_level;
             int log_slice_bin_cap;
+            int io_mode;  // 0=pcm (default), 1=spectral, 2=both
             // Backend streaming configuration (hop and realized stream params)
             int backend_mode;
             int backend_hop;
@@ -2040,6 +2041,7 @@ static void fftdiv_construct_state(node_state_t *state) {
     state->u.fftdiv.log_slice_bin_cap = kFftDivDefaultSliceLogCap;
     state->u.fftdiv.halt_on_zero_stage_output = 0;
     state->u.fftdiv.halt_on_zero_stage5_pcm_output = 0;
+    state->u.fftdiv.io_mode = 0;  // 0=pcm (default)
     state->fftdiv_constructed = true;
 }
 
@@ -3593,9 +3595,14 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             if (slot.forward_handle == nullptr) {
                 throw std::bad_alloc();
             }
-            slot.inverse_handle = amp_fft_backend_stream_create_inverse(window_size, window_size, hop, window_kind);
-            if (slot.inverse_handle == nullptr) {
-                throw std::bad_alloc();
+            // Only create inverse handle if io_mode allows PCM output (mode 0=pcm or 2=both)
+            if (state->u.fftdiv.io_mode != 1) {  // 1=spectral (no PCM output)
+                slot.inverse_handle = amp_fft_backend_stream_create_inverse(window_size, window_size, hop, window_kind);
+                if (slot.inverse_handle == nullptr) {
+                    throw std::bad_alloc();
+                }
+            } else {
+                slot.inverse_handle = nullptr;
             }
             slot.forward_stage_real.assign(stage_capacity, 0.0);
             slot.forward_stage_imag.assign(stage_capacity, 0.0);
