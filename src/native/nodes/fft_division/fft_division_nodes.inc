@@ -3353,6 +3353,20 @@ static bool fftdiv_worker_process_command(
     if (!command->input_consumed_once) {
         command->input_consumed_once = true;
     }
+    // For streaming, keep command active until final delivery is signaled.
+    // This allows multiple chunks to be appended to the same command session
+    // without prematurely recycling it after each chunk's output.
+    // Only mark as finished when:
+    // 1. Work is complete (status != PENDING), AND
+    // 2. Final delivery flag has been set (no more chunks expected)
+    if (status != AMP_E_PENDING && !command->task.final_delivery) {
+        // Output was produced but final chunk hasn't arrived yet.
+        // Keep command active for more streaming chunks.
+        return false;
+    }
+    // Mark as finished when status indicates completion AND either:
+    // - final_delivery is true (all chunks delivered), or
+    // - status is still pending (will be picked up in next iteration)
     return status != AMP_E_PENDING;
 }
 
