@@ -83,6 +83,7 @@
         "filesystem": "cpp",
         "future": "cpp",
         "numeric": "cpp",
-        "valarray": "cpp"
+        "valarray": "cpp",
+        "fft": "cpp"
     }
 }
