@@ -3029,7 +3029,9 @@ static int fftdiv_execute_block(
     
     // Push one mailbox entry per frame (only push what was actually written)
     size_t frames_to_push = pcm_written_samples;
-    if (pcm_written_samples == 0 || pcm_written_samples > 1000) {
+    // In spectral mode (io_mode=1), zero PCM output is expected, not anomalous
+    const bool is_spectral_only = (state != nullptr && state->u.fftdiv.io_mode == 1);
+    if ((pcm_written_samples == 0 && !is_spectral_only) || pcm_written_samples > 1000) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu ANOMALY\n",
                    pcm_written_samples, frames_to_push);
