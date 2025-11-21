@@ -1140,12 +1140,31 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     AmpNodeMetrics metrics{};
 
     size_t frames_processed = 0;
+    size_t chunk_index = 0;
     while (frames_processed < total_frames) {
         const size_t frames_to_process = std::min(chunk_frames, total_frames - frames_processed);
+        const double *chunk_data = signal.data() + frames_processed;
         EdgeRunnerAudioView audio = build_audio_view_span(
-            signal.data() + frames_processed,
+            chunk_data,
             frames_to_process
         );
+        if (g_verbosity >= VerbosityLevel::Trace && chunk_data != nullptr && frames_to_process > 0) {
+            // Trace raw PCM chunk before it enters stage 1 packaging.
+            emit_diagnostic(
+                "[stream-trace] chunk=%zu start_frame=%zu frames=%zu",
+                chunk_index,
+                frames_processed,
+                frames_to_process
+            );
+            for (size_t i = 0; i < frames_to_process; ++i) {
+                emit_diagnostic(
+                    "[stream-trace] chunk=%zu pcm[%zu]= % .12f",
+                    chunk_index,
+                    frames_processed + i,
+                    chunk_data[i]
+                );
+            }
+        }
         inputs.audio = audio;
 
         int rc = amp_run_node_v2(
@@ -1169,6 +1188,7 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         }
 
         frames_processed += frames_to_process;
+        ++chunk_index;
     }
 
     // Ensure all remaining frames are processed
@@ -1449,8 +1469,25 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
         result.spectral_imag.clear();
     }
 
+    auto drain_inverse = [&](int flush_mode) {
+        const size_t drained = amp_fft_backend_stream_push_spectrum(
+            inverse,
+            nullptr,
+            nullptr,
+            0,
+            clamped_window,
+            inverse_scratch.data(),
+            inverse_scratch.size(),
+            flush_mode
+        );
+        for (size_t i = 0; i < drained; ++i) {
+            produced_pcm.push_back(inverse_scratch[i]);
+        }
+        return drained;
+    };
+
     if (spectral_frames_emitted > 0) {
-        size_t produced = amp_fft_backend_stream_push_spectrum(
+        const size_t produced = amp_fft_backend_stream_push_spectrum(
             inverse,
             spectral_stage_real.data(),
             spectral_stage_imag.data(),
@@ -1463,31 +1500,19 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
         for (size_t i = 0; i < produced; ++i) {
             produced_pcm.push_back(inverse_scratch[i]);
         }
-    }
 
-    int flush_iterations = 0;
-    while (amp_fft_backend_stream_pending_pcm(inverse) > 0 && flush_iterations < 8) {
-        const int flush_mode = (flush_iterations + 1 < 8)
-            ? AMP_FFT_STREAM_FLUSH_PARTIAL
-            : AMP_FFT_STREAM_FLUSH_FINAL;
-        const size_t drained = amp_fft_backend_stream_push_spectrum(
-            inverse,
-            nullptr,
-            nullptr,
-            0,
-            clamped_window,
-            inverse_scratch.data(),
-            inverse_scratch.size(),
-            flush_mode
-        );
-        if (drained == 0) {
-            flush_iterations++;
-            continue;
+        // Mirror forward-stream draining logic so the simulator emits the full
+        // PCM tail even when pending counts report zero before a final flush.
+        for (int flush_iteration = 0; flush_iteration < 8; ++flush_iteration) {
+            if (drain_inverse(AMP_FFT_STREAM_FLUSH_PARTIAL) == 0) {
+                break;
+            }
         }
-        for (size_t i = 0; i < drained; ++i) {
-            produced_pcm.push_back(inverse_scratch[i]);
+        for (int flush_iteration = 0; flush_iteration < 8; ++flush_iteration) {
+            if (drain_inverse(AMP_FFT_STREAM_FLUSH_FINAL) == 0) {
+                break;
+            }
         }
-        flush_iterations++;
     }
 
     const size_t copy_count = std::min(result.pcm.size(), produced_pcm.size());
@@ -1823,6 +1848,7 @@ int main(int argc, char **argv) {
                 raw_streaming_signal.size()
             );
         }
+        require_identity(raw_streaming_signal, streaming_preconditioned.pcm, "streaming_preconditioned_identity");
         const std::vector<double> streaming_signal = streaming_preconditioned.pcm;
 
         SimulationResult streaming_expected = simulate_stream_identity(
