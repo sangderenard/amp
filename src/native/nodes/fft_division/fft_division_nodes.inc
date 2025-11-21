@@ -2045,7 +2045,7 @@ static int fftdiv_execute_block(
                             stage_capacity_frames,
                             flush_mode);
                         if (frames_emitted > 0 && window_size > 0 && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
-                            if (fftdiv_stage_assert_enabled(state)) {
+                            if (fftdiv_stage_assert_enabled(state) && slot_state.warmup_complete) {
                                 const size_t frame_bins = (size_t)window_size;
                                 for (size_t emitted_index = 0; emitted_index < frames_emitted; ++emitted_index) {
                                     const size_t base_offset = emitted_index * frame_bins;
