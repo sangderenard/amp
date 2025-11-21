@@ -1854,7 +1854,17 @@ static int fftdiv_execute_block(
                 double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
                 if (audio_base != NULL && frames > 0) {
                     const size_t backlog_growth = (size_t)frames;
-                    const size_t reserve_target = slot_state.pcm_backlog.size() + backlog_growth;
+                    const size_t backlog_before = slot_state.pcm_backlog.size();
+                    const size_t reserve_target = backlog_before + backlog_growth;
+                    const size_t pending_before = (backlog_before > slot_state.pcm_consumed_samples)
+                        ? (backlog_before - slot_state.pcm_consumed_samples)
+                        : 0U;
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE1-PCM-BACKLOG] slot=%d backlog_before=%zu pending_before=%zu reserve_target=%zu\n",
+                               slot,
+                               backlog_before,
+                               pending_before,
+                               reserve_target);
                     if (reserve_target > slot_state.pcm_backlog.capacity()) {
                         try {
                             slot_state.pcm_backlog.reserve(reserve_target);
@@ -1872,6 +1882,14 @@ static int fftdiv_execute_block(
                         pcm_cursor[frame_cursor] = input_sample;
                         slot_state.pcm_backlog.push_back(input_sample);
                     }
+                    const size_t backlog_after = slot_state.pcm_backlog.size();
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE1-PCM-BACKLOG] slot=%d appended=%zu backlog_after=%zu push_range=[%zu,%zu)\n",
+                               slot,
+                               backlog_growth,
+                               backlog_after,
+                               backlog_before,
+                               backlog_after);
                     slot_state.input_frame_cursor += (size_t)frames;
                     slot_state.total_ingested_samples += backlog_growth;
                 }
@@ -1900,6 +1918,12 @@ static int fftdiv_execute_block(
                 const size_t pending_samples = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
                     ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
                     : 0U;
+                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                           "[STAGE1-PCM-PENDING] slot=%d pending_samples=%zu consumed=%zu backlog_size=%zu\n",
+                           slot,
+                           pending_samples,
+                           slot_state.pcm_consumed_samples,
+                           slot_state.pcm_backlog.size());
                 if (slot_state.forward_handle != NULL && pending_samples > 0U) {
                     size_t stage_capacity_frames = slot_state.forward_frame_capacity;
                     if (stage_capacity_frames == 0U) {
