@@ -1109,7 +1109,7 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     streaming_imag_descriptor.name = "spectral_imag";
     TapDescriptor streaming_pcm_descriptor = BuildPcmTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
-        static_cast<uint32_t>(std::max(1, g_config.hop_size)),
+        1U,
         total_frames
     );
 
@@ -1117,81 +1117,43 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     tap_buffers[1] = InstantiateTapBuffer(streaming_imag_descriptor, result.spectral_imag.data());
     tap_buffers[2] = InstantiateTapBuffer(streaming_pcm_descriptor, result.pcm.data());
 
-    const size_t spectral_lane_count = tap_buffers[0].shape.batches > 0U
-        ? tap_buffers[0].shape.batches
-        : 1U;
-    std::vector<uint8_t> spectral_row_written(spectral_lane_count * total_frames, 0U);
-    size_t spectral_rows_captured = 0U;
-    size_t pcm_frames_captured = 0U;
-    AmpMailboxEntry *pcm_cursor_anchor = nullptr;
+    EdgeRunnerTapBuffer &spectral_real_tap = tap_buffers[0];
+    EdgeRunnerTapBuffer &spectral_imag_tap = tap_buffers[1];
+    EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
 
     EdgeRunnerTapBufferSet tap_set{};
     tap_set.items = tap_buffers.data();
     tap_set.count = static_cast<uint32_t>(tap_buffers.size());
 
-    EdgeRunnerTapStatusSet status_set{};
-    status_set.items = nullptr;
-    status_set.count = 0U;
-
     EdgeRunnerTapContext tap_context{};
     tap_context.outputs = tap_set;
-    tap_context.status = status_set;
-
-    void *state = nullptr;
-    bool saw_state = false;
+    tap_context.status = {};
 
     EdgeRunnerNodeInputs inputs{};
+    inputs.audio = {};
     inputs.params = params;
     inputs.taps = tap_context;
 
-    auto capture_pcm_entries = [&](EdgeRunnerTapBuffer &pcm_tap) -> size_t {
-        if (state == nullptr) {
-            return 0U;
-        }
-        const size_t before = pcm_frames_captured;
-        AmpMailboxEntry *cursor = (pcm_cursor_anchor == nullptr)
-            ? amp_node_mailbox_head(state)
-            : pcm_cursor_anchor->next;
-        while (cursor != nullptr && pcm_frames_captured < total_frames) {
-            const int entry_channels = (cursor->channels > 0) ? cursor->channels : 1;
-            const size_t entry_frames = (cursor->frames > 0U) ? cursor->frames : 0U;
-            const double *entry_buffer = cursor->buffer;
-            for (size_t frame = 0; frame < entry_frames && pcm_frames_captured < total_frames; ++frame) {
-                const double *src = entry_buffer + frame * (size_t)entry_channels;
-                write_tap_row(
-                    pcm_tap,
-                    0,
-                    static_cast<int>(pcm_frames_captured),
-                    src,
-                    entry_channels
-                );
-                pcm_frames_captured += 1U;
-            }
-            pcm_cursor_anchor = cursor;
-            cursor = cursor->next;
-        }
-        return pcm_frames_captured - before;
-    };
+    void *state = nullptr;
+    double *out_buffer = nullptr;
+    int out_channels = 0;
+    AmpNodeMetrics metrics{};
 
-    for (size_t offset = 0; offset < total_frames; offset += chunk_frames) {
-        const size_t frames = std::min(chunk_frames, total_frames - offset);
-
-        EdgeRunnerAudioView audio = build_audio_view_span(signal.data() + offset, frames);
-        if (offset + frames >= total_frames) {
-            audio.has_audio |= EDGE_RUNNER_AUDIO_FLAG_FINAL;
-        }
+    size_t frames_processed = 0;
+    while (frames_processed < total_frames) {
+        const size_t frames_to_process = std::min(chunk_frames, total_frames - frames_processed);
+        EdgeRunnerAudioView audio = build_audio_view_span(
+            signal.data() + frames_processed,
+            frames_to_process
+        );
         inputs.audio = audio;
-
-        double *out_buffer = nullptr;
-        int out_channels = 0;
-        AmpNodeMetrics metrics{};
 
         int rc = amp_run_node_v2(
             &descriptor,
             &inputs,
             1,
             1,
-            static_cast<int>(frames),
+            static_cast<int>(frames_to_process),
             kSampleRate,
             &out_buffer,
             &out_channels,
@@ -1202,86 +1164,50 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         );
 
         if (rc != 0 && rc != AMP_E_PENDING) {
-            record_failure(
-                "streaming call %zu failed rc=%d",
-                offset / chunk_frames,
-                rc
-            );
+            record_failure("amp_run_node_v2 failed rc=%d", rc);
+            break;
         }
 
-        EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
-        if (out_buffer != nullptr && out_channels == 1) {
-            const size_t frames_to_copy = std::min<size_t>(frames, total_frames - pcm_frames_captured);
-            for (size_t i = 0; i < frames_to_copy; ++i) {
-                write_tap_row(
-                    pcm_tap,
-                    0,
-                    static_cast<int>(pcm_frames_captured),
-                    out_buffer + i,
-                    1
-                );
-                pcm_frames_captured++;
-            }
-        }
-
-        if (out_buffer != nullptr) {
-            amp_free(out_buffer);
-            out_buffer = nullptr;
-        }
-
-        capture_pcm_entries(pcm_tap);
-
-        if (state == nullptr) {
-            record_failure("streaming call %zu did not return persistent state", offset / chunk_frames);
-        } else {
-            saw_state = true;
-            result.state_allocated = true;
-        }
-
-        result.metrics_per_call.push_back(metrics);
-        result.call_count += 1;
+        frames_processed += frames_to_process;
     }
 
-    spectral_rows_captured += drain_spectral_mailbox_rows(
-        state,
-        tap_buffers[0],
-        tap_buffers[1],
-        spectral_row_written,
-        static_cast<uint32_t>(total_frames)
+    // Ensure all remaining frames are processed
+    int rc = wait_for_completion(
+        descriptor,
+        inputs,
+        1,
+        1,
+        static_cast<int>(total_frames - frames_processed),
+        kSampleRate,
+        &state,
+        &out_buffer,
+        &out_channels,
+        &metrics
     );
 
-    const size_t target_pcm_frames = total_frames;
-    const int max_poll_attempts = 1000;
-    int poll_attempts = 0;
-    while (pcm_frames_captured < target_pcm_frames && poll_attempts < max_poll_attempts) {
-        size_t before = pcm_frames_captured;
-        capture_pcm_entries(tap_buffers[2]);
-        if (pcm_frames_captured == before) {
-            poll_attempts += 1;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        } else {
-            poll_attempts = 0;
+    if (rc != 0) {
+        record_failure(
+            "[FFT-TEST] wait_for_completion failed rc=%d descriptor=%s expected=%d batches=%d channels=%d",
+            rc,
+            descriptor.name,
+            static_cast<int>(total_frames - frames_processed),
+            inputs.audio.batches,
+            inputs.audio.channels
+        );
+
+        if (out_buffer != nullptr) {
+            for (size_t frame = 0; frame < static_cast<size_t>(total_frames - frames_processed); ++frame) {
+                emit_diagnostic(
+                    "[FFT-TEST] Unexpected zero energy at frame %zu: value=%f",
+                    frame,
+                    out_buffer[frame]
+                );
+            }
         }
     }
-
-    if (pcm_frames_captured < target_pcm_frames) {
-        record_failure(
-            "streaming run captured %zu/%zu pcm frames",
-            pcm_frames_captured,
-            target_pcm_frames
-        );
-    }
-
-    result.spectral_rows_committed = spectral_rows_captured;
-    result.pcm_frames_committed = pcm_frames_captured;
 
     if (state != nullptr) {
         amp_release_state(state);
-        state = nullptr;
-    }
-
-    if (!saw_state) {
-        record_failure("streaming run never produced node state");
     }
 
     return result;

@@ -186,16 +186,18 @@ static void fftdiv_stage_trigger_halt(
     const char *detail,
     const double *probe_real,
     const double *probe_imag,
-    size_t probe_count
+    size_t probe_count,
+    size_t frame_number // Added frame number
 ) {
     if (stage_name == NULL) {
         stage_name = "stage";
     }
     const char *reason = (detail != NULL) ? detail : "zero-output";
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-               "[STAGE-HALT] stage=%s slot=%d reason=%s samples=%zu\n",
+               "[STAGE-HALT] stage=%s slot=%d frame=%zu reason=%s samples=%zu\n",
                stage_name,
                slot,
+               frame_number, // Log frame number
                reason,
                probe_count);
     const size_t sample_cap = (probe_count < 4U) ? probe_count : 4U;
@@ -209,9 +211,10 @@ static void fftdiv_stage_trigger_halt(
                    im);
     }
     fprintf(stderr,
-            "[fftdiv-stage-halt] stage=%s slot=%d reason=%s samples=%zu\n",
+            "[fftdiv-stage-halt] stage=%s slot=%d frame=%zu reason=%s samples=%zu\n",
             stage_name,
             slot,
+            frame_number, // Log frame number
             reason,
             probe_count);
     for (size_t i = 0; i < sample_cap; ++i) {
@@ -233,7 +236,8 @@ static void fftdiv_stage_assert_complex_output(
     int slot,
     const double *real,
     const double *imag,
-    size_t value_count
+    size_t value_count,
+    size_t frame_number // Added frame number
 ) {
     if (!fftdiv_stage_assert_enabled(state) || value_count == 0) {
         return;
@@ -241,7 +245,7 @@ static void fftdiv_stage_assert_complex_output(
     if (fftdiv_complex_block_has_signal(real, imag, value_count)) {
         return;
     }
-    fftdiv_stage_trigger_halt(state, stage_name, slot, "complex-output-zero", real, imag, value_count);
+    fftdiv_stage_trigger_halt(state, stage_name, slot, "complex-output-zero", real, imag, value_count, frame_number);
 }
 
 static void fftdiv_stage_assert_real_output(
@@ -249,7 +253,8 @@ static void fftdiv_stage_assert_real_output(
     const char *stage_name,
     int slot,
     const double *values,
-    size_t value_count
+    size_t value_count,
+    size_t frame_number
 ) {
     if (!fftdiv_stage_assert_enabled(state) || value_count == 0) {
         return;
@@ -257,7 +262,7 @@ static void fftdiv_stage_assert_real_output(
     if (fftdiv_block_has_signal(values, value_count)) {
         return;
     }
-    fftdiv_stage_trigger_halt(state, stage_name, slot, "pcm-output-zero", values, NULL, value_count);
+    fftdiv_stage_trigger_halt(state, stage_name, slot, "pcm-output-zero", values, NULL, value_count, frame_number);
 }
 
 #if defined(__cplusplus)
@@ -729,9 +734,9 @@ static FftDivTailPlan fftdiv_calculate_tail_plan(
     plan.backend_hop = 1;
     plan.working_span = 1;
     plan.working_hop = 1;
+    plan.istft_tail_frames = 0;
     if (state == NULL) {
         plan.pcm_frames = 1U;
-        plan.istft_tail_frames = 0;
         return plan;
     }
     const auto &fftdiv = state->u.fftdiv;
@@ -1962,16 +1967,9 @@ static int fftdiv_execute_block(
                                pending_samples,
                                (void*)slot_state.forward_handle);
                     if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE) && pending_samples > 0U && pcm_source != NULL) {
-                        const size_t pcm_log_count = (pending_samples < (size_t)window_size)
-                            ? pending_samples
-                            : (size_t)window_size;
-                        const int pcm_log_cap = 8;
-                        const size_t to_log = (pcm_log_count < (size_t)pcm_log_cap)
-                            ? pcm_log_count
-                            : (size_t)pcm_log_cap;
-                        for (int sample_idx = 0; sample_idx < to_log; ++sample_idx) {
+                        for (size_t sample_idx = 0; sample_idx < pending_samples; ++sample_idx) {
                             FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                                       "[STAGE1-PCM] slot=%d frame=%d sample=%d value=%.6f\n",
+                                       "[STAGE1-PCM] slot=%d frame=%d sample=%zu value=%.6f\n",
                                        slot,
                                        frame_index_int,
                                        sample_idx,
@@ -2033,7 +2031,9 @@ static int fftdiv_execute_block(
                                         slot,
                                         slot_spectral_real + base_offset,
                                         slot_spectral_imag + base_offset,
-                                        frame_bins);
+                                        frame_bins,
+                                        emitted_index // Pass frame number
+                                    );
                                 }
                             }
                         }
@@ -2411,13 +2411,16 @@ static int fftdiv_execute_block(
                     commit_imag,
                     commit_bins);
                 if (commit_bins > 0) {
+                    const size_t stage2_frame_number = (size_t)(frame_counter + (int64_t)processed_passes);
                     fftdiv_stage_assert_complex_output(
                         state,
                         "stage2",
                         slot,
                         commit_real,
                         commit_imag,
-                        (size_t)commit_bins);
+                        (size_t)commit_bins,
+                        stage2_frame_number
+                    );
                 }
                 /* TODO: introduce interpolation when tensor_freq_bins != commit_bins. */
                 if (!state->u.fftdiv.preserve_tensor_on_ingest && scratch_real != NULL && scratch_imag != NULL && scratch_bins > 0) {
@@ -2676,13 +2679,16 @@ static int fftdiv_execute_block(
                         lane_snapshot.spectral_real.data(),
                         lane_snapshot.spectral_imag.data(),
                         window_size);
+                    const size_t stage3_frame_number = (size_t)(frame_counter + (int64_t)processed_passes);
                     fftdiv_stage_assert_complex_output(
                         state,
                         "stage3",
                         slot,
                         lane_snapshot.spectral_real.data(),
                         lane_snapshot.spectral_imag.data(),
-                        (size_t)window_size);
+                        (size_t)window_size,
+                        stage3_frame_number
+                    );
                 }
             } else {
                 if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
@@ -2817,7 +2823,9 @@ static int fftdiv_execute_block(
                             slot,
                             released_real,
                             released_imag,
-                            (size_t)window_size);
+                            (size_t)window_size,
+                            slice.frame_index // Pass frame number
+                    );
                         /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
                         const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
                         stage_emit_spectral(
@@ -2918,8 +2926,22 @@ static int fftdiv_execute_block(
                            "[STAGE5-PCM-ISTFT] slot=%d produced_pcm=%zu\n",
                            slot,
                            produced_pcm);
-                if (produced_pcm > 0) {
-                    made_progress = true;
+                if (produced_pcm > 0 && window_size > 0 && slot_state.inverse_scratch.data() != NULL) {
+                    if (fftdiv_stage_assert_enabled(state)) {
+                        const size_t frame_bins = (size_t)window_size;
+                        for (size_t emitted_index = 0; emitted_index < produced_pcm; ++emitted_index) {
+                            const size_t base_offset = emitted_index * frame_bins;
+                            fftdiv_stage_assert_complex_output(
+                                state,
+                                "stage5",
+                                slot,
+                                slot_state.inverse_scratch.data() + base_offset,
+                                slot_state.inverse_scratch.data() + base_offset,
+                                frame_bins,
+                                emitted_index // Pass frame number
+                            );
+                        }
+                    }
                 }
                 for (size_t i = 0; i < produced_pcm && i < slot_state.inverse_scratch.size(); ++i) {
                     slot_state.inverse_queue.push_back(slot_state.inverse_scratch[i]);
@@ -2929,7 +2951,8 @@ static int fftdiv_execute_block(
             while (!slot_state.inverse_queue.empty() && buffer_offset < total_samples) {
                 double sample_value = slot_state.inverse_queue.front();
                 if (stage5_pcm_assert_enabled) {
-                    fftdiv_stage_assert_real_output(state, "stage5", slot, &sample_value, 1U);
+                    const size_t pcm_frame_number = base_index + buffer_offset;
+                    fftdiv_stage_assert_real_output(state, "stage5", slot, &sample_value, 1U, pcm_frame_number);
                 }
                 buffer[buffer_offset] = sample_value;
                 slot_state.inverse_queue.pop_front();
@@ -3357,7 +3380,7 @@ static int fftdiv_wait_for_completion(
         : (fftdiv.last_sample_rate > 0.0 ? fftdiv.last_sample_rate : fftdiv.sample_rate_hint);
 
     EdgeRunnerAudioView audio{};
-    audio.has_audio = 0;
+    audio.has_audio = 0; // No new PCM; advance existing pipeline only
     audio.batches = static_cast<uint32_t>(effective_batches);
     audio.channels = static_cast<uint32_t>(effective_channels);
     audio.frames = static_cast<uint32_t>(effective_frames);
@@ -3501,7 +3524,7 @@ static bool fftdiv_worker_process_command(
     bool emit_entry = (buffer != nullptr) || (status != AMP_E_PENDING);
     if (emit_entry) {
         int frames = command->expected_frames > 0 ? command->expected_frames : command->task.frames;
-        if (frames <= 0) {
+        if (frames <=  0) {
             frames = state->u.fftdiv.last_frames > 0
                 ? state->u.fftdiv.last_frames
                 : state->u.fftdiv.window_size;
@@ -3553,9 +3576,9 @@ static bool fftdiv_worker_drain_pending_outputs(node_state_t *state) {
 
         EdgeRunnerAudioView audio{};
         audio.has_audio = 0; // No new PCM; advance existing pipeline only
-        audio.batches = (uint32_t)batches;
-        audio.channels = (uint32_t)channels;
-        audio.frames = (uint32_t)frames;
+        audio.batches = static_cast<uint32_t>(batches);
+        audio.channels = static_cast<uint32_t>(channels);
+        audio.frames = static_cast<uint32_t>(frames);
         audio.data = nullptr;
 
         EdgeRunnerParamSet params{};
