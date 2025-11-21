@@ -1312,7 +1312,9 @@ static void fftdiv_prepare_lane_plan(
         // Lane should be active if there's anything left that could be used
         const bool could_use_anything = has_pcm_feed || has_spectral_in || has_ring_data || has_wheel_frame || has_pcm_backlog || has_pending_output;
         const bool enable_pcm_in = has_pcm_feed || has_spectral_in || has_ring_data || has_pcm_backlog;
-        const bool enable_pcm_out = could_use_anything;
+        // Respect io_mode: only enable PCM output if mode is 0 (pcm) or 2 (both), not 1 (spectral)
+        const bool pcm_output_allowed = (state->u.fftdiv.io_mode != 1);
+        const bool enable_pcm_out = could_use_anything && pcm_output_allowed;
 
         lane.enable_pcm_in = enable_pcm_in;
         lane.enable_pcm_out = enable_pcm_out;
@@ -1473,6 +1475,29 @@ static int fftdiv_execute_block(
         state->u.fftdiv.halt_on_zero_stage_output
     );
     state->u.fftdiv.halt_on_zero_stage_output = (halt_on_zero_flag != 0) ? 1 : 0;
+
+    // Parse io_mode: "pcm" (default), "spectral", or "both"
+    char io_mode_str[32];
+    io_mode_str[0] = '\0';
+    int io_mode = 0;  // default to PCM mode
+    if (json_copy_string(
+            descriptor->params_json,
+            descriptor->params_len,
+            "io_mode",
+            io_mode_str,
+            sizeof(io_mode_str)) != 0) {
+        for (size_t i = 0; io_mode_str[i] != '\0'; ++i) {
+            io_mode_str[i] = (char)tolower((unsigned char)io_mode_str[i]);
+        }
+        if (strcmp(io_mode_str, "spectral") == 0) {
+            io_mode = 1;
+        } else if (strcmp(io_mode_str, "both") == 0) {
+            io_mode = 2;
+        } else {
+            io_mode = 0;  // "pcm" or unknown defaults to PCM mode
+        }
+    }
+    state->u.fftdiv.io_mode = io_mode;
 
     // Default working frequency bins should follow the effective window_size
     // so the tensor's bin dimension matches the STFT output bins unless explicitly overridden.
@@ -3051,7 +3076,9 @@ static int fftdiv_execute_block(
     
     // Push one mailbox entry per frame (only push what was actually written)
     size_t frames_to_push = pcm_written_samples;
-    if (pcm_written_samples == 0 || pcm_written_samples > 1000) {
+    // In spectral mode (io_mode=1), zero PCM output is expected, not anomalous
+    const bool is_spectral_only = (state != nullptr && state->u.fftdiv.io_mode == 1);
+    if ((pcm_written_samples == 0 && !is_spectral_only) || pcm_written_samples > 1000) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu ANOMALY\n",
                    pcm_written_samples, frames_to_push);
