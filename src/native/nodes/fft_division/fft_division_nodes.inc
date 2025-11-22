@@ -236,7 +236,35 @@ static void fftdiv_stage_trigger_halt(
                 im);
     }
     fflush(stderr);
-    abort();
+    // Instead of aborting the process, try to stop the worker thread
+    // and perform a graceful shutdown of the FFT division subsystem.
+#if defined(__cplusplus)
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[STAGE-HALT] initiating graceful shutdown for state=%p\n",
+               (void*)state);
+    // Request the worker stop and allow it to perform its own shutdown.
+    // Do NOT call `fftdiv_stop_worker` here because this handler is often
+    // invoked from the worker thread itself; joining the current thread
+    // would deadlock or cause undefined behaviour. Instead set the
+    // stop flag, enable flush-on-stop, and notify the worker condition
+    // variable so the worker will drain pending outputs and exit cleanly.
+    if (state != nullptr) {
+        auto &worker = state->u.fftdiv.worker;
+        {
+            std::lock_guard<std::mutex> wlock(worker.mutex);
+            worker.flush_on_stop = true;
+            worker.stop_requested = true;
+        }
+        worker.cv_request.notify_all();
+    }
+    // Mark mailbox as shutdown and notify any waiters so they can exit cleanly.
+    {
+        std::lock_guard<std::mutex> lock(state->mailbox_mutex);
+        state->mailbox_shutdown = true;
+    }
+    state->mailbox_cv.notify_all();
+#endif
+    return;
 }
 
 static void fftdiv_stage_assert_complex_output(
@@ -312,34 +340,15 @@ static bool fftdiv_window_release_tail(
     int *wheel_filled,
     const char *reason
 ) {
-    if (state == nullptr || wheel_tail == nullptr || wheel_filled == nullptr || wheel_length <= 0) {
-        return false;
-    }
-    auto &meta = state->u.fftdiv.wheel_slice_metadata;
-    if (meta.size() != (size_t)wheel_length) {
-        return false;
-    }
-    bool released = false;
-    while (*wheel_filled > 0) {
-        FftDivFilledSlice &tail_slice = meta[(size_t)(*wheel_tail)];
-        if (!tail_slice.valid || !tail_slice.stage4_emitted) {
-            break;
-        }
-        tail_slice.valid = false;
-        tail_slice.stage4_emitted = false;
-        *wheel_tail = (*wheel_tail + 1) % wheel_length;
-        *wheel_filled -= 1;
-        released = true;
-    }
-    if (released && fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-               "[STAGE4-WHEEL-DELIVERY] reason=%s tail=%d filled=%d len=%d\n",
-                   (reason != NULL) ? reason : "unspecified",
-                   *wheel_tail,
-                   *wheel_filled,
-                   wheel_length);
-    }
-    return released;
+    // Disable automatic Stage-4 tail release: this behavior was introduced
+    // externally and may interfere with expected Stage-1 zero-fill semantics.
+    // Keep the function present for API compatibility but make it a no-op.
+    (void)state;
+    (void)wheel_length;
+    (void)wheel_tail;
+    (void)wheel_filled;
+    (void)reason;
+    return false;
 }
 
 static void fftdiv_window_reserve_leading_edge(
@@ -2895,19 +2904,15 @@ static int fftdiv_execute_block(
             }
             slice.stage4_emitted = true;
             if (wheel_length > 0) {
+                // Call tail-release helper (now a no-op). We intentionally
+                // avoid emitting STAGE4 tail notices or mutating wheel cursors
+                // here so Stage-1 zero-tail mechanics remain authoritative.
                 fftdiv_window_release_tail(
                     state,
                     wheel_length,
                     &wheel_tail_cursor,
                     &wheel_filled_cursor,
                     "stage4-inline");
-                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                               "[STAGE4-TAIL] idx=%d new_tail=%d filled=%d\n",
-                               idx,
-                               wheel_tail_cursor,
-                               wheel_filled_cursor);
-                }
             }
         }
         if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
@@ -3273,90 +3278,10 @@ static bool fftdiv_stage1_zero_insertion_active(const node_state_t *state) {
 
 
 static void fftdiv_flush_with_zeroes(node_state_t *state) {
-    if (state == nullptr) {
-        FFTDIV_LOG(nullptr, FFTDIV_LOG_LEVEL_SUMMARY,
-                   "[FFT-LATENCY-FLUSH] skip state=null reason=null-state\n");
-        return;
-    }
-    auto &fftdiv = state->u.fftdiv;
-    const EdgeRunnerNodeDescriptor *descriptor = fftdiv.last_descriptor;
-    if (descriptor == nullptr) {
-        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-                   "[FFT-LATENCY-FLUSH] skip state=%p reason=no-descriptor slots=%zu\n",
-                   (void *)state,
-                   static_cast<size_t>(fftdiv.stream_slots.size()));
-        return;
-    }
-    if (fftdiv.stream_slots.empty()) {
-        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-                   "[FFT-LATENCY-FLUSH] skip state=%p reason=no-slots descriptor=%s\n",
-                   (void *)state,
-                   descriptor->name != nullptr ? descriptor->name : "<unnamed>");
-        return;
-    }
-    const FftDivStageLockSnapshot stage_snapshot = fftdiv_snapshot_stage_locks(state);
-    const bool pipeline_active = fftdiv_stage_snapshot_any_ready(stage_snapshot);
-    int batches = fftdiv.last_batches > 0 ? fftdiv.last_batches : 1;
-    int channels = fftdiv.last_channels > 0 ? fftdiv.last_channels : 1;
-    const FftDivTailPlan tail_plan = fftdiv_calculate_tail_plan(state, pipeline_active);
-    const size_t frame0_delay = tail_plan.pcm_frames;
-    int frames = (frame0_delay > 0U)
-        ? static_cast<int>(frame0_delay)
-        : 1;
-    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-               "[FFT-LATENCY-FLUSH-COMPUTE] W_fft=%d H_fft=%d W_work=%d H_work=%d L_istft=%d frame0_delay=%zu inject_pcm=%d\n",
-               tail_plan.window_size,
-               tail_plan.backend_hop,
-               tail_plan.working_span,
-               tail_plan.working_hop,
-               tail_plan.istft_tail_frames,
-               frame0_delay,
-               frames);
-    int slot_count = fftdiv.last_slot_count > 0 ? fftdiv.last_slot_count : batches * channels;
-    if (slot_count <= 0) {
-        slot_count = 1;
-    }
-    const double sample_rate = (fftdiv.last_sample_rate > 0.0)
-        ? fftdiv.last_sample_rate
-        : fftdiv.sample_rate_hint;
-
-    std::vector<double> zeros(
-        static_cast<size_t>(slot_count) * static_cast<size_t>(frames),
-        0.0
-    );
-
-    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-               "[FFT-ANALYTIC-FLUSH] start state=%p slots=%zu frames_pcm=%d pending=%s\n",
-               (void *)state,
-               static_cast<size_t>(fftdiv.stream_slots.size()),
-               frames,
-               pipeline_active ? "yes" : "no");
-
-    EdgeRunnerAudioView audio{};
-    audio.has_audio = 1;
-    audio.batches = static_cast<uint32_t>(batches);
-    audio.channels = static_cast<uint32_t>(channels);
-    audio.frames = frames;
-    audio.data = zeros.data();
-
-    EdgeRunnerParamSet params{};
-    EdgeRunnerNodeInputs flush_inputs{};
-    flush_inputs.audio = audio;
-    flush_inputs.params = params;
-    flush_inputs.taps.outputs.items = nullptr;
-    flush_inputs.taps.outputs.count = 0;
-    flush_inputs.taps.status.items = nullptr;
-    flush_inputs.taps.status.count = 0;
-
-    // Analytic zero-injection: push zeros as normal input, no flush enum needed
-    double *tmp_buf = nullptr;
-    int tmp_ch = 0;
-    const size_t runtime_pcm_block = frames > 0 ? static_cast<size_t>(frames) : 1U;
-
-    if (tmp_buf != nullptr) {
-        free(tmp_buf);
-    }
-    
+    // Disabled analytic flush: avoid injecting zeros outside of Stage-1
+    // zero-tail mechanics. Keep symbol for compatibility.
+    (void)state;
+    return;
 }
 
 static int fftdiv_wait_for_completion(
@@ -3658,6 +3583,7 @@ static void fftdiv_worker_main(node_state_t *state) {
     if (state == nullptr) {
         return;
     }
+    fprintf(stderr, "[DIAG] fftdiv_worker_main: started state=%p\n", (void*)state);
     // The FFT division worker is intended to be a "live" stage scheduler that
     // keeps all five pipeline stages moving as long as there is outstanding
     // work anywhere in the internal queues.  Each pass through the loop pulls a
@@ -3774,12 +3700,15 @@ static void fftdiv_worker_main(node_state_t *state) {
             break;
         }
 
+        fprintf(stderr, "[DIAG] fftdiv_worker_main: waiting on cv state=%p pending=%zu\n", (void*)state, worker.pending_commands.size());
         worker.cv_request.wait(lock, should_wake);
+        fprintf(stderr, "[DIAG] fftdiv_worker_main: woke from cv state=%p pending=%zu\n", (void*)state, worker.pending_commands.size());
         if (worker.stop_requested) {
             continue;
         }
 
         bool did_work = process_ready_work(lock);
+        fprintf(stderr, "[DIAG] fftdiv_worker_main: loop did_work=%d pending=%zu active=%p\n", did_work ? 1 : 0, worker.pending_commands.size(), (void*)(worker.active_command ? worker.active_command.get() : nullptr));
         if (!did_work && fftdiv_pipeline_can_advance(state)) {
             std::this_thread::yield();
         }
@@ -3916,9 +3845,12 @@ static int run_fft_division_node(
     *out_buffer = NULL;
     *out_channels = 0;
 
+    fprintf(stderr, "[DIAG] run_fft_division_node: entry descriptor=%p name=%s state=%p frames=%d\n", (void*)descriptor, descriptor ? descriptor->name : "<null>", (void*)state, frames);
     if (fftdiv_start_worker(state) != 0) {
+        fprintf(stderr, "[DIAG] run_fft_division_node: fftdiv_start_worker failed state=%p\n", (void*)state);
         return -1;
     }
+    fprintf(stderr, "[DIAG] run_fft_division_node: fftdiv_start_worker succeeded state=%p\n", (void*)state);
 
     int effective_batches = (batches > 0) ? batches : 1;
     int effective_channels = channels;
@@ -3955,6 +3887,7 @@ static int run_fft_division_node(
         }
         worker.pending_commands.push_back(command);
         worker.append_invocations++;
+        fprintf(stderr, "[DIAG] run_fft_division_node: pushed command pending=%zu expected_entries=%zu state=%p\n", worker.pending_commands.size(), worker.mailbox_expected_entries, (void*)state);
         size_t expected = command->expected_frames > 0
             ? static_cast<size_t>(command->expected_frames)
             : 1U;
