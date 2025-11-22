@@ -42,8 +42,10 @@ AmpMailboxNode amp_mailbox_get_spectral_head(void* state, const char* tap_name);
 AmpMailboxNode amp_mailbox_get_pcm_head(void* state);
 
 // Node accessors
-const double* amp_mailbox_node_real(AmpMailboxNode node);
-const double* amp_mailbox_node_imag(AmpMailboxNode node);
+// Spectral getters expose raw values (not pointers) so legacy readers copy
+// discrete doubles from each mailbox node rather than aliasing node storage.
+double amp_mailbox_node_real(AmpMailboxNode node);
+double amp_mailbox_node_imag(AmpMailboxNode node);
 int amp_mailbox_node_window_size(AmpMailboxNode node);
 int amp_mailbox_node_frame_index(AmpMailboxNode node);
 // PCM helpers

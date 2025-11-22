@@ -63,6 +63,7 @@ public:
             2,
             window,
             hop,
+            kStftModeBatched,
             FFT_TRANSFORM_C2C,
             0,
             0,

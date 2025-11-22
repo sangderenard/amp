@@ -624,6 +624,15 @@ AMP_CAPI int amp_graph_runtime_debug_snapshot(
    flags (accepted/read) and must be honoured by the caller. */
 AMP_CAPI int amp_tap_cache_stage(EdgeRunnerTapBuffer* tap, double* buffer, size_t buffer_len, uint32_t batches, uint32_t channels, uint32_t frames);
 AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap);
+// Block until the mailbox chain backing a tap has enough nodes to satisfy the
+// expected legacy buffer shape, then attach the chain head to the tap. Returns
+// the number of nodes observed when the wait finished. A timeout of 0 waits
+// indefinitely.
+AMP_CAPI int amp_tap_cache_block_until_ready(
+    void* state,
+    EdgeRunnerTapBuffer* tap,
+    const char* tap_name,
+    uint64_t timeout_ms);
 AMP_CAPI void amp_tap_cache_mark_accepted(EdgeRunnerTapBuffer* tap);
 AMP_CAPI void amp_tap_cache_mark_read(EdgeRunnerTapBuffer* tap);
 AMP_CAPI double* amp_tap_cache_get_buffer(EdgeRunnerTapBuffer* tap);
