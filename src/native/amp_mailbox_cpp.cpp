@@ -2,9 +2,12 @@
 #ifdef __cplusplus
 
 #include "amp_native_mailbox_chain.hpp"
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <map>
-#include <string>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include "nodes/fft_division/fft_division_types.h"
 
@@ -18,12 +21,65 @@ struct MailboxStateWrapper {
     MailboxChainHead pcm_mailbox_chain;
     std::map<std::string, FftDivTapMailboxCursor> tap_mailbox_cursors;
     std::mutex mtx;
+    std::condition_variable cv;
     std::unordered_map<std::string, size_t> spectral_counts;
     size_t pcm_count{0};
     // instrumentation counters
     size_t total_spectral_appends{0};
     size_t total_pcm_appends{0};
 };
+
+static size_t expected_nodes_for_tap(const EdgeRunnerTapBuffer* tap) {
+    if (!tap) return 0;
+    const bool is_pcm = (tap->buffer_class && std::strcmp(tap->buffer_class, "pcm") == 0);
+    const size_t frames = tap->cache_frames > 0 ? tap->cache_frames : (tap->shape.frames > 0 ? tap->shape.frames : 1U);
+    const size_t channels = tap->cache_channels > 0 ? tap->cache_channels : (tap->shape.channels > 0 ? tap->shape.channels : 1U);
+    const size_t expected = is_pcm ? frames : (frames * channels);
+    return expected > 0 ? expected : 1U;
+}
+
+static size_t tap_chain_length_locked(
+    MailboxStateWrapper* w,
+    const EdgeRunnerTapBuffer* tap,
+    const char* tap_name,
+    std::string* resolved_name_out,
+    MailboxChainHead** chain_out) {
+    if (!w) return 0;
+    const bool is_pcm = tap && tap->buffer_class && std::strcmp(tap->buffer_class, "pcm") == 0;
+    if (is_pcm) {
+        if (chain_out) *chain_out = &w->pcm_mailbox_chain;
+        return w->pcm_count;
+    }
+    std::string resolved_name;
+    if (tap && tap->tap_name) {
+        resolved_name = std::string(tap->tap_name);
+    }
+    if (resolved_name.empty() && tap_name) {
+        resolved_name = std::string(tap_name);
+    }
+    if (resolved_name.empty()) {
+        resolved_name = "spectral";
+    }
+    if (resolved_name_out) {
+        *resolved_name_out = resolved_name;
+    }
+    auto it = w->spectral_counts.find(resolved_name);
+    if (it != w->spectral_counts.end()) {
+        if (chain_out) {
+            *chain_out = &w->spectral_mailbox_chains[resolved_name];
+        }
+        return it->second;
+    }
+    auto it_chain = w->spectral_mailbox_chains.find(resolved_name);
+    if (it_chain == w->spectral_mailbox_chains.end()) {
+        if (chain_out) *chain_out = nullptr;
+        return 0;
+    }
+    if (chain_out) {
+        *chain_out = &it_chain->second;
+    }
+    return EdgeRunnerTapMailboxChain::count_nodes(it_chain->second.head);
+}
 
 static MailboxStateWrapper* state_for(void* key) {
     std::lock_guard<std::mutex> lock(g_states_mtx);
@@ -125,6 +181,43 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
     return static_cast<int>(written);
 }
 
+extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
+    void* state,
+    EdgeRunnerTapBuffer* tap,
+    const char* tap_name,
+    uint64_t timeout_ms) {
+    if (!tap) return -1;
+    MailboxStateWrapper* w = state_for(state);
+    const size_t expected = expected_nodes_for_tap(tap);
+    if (expected == 0) return 0;
+
+    std::unique_lock<std::mutex> lock(w->mtx);
+    auto predicate = [&]() {
+        return tap_chain_length_locked(w, tap, tap_name, nullptr, nullptr) >= expected;
+    };
+    bool ready = false;
+    if (timeout_ms == 0) {
+        w->cv.wait(lock, predicate);
+        ready = true;
+    } else {
+        ready = w->cv.wait_until(
+            lock,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms),
+            predicate);
+    }
+
+    std::string resolved_name;
+    MailboxChainHead* chain = nullptr;
+    const size_t available = tap_chain_length_locked(w, tap, tap_name, &resolved_name, &chain);
+    if (chain != nullptr) {
+        tap->mailbox_head = chain->head;
+    } else if (tap->buffer_class && std::strcmp(tap->buffer_class, "pcm") == 0) {
+        tap->mailbox_head = w->pcm_mailbox_chain.head;
+    }
+
+    return ready ? static_cast<int>(available) : 0;
+}
+
 extern "C" AMP_CAPI void amp_tap_cache_mark_accepted(EdgeRunnerTapBuffer* tap) {
     if (!tap) return;
     tap->cache_state = 2; // accepted by downstream (ownership transferred)
@@ -168,6 +261,7 @@ void amp_mailbox_attach_spectral_node(void* state, const char* tap_name, AmpMail
     // update instrumentation
     w->spectral_counts[std::string(tap_name)] = EdgeRunnerTapMailboxChain::count_nodes(chain.head);
     ++w->total_spectral_appends;
+    w->cv.notify_all();
 }
 
 AmpMailboxNode amp_mailbox_create_pcm_node(double value, int frame_index) {
@@ -190,6 +284,7 @@ void amp_mailbox_append_pcm_node(void* state, AmpMailboxNode node) {
     // update instrumentation
     w->pcm_count = EdgeRunnerTapMailboxChain::count_nodes(chain.head);
     ++w->total_pcm_appends;
+    w->cv.notify_all();
 }
 
 size_t amp_mailbox_spectral_chain_length(void* state, const char* tap_name) {
@@ -281,17 +376,17 @@ AmpMailboxNode amp_mailbox_get_tap_cursor(void* state, const char* tap_name) {
     return reinterpret_cast<AmpMailboxNode>(const_cast<AmpSpectralMailboxEntry*>(cursor.read_cursor));
 }
 
-const double* amp_mailbox_node_real(AmpMailboxNode node) {
+double amp_mailbox_node_real(AmpMailboxNode node) {
     PersistentMailboxNode* n = reinterpret_cast<PersistentMailboxNode*>(node);
-    if (!n) return nullptr;
-    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) return &n->spectral_real;
-    return nullptr;
+    if (!n) return 0.0;
+    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) return n->spectral_real;
+    return 0.0;
 }
-const double* amp_mailbox_node_imag(AmpMailboxNode node) {
+double amp_mailbox_node_imag(AmpMailboxNode node) {
     PersistentMailboxNode* n = reinterpret_cast<PersistentMailboxNode*>(node);
-    if (!n) return nullptr;
-    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) return &n->spectral_imag;
-    return nullptr;
+    if (!n) return 0.0;
+    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) return n->spectral_imag;
+    return 0.0;
 }
 int amp_mailbox_node_window_size(AmpMailboxNode node) {
     PersistentMailboxNode* n = reinterpret_cast<PersistentMailboxNode*>(node);

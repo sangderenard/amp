@@ -33,10 +33,7 @@ static constexpr const char *kDevNullPath = "/dev/null";
 extern "C" {
 #include "amp_fft_backend.h"
 #include "amp_native.h"
-#include "mailbox.h"
 }
-
-#include "amp_native_mailbox_chain.hpp"
 
 #include "fft_division_test_helpers.h"
 
@@ -82,6 +79,8 @@ enum class VerbosityLevel : int {
 using amp::tests::fft_division_shared::BuildPcmTapDescriptor;
 using amp::tests::fft_division_shared::BuildSpectralTapDescriptor;
 using amp::tests::fft_division_shared::InstantiateTapBuffer;
+using amp::tests::fft_division_shared::PopulateLegacyPcmFromMailbox;
+using amp::tests::fft_division_shared::PopulateLegacySpectrumFromMailbox;
 using amp::tests::fft_division_shared::TapDescriptor;
 
 struct TestConfig {
@@ -865,7 +864,6 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     result.pcm.assign(signal.size(), 0.0);
     result.spectral_real.assign(signal.size() * g_config.window_size, 0.0);
     result.spectral_imag.assign(signal.size() * g_config.window_size, 0.0);
-    const uint32_t frame_count = static_cast<uint32_t>(signal.size());
     std::array<EdgeRunnerTapBuffer, 3> tap_buffers{};
     TapDescriptor spectral_descriptor = BuildSpectralTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
@@ -882,23 +880,109 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         signal.size()
     );
 
-    // Allow the node to construct and own persistent mailbox chains for each tap output.
-    // Tests no longer provide pre-built mailbox chains; pass nullptr so node creates them.
-    amp::tests::fft_division_shared::PersistentMailboxNode *spectral_real_mailbox = nullptr;
-    amp::tests::fft_division_shared::PersistentMailboxNode *spectral_imag_mailbox = nullptr;
-    amp::tests::fft_division_shared::PersistentMailboxNode *pcm_mailbox = nullptr;
-    tap_buffers[0] = InstantiateTapBuffer(spectral_real_descriptor, spectral_real_mailbox);
-    tap_buffers[1] = InstantiateTapBuffer(spectral_imag_descriptor, spectral_imag_mailbox);
-    tap_buffers[2] = InstantiateTapBuffer(pcm_descriptor, pcm_mailbox);
+    tap_buffers[0] = InstantiateTapBuffer(
+        spectral_real_descriptor,
+        result.spectral_real.data()
+    );
+    tap_buffers[1] = InstantiateTapBuffer(
+        spectral_imag_descriptor,
+        result.spectral_imag.data()
+    );
+    tap_buffers[2] = InstantiateTapBuffer(
+        pcm_descriptor,
+        result.pcm.data()
+    );
 
-    const size_t spectral_lane_count = tap_buffers[0].shape.batches > 0U
-        ? tap_buffers[0].shape.batches
-        : 1U;
-    std::vector<uint8_t> spectral_row_written(spectral_lane_count * frame_count, 0U);
-    // ...existing code...
-    // (Removed: all after-node draining, mailbox pop, and tap buffer writing logic)
-    // The node now handles mailbox handoff internally; taps will be read by unified helpers.
-    // ...existing code...
+    std::string params_json;
+    EdgeRunnerNodeDescriptor descriptor = build_descriptor(params_json);
+
+    EdgeRunnerAudioView audio = build_audio_view(signal);
+    audio.has_audio |= EDGE_RUNNER_AUDIO_FLAG_FINAL;
+
+    EdgeRunnerParamSet params{};
+    params.count = 0U;
+    params.items = nullptr;
+
+    EdgeRunnerTapBufferSet tap_set{};
+    tap_set.items = tap_buffers.data();
+    tap_set.count = static_cast<uint32_t>(tap_buffers.size());
+
+    EdgeRunnerTapStatusSet status_set{};
+    status_set.items = nullptr;
+    status_set.count = 0U;
+
+    EdgeRunnerTapContext tap_context{};
+    tap_context.outputs = tap_set;
+    tap_context.status = status_set;
+
+    EdgeRunnerNodeInputs inputs{};
+    inputs.audio = audio;
+    inputs.params = params;
+    inputs.taps = tap_context;
+
+    double *out_buffer = nullptr;
+    int out_channels = 0;
+    void *state = nullptr;
+    AmpNodeMetrics metrics{};
+
+    int rc = amp_run_node_v2(
+        &descriptor,
+        &inputs,
+        1,
+        1,
+        static_cast<int>(signal.size()),
+        kSampleRate,
+        &out_buffer,
+        &out_channels,
+        &state,
+        nullptr,
+        AMP_EXECUTION_MODE_FORWARD,
+        &metrics
+    );
+
+    if (rc != 0) {
+        record_failure(
+            "amp_run_node_v2 failed rc=%d descriptor=%s expected_frames=%zu",
+            rc,
+            descriptor.name,
+            signal.size()
+        );
+    }
+
+    result.metrics = metrics;
+
+    // Allow the worker to populate mailbox chains, then copy into the legacy
+    // tap buffers. This enforces the contract that verification reads only
+    // traverse the legacy tap storage rather than aliasing mailbox nodes or
+    // using direct return buffers.
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[2], tap_buffers[2].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[0], tap_buffers[0].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
+
+    const auto pcm_read = PopulateLegacyPcmFromMailbox(
+        tap_buffers[2],
+        result.pcm.data(),
+        result.pcm.size()
+    );
+    const auto spectral_read = PopulateLegacySpectrumFromMailbox(
+        tap_buffers[0],
+        tap_buffers[1],
+        result.spectral_real.data(),
+        result.spectral_imag.data(),
+        result.spectral_real.size()
+    );
+
+    result.pcm_frames_committed = pcm_read.frames_committed;
+    result.spectral_rows_committed = spectral_read.frames_committed;
+
+    if (out_buffer != nullptr) {
+        amp_free(out_buffer);
+        out_buffer = nullptr;
+    }
+
+    if (state != nullptr) {
+        amp_release_state(state);
+    }
     return result;
 }
 
@@ -937,17 +1021,18 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         total_frames
     );
 
-    // Let the node create and own the persistent mailbox chains for streaming outputs.
-    amp::tests::fft_division_shared::PersistentMailboxNode *streaming_real_mailbox = nullptr;
-    amp::tests::fft_division_shared::PersistentMailboxNode *streaming_imag_mailbox = nullptr;
-    amp::tests::fft_division_shared::PersistentMailboxNode *streaming_pcm_mailbox = nullptr;
-    tap_buffers[0] = InstantiateTapBuffer(streaming_real_descriptor, streaming_real_mailbox);
-    tap_buffers[1] = InstantiateTapBuffer(streaming_imag_descriptor, streaming_imag_mailbox);
-    tap_buffers[2] = InstantiateTapBuffer(streaming_pcm_descriptor, streaming_pcm_mailbox);
-
-    EdgeRunnerTapBuffer &spectral_real_tap = tap_buffers[0];
-    EdgeRunnerTapBuffer &spectral_imag_tap = tap_buffers[1];
-    EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
+    tap_buffers[0] = InstantiateTapBuffer(
+        streaming_real_descriptor,
+        result.spectral_real.data()
+    );
+    tap_buffers[1] = InstantiateTapBuffer(
+        streaming_imag_descriptor,
+        result.spectral_imag.data()
+    );
+    tap_buffers[2] = InstantiateTapBuffer(
+        streaming_pcm_descriptor,
+        result.pcm.data()
+    );
 
     EdgeRunnerTapBufferSet tap_set{};
     tap_set.items = tap_buffers.data();
@@ -976,6 +1061,9 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
             chunk_data,
             frames_to_process
         );
+        if (frames_processed + frames_to_process >= total_frames) {
+            audio.has_audio |= EDGE_RUNNER_AUDIO_FLAG_FINAL;
+        }
         if (g_verbosity >= VerbosityLevel::Trace && chunk_data != nullptr && frames_to_process > 0) {
             // Trace raw PCM chunk before it enters stage 1 packaging.
             emit_diagnostic(
@@ -994,6 +1082,8 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
             }
         }
         inputs.audio = audio;
+
+        const size_t start_frame = frames_processed;
 
         int rc = amp_run_node_v2(
             &descriptor,
@@ -1017,41 +1107,37 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
 
         frames_processed += frames_to_process;
         ++chunk_index;
+
+        result.call_count = chunk_index;
+        result.metrics_per_call.push_back(metrics);
+        result.state_allocated = result.state_allocated || (state != nullptr);
     }
 
-    // Ensure all remaining frames are processed
-    int rc = wait_for_completion(
-        descriptor,
-        inputs,
-        1,
-        1,
-        static_cast<int>(total_frames - frames_processed),
-        kSampleRate,
-        &state,
-        &out_buffer,
-        &out_channels,
-        &metrics
+    // After all chunks (including the final flag), wait for mailbox chains to
+    // be ready and then copy into the legacy tap buffers for verification.
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[2], tap_buffers[2].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[0], tap_buffers[0].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
+
+    const auto pcm_read = PopulateLegacyPcmFromMailbox(
+        tap_buffers[2],
+        result.pcm.data(),
+        result.pcm.size()
+    );
+    const auto spectral_read = PopulateLegacySpectrumFromMailbox(
+        tap_buffers[0],
+        tap_buffers[1],
+        result.spectral_real.data(),
+        result.spectral_imag.data(),
+        result.spectral_real.size()
     );
 
-    if (rc != 0) {
-        record_failure(
-            "[FFT-TEST] wait_for_completion failed rc=%d descriptor=%s expected=%d batches=%d channels=%d",
-            rc,
-            descriptor.name,
-            static_cast<int>(total_frames - frames_processed),
-            inputs.audio.batches,
-            inputs.audio.channels
-        );
+    result.pcm_frames_committed = pcm_read.frames_committed;
+    result.spectral_rows_committed = spectral_read.frames_committed;
 
-        if (out_buffer != nullptr) {
-            for (size_t frame = 0; frame < static_cast<size_t>(total_frames - frames_processed); ++frame) {
-                emit_diagnostic(
-                    "[FFT-TEST] Unexpected zero energy at frame %zu: value=%f",
-                    frame,
-                    out_buffer[frame]
-                );
-            }
-        }
+    if (out_buffer != nullptr) {
+        amp_free(out_buffer);
+        out_buffer = nullptr;
     }
 
     if (state != nullptr) {

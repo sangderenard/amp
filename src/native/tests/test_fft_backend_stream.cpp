@@ -61,6 +61,7 @@ public:
             2,
             window,
             hop,
+            kStftModeStreaming,
             FFT_TRANSFORM_C2C,
             0,
             0,
