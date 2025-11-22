@@ -9,9 +9,14 @@
 #include <unordered_map>
 #include <vector>
 
+
 extern "C" {
 #include "amp_native.h"
 }
+
+#ifdef __cplusplus
+#include "amp_native_mailbox_chain.hpp"
+#endif
 
 namespace amp::tests::fft_division_shared {
 
@@ -74,7 +79,10 @@ inline TapDescriptor BuildSpectralTapDescriptor(
     return descriptor;
 }
 
-inline EdgeRunnerTapBuffer InstantiateTapBuffer(const TapDescriptor &descriptor, double *data) {
+
+#ifdef __cplusplus
+// Overload for persistent mailbox chain
+inline EdgeRunnerTapBuffer InstantiateTapBuffer(const TapDescriptor &descriptor, amp::tests::fft_division_shared::PersistentMailboxNode* mailbox_head) {
     EdgeRunnerTapBuffer tap{};
     tap.tap_name = descriptor.name.c_str();
     tap.buffer_class = descriptor.buffer_class.c_str();
@@ -83,9 +91,24 @@ inline EdgeRunnerTapBuffer InstantiateTapBuffer(const TapDescriptor &descriptor,
         std::max<uint32_t>(1U, descriptor.shape.batches) *
         std::max<uint32_t>(1U, descriptor.shape.channels));
     tap.frame_stride = computed_stride;
-    tap.data = data;
+    tap.data = nullptr; // Data is accessed via mailbox chain
+    tap.mailbox_head = mailbox_head;
     return tap;
 }
+
+// Helper to build a persistent mailbox chain from a vector of data pointers
+inline amp::tests::fft_division_shared::PersistentMailboxNode* BuildPersistentMailboxChain(const std::vector<void*>& chunks, const std::vector<size_t>& sizes) {
+    using Node = amp::tests::fft_division_shared::PersistentMailboxNode;
+    if (chunks.empty() || chunks.size() != sizes.size()) return nullptr;
+    Node* head = new Node(chunks[0], sizes[0]);
+    Node* current = head;
+    for (size_t i = 1; i < chunks.size(); ++i) {
+        current->next = new Node(chunks[i], sizes[i]);
+        current = current->next;
+    }
+    return head;
+}
+#endif
 
 namespace detail {
 

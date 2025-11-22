@@ -1393,31 +1393,16 @@
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu ANOMALY\n",
                    pcm_written_samples, frames_to_push);
     }
+    // Emit persistent PCM mailbox nodes only. Tests/harness should not rely
+    // on legacy AmpMailboxEntry list anymore — taps read from the persistent
+    // pcm mailbox chain owned by the node.
     for (size_t i = 0; i < frames_to_push; ++i) {
-        double *frame_buffer = (double *)malloc(input_channels * sizeof(double));
-        if (frame_buffer == NULL) {
-            free(buffer);
-            return -1;
-        }
-        for (int ch = 0; ch < input_channels; ++ch) {
-            frame_buffer[ch] = buffer[i * input_channels + ch];
-        }
-        AmpMailboxEntry *entry = amp_mailbox_entry_create(
-            frame_buffer,
-            input_channels,
-            1,  // One frame per entry
-            0,
-            metrics,
-            NULL,
-            NULL
-        );
-        if (entry != NULL) {
-            amp_node_mailbox_push(state, entry);
-        } else {
-            free(frame_buffer);
-            free(buffer);
-            return -1;
-        }
+        // Choose first channel sample as the PCM value for persistent node.
+        double pcm_sample = buffer[i * input_channels + 0];
+        // Use absolute frame index based on wheel_frame_counter as the frame id.
+        int frame_index = (int)(state->u.fftdiv.wheel_frame_counter + (int)i);
+        AmpMailboxNode pcm_node = amp_mailbox_create_pcm_node(pcm_sample, frame_index);
+        amp_mailbox_append_pcm_node((void*)state, pcm_node);
     }
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                "[STAGE5-PCM-EMIT] pushed %zu individual frame entries\n",

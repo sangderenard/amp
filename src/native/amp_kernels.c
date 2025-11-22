@@ -31,10 +31,15 @@
 #endif
 
 #if defined(__cplusplus)
+#include <map>
+#include <string>
+#include <vector>
+#include <deque>
 #include <complex>
 #include <condition_variable>
 #include <deque>
 #include <memory>
+#include "amp_mailbox_capi.h"
 #include <mutex>
 #include <new>
 #include <thread>
@@ -42,6 +47,7 @@
 #include <cstring>
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
+#include "amp_native_mailbox_chain.hpp"
 using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>;
 #endif
 
@@ -1965,6 +1971,13 @@ typedef union {
             int64_t wheel_frame_counter;
             double sample_rate_hint;
             double timeline_seconds;
+// C++-only mailbox chains for persistent tap/PCM output
+
+#if defined(__cplusplus)
+            std::map<std::string, FftDivTapMailboxCursor> tap_mailbox_cursors;
+            std::map<std::string, amp::tests::fft_division_shared::MailboxChainHead> spectral_mailbox_chains;
+            amp::tests::fft_division_shared::MailboxChainHead pcm_mailbox_chain;
+#endif
         } fftdiv;
         struct {
             int mode;

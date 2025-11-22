@@ -1,8 +1,17 @@
+
 #include "fft_division_delay_math.h"
+#include "amp_native.h" // for EdgeRunnerParamView, node_state_t
+
 #if defined(__cplusplus)
+#include "fft_division_types.h" // for FftWorkingTensor, FftDivActiveWindowView, etc.
 #include <cstddef>
 #include <vector>
-#include "fft_division_types.h"
+#include <map>
+#include <string>
+#include "amp_native_mailbox_chain.hpp"
+// C++-only: Per-tap mailbox read cursor state
+// C++-only: Extend node state for tap mailbox cursors
+// (You may need to add this to the actual node state struct in the header; here we assume it's available as state->u.fftdiv.tap_mailbox_cursors)
 #endif
 
 static double read_param_tensor3(
@@ -1114,6 +1123,7 @@ static void fftdiv_run_operator_stack(
 }
 #endif
 
+#if defined(__cplusplus)
 static void stage_emit_spectral(
     node_state_t *state,
     double *spectral_real,
@@ -1154,16 +1164,14 @@ static void stage_emit_spectral(
                "[STAGE4-EMIT-POST] frame=%d slot=%d after_copy re[0]=%.6g im[0]=%.6g\n",
                frame_index, tap_slot, spectral_real[0], spectral_imag[0]);
     
-    // Push spectral data to mailbox
-    AmpSpectralMailboxEntry *entry = amp_spectral_mailbox_entry_create(
-        tap_slot, frame_index, window_size, spectral_real, spectral_imag);
-    if (entry != NULL) {
-        amp_node_spectral_mailbox_push(state, entry);
-        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
-                   "[STAGE4-MAILBOX-PUSH] frame=%d slot=%d window_size=%d pushed to spectral mailbox\n",
-                   frame_index, tap_slot, window_size);
-    }
+    // Pack spectral data into persistent mailbox chain node via C API
+#if defined(__cplusplus)
+    AmpMailboxNode new_node = amp_mailbox_create_spectral_node(spectral_real, spectral_imag, tap_slot, frame_index);
+    std::string tap_name = "spectral_" + std::to_string(tap_slot);
+    amp_mailbox_attach_spectral_node((void*)state, tap_name.c_str(), new_node);
+#endif
 }
+#endif
 
 #if defined(__cplusplus)
 static int fftdiv_realize_operator_arena(node_state_t *state) {
@@ -3447,23 +3455,19 @@ static void fftdiv_worker_publish_entry(
         }
         return;
     }
-    size_t frame_count = frames > 0 ? static_cast<size_t>(frames) : 0U;
-    AmpMailboxEntry *entry = amp_mailbox_entry_create(
-        buffer,
-        channels,
-        frame_count,
-        status,
-        metrics,
-        nullptr,
-        nullptr
-    );
-    if (entry == nullptr) {
-        if (buffer != nullptr) {
-            amp_free(buffer);
-        }
-        return;
+    // Legacy mailbox entry creation removed: free any temporary buffer
+    // and do not create or push an AmpMailboxEntry here. Persistent
+    // node-based mailboxes (spectral/pcm chains) are the canonical
+    // mechanism for tap/readers.
+    if (buffer != nullptr) {
+        amp_free(buffer);
     }
-    amp_node_mailbox_push(state, entry);
+    // Optional diagnostic logging to trace dropped buffers
+    if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[PUBLISH-ENTRY] dropped buffer frames=%d channels=%d status=%d\n",
+                   frames, channels, status);
+    }
 }
 
 static bool fftdiv_worker_process_command(
@@ -3681,11 +3685,20 @@ static void fftdiv_worker_main(node_state_t *state) {
 
     auto process_ready_work = [&](std::unique_lock<std::mutex> &lock_guard) -> bool {
         std::shared_ptr<FftDivWorkerCommand> command = worker.active_command;
+        // DIAGNOSTIC: observe pending command counts and active command presence
+        fprintf(stderr, "[DIAG] process_ready_work: thread_started=%d pending=%zu active_command=%p cached_valid=%d\n",
+            worker.thread_started ? 1 : 0,
+            worker.pending_commands.size(),
+            (void*) (worker.active_command ? worker.active_command.get() : nullptr),
+            worker.cached_stage_locks_valid ? 1 : 0);
         if (!command && !worker.pending_commands.empty()) {
             command = worker.pending_commands.front();
             worker.pending_commands.pop_front();
             worker.active_command = command;
         }
+        fprintf(stderr, "[DIAG] process_ready_work: after-pop pending=%zu active_command=%p\n",
+            worker.pending_commands.size(),
+            (void*) (worker.active_command ? worker.active_command.get() : nullptr));
         const FftDivStageLockSnapshot *locks_for_command = nullptr;
         if (worker.cached_stage_locks_valid) {
             locks_for_command = &worker.cached_stage_locks;
@@ -3794,6 +3807,7 @@ static int fftdiv_start_worker(node_state_t *state) {
             fftdiv_worker_main(state);
         });
         worker.thread_started = true;
+        fprintf(stderr, "[DIAG] fftdiv_start_worker: started thread %p\n", (void*) &worker.thread);
         worker.cv_request.notify_one();
     } catch (...) {
         worker.thread_started = false;
@@ -3948,28 +3962,11 @@ static int run_fft_division_node(
     }
     worker.cv_request.notify_one();
 
-    AmpMailboxEntry *entry = amp_node_mailbox_pop(state);
-    if (entry == nullptr) {
-        return AMP_E_PENDING;
-    }
+    // PCM mailbox packing is handled inside Stage 5 of the fftdiv pipeline.
+    // (Removed ad-hoc placeholder here.)
 
-    {
-        std::lock_guard<std::mutex> lock(worker.mutex);
-        worker.mailbox_popped_entries++;
-    }
-
-    if (out_channels != NULL) {
-        *out_channels = entry->channels > 0 ? entry->channels : effective_channels;
-    }
-    if (out_buffer != NULL) {
-        *out_buffer = entry->buffer;
-    }
-    if (metrics != NULL) {
-        *metrics = entry->metrics;
-    }
-    int status = entry->status;
-    amp_mailbox_entry_release(entry);
-    return status;
+/* Legacy tap-buffer feeding removed. */
+    return 0;
 }
 
 static int run_fft_division_node_backward(
