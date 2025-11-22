@@ -340,15 +340,34 @@ static bool fftdiv_window_release_tail(
     int *wheel_filled,
     const char *reason
 ) {
-    // Disable automatic Stage-4 tail release: this behavior was introduced
-    // externally and may interfere with expected Stage-1 zero-fill semantics.
-    // Keep the function present for API compatibility but make it a no-op.
-    (void)state;
-    (void)wheel_length;
-    (void)wheel_tail;
-    (void)wheel_filled;
-    (void)reason;
-    return false;
+    if (state == nullptr || wheel_length <= 0 || wheel_tail == nullptr || wheel_filled == nullptr) {
+        return false;
+    }
+    auto &meta = state->u.fftdiv.wheel_slice_metadata;
+    if (meta.size() < (size_t)wheel_length) {
+        return false;
+    }
+    bool released = false;
+    while (*wheel_filled > 0) {
+        FftDivFilledSlice &tail_slice = meta[(size_t)(*wheel_tail)];
+        if (!tail_slice.valid || !tail_slice.stage4_emitted) {
+            break;
+        }
+        tail_slice.valid = false;
+        tail_slice.stage4_emitted = false;
+        *wheel_tail = (*wheel_tail + 1) % wheel_length;
+        *wheel_filled -= 1;
+        released = true;
+    }
+    if (released && fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+               "[STAGE4-WHEEL-DELIVERY] reason=%s tail=%d filled=%d len=%d\n",
+                   (reason != NULL) ? reason : "unspecified",
+                   *wheel_tail,
+                   *wheel_filled,
+                   wheel_length);
+    }
+    return released;
 }
 
 static void fftdiv_window_reserve_leading_edge(
@@ -3278,10 +3297,105 @@ static bool fftdiv_stage1_zero_insertion_active(const node_state_t *state) {
 
 
 static void fftdiv_flush_with_zeroes(node_state_t *state) {
-    // Disabled analytic flush: avoid injecting zeros outside of Stage-1
-    // zero-tail mechanics. Keep symbol for compatibility.
-    (void)state;
-    return;
+    if (state == nullptr) {
+        FFTDIV_LOG(nullptr, FFTDIV_LOG_LEVEL_SUMMARY,
+                   "[FFT-LATENCY-FLUSH] skip state=null reason=null-state\n");
+        return;
+    }
+    auto &fftdiv = state->u.fftdiv;
+    const EdgeRunnerNodeDescriptor *descriptor = fftdiv.last_descriptor;
+    if (descriptor == nullptr) {
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+                   "[FFT-LATENCY-FLUSH] skip state=%p reason=no-descriptor slots=%zu\n",
+                   (void *)state,
+                   static_cast<size_t>(fftdiv.stream_slots.size()));
+        return;
+    }
+    if (fftdiv.stream_slots.empty()) {
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+                   "[FFT-LATENCY-FLUSH] skip state=%p reason=no-slots descriptor=%s\n",
+                   (void *)state,
+                   descriptor->name != nullptr ? descriptor->name : "<unnamed>");
+        return;
+    }
+    const FftDivStageLockSnapshot stage_snapshot = fftdiv_snapshot_stage_locks(state);
+    const bool pipeline_active = fftdiv_stage_snapshot_any_ready(stage_snapshot);
+    int batches = fftdiv.last_batches > 0 ? fftdiv.last_batches : 1;
+    int channels = fftdiv.last_channels > 0 ? fftdiv.last_channels : 1;
+    const FftDivTailPlan tail_plan = fftdiv_calculate_tail_plan(state, pipeline_active);
+    const size_t frame0_delay = tail_plan.pcm_frames;
+    int frames = (frame0_delay > 0U)
+        ? static_cast<int>(frame0_delay)
+        : 1;
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[FFT-LATENCY-FLUSH-COMPUTE] W_fft=%d H_fft=%d W_work=%d H_work=%d L_istft=%d frame0_delay=%zu inject_pcm=%d\n",
+               tail_plan.window_size,
+               tail_plan.backend_hop,
+               tail_plan.working_span,
+               tail_plan.working_hop,
+               tail_plan.istft_tail_frames,
+               frame0_delay,
+               frames);
+    int slot_count = fftdiv.last_slot_count > 0 ? fftdiv.last_slot_count : batches * channels;
+    if (slot_count <= 0) {
+        slot_count = 1;
+    }
+    const double sample_rate = (fftdiv.last_sample_rate > 0.0)
+        ? fftdiv.last_sample_rate
+        : fftdiv.sample_rate_hint;
+
+    std::vector<double> zeros(
+        static_cast<size_t>(slot_count) * static_cast<size_t>(frames),
+        0.0
+    );
+
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[FFT-ANALYTIC-FLUSH] start state=%p slots=%zu frames_pcm=%d pending=%s\n",
+               (void *)state,
+               static_cast<size_t>(fftdiv.stream_slots.size()),
+               frames,
+               pipeline_active ? "yes" : "no");
+
+    EdgeRunnerAudioView audio{};
+    audio.has_audio = 1;
+    audio.batches = static_cast<uint32_t>(batches);
+    audio.channels = static_cast<uint32_t>(channels);
+    audio.frames = frames;
+    audio.data = zeros.data();
+
+    EdgeRunnerParamSet params{};
+    EdgeRunnerNodeInputs flush_inputs{};
+    flush_inputs.audio = audio;
+    flush_inputs.params = params;
+    flush_inputs.taps.outputs.items = nullptr;
+    flush_inputs.taps.outputs.count = 0;
+    flush_inputs.taps.status.items = nullptr;
+    flush_inputs.taps.status.count = 0;
+
+    // Analytic zero-injection: push zeros as normal input, no flush enum needed
+    double *tmp_buf = nullptr;
+    int tmp_ch = 0;
+    const size_t runtime_pcm_block = frames > 0 ? static_cast<size_t>(frames) : 1U;
+
+    fftdiv_execute_block(
+        descriptor,
+        &flush_inputs,
+        batches,
+        channels,
+        frames,
+        runtime_pcm_block,
+        &stage_snapshot,
+        sample_rate,
+        &tmp_buf,
+        &tmp_ch,
+        state,
+        nullptr,
+        AMP_FFT_STREAM_FLUSH_NONE
+    );
+
+    if (tmp_buf != nullptr) {
+        free(tmp_buf);
+    }
 }
 
 static int fftdiv_wait_for_completion(
