@@ -984,16 +984,6 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
                  reinterpret_cast<void*>(tap_buffers[0].cache_data), reinterpret_cast<void*>(tap_buffers[0].data));
     fflush(stderr);
 
-    // Avoid using the staged cache path for spectral taps: when the
-    // tap cache is filled from persistent mailbox nodes the cache layout
-    // may be interleaved (real,imag) which breaks the legacy contiguous
-    // per-component layout expected by the verification helpers. Clear
-    // any staged cache pointers so the populate helper walks the
-    // mailbox nodes directly and writes values into the legacy arrays
-    // in the canonical frame-major order.
-    tap_buffers[0].cache_data = nullptr;
-    tap_buffers[1].cache_data = nullptr;
-
     const auto spectral_read = PopulateLegacySpectrumFromMailbox(
         tap_buffers[0],
         tap_buffers[1],
@@ -1160,16 +1150,6 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     if (pcm_read.frames_committed > 0) {
         (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
     }
-    // Avoid using the staged cache path for spectral taps in streaming
-    // mode as well: when the tap cache is filled from persistent mailbox
-    // nodes the cache layout may be interleaved (real,imag) which breaks
-    // the legacy contiguous per-component layout expected by the
-    // verification helpers. Clear any staged cache pointers so the
-    // populate helper walks the mailbox nodes directly and writes values
-    // into the legacy arrays in the canonical frame-major order.
-    tap_buffers[0].cache_data = nullptr;
-    tap_buffers[1].cache_data = nullptr;
-
     const auto spectral_read = PopulateLegacySpectrumFromMailbox(
         tap_buffers[0],
         tap_buffers[1],
