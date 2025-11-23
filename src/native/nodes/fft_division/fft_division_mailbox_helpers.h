@@ -190,20 +190,29 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
 
     MailboxNode *node = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(real_buffer));
     while (node != nullptr) {
-        if (node->node_kind == MailboxNode::NodeKind::SPECTRAL && node->frame_index >= 0) {
+        if (node->node_kind == MailboxNode::NodeKind::SPECTRAL &&
+            node->frame_index >= 0 &&
+            node->spectral_real != nullptr &&
+            node->spectral_imag != nullptr) {
+
             const size_t frame = static_cast<size_t>(
                 static_cast<int>(node->frame_index) - base_frame);
-            const size_t bin = (node->slot >= 0 && node->slot < static_cast<int>(window))
-                ? static_cast<size_t>(node->slot)
-                : 0U;
-            if (frame < capacity_frames && bin < window) {
-                const size_t base = frame * window + bin;
-                if (base < legacy_value_count) {
-                    legacy_real[base] = node->spectral_real;
-                    legacy_imag[base] = node->spectral_imag;
-                    result.frames_committed = std::max(result.frames_committed, frame + 1);
-                    ++result.values_written;
+            const size_t bins = (node->window_size > 0)
+                ? static_cast<size_t>(node->window_size)
+                : window;
+
+            if (frame < capacity_frames) {
+                const size_t bins_to_copy = std::min(window, bins);
+                const size_t base = frame * window;
+                for (size_t bin = 0; bin < bins_to_copy; ++bin) {
+                    const size_t idx = base + bin;
+                    if (idx < legacy_value_count) {
+                        legacy_real[idx] = node->spectral_real[bin];
+                        legacy_imag[idx] = node->spectral_imag[bin];
+                        result.values_written += 1U;
+                    }
                 }
+                result.frames_committed = std::max(result.frames_committed, frame + 1);
             }
         }
         node = node->next;
