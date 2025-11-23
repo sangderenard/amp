@@ -127,9 +127,13 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
         const size_t cache_window = real_buffer.shape.channels > 0U
             ? static_cast<size_t>(real_buffer.shape.channels)
             : window;
-        const size_t cache_frames = real_buffer.cache_frames > 0U
+        const size_t cache_frames_hint = real_buffer.cache_frames > 0U
             ? static_cast<size_t>(real_buffer.cache_frames)
-            : (cache_window > 0U ? real_buffer.cache_buffer_len / cache_window : 0U);
+            : 0U;
+        const size_t cache_frames_from_len = (cache_window > 0U)
+            ? (real_buffer.cache_buffer_len / cache_window)
+            : 0U;
+        const size_t cache_frames = std::max(cache_frames_hint, cache_frames_from_len);
         const size_t cache_values = cache_frames * cache_window;
         if (cache_values > 0) {
             const size_t copy_values = std::min(legacy_value_count, cache_values);

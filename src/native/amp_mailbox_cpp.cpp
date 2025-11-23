@@ -182,8 +182,11 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
     size_t capacity = tap->cache_buffer_len;
     const size_t window = tap->shape.channels > 0 ? static_cast<size_t>(tap->shape.channels) : 1U;
     const char *tname = tap->tap_name;
-    const bool prefer_imag = (tname != nullptr && std::strstr(tname, "imag") != nullptr);
-    const bool prefer_real = (tname != nullptr && std::strstr(tname, "real") != nullptr);
+    const char *bclass = tap->buffer_class;
+    const bool prefer_imag = (tname != nullptr && std::strstr(tname, "imag") != nullptr) ||
+        (bclass != nullptr && std::strstr(bclass, "imag") != nullptr);
+    const bool prefer_real = (tname != nullptr && std::strstr(tname, "real") != nullptr) ||
+        (bclass != nullptr && std::strstr(bclass, "real") != nullptr);
     // Pack each mailbox node contiguously: spectral nodes contribute full window bins,
     // PCM nodes contribute a single sample.
     while (cur && written < capacity) {
@@ -230,7 +233,10 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
     }
     tap->cache_state = (written > 0) ? 1 /*staged/filled*/ : 0;
     if (frames_written > 0) {
-        tap->cache_frames = static_cast<uint32_t>(frames_written);
+        const uint32_t frames_written_u32 = static_cast<uint32_t>(frames_written);
+        tap->cache_frames = (tap->cache_frames > 0)
+            ? std::max<uint32_t>(tap->cache_frames, frames_written_u32)
+            : frames_written_u32;
     }
     // Report whether this buffer was mailbox-allocated (owned) so callers
     // can see ownership transitions in logs.

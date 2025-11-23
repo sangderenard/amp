@@ -873,8 +873,10 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     );
     auto spectral_real_descriptor = spectral_descriptor;
     spectral_real_descriptor.name = "spectral_0";
+    spectral_real_descriptor.buffer_class = "spectrum_real";
     auto spectral_imag_descriptor = spectral_descriptor;
     spectral_imag_descriptor.name = "spectral_0";
+    spectral_imag_descriptor.buffer_class = "spectrum_imag";
     TapDescriptor pcm_descriptor = BuildPcmTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
         1U,
@@ -1036,8 +1038,10 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     );
     auto streaming_real_descriptor = streaming_spectral_descriptor;
     streaming_real_descriptor.name = "spectral_0";
+    streaming_real_descriptor.buffer_class = "spectrum_real";
     auto streaming_imag_descriptor = streaming_spectral_descriptor;
     streaming_imag_descriptor.name = "spectral_0";
+    streaming_imag_descriptor.buffer_class = "spectrum_imag";
     TapDescriptor streaming_pcm_descriptor = BuildPcmTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
         1U,
