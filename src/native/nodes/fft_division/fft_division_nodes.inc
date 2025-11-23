@@ -5,6 +5,8 @@
 #if defined(__cplusplus)
 #include "fft_division_types.h" // for FftWorkingTensor, FftDivActiveWindowView, etc.
 #include <cstddef>
+#include <cstdint>
+#include <algorithm>
 #include <vector>
 #include <map>
 #include <string>
@@ -641,7 +643,8 @@ static void fftdiv_ring_append_frames(
     const double *stage_real,
     const double *stage_imag,
     size_t frames,
-    int window_size
+    int window_size,
+    bool expect_signal
 ) {
     if (state == nullptr || window_size <= 0 || stage_real == nullptr || stage_imag == nullptr) {
         return;
@@ -658,6 +661,9 @@ static void fftdiv_ring_append_frames(
     #if defined(__cplusplus)
     if (slot.forward_imag.size() < capacity_frames * (std::size_t)window_size) {
         fftdiv_ring_ensure_capacity(slot.forward_imag, capacity_frames * (std::size_t)window_size);
+    }
+    if (slot.forward_expect_signal.size() < capacity_frames) {
+        fftdiv_ring_ensure_capacity(slot.forward_expect_signal, capacity_frames);
     }
     std::size_t write = slot.forward_ring_write % capacity_frames;
     std::size_t read = slot.forward_ring_read % capacity_frames;
@@ -706,6 +712,10 @@ static void fftdiv_ring_append_frames(
             slot.forward_imag.data() + write_offset,
             stage_imag + stage_offset,
             copy_bins * sizeof(double));
+        std::fill_n(
+            slot.forward_expect_signal.begin() + write,
+            write_frames,
+            expect_signal ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0));
         write = (write + write_frames) % capacity_frames;
         remaining -= write_frames;
     }
@@ -762,6 +772,25 @@ static const double *fftdiv_ring_frame_imag(
         return nullptr;
     }
     return slot.forward_imag.data() + offset;
+}
+
+template <typename SlotState>
+static bool fftdiv_ring_frame_expect_signal(
+    const SlotState &slot,
+    size_t frame_offset
+) {
+    if (slot.forward_ring_capacity_frames == 0U || slot.forward_ring_filled == 0U) {
+        return true;
+    }
+    const std::size_t capacity_frames = slot.forward_ring_capacity_frames;
+    if (frame_offset >= slot.forward_ring_filled) {
+        return true;
+    }
+    const std::size_t index = (slot.forward_ring_read + frame_offset) % capacity_frames;
+    if (index >= slot.forward_expect_signal.size()) {
+        return true;
+    }
+    return slot.forward_expect_signal[index] != 0U;
 }
 
 #if defined(__cplusplus)
@@ -2099,7 +2128,14 @@ static int fftdiv_execute_block(
                             stage_capacity_frames,
                             flush_mode);
                         if (frames_emitted > 0 && window_size > 0 && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
-                            if (fftdiv_stage_assert_enabled(state)) {
+                            const bool stage1_expect_signal =
+                                (pcm_source != NULL)
+                                ? fftdiv_block_has_signal(pcm_source, pending_samples)
+                                : false;
+                            const bool stage1_assert_enabled =
+                                (fftdiv_stage_assert_enabled(state)
+                                 && stage1_expect_signal);
+                            if (stage1_assert_enabled) {
                                 const size_t frame_bins = (size_t)window_size;
                                 for (size_t emitted_index = 0; emitted_index < frames_emitted; ++emitted_index) {
                                     const size_t base_offset = emitted_index * frame_bins;
@@ -2129,7 +2165,8 @@ static int fftdiv_execute_block(
                                 slot_spectral_real,
                                 slot_spectral_imag,
                                 frames_emitted,
-                                window_size);
+                                window_size,
+                                stage1_expect_signal);
                             const double *ring_real = fftdiv_ring_frame_real(slot_state, 0U, window_size);
                             const double *ring_imag = fftdiv_ring_frame_imag(slot_state, 0U, window_size);
                             if (ring_real != NULL && ring_imag != NULL) {
@@ -2431,6 +2468,7 @@ static int fftdiv_execute_block(
                     : 0U;
                 const double *ring_real = fftdiv_ring_frame_real(slot_state, frame_offset, window_size);
                 const double *ring_imag = fftdiv_ring_frame_imag(slot_state, frame_offset, window_size);
+                const bool expect_signal = fftdiv_ring_frame_expect_signal(slot_state, frame_offset);
                 double *slot_spectral_real = (ring_real != NULL)
                     ? const_cast<double *>(ring_real)
                     : slot_state.forward_real.data();
@@ -2488,7 +2526,8 @@ static int fftdiv_execute_block(
                     commit_real,
                     commit_imag,
                     commit_bins);
-                if (commit_bins > 0) {
+                lane_snapshot.expect_signal = expect_signal;
+                if (commit_bins > 0 && expect_signal) {
                     const size_t stage2_frame_number = (size_t)(frame_counter + (int64_t)processed_passes);
                     fftdiv_stage_assert_complex_output(
                         state,
@@ -2542,6 +2581,14 @@ static int fftdiv_execute_block(
             auto &lane_meta = state->u.fftdiv.lane_plan[(size_t)slot];
             auto &lane_snapshot = slice.lanes[(size_t)slot];
             lane_snapshot.frame_ready = lane_meta.frame_ready;
+            if (lane_snapshot.frame_ready) {
+                const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
+                    ? lane_frame_offsets[(size_t)slot]
+                    : 0U;
+                lane_snapshot.expect_signal = fftdiv_ring_frame_expect_signal(
+                    state->u.fftdiv.stream_slots[(size_t)slot],
+                    frame_offset);
+            }
             if ((size_t)slot < slice.lane_frame_offsets.size()) {
                 const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
                     ? lane_frame_offsets[(size_t)slot]
@@ -2893,21 +2940,23 @@ static int fftdiv_execute_block(
                                    slot);
                     }
                 }
-                if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
-                    if (lane.enable_spectral_out) {
-                        fftdiv_stage_assert_complex_output(
-                            state,
-                            "stage4",
-                            slot,
-                            released_real,
-                            released_imag,
-                            (size_t)window_size,
-                            slice.frame_index // Pass frame number
-                    );
-                        /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
-                        const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
-                        stage_emit_spectral(
-                            state,
+                    if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
+                        if (lane.enable_spectral_out) {
+                            if (lane_snapshot.expect_signal) {
+                                fftdiv_stage_assert_complex_output(
+                                    state,
+                                    "stage4",
+                                    slot,
+                                    released_real,
+                                    released_imag,
+                                    (size_t)window_size,
+                                    slice.frame_index // Pass frame number
+                                );
+                            }
+                            /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
+                            const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
+                            stage_emit_spectral(
+                                state,
                             const_cast<double *>(released_real),
                             const_cast<double *>(released_imag),
                             window_size,
@@ -2926,16 +2975,17 @@ static int fftdiv_execute_block(
 
                     if (lane.enable_pcm_out) {
                         // Stage 3 enqueues spectrum for deferred inverse in Stage 5
-                        if (released_real != nullptr && released_imag != nullptr) {
-                            decltype(slot_state.pending_spectra)::value_type pending;
-                            try {
-                                pending.real.assign(released_real, released_real + (size_t)window_size);
-                                pending.imag.assign(released_imag, released_imag + (size_t)window_size);
-                                slot_state.pending_spectra.push_back(std::move(pending));
-                            } catch (...) {
-                                // Allocation failure: drop this frame; Stage 5 will still drain what exists
+                            if (released_real != nullptr && released_imag != nullptr) {
+                                decltype(slot_state.pending_spectra)::value_type pending;
+                                try {
+                                    pending.real.assign(released_real, released_real + (size_t)window_size);
+                                    pending.imag.assign(released_imag, released_imag + (size_t)window_size);
+                                    pending.expect_signal = lane_snapshot.expect_signal;
+                                    slot_state.pending_spectra.push_back(std::move(pending));
+                                } catch (...) {
+                                    // Allocation failure: drop this frame; Stage 5 will still drain what exists
+                                }
                             }
-                        }
                     }
                 }
             }
@@ -2978,7 +3028,7 @@ static int fftdiv_execute_block(
     
     size_t buffer_offset = 0;
     std::vector<size_t> slot_pcm_emitted(static_cast<size_t>(slot_count), 0U);
-    const bool stage5_pcm_assert_enabled =
+    const bool stage5_pcm_assert_base =
         (state != nullptr && state->u.fftdiv.halt_on_zero_stage_output != 0 &&
          state->u.fftdiv.halt_on_zero_stage5_pcm_output != 0);
 
@@ -2988,6 +3038,7 @@ static int fftdiv_execute_block(
             // First, run inverse on spectra accumulated by Stage 3
             while (!slot_state.pending_spectra.empty() && slot_state.inverse_handle != NULL && !slot_state.inverse_scratch.empty()) {
                 auto &pending = slot_state.pending_spectra.front();
+                const bool pending_expect_signal = pending.expect_signal;
                 const size_t produced_pcm = amp_fft_backend_stream_push_spectrum(
                     slot_state.inverse_handle,
                     pending.real.empty() ? NULL : pending.real.data(),
@@ -3001,8 +3052,10 @@ static int fftdiv_execute_block(
                            "[STAGE5-PCM-ISTFT] slot=%d produced_pcm=%zu\n",
                            slot,
                            produced_pcm);
+                const bool stage5_complex_assert_enabled =
+                    (fftdiv_stage_assert_enabled(state) && pending_expect_signal);
                 if (produced_pcm > 0 && window_size > 0 && slot_state.inverse_scratch.data() != NULL) {
-                    if (fftdiv_stage_assert_enabled(state)) {
+                    if (stage5_complex_assert_enabled) {
                         const size_t frame_bins = (size_t)window_size;
                         for (size_t emitted_index = 0; emitted_index < produced_pcm; ++emitted_index) {
                             const size_t base_offset = emitted_index * frame_bins;
@@ -3025,6 +3078,7 @@ static int fftdiv_execute_block(
             }
             while (!slot_state.inverse_queue.empty() && buffer_offset < total_samples) {
                 double sample_value = slot_state.inverse_queue.front();
+                const bool stage5_pcm_assert_enabled = (stage5_pcm_assert_base && pending_expect_signal);
                 if (stage5_pcm_assert_enabled) {
                     const size_t pcm_frame_number = base_index + buffer_offset;
                     fftdiv_stage_assert_real_output(state, "stage5", slot, &sample_value, 1U, pcm_frame_number);

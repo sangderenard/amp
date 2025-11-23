@@ -15,6 +15,7 @@ struct FftDivTapMailboxCursor {
 
 struct FftDivLaneFrameState {
     bool frame_ready{false};
+    bool expect_signal{false};
     std::vector<double> spectral_real;
     std::vector<double> spectral_imag;
 };
