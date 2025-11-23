@@ -621,6 +621,10 @@
                                    slot,
                                    pending_samples,
                                    stage_capacity_frames);
+                        const bool stage1_expect_signal =
+                            (pcm_source != NULL)
+                            ? fftdiv_block_has_signal(pcm_source, pending_samples)
+                            : false;
                         frames_emitted = amp_fft_backend_stream_push(
                             slot_state.forward_handle,
                             pcm_source,
@@ -644,7 +648,8 @@
                                 slot_spectral_real,
                                 slot_spectral_imag,
                                 frames_emitted,
-                                window_size);
+                                window_size,
+                                stage1_expect_signal);
                             const double *ring_real = fftdiv_ring_frame_real(slot_state, 0U, window_size);
                             const double *ring_imag = fftdiv_ring_frame_imag(slot_state, 0U, window_size);
                             if (ring_real != NULL && ring_imag != NULL) {
@@ -1007,6 +1012,14 @@
             auto &lane_meta = state->u.fftdiv.lane_plan[(size_t)slot];
             auto &lane_snapshot = slice.lanes[(size_t)slot];
             lane_snapshot.frame_ready = lane_meta.frame_ready;
+            if (lane_snapshot.frame_ready) {
+                const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
+                    ? lane_frame_offsets[(size_t)slot]
+                    : 0U;
+                lane_snapshot.expect_signal = fftdiv_ring_frame_expect_signal(
+                    state->u.fftdiv.stream_slots[(size_t)slot],
+                    frame_offset);
+            }
             if ((size_t)slot < slice.lane_frame_offsets.size()) {
                 const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
                     ? lane_frame_offsets[(size_t)slot]

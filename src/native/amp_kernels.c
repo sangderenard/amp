@@ -1846,6 +1846,7 @@ typedef union {
                 std::vector<double> forward_stage_imag;
                 std::vector<double> forward_real;
                 std::vector<double> forward_imag;
+                std::vector<uint8_t> forward_expect_signal;
                 std::size_t forward_frame_capacity{0U};
                 std::size_t forward_ring_capacity_frames{0U};
                 std::size_t forward_ring_write{0U};
@@ -1859,6 +1860,7 @@ typedef union {
                 struct PendingSpectrum {
                     std::vector<double> real;
                     std::vector<double> imag;
+                    bool expect_signal{true};
                 };
                 std::deque<PendingSpectrum> pending_spectra;
                 std::vector<double> pcm_backlog;
