@@ -201,6 +201,16 @@ static void fftdiv_stage_trigger_halt(
     if (stage_name == NULL) {
         stage_name = "stage";
     }
+    if (state != nullptr) {
+        auto &worker = state->u.fftdiv.worker;
+        std::lock_guard<std::mutex> wlock(worker.mutex);
+        if (worker.halt_requested) {
+            return;
+        }
+        worker.halt_requested = true;
+        worker.flush_on_stop = true;
+        worker.stop_requested = true;
+    }
     const char *reason = (detail != NULL) ? detail : "zero-output";
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE-HALT] stage=%s slot=%d frame=%zu reason=%s samples=%zu\n",
@@ -250,11 +260,6 @@ static void fftdiv_stage_trigger_halt(
     // variable so the worker will drain pending outputs and exit cleanly.
     if (state != nullptr) {
         auto &worker = state->u.fftdiv.worker;
-        {
-            std::lock_guard<std::mutex> wlock(worker.mutex);
-            worker.flush_on_stop = true;
-            worker.stop_requested = true;
-        }
         worker.cv_request.notify_all();
     }
     // Mark mailbox as shutdown and notify any waiters so they can exit cleanly.
@@ -3979,6 +3984,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         worker.flush_on_stop = flush;
         if (!worker.thread_started) {
             worker.stop_requested = false;
+            worker.halt_requested = false;
             worker.active_command.reset();
             worker.pending_commands.clear();
             worker.shared_command.reset();
@@ -4000,6 +4006,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         worker.thread_started = false;
         worker.stop_requested = false;
+        worker.halt_requested = false;
         worker.active_command.reset();
         worker.pending_commands.clear();
         worker.shared_command.reset();
@@ -4048,6 +4055,14 @@ static int run_fft_division_node(
     *out_channels = 0;
 
     fprintf(stderr, "[DIAG] run_fft_division_node: entry descriptor=%p name=%s state=%p frames=%d\n", (void*)descriptor, descriptor ? descriptor->name : "<null>", (void*)state, frames);
+    {
+        auto &worker = state->u.fftdiv.worker;
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.halt_requested) {
+            fprintf(stderr, "[DIAG] run_fft_division_node: halt already requested, rejecting new work\n");
+            return -1;
+        }
+    }
     if (fftdiv_start_worker(state) != 0) {
         fprintf(stderr, "[DIAG] run_fft_division_node: fftdiv_start_worker failed state=%p\n", (void*)state);
         return -1;
