@@ -94,8 +94,7 @@ int main() {
         0,
         2,             // pad_mode = never
         window_size,
-        window_size,
-        2);            // window, hop, stft_mode=streaming
+        window_size);
 
     if (!stream_ctx) {
         std::cerr << "Failed to initialize streaming FFT context" << std::endl;

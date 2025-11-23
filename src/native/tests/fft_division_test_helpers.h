@@ -17,6 +17,7 @@ extern "C" {
 
 #ifdef __cplusplus
 #include "amp_native_mailbox_chain.hpp"
+#include "nodes/fft_division/fft_division_mailbox_helpers.h"
 #endif
 
 namespace amp::tests::fft_division_shared {
@@ -114,128 +115,9 @@ inline amp::tests::fft_division_shared::PersistentMailboxNode* BuildPersistentMa
     return head;
 }
 
-struct TapMailboxReadResult {
-    size_t frames_committed{0};
-    size_t values_written{0};
-    // Indicates whether the helper copied values into the legacy buffer (true)
-    // or simply aliased an existing region (false). At present, mailbox nodes
-    // are discrete so reads are performed via copy into the legacy tap buffer.
-    bool copied_from_mailbox{false};
-    // Communicates whether the caller is now holding a direct reference to the
-    // legacy tap buffer supplied to the node. When copying from a mailbox chain
-    // this remains false; callers can set it when choosing to retain/alias.
-    bool aliased_legacy_buffer{false};
-};
-
-inline TapMailboxReadResult PopulateLegacyPcmFromMailbox(
-    const EdgeRunnerTapBuffer &pcm_buffer,
-    double *legacy_pcm,
-    size_t legacy_capacity_frames
-) {
-    using MailboxNode = amp::tests::fft_division_shared::PersistentMailboxNode;
-    using MailboxChain = amp::tests::fft_division_shared::EdgeRunnerTapMailboxChain;
-
-    TapMailboxReadResult result{};
-    if (legacy_pcm == nullptr || legacy_capacity_frames == 0U) {
-        return result;
-    }
-
-    // Communicate that the caller supplied the legacy tap buffer directly.
-    // This distinguishes copy-from-mailbox from alias/reference semantics.
-    result.aliased_legacy_buffer = (legacy_pcm == pcm_buffer.data);
-
-    MailboxNode *node = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(pcm_buffer));
-
-    // Normalize frame indices so the first observed frame maps to legacy index 0.
-    int base_frame = std::numeric_limits<int>::max();
-    for (MailboxNode *cursor = node; cursor != nullptr; cursor = cursor->next) {
-        if (cursor->node_kind == MailboxNode::NodeKind::PCM && cursor->frame_index >= 0) {
-            base_frame = std::min(base_frame, cursor->frame_index);
-        }
-    }
-    if (base_frame == std::numeric_limits<int>::max()) {
-        return result;
-    }
-
-    while (node != nullptr) {
-        if (node->node_kind == MailboxNode::NodeKind::PCM && node->frame_index >= 0) {
-            const size_t frame = static_cast<size_t>(
-                static_cast<int>(node->frame_index) - base_frame);
-            if (frame < legacy_capacity_frames) {
-                legacy_pcm[frame] = node->pcm_sample;
-                result.frames_committed = std::max(result.frames_committed, frame + 1);
-                ++result.values_written;
-            }
-        }
-        node = node->next;
-    }
-
-    result.copied_from_mailbox = (result.values_written > 0U);
-    return result;
-}
-
-inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
-    const EdgeRunnerTapBuffer &real_buffer,
-    const EdgeRunnerTapBuffer &imag_buffer,
-    double *legacy_real,
-    double *legacy_imag,
-    size_t legacy_value_count
-) {
-    using MailboxNode = amp::tests::fft_division_shared::PersistentMailboxNode;
-    using MailboxChain = amp::tests::fft_division_shared::EdgeRunnerTapMailboxChain;
-
-    TapMailboxReadResult result{};
-    if (legacy_real == nullptr || legacy_imag == nullptr || legacy_value_count == 0U) {
-        return result;
-    }
-
-    // Communicate that the caller supplied the legacy spectral tap buffers directly.
-    result.aliased_legacy_buffer = (
-        legacy_real == real_buffer.data && legacy_imag == imag_buffer.data
-    );
-
-    const size_t window = real_buffer.shape.channels > 0U
-        ? static_cast<size_t>(real_buffer.shape.channels)
-        : 1U;
-    const size_t capacity_frames = window > 0U ? legacy_value_count / window : 0U;
-
-    // Normalize frame indices to start at 0 in the legacy buffer.
-    int base_frame = std::numeric_limits<int>::max();
-    MailboxNode *scan = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(real_buffer));
-    while (scan != nullptr) {
-        if (scan->node_kind == MailboxNode::NodeKind::SPECTRAL && scan->frame_index >= 0) {
-            base_frame = std::min(base_frame, scan->frame_index);
-        }
-        scan = scan->next;
-    }
-    if (base_frame == std::numeric_limits<int>::max()) {
-        return result;
-    }
-
-    MailboxNode *node = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(real_buffer));
-    while (node != nullptr) {
-        if (node->node_kind == MailboxNode::NodeKind::SPECTRAL && node->frame_index >= 0) {
-            const size_t frame = static_cast<size_t>(
-                static_cast<int>(node->frame_index) - base_frame);
-            const size_t bin = (node->slot >= 0 && node->slot < static_cast<int>(window))
-                ? static_cast<size_t>(node->slot)
-                : 0U;
-            if (frame < capacity_frames && bin < window) {
-                const size_t base = frame * window + bin;
-                if (base < legacy_value_count) {
-                    legacy_real[base] = node->spectral_real;
-                    legacy_imag[base] = node->spectral_imag;
-                    result.frames_committed = std::max(result.frames_committed, frame + 1);
-                    ++result.values_written;
-                }
-            }
-        }
-        node = node->next;
-    }
-
-    result.copied_from_mailbox = (result.values_written > 0U);
-    return result;
-}
+#if 0
+// mailbox helpers moved to node header; included above.
+#endif
 #endif
 
 namespace detail {

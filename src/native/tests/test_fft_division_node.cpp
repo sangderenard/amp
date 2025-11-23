@@ -33,6 +33,7 @@ static constexpr const char *kDevNullPath = "/dev/null";
 extern "C" {
 #include "amp_fft_backend.h"
 #include "amp_native.h"
+#include "amp_mailbox_capi.h"
 }
 
 #include "fft_division_test_helpers.h"
@@ -871,9 +872,9 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         signal.size()
     );
     auto spectral_real_descriptor = spectral_descriptor;
-    spectral_real_descriptor.name = "spectral_real";
+    spectral_real_descriptor.name = "spectral_0";
     auto spectral_imag_descriptor = spectral_descriptor;
-    spectral_imag_descriptor.name = "spectral_imag";
+    spectral_imag_descriptor.name = "spectral_0";
     TapDescriptor pcm_descriptor = BuildPcmTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
         1U,
@@ -959,11 +960,40 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     (void)amp_tap_cache_block_until_ready(state, &tap_buffers[0], tap_buffers[0].tap_name, 0);
     (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
 
+    // Diagnostic: report tap pointers and buffers immediately before population
+    std::fprintf(stderr, "[TEST-DIAG] before_populate pcm_tap=%p mailbox_head=%p cache=%p data=%p\n",
+                 reinterpret_cast<void*>(&tap_buffers[2]), reinterpret_cast<void*>(tap_buffers[2].mailbox_head),
+                 reinterpret_cast<void*>(tap_buffers[2].cache_data), reinterpret_cast<void*>(tap_buffers[2].data));
+    fflush(stderr);
+
     const auto pcm_read = PopulateLegacyPcmFromMailbox(
         tap_buffers[2],
         result.pcm.data(),
         result.pcm.size()
     );
+    std::fprintf(stderr, "[TEST-DIAG] after_populate pcm_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
+                 pcm_read.frames_committed, pcm_read.values_written, pcm_read.copied_from_mailbox ? 1 : 0, pcm_read.aliased_legacy_buffer ? 1 : 0);
+    fflush(stderr);
+    if (pcm_read.frames_committed > 0) {
+        std::fprintf(stderr, "[TEST-DIAG] advancing pcm cursor by=%zu\n", pcm_read.frames_committed);
+        fflush(stderr);
+        (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
+    }
+    std::fprintf(stderr, "[TEST-DIAG] before_populate spectral_tap_real=%p mailbox_head=%p cache=%p data=%p\n",
+                 reinterpret_cast<void*>(&tap_buffers[0]), reinterpret_cast<void*>(tap_buffers[0].mailbox_head),
+                 reinterpret_cast<void*>(tap_buffers[0].cache_data), reinterpret_cast<void*>(tap_buffers[0].data));
+    fflush(stderr);
+
+    // Avoid using the staged cache path for spectral taps: when the
+    // tap cache is filled from persistent mailbox nodes the cache layout
+    // may be interleaved (real,imag) which breaks the legacy contiguous
+    // per-component layout expected by the verification helpers. Clear
+    // any staged cache pointers so the populate helper walks the
+    // mailbox nodes directly and writes values into the legacy arrays
+    // in the canonical frame-major order.
+    tap_buffers[0].cache_data = nullptr;
+    tap_buffers[1].cache_data = nullptr;
+
     const auto spectral_read = PopulateLegacySpectrumFromMailbox(
         tap_buffers[0],
         tap_buffers[1],
@@ -971,6 +1001,9 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         result.spectral_imag.data(),
         result.spectral_real.size()
     );
+    std::fprintf(stderr, "[TEST-DIAG] after_populate spectral_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
+                 spectral_read.frames_committed, spectral_read.values_written, spectral_read.copied_from_mailbox ? 1 : 0, spectral_read.aliased_legacy_buffer ? 1 : 0);
+    fflush(stderr);
 
     result.pcm_frames_committed = pcm_read.frames_committed;
     result.spectral_rows_committed = spectral_read.frames_committed;
@@ -1012,9 +1045,9 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         total_frames
     );
     auto streaming_real_descriptor = streaming_spectral_descriptor;
-    streaming_real_descriptor.name = "spectral_real";
+    streaming_real_descriptor.name = "spectral_0";
     auto streaming_imag_descriptor = streaming_spectral_descriptor;
-    streaming_imag_descriptor.name = "spectral_imag";
+    streaming_imag_descriptor.name = "spectral_0";
     TapDescriptor streaming_pcm_descriptor = BuildPcmTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
         1U,
@@ -1124,6 +1157,19 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         result.pcm.data(),
         result.pcm.size()
     );
+    if (pcm_read.frames_committed > 0) {
+        (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
+    }
+    // Avoid using the staged cache path for spectral taps in streaming
+    // mode as well: when the tap cache is filled from persistent mailbox
+    // nodes the cache layout may be interleaved (real,imag) which breaks
+    // the legacy contiguous per-component layout expected by the
+    // verification helpers. Clear any staged cache pointers so the
+    // populate helper walks the mailbox nodes directly and writes values
+    // into the legacy arrays in the canonical frame-major order.
+    tap_buffers[0].cache_data = nullptr;
+    tap_buffers[1].cache_data = nullptr;
+
     const auto spectral_read = PopulateLegacySpectrumFromMailbox(
         tap_buffers[0],
         tap_buffers[1],
@@ -1602,9 +1648,8 @@ int main(int argc, char **argv) {
     RunResult first = run_fft_node_once(signal);
     RunResult second = run_fft_node_once(signal);
 
-    // Lazy intermediate: allow node-owned mailbox chains time to be populated
-    // before the test harness inspects them. This is a temporary measure.
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    // Rely on explicit tap cache blocking helpers instead of sleeping.
+    // Previous versions used a fixed sleep here which is racy and slow.
 
     const size_t expected_pcm_frames = expected_pcm.size();
     const size_t pcm_frames_to_check = std::min(expected_pcm_frames, first.pcm_frames_committed);

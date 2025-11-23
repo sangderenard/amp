@@ -1971,6 +1971,7 @@ typedef union {
             int64_t wheel_frame_counter;
             double sample_rate_hint;
             double timeline_seconds;
+            uint64_t total_pcm_emitted;
 // C++-only mailbox chains for persistent tap/PCM output
 
 #if defined(__cplusplus)
@@ -2053,6 +2054,7 @@ static void fftdiv_construct_state(node_state_t *state) {
     state->u.fftdiv.log_slice_bin_cap = kFftDivDefaultSliceLogCap;
     state->u.fftdiv.halt_on_zero_stage_output = 0;
     state->u.fftdiv.halt_on_zero_stage5_pcm_output = 0;
+    state->u.fftdiv.total_pcm_emitted = 0ULL;
     state->fftdiv_constructed = true;
 }
 
@@ -3698,6 +3700,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.wheel_frame_counter = 0;
     state->u.fftdiv.sample_rate_hint = 0.0;
     state->u.fftdiv.timeline_seconds = 0.0;
+    state->u.fftdiv.total_pcm_emitted = 0ULL;
     state->u.fftdiv.last_descriptor = nullptr;
     state->u.fftdiv.last_batches = 0;
     state->u.fftdiv.last_channels = 0;

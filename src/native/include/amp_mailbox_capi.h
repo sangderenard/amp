@@ -41,6 +41,10 @@ AmpMailboxNode amp_mailbox_get_spectral_head(void* state, const char* tap_name);
 // in the per-state PCM chain, or NULL if none.
 AmpMailboxNode amp_mailbox_get_pcm_head(void* state);
 
+// Advance the per-state PCM read cursor by up to `count` nodes for the
+// tap identified by `tap_name` (use "pcm" for the default PCM tap).
+// Returns the number of nodes remaining available after advancing.
+AMP_CAPI int amp_mailbox_advance_pcm_cursor(void* state, const char* tap_name, size_t count);
 // Node accessors
 // Spectral getters expose raw values (not pointers) so legacy readers copy
 // discrete doubles from each mailbox node rather than aliasing node storage.
@@ -57,6 +61,11 @@ AmpMailboxNode amp_mailbox_node_next(AmpMailboxNode node);
 int amp_mailbox_node_is_spectral(AmpMailboxNode node);
 // Get the spectral real component value (first element) for single-item spectral nodes
 double amp_mailbox_node_spectral_value(AmpMailboxNode node);
+
+// Notify the FFT-division worker associated with `state` (if any) that
+// mailbox activity occurred. This allows external mailbox operations to
+// wake the worker so it can observe state changes (used by tests).
+AMP_CAPI void amp_fftdiv_notify_worker(void* state);
 
 #ifdef __cplusplus
 }
