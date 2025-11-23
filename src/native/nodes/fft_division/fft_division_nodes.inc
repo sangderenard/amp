@@ -1192,7 +1192,13 @@ static void stage_emit_spectral(
                "[STAGE4-EMIT-POST] frame=%d slot=%d after_copy re[0]=%.6g im[0]=%.6g\n",
                frame_index, tap_slot, spectral_real[0], spectral_imag[0]);
     
-    AmpMailboxNode new_node = amp_mailbox_create_spectral_node(spectral_real, spectral_imag, tap_slot, frame_index);
+    AmpMailboxNode new_node = amp_mailbox_create_spectral_node(
+        spectral_real,
+        spectral_imag,
+        tap_slot,
+        frame_index,
+        window_size
+    );
     // Attach the spectral node to the per-lane tap name `spectral_<slot>`.
     // Legacy canonical publishing removed; consumers should read from
     // the per-lane taps (e.g. "spectral_0", "spectral_1", ...).

@@ -5,6 +5,7 @@
 #ifdef __cplusplus
 #include "amp_native.h"
 #include <cstddef>
+#include <vector>
 
 namespace amp { namespace tests { namespace fft_division_shared {
 
@@ -12,6 +13,8 @@ namespace amp { namespace tests { namespace fft_division_shared {
 struct PersistentMailboxNode {
     PersistentMailboxNode* next = nullptr;
     // Node carries exactly one payload. Use `node_kind` to know which.
+    std::vector<double> spectral_real_bins{};
+    std::vector<double> spectral_imag_bins{};
     double spectral_real = 0.0;
     double spectral_imag = 0.0;
     double pcm_sample = 0.0;
@@ -22,18 +25,32 @@ struct PersistentMailboxNode {
     int window_size = 1;
 
     PersistentMailboxNode() = default;
-    PersistentMailboxNode(const double* real, const double* imag, int slot_, int frame_idx)
+    PersistentMailboxNode(const double* real, const double* imag, int slot_, int frame_idx, int window_size_)
         : next(nullptr), slot(slot_), frame_index(frame_idx) {
         node_kind = NodeKind::SPECTRAL;
         pcm_sample = 0.0;
-        spectral_real = real ? real[0] : 0.0;
-        spectral_imag = imag ? imag[0] : 0.0;
+        window_size = window_size_ > 0 ? window_size_ : 1;
+        spectral_real_bins.assign(
+            real ? real : nullptr,
+            real ? real + static_cast<size_t>(window_size) : nullptr
+        );
+        spectral_imag_bins.assign(
+            imag ? imag : nullptr,
+            imag ? imag + static_cast<size_t>(window_size) : nullptr
+        );
+        if (!spectral_real_bins.empty()) spectral_real = spectral_real_bins[0];
+        if (!spectral_imag_bins.empty()) spectral_imag = spectral_imag_bins[0];
     }
     PersistentMailboxNode(const void* data_ptr, size_t size)
         : next(nullptr), slot(0), frame_index(0), window_size(static_cast<int>(size)) {
         const double* d = reinterpret_cast<const double*>(data_ptr);
-        spectral_real = (d != nullptr && size > 0) ? d[0] : 0.0;
-        spectral_imag = 0.0;
+        spectral_real_bins.assign(
+            d ? d : nullptr,
+            d ? d + static_cast<size_t>(size) : nullptr
+        );
+        spectral_imag_bins.assign(spectral_real_bins.size(), 0.0);
+        if (!spectral_real_bins.empty()) spectral_real = spectral_real_bins[0];
+        if (!spectral_imag_bins.empty()) spectral_imag = spectral_imag_bins[0];
     }
     // PCM constructor - creates a node that carries a single PCM sample
     PersistentMailboxNode(double pcm, int frame_idx)

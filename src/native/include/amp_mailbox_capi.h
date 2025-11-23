@@ -10,8 +10,9 @@ extern "C" {
 // Opaque mailbox node pointer
 typedef void* AmpMailboxNode;
 
-// Create/append spectral node to a tap buffer
-AmpMailboxNode amp_mailbox_create_spectral_node(const double* real, const double* imag, int slot, int frame_index);
+// Create/append spectral node to a tap buffer (copies `window_size` bins from
+// both real and imag arrays)
+AmpMailboxNode amp_mailbox_create_spectral_node(const double* real, const double* imag, int slot, int frame_index, int window_size);
 void amp_mailbox_append_node_to_tap(EdgeRunnerTapBuffer* tap_buf, AmpMailboxNode node);
 
 // Attach spectral node to per-state tap chain and update cursor
