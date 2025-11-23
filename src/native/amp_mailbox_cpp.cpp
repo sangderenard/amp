@@ -373,22 +373,37 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
     if (tap->cache_data != nullptr) {
         // Try an immediate fill first.
         filled = amp_tap_cache_fill_from_chain(tap);
-        // If we didn't fill enough, wait a short time and retry until
-        // either filled >= expected or the caller's timeout window elapses.
-        if (filled < static_cast<int>(expected) && ready) {
-            // Give a small grace period where we re-check the condition.
-            const auto fill_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-            int _retry_count = 0;
-            while (std::chrono::steady_clock::now() < fill_deadline) {
-                // Wait on the mailbox condition variable for small increments.
-                w->cv.wait_for(lock, std::chrono::milliseconds(5));
-                ++_retry_count;
-                filled = amp_tap_cache_fill_from_chain(tap);
-                auto _now_retry = std::chrono::steady_clock::now();
-                long long _retry_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_now_retry - _start_time).count());
-                fprintf(stderr, "[TAP-FILL-RETRY] t=%lldms tap=%p tap_name='%s' retry=%d filled=%d expected=%zu\n",
-                        _retry_ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", _retry_count, filled, expected);
-                if (filled >= static_cast<int>(expected)) break;
+        // If predicate was satisfied (enough mailbox nodes exist), ensure
+        // the staged cache actually contains at least `expected` rows
+        // before returning. Use `tap->cache_frames` which is updated by
+        // `amp_tap_cache_fill_from_chain` to reflect the number of rows
+        // written into the staged buffer.
+        if (ready) {
+            if (static_cast<size_t>(tap->cache_frames) < expected) {
+                // Compute a fill deadline based on caller timeout; if
+                // timeout_ms == 0 wait indefinitely until cache_frames
+                // reaches expected.
+                std::chrono::steady_clock::time_point fill_deadline;
+                bool use_deadline = false;
+                if (timeout_ms != 0) {
+                    fill_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+                    use_deadline = true;
+                }
+                int _retry_count = 0;
+                while (static_cast<size_t>(tap->cache_frames) < expected) {
+                    ++_retry_count;
+                    if (use_deadline) {
+                        if (std::chrono::steady_clock::now() >= fill_deadline) break;
+                        w->cv.wait_for(lock, std::chrono::milliseconds(5));
+                    } else {
+                        w->cv.wait(lock);
+                    }
+                    filled = amp_tap_cache_fill_from_chain(tap);
+                    auto _now_retry = std::chrono::steady_clock::now();
+                    long long _retry_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_now_retry - _start_time).count());
+                    fprintf(stderr, "[TAP-FILL-RETRY] t=%lldms tap=%p tap_name='%s' retry=%d filled=%d cache_frames=%u expected=%zu\n",
+                            _retry_ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", _retry_count, filled, tap->cache_frames, expected);
+                }
             }
         }
     }
@@ -399,8 +414,9 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
             _elapsed_ms, tap_name ? tap_name : "(null)", resolved_name.c_str(), expected, available, ready ? 1 : 0, filled, _elapsed_ms);
 
     // Consider the tap ready only if the original predicate succeeded and,
-    // when a staged buffer exists, we filled at least `expected` entries.
-    const bool effective_ready = ready && (tap->cache_data == nullptr || filled >= static_cast<int>(expected));
+    // when a staged buffer exists, the staged cache contains at least
+    // `expected` rows (use `tap->cache_frames` which represents rows).
+    const bool effective_ready = ready && (tap->cache_data == nullptr || static_cast<size_t>(tap->cache_frames) >= expected);
     return effective_ready ? static_cast<int>(available) : 0;
 }
 

@@ -106,6 +106,11 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
     using MailboxChain = EdgeRunnerTapMailboxChain;
 
     TapMailboxReadResult result{};
+    // `result.values_written` will represent the number of complex bins written
+    // (one complex bin == real+imag). Keep a separate scalar counter for
+    // diagnostic prints when needed.
+    size_t values_written_complex = 0U;
+    size_t values_written_scalars = 0U;
     if (legacy_real == nullptr || legacy_imag == nullptr || legacy_value_count == 0U) {
         return result;
     }
@@ -137,15 +142,51 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
         const size_t cache_values = cache_frames * cache_window;
         if (cache_values > 0) {
             const size_t copy_values = std::min(legacy_value_count, cache_values);
+
+            // If both taps expose the same staged cache pointer, the data is
+            // stored interleaved as [r0,i0,r1,i1,...]. Handle that case by
+            // deinterleaving from the single buffer. This avoids false
+            // positives when comparing values across aliased pointers.
+            if (real_buffer.cache_data == imag_buffer.cache_data) {
+                const double *cache = real_buffer.cache_data;
+                const size_t total_scalars = real_buffer.cache_buffer_len;
+                const size_t pairs = std::min(copy_values, total_scalars / 2U);
+                for (size_t p = 0; p < pairs; ++p) {
+                    const size_t src_idx = p * 2U;
+                    legacy_real[p] = cache[src_idx];
+                    legacy_imag[p] = cache[src_idx + 1U];
+                }
+                // `pairs` counts complex bins (pairs of scalars). Report complex
+                // bin counts in `result.values_written` and keep scalar totals
+                // for diagnostics.
+                result.values_written = pairs; // complex bins
+                values_written_complex = pairs;
+                values_written_scalars = pairs * 2U;
+                result.frames_committed = (cache_window > 0U) ? (pairs / cache_window) : pairs;
+                result.copied_from_mailbox = (result.values_written > 0U);
+                fprintf(stderr, "[MAILBOX-COPY] spectral deinterleaved_from_alias_cache window=%zu cache_frames=%zu cache_values=%zu frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
+                    cache_window, cache_frames, cache_values, result.frames_committed, result.values_written, values_written_complex,
+                    result.aliased_legacy_buffer ? 1 : 0);
+                fflush(stderr);
+                return result;
+            }
+
+            // Non-aliased caches: copy per-component from each buffer into
+            // legacy arrays.
             for (size_t i = 0; i < copy_values; ++i) {
                 legacy_real[i] = real_buffer.cache_data[i];
                 legacy_imag[i] = imag_buffer.cache_data[i];
             }
-            result.values_written = copy_values;
-            result.frames_committed = (cache_window > 0U) ? (copy_values / cache_window) : 0U;
-            result.copied_from_mailbox = (result.values_written > 0U);
-            fprintf(stderr, "[MAILBOX-COPY] spectral copied_from_cache frames_committed=%zu values_written=%zu aliased=%d\n",
-                    result.frames_committed, result.values_written, result.aliased_legacy_buffer ? 1 : 0);
+                // `copy_values` counts per-component values copied into real (and imag).
+                // So `copy_values` equals the number of complex bins written.
+                result.values_written = copy_values; // complex bins
+                values_written_complex = copy_values;
+                values_written_scalars = copy_values * 2U;
+                // frames_committed computed from complex bins per row (copy_values / window)
+                result.frames_committed = (cache_window > 0U) ? (copy_values / cache_window) : 0U;
+                result.copied_from_mailbox = (result.values_written > 0U);
+                fprintf(stderr, "[MAILBOX-COPY] spectral copied_from_cache window=%zu cache_frames=%zu cache_values=%zu frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
+                    cache_window, cache_frames, cache_values, result.frames_committed, result.values_written, values_written_complex, result.aliased_legacy_buffer ? 1 : 0);
             fflush(stderr);
             return result;
         }
@@ -166,9 +207,7 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
     MailboxNode *node = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(real_buffer));
     while (node != nullptr) {
         if (node->node_kind == MailboxNode::NodeKind::SPECTRAL &&
-            node->frame_index >= 0 &&
-            node->spectral_real != nullptr &&
-            node->spectral_imag != nullptr) {
+            node->frame_index >= 0) {
 
             const size_t frame = static_cast<size_t>(
                 static_cast<int>(node->frame_index) - base_frame);
@@ -185,7 +224,11 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
                         legacy_real[idx + bin] = bin < real_bins.size() ? real_bins[bin] : 0.0;
                         legacy_imag[idx + bin] = bin < imag_bins.size() ? imag_bins[bin] : 0.0;
                     }
+                    // we wrote `bins_to_copy` complex bins (each bin contributes
+                    // one value in real and one in imag). Count complex bins.
                     result.values_written += bins_to_copy;
+                    values_written_complex += bins_to_copy;
+                    values_written_scalars += (bins_to_copy * 2U);
                     result.frames_committed = std::max(result.frames_committed, frame + 1);
                 }
                 result.frames_committed = std::max(result.frames_committed, frame + 1);
@@ -193,11 +236,20 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
         }
         node = node->next;
     }
-
-    result.copied_from_mailbox = (result.values_written > 0U);
-    if (result.copied_from_mailbox) {
-        fprintf(stderr, "[MAILBOX-COPY] spectral copied frames_committed=%zu values_written=%zu aliased=%d\n",
-                result.frames_committed, result.values_written, result.aliased_legacy_buffer ? 1 : 0);
+    // Normalize/interpret frames_committed from scalar counts across real+imag
+    if (values_written_complex > 0U) {
+        // compute frames from complex-bin counts (bins per row = window)
+        size_t computed_frames = 0U;
+        if (window > 0U) {
+            computed_frames = values_written_complex / window; // complex bins per row
+        }
+        size_t interpreted = result.frames_committed;
+        if (computed_frames > interpreted) interpreted = computed_frames;
+        if (interpreted > capacity_frames) interpreted = capacity_frames;
+        result.frames_committed = interpreted;
+        result.copied_from_mailbox = true;
+        fprintf(stderr, "[MAILBOX-COPY] spectral copied frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
+                result.frames_committed, values_written_scalars, values_written_complex, result.aliased_legacy_buffer ? 1 : 0);
         fflush(stderr);
     } else {
         fprintf(stderr, "[MAILBOX-COPY] spectral nothing_copied\n");
