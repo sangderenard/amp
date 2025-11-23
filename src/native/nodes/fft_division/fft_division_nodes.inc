@@ -162,6 +162,33 @@ static int fftdiv_stage_assert_enabled(const node_state_t *state) {
     return (state != NULL && state->u.fftdiv.halt_on_zero_stage_output != 0);
 }
 
+#if defined(__cplusplus)
+static void fftdiv_mark_halt_requested(node_state_t *state) {
+    if (state == nullptr) {
+        return;
+    }
+    auto &worker = state->u.fftdiv.worker;
+    std::lock_guard<std::mutex> lock(worker.mutex);
+    worker.halt_requested = true;
+    worker.stop_requested = true;
+    worker.cv_request.notify_all();
+}
+
+static void fftdiv_abort_if_halt_requested(node_state_t *state, const char *context) {
+    if (state == nullptr) {
+        return;
+    }
+    auto &worker = state->u.fftdiv.worker;
+    if (!worker.halt_requested) {
+        return;
+    }
+    if (context != nullptr) {
+        fprintf(stderr, "[fftdiv-halt] context=%s aborting immediately\n", context);
+    }
+    abort();
+}
+#endif
+
 static int fftdiv_block_has_signal(const double *values, size_t count) {
     if (values == NULL) {
         return 0;
@@ -236,35 +263,10 @@ static void fftdiv_stage_trigger_halt(
                 im);
     }
     fflush(stderr);
-    // Instead of aborting the process, try to stop the worker thread
-    // and perform a graceful shutdown of the FFT division subsystem.
-#if defined(__cplusplus)
-    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-               "[STAGE-HALT] initiating graceful shutdown for state=%p\n",
-               (void*)state);
-    // Request the worker stop and allow it to perform its own shutdown.
-    // Do NOT call `fftdiv_stop_worker` here because this handler is often
-    // invoked from the worker thread itself; joining the current thread
-    // would deadlock or cause undefined behaviour. Instead set the
-    // stop flag, enable flush-on-stop, and notify the worker condition
-    // variable so the worker will drain pending outputs and exit cleanly.
-    if (state != nullptr) {
-        auto &worker = state->u.fftdiv.worker;
-        {
-            std::lock_guard<std::mutex> wlock(worker.mutex);
-            worker.flush_on_stop = true;
-            worker.stop_requested = true;
-        }
-        worker.cv_request.notify_all();
-    }
-    // Mark mailbox as shutdown and notify any waiters so they can exit cleanly.
-    {
-        std::lock_guard<std::mutex> lock(state->mailbox_mutex);
-        state->mailbox_shutdown = true;
-    }
-    state->mailbox_cv.notify_all();
-#endif
-    return;
+    #if defined(__cplusplus)
+    fftdiv_mark_halt_requested(state);
+    #endif
+    abort();
 }
 
 static void fftdiv_stage_assert_complex_output(
@@ -3573,6 +3575,7 @@ static bool fftdiv_worker_process_command(
     if (!state || !command) {
         return true;
     }
+    fftdiv_abort_if_halt_requested(state, "process-command");
     AmpNodeMetrics local_metrics{};
     AmpNodeMetrics *metrics_ptr = command->want_metrics ? &command->metrics_storage : &local_metrics;
     if (command->want_metrics) {
@@ -3779,6 +3782,8 @@ static void fftdiv_worker_main(node_state_t *state) {
 
     std::unique_lock<std::mutex> lock(worker.mutex);
 
+    fftdiv_abort_if_halt_requested(state, "worker-entry");
+
     auto process_ready_work = [&](std::unique_lock<std::mutex> &lock_guard) -> bool {
         std::shared_ptr<FftDivWorkerCommand> command = worker.active_command;
         // DIAGNOSTIC: observe pending command counts and active command presence
@@ -3844,6 +3849,7 @@ static void fftdiv_worker_main(node_state_t *state) {
     };
 
     while (true) {
+        fftdiv_abort_if_halt_requested(state, "worker-loop");
         while (!worker.stop_requested) {
             bool did_work = process_ready_work(lock);
             if (!did_work) {
@@ -3892,6 +3898,7 @@ static void fftdiv_worker_main(node_state_t *state) {
             (void*)(worker.active_command ? worker.active_command.get() : nullptr),
             worker.pending_commands.size(),
             fftdiv_pipeline_can_advance(state) ? 1 : 0);
+        fftdiv_abort_if_halt_requested(state, "worker-wake");
         if (worker.stop_requested) {
             continue;
         }
@@ -3979,6 +3986,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         worker.flush_on_stop = flush;
         if (!worker.thread_started) {
             worker.stop_requested = false;
+            worker.halt_requested = false;
             worker.active_command.reset();
             worker.pending_commands.clear();
             worker.shared_command.reset();
@@ -4000,6 +4008,7 @@ static void fftdiv_stop_worker(node_state_t *state, bool flush) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         worker.thread_started = false;
         worker.stop_requested = false;
+        worker.halt_requested = false;
         worker.active_command.reset();
         worker.pending_commands.clear();
         worker.shared_command.reset();
@@ -4048,6 +4057,15 @@ static int run_fft_division_node(
     *out_channels = 0;
 
     fprintf(stderr, "[DIAG] run_fft_division_node: entry descriptor=%p name=%s state=%p frames=%d\n", (void*)descriptor, descriptor ? descriptor->name : "<null>", (void*)state, frames);
+    {
+        auto &worker = state->u.fftdiv.worker;
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.halt_requested) {
+            fprintf(stderr, "[DIAG] run_fft_division_node: halt already requested, rejecting new work\n");
+            fftdiv_abort_if_halt_requested(state, "run-node-halt");
+            return -1;
+        }
+    }
     if (fftdiv_start_worker(state) != 0) {
         fprintf(stderr, "[DIAG] run_fft_division_node: fftdiv_start_worker failed state=%p\n", (void*)state);
         return -1;
