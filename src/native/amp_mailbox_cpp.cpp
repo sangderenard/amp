@@ -2,6 +2,7 @@
 #ifdef __cplusplus
 
 #include "amp_native_mailbox_chain.hpp"
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -113,8 +114,8 @@ static MailboxStateWrapper* state_for(void* key) {
     return w;
 }
 
-AmpMailboxNode amp_mailbox_create_spectral_node(const double* real, const double* imag, int slot, int frame_index) {
-    auto* node = new PersistentMailboxNode(real, imag, slot, frame_index);
+AmpMailboxNode amp_mailbox_create_spectral_node(const double* real, const double* imag, int slot, int frame_index, int window_size) {
+    auto* node = new PersistentMailboxNode(real, imag, slot, frame_index, window_size);
     return reinterpret_cast<AmpMailboxNode>(node);
 }
 
@@ -177,41 +178,47 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
 
     PersistentMailboxNode* cur = reinterpret_cast<PersistentMailboxNode*>(tap->mailbox_head);
     size_t written = 0;
+    size_t frames_written = 0;
     size_t capacity = tap->cache_buffer_len;
-    // Simple packing: write scalar values in sequence. For spectral nodes
-    // write real then imag; for PCM nodes write single value.
+    const size_t window = tap->shape.channels > 0 ? static_cast<size_t>(tap->shape.channels) : 1U;
+    const char *tname = tap->tap_name;
+    const char *bclass = tap->buffer_class;
+    const bool prefer_imag = (tname != nullptr && std::strstr(tname, "imag") != nullptr) ||
+        (bclass != nullptr && std::strstr(bclass, "imag") != nullptr);
+    const bool prefer_real = (tname != nullptr && std::strstr(tname, "real") != nullptr) ||
+        (bclass != nullptr && std::strstr(bclass, "real") != nullptr);
+    // Pack each mailbox node contiguously: spectral nodes contribute full window bins,
+    // PCM nodes contribute a single sample.
     while (cur && written < capacity) {
         if (cur->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) {
-            // For spectral nodes: prefer writing the single component that
-            // corresponds to this tap (real or imag). If the tap name
-            // clearly indicates it is the real or imag buffer, write a
-            // single scalar per node so the staged cache contains contiguous
-            // component arrays. Otherwise fall back to interleaved (real, imag).
-            bool wrote = false;
-            const char *tname = tap->tap_name;
-            if (tname != nullptr && std::strstr(tname, "real") != nullptr) {
-                if (written + 1 <= capacity) {
-                    tap->cache_data[written++] = cur->spectral_real;
-                    wrote = true;
-                } else {
-                    break;
+            const size_t node_window = static_cast<size_t>(cur->window_size > 0 ? cur->window_size : 1);
+            const size_t bins_to_copy = std::min(window, node_window);
+            const auto &real_bins = cur->spectral_real_bins;
+            const auto &imag_bins = cur->spectral_imag_bins;
+
+            if (prefer_imag) {
+                if (written + bins_to_copy > capacity) break;
+                for (size_t bin = 0; bin < bins_to_copy; ++bin) {
+                    const double imag_val = bin < imag_bins.size() ? imag_bins[bin] : 0.0;
+                    tap->cache_data[written++] = imag_val;
                 }
-            } else if (tname != nullptr && std::strstr(tname, "imag") != nullptr) {
-                if (written + 1 <= capacity) {
-                    tap->cache_data[written++] = cur->spectral_imag;
-                    wrote = true;
-                } else {
-                    break;
+            } else if (prefer_real) {
+                if (written + bins_to_copy > capacity) break;
+                for (size_t bin = 0; bin < bins_to_copy; ++bin) {
+                    const double real_val = bin < real_bins.size() ? real_bins[bin] : 0.0;
+                    tap->cache_data[written++] = real_val;
                 }
-            }
-            if (!wrote) {
-                if (written + 2 <= capacity) {
-                    tap->cache_data[written++] = cur->spectral_real;
-                    tap->cache_data[written++] = cur->spectral_imag;
-                } else {
-                    break;
+            } else {
+                const size_t required = bins_to_copy * 2U;
+                if (written + required > capacity) break;
+                for (size_t bin = 0; bin < bins_to_copy; ++bin) {
+                    const double real_val = bin < real_bins.size() ? real_bins[bin] : 0.0;
+                    const double imag_val = bin < imag_bins.size() ? imag_bins[bin] : 0.0;
+                    tap->cache_data[written++] = real_val;
+                    tap->cache_data[written++] = imag_val;
                 }
             }
+            ++frames_written;
         } else if (cur->node_kind == PersistentMailboxNode::NodeKind::PCM) {
             if (written + 1 <= capacity) {
                 tap->cache_data[written++] = cur->pcm_sample;
@@ -225,6 +232,12 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
         cur = cur->next;
     }
     tap->cache_state = (written > 0) ? 1 /*staged/filled*/ : 0;
+    if (frames_written > 0) {
+        const uint32_t frames_written_u32 = static_cast<uint32_t>(frames_written);
+        tap->cache_frames = (tap->cache_frames > 0)
+            ? std::max<uint32_t>(tap->cache_frames, frames_written_u32)
+            : frames_written_u32;
+    }
     // Report whether this buffer was mailbox-allocated (owned) so callers
     // can see ownership transitions in logs.
     bool owned = false;
@@ -594,7 +607,9 @@ int amp_mailbox_node_is_spectral(AmpMailboxNode node) {
 double amp_mailbox_node_spectral_value(AmpMailboxNode node) {
     PersistentMailboxNode* n = reinterpret_cast<PersistentMailboxNode*>(node);
     if (!n) return 0.0;
-    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) return n->spectral_real;
+    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) {
+        return n->spectral_real_bins.empty() ? 0.0 : n->spectral_real_bins.front();
+    }
     return 0.0;
 }
 
@@ -626,13 +641,17 @@ AmpMailboxNode amp_mailbox_get_tap_cursor(void* state, const char* tap_name) {
 double amp_mailbox_node_real(AmpMailboxNode node) {
     PersistentMailboxNode* n = reinterpret_cast<PersistentMailboxNode*>(node);
     if (!n) return 0.0;
-    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) return n->spectral_real;
+    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) {
+        return n->spectral_real_bins.empty() ? 0.0 : n->spectral_real_bins.front();
+    }
     return 0.0;
 }
 double amp_mailbox_node_imag(AmpMailboxNode node) {
     PersistentMailboxNode* n = reinterpret_cast<PersistentMailboxNode*>(node);
     if (!n) return 0.0;
-    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) return n->spectral_imag;
+    if (n->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) {
+        return n->spectral_imag_bins.empty() ? 0.0 : n->spectral_imag_bins.front();
+    }
     return 0.0;
 }
 int amp_mailbox_node_window_size(AmpMailboxNode node) {
