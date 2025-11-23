@@ -1944,6 +1944,7 @@ typedef union {
                 size_t append_invocations{0};
                 FftDivStageLockSnapshot cached_stage_locks{};
                 bool cached_stage_locks_valid{false};
+                bool halt_requested{false};
             };
             WorkerState worker;
             const EdgeRunnerNodeDescriptor *last_descriptor{nullptr};
