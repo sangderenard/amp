@@ -228,6 +228,16 @@ static void fftdiv_stage_trigger_halt(
     if (stage_name == NULL) {
         stage_name = "stage";
     }
+    if (state != nullptr) {
+        auto &worker = state->u.fftdiv.worker;
+        std::lock_guard<std::mutex> wlock(worker.mutex);
+        if (worker.halt_requested) {
+            return;
+        }
+        worker.halt_requested = true;
+        worker.flush_on_stop = true;
+        worker.stop_requested = true;
+    }
     const char *reason = (detail != NULL) ? detail : "zero-output";
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE-HALT] stage=%s slot=%d frame=%zu reason=%s samples=%zu\n",
