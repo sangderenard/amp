@@ -161,7 +161,11 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
 
     MailboxNode *node = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(real_buffer));
     while (node != nullptr) {
-        if (node->node_kind == MailboxNode::NodeKind::SPECTRAL && node->frame_index >= 0) {
+        if (node->node_kind == MailboxNode::NodeKind::SPECTRAL &&
+            node->frame_index >= 0 &&
+            node->spectral_real != nullptr &&
+            node->spectral_imag != nullptr) {
+
             const size_t frame = static_cast<size_t>(
                 static_cast<int>(node->frame_index) - base_frame);
             if (frame < capacity_frames) {
@@ -180,6 +184,7 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
                     result.values_written += bins_to_copy;
                     result.frames_committed = std::max(result.frames_committed, frame + 1);
                 }
+                result.frames_committed = std::max(result.frames_committed, frame + 1);
             }
         }
         node = node->next;
