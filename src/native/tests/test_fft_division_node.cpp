@@ -1229,6 +1229,69 @@ void verify_close(const char *label, const double *actual, const double *expecte
     }
 }
 
+void log_tail_summary(
+    const char *label,
+    const std::vector<double> &expected,
+    const std::vector<double> &actual,
+    size_t chunk_frames,
+    double tolerance) {
+    if (expected.empty() || actual.empty() || chunk_frames == 0) {
+        return;
+    }
+
+    const auto last_nonzero_index = [tolerance](const std::vector<double> &values) -> long {
+        for (long i = static_cast<long>(values.size()) - 1; i >= 0; --i) {
+            if (std::fabs(values[static_cast<size_t>(i)]) > tolerance) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    const auto tail_energy = [](const std::vector<double> &values, size_t start) -> double {
+        double energy = 0.0;
+        for (size_t i = start; i < values.size(); ++i) {
+            energy += values[i] * values[i];
+        }
+        return energy;
+    };
+
+    const size_t tail_start = (expected.size() > chunk_frames) ? (expected.size() - chunk_frames) : 0U;
+    const long expected_last = last_nonzero_index(expected);
+    const long actual_last = last_nonzero_index(actual);
+    const double expected_energy = tail_energy(expected, tail_start);
+    const double actual_energy = tail_energy(actual, tail_start);
+
+    const size_t total_frames = expected.size();
+    const size_t chunk_count = (chunk_frames > 0)
+        ? ((total_frames + (chunk_frames - 1U)) / chunk_frames)
+        : 0U;
+    const size_t trailing_zero_pad = (chunk_count > 0)
+        ? (chunk_count * chunk_frames - total_frames)
+        : 0U;
+    const auto chunk_index = [chunk_frames](long index) -> long {
+        return (index < 0 || chunk_frames == 0) ? -1L
+                                               : static_cast<long>(static_cast<size_t>(index) / chunk_frames);
+    };
+    const long expected_last_chunk = chunk_index(expected_last);
+    const long actual_last_chunk = chunk_index(actual_last);
+
+    emit_diagnostic(
+        "[%s-tail] chunk=%zu chunks=%zu trailing_zero_pad=%zu tail_start=%zu last_expected=%ld last_expected_chunk=%ld last_actual=%ld last_actual_chunk=%ld tail_energy_expected=%.12f tail_energy_actual=%.12f",
+        label,
+        chunk_frames,
+        chunk_count,
+        trailing_zero_pad,
+        tail_start,
+        expected_last,
+        expected_last_chunk,
+        actual_last,
+        actual_last_chunk,
+        expected_energy,
+        actual_energy
+    );
+}
+
 void require_identity(const std::vector<double> &input, const std::vector<double> &output, const char *label) {
     if (input.size() != output.size()) {
         record_failure(
@@ -1831,6 +1894,20 @@ int main(int argc, char **argv) {
             g_config.streaming_chunk
         );
         StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
+
+        if (g_verbosity >= VerbosityLevel::Detail) {
+            // Make the tail/chunk interaction explicit: this shows how many fixed-size chunks are
+            // emitted, how much zero padding is implicitly needed to round out the final chunk, and
+            // which chunk holds the last non-zero frame. For a 64-frame chunk size and a 3-frame tail,
+            // the final chunk is expected to be mostly (or entirely) zeros.
+            log_tail_summary(
+                "streaming_pcm",
+                streaming_expected.pcm,
+                streaming_result.pcm,
+                g_config.streaming_chunk,
+                g_config.tolerance
+            );
+        }
 
         verify_close(
             "streaming_pcm_vs_expected",
