@@ -1861,11 +1861,13 @@ typedef union {
                     std::vector<double> real;
                     std::vector<double> imag;
                     bool expect_signal{true};
+                    int64_t frame_index{0};
                 };
                 std::deque<PendingSpectrum> pending_spectra;
                 std::vector<double> pcm_backlog;
                 std::size_t pcm_consumed_samples{0U};
                 std::size_t input_frame_cursor{0U};
+                int64_t next_spectral_frame_index{0};
                 bool warmup_complete{false};
                 double last_pcm_output{0.0};
                 std::size_t total_ingested_samples{0U};
@@ -3465,6 +3467,7 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.pcm_backlog.clear();
         slot.pcm_consumed_samples = 0U;
         slot.input_frame_cursor = 0U;
+        slot.next_spectral_frame_index = 0;
         slot.warmup_complete = false;
         slot.last_pcm_output = 0.0;
         slot.total_ingested_samples = 0U;
@@ -3631,6 +3634,7 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.pcm_backlog.clear();
             slot.pcm_consumed_samples = 0U;
             slot.input_frame_cursor = 0U;
+            slot.next_spectral_frame_index = 0;
             slot.warmup_complete = false;
             slot.last_pcm_output = 0.0;
             slot.total_ingested_samples = 0U;
