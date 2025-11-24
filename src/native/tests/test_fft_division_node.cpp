@@ -1321,7 +1321,12 @@ void verify_metrics(const AmpNodeMetrics &metrics, const char *label, int expect
     }
 }
 
-SimulationResult simulate_stream_identity(const std::vector<double> &signal, int window_kind, int window_size, int hop) {
+SimulationResult simulate_stream_identity(
+    const std::vector<double> &signal,
+    int window_kind,
+    int window_size,
+    int hop,
+    size_t chunk_frames /* 0 => single push (legacy) */) {
     SimulationResult result;
     result.pcm.assign(signal.size(), 0.0);
     result.spectral_frames = 0;
@@ -1347,16 +1352,14 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
     }
 
     const size_t tail_frames = (clamped_window > 0) ? static_cast<size_t>(clamped_window - 1) : 0U;
-    const size_t padded_frames = signal.size() + tail_frames;
-    std::vector<double> padded_signal = signal;
-    padded_signal.resize(padded_frames, 0.0);
+    const size_t total_frames = signal.size() + tail_frames;
 
-    const size_t stage_capacity_frames = padded_frames > 0 ? padded_frames : 1U;
+    const size_t stage_capacity_frames = total_frames > 0 ? total_frames : 1U;
     std::vector<double> spectral_stage_real(stage_capacity_frames * clamped_window, 0.0);
     std::vector<double> spectral_stage_imag(stage_capacity_frames * clamped_window, 0.0);
     std::vector<double> inverse_scratch(clamped_window, 0.0);
     std::vector<double> produced_pcm;
-    produced_pcm.reserve(padded_frames + static_cast<size_t>(clamped_window));
+    produced_pcm.reserve(total_frames + static_cast<size_t>(clamped_window));
 
     size_t spectral_frames_emitted = 0;
     auto push_and_capture = [&](const double *pcm, size_t samples, int flush_mode) -> size_t {
@@ -1380,8 +1383,27 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
         return produced;
     };
 
-    if (!padded_signal.empty()) {
-        push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+    if (chunk_frames == 0) {
+        // Legacy single-shot path used for the non-streaming expectations.
+        std::vector<double> padded_signal = signal;
+        padded_signal.resize(total_frames, 0.0);
+        if (!padded_signal.empty()) {
+            push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+        }
+    } else {
+        // Streaming-accurate path: feed the signal in chunks, then append the zero tail
+        // after the final audio block has been seen. This mirrors the node's behaviour
+        // in run_fft_node_streaming and avoids front-loading the tail.
+        size_t offset = 0;
+        while (offset < signal.size()) {
+            const size_t frames = std::min(chunk_frames, signal.size() - offset);
+            push_and_capture(signal.data() + offset, frames, AMP_FFT_STREAM_FLUSH_NONE);
+            offset += frames;
+        }
+        if (tail_frames > 0) {
+            std::vector<double> zero_tail(tail_frames, 0.0);
+            push_and_capture(zero_tail.data(), zero_tail.size(), AMP_FFT_STREAM_FLUSH_NONE);
+        }
     }
 
     // Drain any ready frames and then issue repeated final flushes until nothing remains.
@@ -1580,7 +1602,8 @@ int main(int argc, char **argv) {
         raw_signal,
         AMP_FFT_WINDOW_HANN,
         g_config.window_size,
-        g_config.hop_size
+        g_config.hop_size,
+        0
     );
 
     // Recite original and cleaned signals for full visibility
@@ -1614,7 +1637,8 @@ int main(int argc, char **argv) {
         signal,
         AMP_FFT_WINDOW_HANN,
         g_config.window_size,
-        g_config.hop_size
+        g_config.hop_size,
+        0
     );
     if (expected_spec.spectral_frames == 0 ||
         expected_spec.spectral_real.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size) ||
@@ -1786,7 +1810,8 @@ int main(int argc, char **argv) {
             raw_streaming_signal,
             AMP_FFT_WINDOW_HANN,
             g_config.window_size,
-            g_config.hop_size
+            g_config.hop_size,
+            0
         );
         if (streaming_preconditioned.pcm.size() != raw_streaming_signal.size()) {
             record_failure(
@@ -1802,7 +1827,8 @@ int main(int argc, char **argv) {
             streaming_signal,
             AMP_FFT_WINDOW_HANN,
             g_config.window_size,
-            g_config.hop_size
+            g_config.hop_size,
+            g_config.streaming_chunk
         );
         StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
 
