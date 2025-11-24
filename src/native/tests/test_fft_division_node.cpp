@@ -1229,6 +1229,69 @@ void verify_close(const char *label, const double *actual, const double *expecte
     }
 }
 
+void log_tail_summary(
+    const char *label,
+    const std::vector<double> &expected,
+    const std::vector<double> &actual,
+    size_t chunk_frames,
+    double tolerance) {
+    if (expected.empty() || actual.empty() || chunk_frames == 0) {
+        return;
+    }
+
+    const auto last_nonzero_index = [tolerance](const std::vector<double> &values) -> long {
+        for (long i = static_cast<long>(values.size()) - 1; i >= 0; --i) {
+            if (std::fabs(values[static_cast<size_t>(i)]) > tolerance) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    const auto tail_energy = [](const std::vector<double> &values, size_t start) -> double {
+        double energy = 0.0;
+        for (size_t i = start; i < values.size(); ++i) {
+            energy += values[i] * values[i];
+        }
+        return energy;
+    };
+
+    const size_t tail_start = (expected.size() > chunk_frames) ? (expected.size() - chunk_frames) : 0U;
+    const long expected_last = last_nonzero_index(expected);
+    const long actual_last = last_nonzero_index(actual);
+    const double expected_energy = tail_energy(expected, tail_start);
+    const double actual_energy = tail_energy(actual, tail_start);
+
+    const size_t total_frames = expected.size();
+    const size_t chunk_count = (chunk_frames > 0)
+        ? ((total_frames + (chunk_frames - 1U)) / chunk_frames)
+        : 0U;
+    const size_t trailing_zero_pad = (chunk_count > 0)
+        ? (chunk_count * chunk_frames - total_frames)
+        : 0U;
+    const auto chunk_index = [chunk_frames](long index) -> long {
+        return (index < 0 || chunk_frames == 0) ? -1L
+                                               : static_cast<long>(static_cast<size_t>(index) / chunk_frames);
+    };
+    const long expected_last_chunk = chunk_index(expected_last);
+    const long actual_last_chunk = chunk_index(actual_last);
+
+    emit_diagnostic(
+        "[%s-tail] chunk=%zu chunks=%zu trailing_zero_pad=%zu tail_start=%zu last_expected=%ld last_expected_chunk=%ld last_actual=%ld last_actual_chunk=%ld tail_energy_expected=%.12f tail_energy_actual=%.12f",
+        label,
+        chunk_frames,
+        chunk_count,
+        trailing_zero_pad,
+        tail_start,
+        expected_last,
+        expected_last_chunk,
+        actual_last,
+        actual_last_chunk,
+        expected_energy,
+        actual_energy
+    );
+}
+
 void require_identity(const std::vector<double> &input, const std::vector<double> &output, const char *label) {
     if (input.size() != output.size()) {
         record_failure(
@@ -1321,7 +1384,12 @@ void verify_metrics(const AmpNodeMetrics &metrics, const char *label, int expect
     }
 }
 
-SimulationResult simulate_stream_identity(const std::vector<double> &signal, int window_kind, int window_size, int hop) {
+SimulationResult simulate_stream_identity(
+    const std::vector<double> &signal,
+    int window_kind,
+    int window_size,
+    int hop,
+    size_t chunk_frames /* 0 => single push (legacy) */) {
     SimulationResult result;
     result.pcm.assign(signal.size(), 0.0);
     result.spectral_frames = 0;
@@ -1347,16 +1415,14 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
     }
 
     const size_t tail_frames = (clamped_window > 0) ? static_cast<size_t>(clamped_window - 1) : 0U;
-    const size_t padded_frames = signal.size() + tail_frames;
-    std::vector<double> padded_signal = signal;
-    padded_signal.resize(padded_frames, 0.0);
+    const size_t total_frames = signal.size() + tail_frames;
 
-    const size_t stage_capacity_frames = padded_frames > 0 ? padded_frames : 1U;
+    const size_t stage_capacity_frames = total_frames > 0 ? total_frames : 1U;
     std::vector<double> spectral_stage_real(stage_capacity_frames * clamped_window, 0.0);
     std::vector<double> spectral_stage_imag(stage_capacity_frames * clamped_window, 0.0);
     std::vector<double> inverse_scratch(clamped_window, 0.0);
     std::vector<double> produced_pcm;
-    produced_pcm.reserve(padded_frames + static_cast<size_t>(clamped_window));
+    produced_pcm.reserve(total_frames + static_cast<size_t>(clamped_window));
 
     size_t spectral_frames_emitted = 0;
     auto push_and_capture = [&](const double *pcm, size_t samples, int flush_mode) -> size_t {
@@ -1380,8 +1446,27 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
         return produced;
     };
 
-    if (!padded_signal.empty()) {
-        push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+    if (chunk_frames == 0) {
+        // Legacy single-shot path used for the non-streaming expectations.
+        std::vector<double> padded_signal = signal;
+        padded_signal.resize(total_frames, 0.0);
+        if (!padded_signal.empty()) {
+            push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+        }
+    } else {
+        // Streaming-accurate path: feed the signal in chunks, then append the zero tail
+        // after the final audio block has been seen. This mirrors the node's behaviour
+        // in run_fft_node_streaming and avoids front-loading the tail.
+        size_t offset = 0;
+        while (offset < signal.size()) {
+            const size_t frames = std::min(chunk_frames, signal.size() - offset);
+            push_and_capture(signal.data() + offset, frames, AMP_FFT_STREAM_FLUSH_NONE);
+            offset += frames;
+        }
+        if (tail_frames > 0) {
+            std::vector<double> zero_tail(tail_frames, 0.0);
+            push_and_capture(zero_tail.data(), zero_tail.size(), AMP_FFT_STREAM_FLUSH_NONE);
+        }
     }
 
     // Drain any ready frames and then issue repeated final flushes until nothing remains.
@@ -1580,7 +1665,8 @@ int main(int argc, char **argv) {
         raw_signal,
         AMP_FFT_WINDOW_HANN,
         g_config.window_size,
-        g_config.hop_size
+        g_config.hop_size,
+        0
     );
 
     // Recite original and cleaned signals for full visibility
@@ -1614,7 +1700,8 @@ int main(int argc, char **argv) {
         signal,
         AMP_FFT_WINDOW_HANN,
         g_config.window_size,
-        g_config.hop_size
+        g_config.hop_size,
+        0
     );
     if (expected_spec.spectral_frames == 0 ||
         expected_spec.spectral_real.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size) ||
@@ -1786,7 +1873,8 @@ int main(int argc, char **argv) {
             raw_streaming_signal,
             AMP_FFT_WINDOW_HANN,
             g_config.window_size,
-            g_config.hop_size
+            g_config.hop_size,
+            0
         );
         if (streaming_preconditioned.pcm.size() != raw_streaming_signal.size()) {
             record_failure(
@@ -1802,9 +1890,24 @@ int main(int argc, char **argv) {
             streaming_signal,
             AMP_FFT_WINDOW_HANN,
             g_config.window_size,
-            g_config.hop_size
+            g_config.hop_size,
+            g_config.streaming_chunk
         );
         StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
+
+        if (g_verbosity >= VerbosityLevel::Detail) {
+            // Make the tail/chunk interaction explicit: this shows how many fixed-size chunks are
+            // emitted, how much zero padding is implicitly needed to round out the final chunk, and
+            // which chunk holds the last non-zero frame. For a 64-frame chunk size and a 3-frame tail,
+            // the final chunk is expected to be mostly (or entirely) zeros.
+            log_tail_summary(
+                "streaming_pcm",
+                streaming_expected.pcm,
+                streaming_result.pcm,
+                g_config.streaming_chunk,
+                g_config.tolerance
+            );
+        }
 
         verify_close(
             "streaming_pcm_vs_expected",
