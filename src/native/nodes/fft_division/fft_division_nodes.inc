@@ -2310,16 +2310,16 @@ static int fftdiv_execute_block(
                         slot_spectral_imag = slot_state.forward_imag.data();
                     }
                     if (slot_state.forward_handle != NULL) {
-                        size_t forward_pending_after = amp_fft_backend_stream_pending_pcm(slot_state.forward_handle);
-                        if (forward_pending_after >= forward_pending_before) {
-                            size_t moved = forward_pending_after - forward_pending_before;
-                            const size_t backlog_size = slot_state.pcm_backlog.size();
-                            size_t new_consumed = slot_state.pcm_consumed_samples + moved;
-                            if (new_consumed > backlog_size) new_consumed = backlog_size;
-                            slot_state.pcm_consumed_samples = new_consumed;
-                        } else {
-                            // Unexpected decrease in backend pending counter; do not advance consumed.
-                        }
+                        // Advance consumed samples by the amount we attempted to push into the
+                        // backend, clamped to the backlog size. Using the delta of the backend's
+                        // pending counter can under-report progress when the backend drains while
+                        // we are pushing, which caused the same PCM to be re-sent and the single-
+                        // shot loop to spin indefinitely.
+                        const size_t backlog_size = slot_state.pcm_backlog.size();
+                        const size_t consumed_now = (slot_state.pcm_consumed_samples + pending_samples > backlog_size)
+                            ? backlog_size
+                            : (slot_state.pcm_consumed_samples + pending_samples);
+                        slot_state.pcm_consumed_samples = consumed_now;
                     } else {
                         slot_state.pcm_consumed_samples = slot_state.pcm_backlog.size();
                     }
