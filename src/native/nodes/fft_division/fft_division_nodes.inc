@@ -1991,6 +1991,24 @@ static int fftdiv_execute_block(
             if (lane.enable_pcm_in) {
                 const size_t hop = (size_t)slot_count;
                 double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
+                // If a zero-tail was previously enqueued but new real PCM arrives, splice
+                // the tail off so fresh input stays ahead of the padding. The tail will be
+                // re-injected when the real final chunk is observed.
+                if (slot_state.zero_tail_enqueued && slot_state.tail_injected_samples > 0U) {
+                    const size_t tail = slot_state.tail_injected_samples;
+                    const size_t backlog_size = slot_state.pcm_backlog.size();
+                    const size_t consumed = slot_state.pcm_consumed_samples;
+                    if (backlog_size >= tail && backlog_size >= consumed + tail) {
+                        slot_state.pcm_backlog.resize(backlog_size - tail);
+                        if (slot_state.total_ingested_samples >= tail) {
+                            slot_state.total_ingested_samples -= tail;
+                        }
+                        slot_state.tail_injected_samples = 0U;
+                        slot_state.zero_tail_enqueued = false;
+                        slot_state.ingest_finalized = false;
+                        slot_state.final_flag_observed = false;
+                    }
+                }
                 if (audio_base != NULL && frames > 0) {
                     const size_t backlog_growth = (size_t)frames;
                     const size_t backlog_before = slot_state.pcm_backlog.size();
@@ -2684,9 +2702,39 @@ static int fftdiv_execute_block(
                 const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
                     ? lane_frame_offsets[(size_t)slot]
                     : 0U;
-                lane_snapshot.expect_signal = fftdiv_ring_frame_expect_signal(
+                bool expect_signal = fftdiv_ring_frame_expect_signal(
                     state->u.fftdiv.stream_slots[(size_t)slot],
                     frame_offset);
+                if (expect_signal && state != NULL && (size_t)slot < state->u.fftdiv.stream_slots.size()) {
+                    const auto &slot_state_expect = state->u.fftdiv.stream_slots[(size_t)slot];
+                    if (slot_state_expect.zero_tail_enqueued) {
+                        const size_t total_samples = slot_state_expect.total_ingested_samples;
+                        const size_t tail_samples = slot_state_expect.tail_injected_samples;
+                        const size_t real_samples = (total_samples > tail_samples)
+                            ? (total_samples - tail_samples)
+                            : 0U;
+                        if (real_samples == 0U) {
+                            expect_signal = false;
+                        } else {
+                            const int H_fft = (state->u.fftdiv.backend_hop > 0)
+                                ? state->u.fftdiv.backend_hop
+                                : 1;
+                            const size_t real_frames = (real_samples + (size_t)H_fft - 1U) / (size_t)H_fft;
+                            size_t lane_frame_index = (frame_index_iter >= 0)
+                                ? (size_t)frame_index_iter
+                                : 0U;
+                            if ((size_t)slot < lane_frame_offsets.size()) {
+                                lane_frame_index += lane_frame_offsets[(size_t)slot];
+                            }
+                            if (lane_frame_index >= real_frames) {
+                                expect_signal = false;
+                            }
+                        }
+                    }
+                }
+                lane_snapshot.expect_signal = expect_signal;
+            } else {
+                lane_snapshot.expect_signal = false;
             }
             if ((size_t)slot < slice.lane_frame_offsets.size()) {
                 const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
@@ -2904,15 +2952,22 @@ static int fftdiv_execute_block(
                         lane_snapshot.spectral_imag.data(),
                         window_size);
                     const size_t stage3_frame_number = (size_t)(frame_counter + (int64_t)processed_passes);
-                    fftdiv_stage_assert_complex_output(
-                        state,
-                        "stage3",
-                        slot,
-                        lane_snapshot.spectral_real.data(),
-                        lane_snapshot.spectral_imag.data(),
-                        (size_t)window_size,
-                        stage3_frame_number
-                    );
+                    if (lane_snapshot.expect_signal) {
+                        fftdiv_stage_assert_complex_output(
+                            state,
+                            "stage3",
+                            slot,
+                            lane_snapshot.spectral_real.data(),
+                            lane_snapshot.spectral_imag.data(),
+                            (size_t)window_size,
+                            stage3_frame_number
+                        );
+                    } else if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                                   "[STAGE3-SKIP-CHECK] slot=%d frame=%zu expect_signal=0\n",
+                                   slot,
+                                   stage3_frame_number);
+                    }
                 }
             } else {
                 if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
@@ -3346,18 +3401,31 @@ static int fftdiv_execute_block(
     // remains and we didn't push any PCM frames, return a terminal success
     // (0) so callers / worker can clear the active command and stop busy-waking.
     bool any_pending = false;
-    for (const auto &slot : state->u.fftdiv.stream_slots) {
-        if (!slot.pending_spectra.empty() || !slot.inverse_queue.empty()) {
+    for (auto &slot : state->u.fftdiv.stream_slots) {
+        const bool spectra_pending = !slot.pending_spectra.empty();
+        const bool inverse_pending = !slot.inverse_queue.empty();
+        const bool backend_pending = (slot.inverse_handle != nullptr)
+            && (amp_fft_backend_stream_pending_pcm(slot.inverse_handle) > 0U);
+        if (spectra_pending || inverse_pending || backend_pending) {
             any_pending = true;
             break;
         }
-        if (slot.inverse_handle != nullptr && amp_fft_backend_stream_pending_pcm(slot.inverse_handle) > 0U) {
+        const size_t pending_pcm = (slot.pcm_backlog.size() > slot.pcm_consumed_samples)
+            ? (slot.pcm_backlog.size() - slot.pcm_consumed_samples)
+            : 0U;
+        const bool forward_ring_pending = slot.forward_ring_filled > 0U;
+        const bool forward_backend_pending = (slot.forward_handle != nullptr)
+            && (amp_fft_backend_stream_pending_pcm(slot.forward_handle) > 0U);
+        const bool tail_inflight = slot.zero_tail_enqueued
+            && (pending_pcm > 0U || forward_ring_pending || forward_backend_pending);
+        if (tail_inflight) {
             any_pending = true;
             break;
         }
         if (slot.zero_tail_enqueued) {
-            any_pending = true;
-            break;
+            // Tail was enqueued but fully drained; clear marker so pending state can resolve.
+            slot.zero_tail_enqueued = false;
+            slot.tail_injected_samples = 0U;
         }
     }
     if (!any_pending) {

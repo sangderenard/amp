@@ -457,6 +457,23 @@
             if (lane.enable_pcm_in) {
                 const size_t hop = (size_t)slot_count;
                 double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
+                // If zero padding was already queued but new real PCM arrives, move the
+                // tail out of the way so subsequent input stays in front of it.
+                if (slot_state.zero_tail_enqueued && slot_state.tail_injected_samples > 0U) {
+                    const size_t tail = slot_state.tail_injected_samples;
+                    const size_t backlog_size = slot_state.pcm_backlog.size();
+                    const size_t consumed = slot_state.pcm_consumed_samples;
+                    if (backlog_size >= tail && backlog_size >= consumed + tail) {
+                        slot_state.pcm_backlog.resize(backlog_size - tail);
+                        if (slot_state.total_ingested_samples >= tail) {
+                            slot_state.total_ingested_samples -= tail;
+                        }
+                        slot_state.tail_injected_samples = 0U;
+                        slot_state.zero_tail_enqueued = false;
+                        slot_state.ingest_finalized = false;
+                        slot_state.final_flag_observed = false;
+                    }
+                }
                 if (audio_base != NULL && frames > 0) {
                     const size_t backlog_growth = (size_t)frames;
                     const size_t reserve_target = slot_state.pcm_backlog.size() + backlog_growth;
