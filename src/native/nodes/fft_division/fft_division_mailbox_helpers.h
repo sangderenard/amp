@@ -233,7 +233,7 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
                 }
                 result.frames_committed = std::max(result.frames_committed, frame + 1);
             }
-        }
+        } // i hurt so much.
         node = node->next;
     }
     // Normalize/interpret frames_committed from scalar counts across real+imag

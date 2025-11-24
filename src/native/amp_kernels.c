@@ -1694,7 +1694,6 @@ bool FftDivWorkerCommand::append_inputs(
     int frames,
     int slot_count
 ) {
-    const bool already_bound = inputs_bound;
     const bool final_flag = (src_inputs != NULL)
         && ((src_inputs->audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_FINAL) != 0U);
     if (task.final_delivery && !final_flag) {
@@ -1715,13 +1714,6 @@ bool FftDivWorkerCommand::append_inputs(
         appended_frames = 1;
     }
     expected_frames = appended_frames;
-    // On reuse of the same shared command, do not include audio again.
-    // Clear audio flags/data for this call so Stage 1 does not re-append.
-    // Keep frames unchanged to preserve downstream expectations.
-    if (already_bound) {
-        inputs.audio.has_audio = 0U;
-        inputs.audio.data = nullptr;
-    }
     if (final_flag) {
         task.final_delivery = true;
     }
@@ -1872,6 +1864,7 @@ typedef union {
                 double last_pcm_output{0.0};
                 std::size_t total_ingested_samples{0U};
                 std::size_t tail_injected_samples{0U};
+                std::size_t pending_zero_tail_frames{0U};
                 bool zero_tail_enqueued{false};
                 bool ingest_finalized{false};
                 bool final_flag_observed{false};
@@ -3472,6 +3465,7 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.last_pcm_output = 0.0;
         slot.total_ingested_samples = 0U;
         slot.tail_injected_samples = 0U;
+        slot.pending_zero_tail_frames = 0U;
         slot.zero_tail_enqueued = false;
         slot.ingest_finalized = false;
         slot.final_flag_observed = false;

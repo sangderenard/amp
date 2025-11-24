@@ -457,23 +457,6 @@
             if (lane.enable_pcm_in) {
                 const size_t hop = (size_t)slot_count;
                 double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
-                // If zero padding was already queued but new real PCM arrives, move the
-                // tail out of the way so subsequent input stays in front of it.
-                if (slot_state.zero_tail_enqueued && slot_state.tail_injected_samples > 0U) {
-                    const size_t tail = slot_state.tail_injected_samples;
-                    const size_t backlog_size = slot_state.pcm_backlog.size();
-                    const size_t consumed = slot_state.pcm_consumed_samples;
-                    if (backlog_size >= tail && backlog_size >= consumed + tail) {
-                        slot_state.pcm_backlog.resize(backlog_size - tail);
-                        if (slot_state.total_ingested_samples >= tail) {
-                            slot_state.total_ingested_samples -= tail;
-                        }
-                        slot_state.tail_injected_samples = 0U;
-                        slot_state.zero_tail_enqueued = false;
-                        slot_state.ingest_finalized = false;
-                        slot_state.final_flag_observed = false;
-                    }
-                }
                 if (audio_base != NULL && frames > 0) {
                     const size_t backlog_growth = (size_t)frames;
                     const size_t reserve_target = slot_state.pcm_backlog.size() + backlog_growth;
@@ -506,13 +489,42 @@
                         final_tail_plan.window_size,
                         final_tail_plan.istft_tail_frames);
                     if (tail_frames > 0U) {
+                        slot_state.pending_zero_tail_frames = tail_frames;
+                        slot_state.ingest_finalized = true;
+                    }
+                }
+                // If a pending tail is registered, append it only when no real input
+                // is waiting and capacity permits, so tail always sits behind data.
+                const size_t pending_samples_before_tail = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
+                    ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
+                    : 0U;
+                const bool tail_can_append = (slot_state.pending_zero_tail_frames > 0U)
+                    && (pending_samples_before_tail == 0U)
+                    && (slot_state.forward_ring_filled == 0U)
+                    && (slot_state.forward_handle == NULL
+                        || amp_fft_backend_stream_pending_pcm(slot_state.forward_handle) == 0U);
+                if (tail_can_append) {
+                    const size_t backlog_limit = fftdiv_pcm_backlog_limit(state);
+                    const size_t backlog_size = slot_state.pcm_backlog.size();
+                    size_t capacity = 0U;
+                    if (backlog_limit == 0U || backlog_size < backlog_limit) {
+                        const size_t available = (backlog_limit > 0U && backlog_limit > backlog_size)
+                            ? (backlog_limit - backlog_size)
+                            : slot_state.pending_zero_tail_frames;
+                        capacity = available;
+                    }
+                    if (capacity > slot_state.pending_zero_tail_frames) {
+                        capacity = slot_state.pending_zero_tail_frames;
+                    }
+                    if (capacity > 0U) {
                         const bool already_enqueued = slot_state.zero_tail_enqueued;
-                        fftdiv_stage1_append_zero_tail(state, slot_state, tail_frames);
+                        fftdiv_stage1_append_zero_tail(state, slot_state, capacity);
+                        slot_state.pending_zero_tail_frames -= capacity;
                         if (!already_enqueued && slot_state.zero_tail_enqueued) {
                             FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                                        "[STAGE1-ZERO-TAIL] slot=%d tail_frames=%zu total_ingested=%zu\n",
                                        slot,
-                                       tail_frames,
+                                       capacity,
                                        slot_state.total_ingested_samples);
                         }
                     }
