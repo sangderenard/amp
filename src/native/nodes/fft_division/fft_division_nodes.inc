@@ -657,6 +657,7 @@ static size_t fftdiv_pcm_backlog_limit(const node_state_t *state) {
 static void fftdiv_trim_pcm_backlog(
     node_state_t *state,
     std::vector<double> &pcm_backlog,
+    std::vector<uint8_t> &pcm_backlog_mask,
     std::size_t &pcm_consumed_samples,
     size_t window_size
 ) {
@@ -665,18 +666,9 @@ static void fftdiv_trim_pcm_backlog(
     }
     const size_t guard = window_size;
     size_t trim_target = 0U;
+    // Only trim already-consumed history beyond a one-window guard.
     if (pcm_consumed_samples > guard) {
         trim_target = pcm_consumed_samples - guard;
-    }
-    size_t backlog_limit = fftdiv_pcm_backlog_limit(state);
-    if (backlog_limit > 0U && backlog_limit < guard) {
-        backlog_limit = guard;
-    }
-    if (backlog_limit > 0U && pcm_backlog.size() > backlog_limit) {
-        const size_t overflow = pcm_backlog.size() - backlog_limit;
-        if (overflow > trim_target) {
-            trim_target = overflow;
-        }
     }
     if (trim_target == 0U) {
         return;
@@ -688,6 +680,9 @@ static void fftdiv_trim_pcm_backlog(
         trim_target = pcm_backlog.size();
     }
     pcm_backlog.erase(pcm_backlog.begin(), pcm_backlog.begin() + trim_target);
+    if (!pcm_backlog_mask.empty() && pcm_backlog_mask.size() >= trim_target) {
+        pcm_backlog_mask.erase(pcm_backlog_mask.begin(), pcm_backlog_mask.begin() + trim_target);
+    }
     pcm_consumed_samples -= trim_target;
 }
 #endif
@@ -919,6 +914,7 @@ static void fftdiv_stage1_append_zero_tail(
         }
     }
     slot.pcm_backlog.insert(slot.pcm_backlog.end(), tail_frames, 0.0);
+    slot.pcm_backlog_mask.insert(slot.pcm_backlog_mask.end(), tail_frames, 1U);
     slot.total_ingested_samples += tail_frames;
     slot.tail_injected_samples = tail_frames;
     slot.zero_tail_enqueued = true;
@@ -2024,6 +2020,7 @@ static int fftdiv_execute_block(
                 }
                 pcm_cursor[frame_cursor] = input_sample;
                 slot_state.pcm_backlog.push_back(input_sample);
+                slot_state.pcm_backlog_mask.push_back(1U);
             }
                     const size_t backlog_after = slot_state.pcm_backlog.size();
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
@@ -2087,8 +2084,13 @@ static int fftdiv_execute_block(
                         }
                     }
                 }
-                const size_t pending_samples = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
-                    ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
+                size_t first_pending = 0U;
+                while (first_pending < slot_state.pcm_backlog_mask.size() &&
+                       slot_state.pcm_backlog_mask[first_pending] == 0U) {
+                    ++first_pending;
+                }
+                const size_t pending_samples = (first_pending < slot_state.pcm_backlog.size())
+                    ? (slot_state.pcm_backlog.size() - first_pending)
                     : 0U;
                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                            "[STAGE1-PCM-PENDING] slot=%d pending_samples=%zu consumed=%zu backlog_size=%zu\n",
@@ -2148,9 +2150,9 @@ static int fftdiv_execute_block(
                     slot_state.forward_frame_capacity = stage_capacity_frames;
                     slot_spectral_real = slot_state.forward_stage_real.empty() ? NULL : slot_state.forward_stage_real.data();
                     slot_spectral_imag = slot_state.forward_stage_imag.empty() ? NULL : slot_state.forward_stage_imag.data();
-                    const double *pcm_source = slot_state.pcm_backlog.empty()
+                    const double *pcm_source = (slot_state.pcm_backlog.empty() || first_pending >= slot_state.pcm_backlog.size())
                         ? NULL
-                        : slot_state.pcm_backlog.data() + slot_state.pcm_consumed_samples;
+                        : slot_state.pcm_backlog.data() + first_pending;
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                                "[STAGE1-INPUT] slot=%d\n"
                                "  PCM calling code put into command: pcm_backlog.size()=%zu\n"
@@ -2209,6 +2211,7 @@ static int fftdiv_execute_block(
                         forward_pending_before = amp_fft_backend_stream_pending_pcm(slot_state.forward_handle);
                     }
 
+                    bool pushed_to_backend = false;
                     if (slot_spectral_real != NULL && slot_spectral_imag != NULL && pcm_source != NULL) {
                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                                    "[STAGE1-FFT-PREP] slot=%d input_samples=%zu stage_capacity=%zu\n",
@@ -2243,6 +2246,7 @@ static int fftdiv_execute_block(
                                 slot_spectral_imag,
                                 stage_capacity_frames,
                                 flush_mode);
+                            pushed_to_backend = true;
                         }
                         if (frames_emitted > 0 && window_size > 0 && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
                             stage1_expect_signal = (pcm_source != NULL)
@@ -2348,15 +2352,36 @@ static int fftdiv_execute_block(
                         // pending counter can under-report progress when the backend drains while
                         // we are pushing, which caused the same PCM to be re-sent and the single-
                         // shot loop to spin indefinitely.
-                        const size_t backlog_size = slot_state.pcm_backlog.size();
-                        const size_t consumed_now = (slot_state.pcm_consumed_samples + pending_samples > backlog_size)
-                            ? backlog_size
-                            : (slot_state.pcm_consumed_samples + pending_samples);
-                        slot_state.pcm_consumed_samples = consumed_now;
+                        const size_t samples_sent = (pushed_to_backend && frames_emitted > 0U)
+                            ? pending_samples
+                            : 0U;
+                        if (samples_sent > 0U) {
+                            const size_t backlog_size = slot_state.pcm_backlog.size();
+                            const size_t consumed_now = (slot_state.pcm_consumed_samples + samples_sent > backlog_size)
+                                ? backlog_size
+                                : (slot_state.pcm_consumed_samples + samples_sent);
+                            // Mark sent samples in the mask.
+                            size_t mark_start = first_pending;
+                            size_t mark_end = mark_start + samples_sent;
+                            if (mark_end > slot_state.pcm_backlog_mask.size()) {
+                                mark_end = slot_state.pcm_backlog_mask.size();
+                            }
+                            for (size_t idx = mark_start; idx < mark_end; ++idx) {
+                                slot_state.pcm_backlog_mask[idx] = 0U;
+                            }
+                            // Advance consumed pointer if mask front is clear.
+                            while (slot_state.pcm_consumed_samples < slot_state.pcm_backlog_mask.size() &&
+                                   slot_state.pcm_backlog_mask[slot_state.pcm_consumed_samples] == 0U) {
+                                slot_state.pcm_consumed_samples += 1U;
+                            }
+                            if (slot_state.pcm_consumed_samples > backlog_size) {
+                                slot_state.pcm_consumed_samples = backlog_size;
+                            }
+                        }
                     } else {
                         slot_state.pcm_consumed_samples = slot_state.pcm_backlog.size();
                     }
-                    fftdiv_trim_pcm_backlog(state, slot_state.pcm_backlog, slot_state.pcm_consumed_samples, (size_t)window_size);
+                    fftdiv_trim_pcm_backlog(state, slot_state.pcm_backlog, slot_state.pcm_backlog_mask, slot_state.pcm_consumed_samples, (size_t)window_size);
                 }
             }
             lane_frames_emitted[(size_t)slot] = frames_emitted;
