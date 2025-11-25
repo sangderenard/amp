@@ -9,10 +9,12 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 
 
 extern "C" {
 #include "amp_native.h"
+#include "amp_fft_backend.h"
 }
 
 #ifdef __cplusplus
@@ -180,5 +182,131 @@ inline std::unordered_map<std::string, std::vector<double>> DecodeTapBuffers(con
 }
 
 }  // namespace amp::tests::fft_division_shared
+
+// FFT identity helpers for cleaning signals and spectral data
+namespace amp::tests::fft_identity {
+
+// Forward FFT: PCM -> spectral (real, imag)
+inline std::pair<std::vector<double>, std::vector<double>> forward_fft(
+    const std::vector<double>& pcm, int window_size, int hop, int window_kind = AMP_FFT_WINDOW_HANN) {
+    std::pair<std::vector<double>, std::vector<double>> result;
+    if (pcm.empty() || window_size <= 0 || hop <= 0) {
+        return result;
+    }
+
+    void* forward = amp_fft_backend_stream_create(window_size, window_size, hop, window_kind);
+    if (forward == nullptr) {
+        return result;
+    }
+
+    const size_t tail_frames = 0; // no tail for simple identity
+    const size_t total_input = pcm.size() + tail_frames;
+    std::vector<double> spectral_real(total_input * window_size, 0.0);
+    std::vector<double> spectral_imag(total_input * window_size, 0.0);
+
+    // Push the PCM + zero tail
+    std::vector<double> input = pcm;
+    size_t spectral_emitted = 0;
+    const size_t produced = amp_fft_backend_stream_push(
+        forward, input.data(), input.size(), window_size,
+        spectral_real.data(), spectral_imag.data(), spectral_real.size(), AMP_FFT_STREAM_FLUSH_NONE);
+    spectral_emitted += produced;
+
+    // Drain any remaining
+    for (int i = 0; i < 8; ++i) {
+        const size_t p = amp_fft_backend_stream_push(
+            forward, nullptr, 0, window_size,
+            spectral_real.data() + spectral_emitted * window_size,
+            spectral_imag.data() + spectral_emitted * window_size,
+            spectral_real.size() - spectral_emitted * window_size, AMP_FFT_STREAM_FLUSH_PARTIAL);
+        if (p == 0) break;
+        spectral_emitted += p;
+    }
+    for (int i = 0; i < 8; ++i) {
+        const size_t p = amp_fft_backend_stream_push(
+            forward, nullptr, 0, window_size,
+            spectral_real.data() + spectral_emitted * window_size,
+            spectral_imag.data() + spectral_emitted * window_size,
+            spectral_real.size() - spectral_emitted * window_size, AMP_FFT_STREAM_FLUSH_FINAL);
+        if (p == 0) break;
+        spectral_emitted += p;
+    }
+
+    amp_fft_backend_stream_destroy(forward);
+
+    result.first.assign(spectral_real.begin(), spectral_real.begin() + spectral_emitted * window_size);
+    result.second.assign(spectral_imag.begin(), spectral_imag.begin() + spectral_emitted * window_size);
+    return result;
+}
+
+// Reverse FFT: spectral (real, imag) -> PCM
+inline std::vector<double> reverse_fft(
+    const std::vector<double>& spectral_real, const std::vector<double>& spectral_imag,
+    int window_size, int hop, int window_kind = AMP_FFT_WINDOW_HANN) {
+    std::vector<double> result;
+    if (spectral_real.empty() || spectral_imag.empty() || spectral_real.size() != spectral_imag.size() ||
+        window_size <= 0 || hop <= 0) {
+        return result;
+    }
+
+    void* inverse = amp_fft_backend_stream_create_inverse(window_size, window_size, hop, window_kind);
+    if (inverse == nullptr) {
+        return result;
+    }
+
+    const size_t spectral_frames = spectral_real.size() / window_size;
+    std::vector<double> pcm_scratch(window_size, 0.0);
+    std::vector<double> produced_pcm;
+
+    // Push all spectral frames
+    const size_t produced = amp_fft_backend_stream_push_spectrum(
+        inverse, spectral_real.data(), spectral_imag.data(), spectral_frames,
+        window_size, pcm_scratch.data(), pcm_scratch.size(), AMP_FFT_STREAM_FLUSH_NONE);
+    for (size_t i = 0; i < produced; ++i) {
+        produced_pcm.push_back(pcm_scratch[i]);
+    }
+
+    // Drain
+    for (int i = 0; i < 8; ++i) {
+        const size_t p = amp_fft_backend_stream_push_spectrum(
+            inverse, nullptr, nullptr, 0, window_size,
+            pcm_scratch.data(), pcm_scratch.size(), AMP_FFT_STREAM_FLUSH_PARTIAL);
+        if (p == 0) break;
+        for (size_t j = 0; j < p; ++j) {
+            produced_pcm.push_back(pcm_scratch[j]);
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        const size_t p = amp_fft_backend_stream_push_spectrum(
+            inverse, nullptr, nullptr, 0, window_size,
+            pcm_scratch.data(), pcm_scratch.size(), AMP_FFT_STREAM_FLUSH_FINAL);
+        if (p == 0) break;
+        for (size_t j = 0; j < p; ++j) {
+            produced_pcm.push_back(pcm_scratch[j]);
+        }
+    }
+
+    amp_fft_backend_stream_destroy(inverse);
+    return produced_pcm;
+}
+
+// Clean PCM: identity roundtrip (forward then reverse)
+inline std::vector<double> clean_pcm(
+    const std::vector<double>& pcm, int window_size, int hop, int window_kind = AMP_FFT_WINDOW_HANN) {
+    auto [real, imag] = forward_fft(pcm, window_size, hop, window_kind);
+    std::vector<double> cleaned = reverse_fft(real, imag, window_size, hop, window_kind);
+    cleaned.resize(pcm.size()); // truncate to input size
+    return cleaned;
+}
+
+// Clean spectral: reverse then forward
+inline std::pair<std::vector<double>, std::vector<double>> clean_spectral(
+    const std::vector<double>& spectral_real, const std::vector<double>& spectral_imag,
+    int window_size, int hop, int window_kind = AMP_FFT_WINDOW_HANN) {
+    std::vector<double> pcm = reverse_fft(spectral_real, spectral_imag, window_size, hop, window_kind);
+    return forward_fft(pcm, window_size, hop, window_kind);
+}
+
+}  // namespace amp::tests::fft_identity
 
 #endif  // AMP_NATIVE_TESTS_FFT_DIVISION_TEST_HELPERS_H_

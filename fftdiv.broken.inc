@@ -1,4 +1,3 @@
-
 #include "fft_division_delay_math.h"
 #include "amp_native.h" // for EdgeRunnerParamView, node_state_t
 
@@ -705,16 +704,18 @@ static void fftdiv_ring_append_frames(
     if (state == nullptr || window_size <= 0 || stage_real == nullptr || stage_imag == nullptr) {
         return;
     }
+
     if (frames == 0) {
         return;
     }
+
     const std::size_t capacity_frames = slot.forward_ring_capacity_frames > 0
         ? slot.forward_ring_capacity_frames
         : 1U;
     if (slot.forward_real.size() < capacity_frames * (std::size_t)window_size) {
         fftdiv_ring_ensure_capacity(slot.forward_real, capacity_frames * (std::size_t)window_size);
     }
-    #if defined(__cplusplus)
+#if defined(__cplusplus)
     if (slot.forward_imag.size() < capacity_frames * (std::size_t)window_size) {
         fftdiv_ring_ensure_capacity(slot.forward_imag, capacity_frames * (std::size_t)window_size);
     }
@@ -724,14 +725,15 @@ static void fftdiv_ring_append_frames(
     std::size_t write = slot.forward_ring_write % capacity_frames;
     std::size_t read = slot.forward_ring_read % capacity_frames;
     std::size_t filled = slot.forward_ring_filled;
-    #endif
+#endif
 
     const std::size_t bins = (std::size_t)window_size;
 
-    // Do not silently clobber the ring when callers attempt to append
-    // more frames than the ring can hold; treat that as a hard error.
+    // Treat attempts to append more frames than the configured ring capacity
+    // as a hard error; this prevents silent clobbering of existing ring
+    // contents and surfaces upstream logic errors.
     if (frames > capacity_frames) {
-        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_ERROR,
                    "[ERROR] fftdiv_ring_append_frames: frames (%zu) > capacity_frames (%zu)",
                    frames, capacity_frames);
         std::abort();
@@ -2139,8 +2141,8 @@ static int fftdiv_execute_block(
                         }
                     }
                     slot_state.forward_frame_capacity = stage_capacity_frames;
-                    slot_spectral_real = slot_state.forward_stage_real.empty() ? NULL : slot_state.forward_stage_real.data();
-                    slot_spectral_imag = slot_state.forward_stage_imag.empty() ? NULL : slot_state.forward_stage_imag.data();
+                    slot_spectral_real = slot_state.forward_real.data();
+                    slot_spectral_imag = slot_state.forward_imag.data();
                     const double *pcm_source = slot_state.pcm_backlog.empty()
                         ? NULL
                         : slot_state.pcm_backlog.data() + slot_state.pcm_consumed_samples;
@@ -2936,51 +2938,93 @@ static int fftdiv_execute_block(
                 for (int slot = 0; slot < slot_count; ++slot) {
                     auto &lane_meta = state->u.fftdiv.lane_plan[(size_t)slot];
                     auto &lane_snapshot = slice.lanes[(size_t)slot];
-                    if (!lane_meta.active || !lane_snapshot.frame_ready) {
-                        lane_snapshot.spectral_real.clear();
-                        lane_snapshot.spectral_imag.clear();
-                        continue;
+                    lane_snapshot.frame_ready = lane_meta.frame_ready;
+                    if (lane_snapshot.frame_ready) {
+                        const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
+                            ? lane_frame_offsets[(size_t)slot]
+                            : 0U;
+                        bool expect_signal = fftdiv_ring_frame_expect_signal(
+                            state->u.fftdiv.stream_slots[(size_t)slot],
+                            frame_offset);
+                        if (expect_signal && state != NULL && (size_t)slot < state->u.fftdiv.stream_slots.size()) {
+                            const auto &slot_state_expect = state->u.fftdiv.stream_slots[(size_t)slot];
+                            if (slot_state_expect.zero_tail_enqueued) {
+                                const size_t total_samples = slot_state_expect.total_ingested_samples;
+                                const size_t tail_samples = slot_state_expect.tail_injected_samples;
+                                const size_t real_samples = (total_samples > tail_samples)
+                                    ? (total_samples - tail_samples)
+                                    : 0U;
+                                if (real_samples == 0U) {
+                                    expect_signal = false;
+                                } else {
+                                    const int H_fft = (state->u.fftdiv.backend_hop > 0)
+                                        ? state->u.fftdiv.backend_hop
+                                        : 1;
+                                    const size_t real_frames = (real_samples + (size_t)H_fft - 1U) / (size_t)H_fft;
+                                    size_t lane_frame_index = (frame_index_iter >= 0)
+                                        ? (size_t)frame_index_iter
+                                        : 0U;
+                                    if ((size_t)slot < lane_frame_offsets.size()) {
+                                        lane_frame_index += lane_frame_offsets[(size_t)slot];
+                                    }
+                                    if (lane_frame_index >= real_frames) {
+                                        expect_signal = false;
+                                    }
+                                }
+                            }
+                        }
+                        lane_snapshot.expect_signal = expect_signal;
+                    } else {
+                        lane_snapshot.expect_signal = false;
                     }
-                    const int tensor_lane = (lane_meta.tensor_lane >= 0) ? lane_meta.tensor_lane : slot;
-                    try {
-                        lane_snapshot.spectral_real.assign((size_t)window_size, 0.0);
-                        lane_snapshot.spectral_imag.assign((size_t)window_size, 0.0);
-                    } catch (...) {
-                        lane_snapshot.spectral_real.clear();
-                        lane_snapshot.spectral_imag.clear();
-                        continue;
+                    if ((size_t)slot < slice.lane_frame_offsets.size()) {
+                        const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
+                            ? lane_frame_offsets[(size_t)slot]
+                            : 0U;
+                        slice.lane_frame_offsets[(size_t)slot] = frame_offset;
                     }
-                    fftdiv_copy_working_to_slot_buffer(
-                        working_tensor,
-                        tensor_page,
-                        tensor_lane,
-                        release_tensor_slice,
-                        tensor_freq_bins,
-                        lane_snapshot.spectral_real.data(),
-                        lane_snapshot.spectral_imag.data(),
-                        window_size);
-                    const size_t stage3_frame_number = (size_t)(frame_counter + (int64_t)processed_passes);
-                    if (lane_snapshot.expect_signal) {
-                        fftdiv_stage_assert_complex_output(
-                            state,
-                            "stage3",
-                            slot,
-                            lane_snapshot.spectral_real.data(),
-                            lane_snapshot.spectral_imag.data(),
-                            (size_t)window_size,
-                            stage3_frame_number
-                        );
-                    } else if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                                   "[STAGE3-SKIP-CHECK] slot=%d frame=%zu expect_signal=0\n",
-                                   slot,
-                                   stage3_frame_number);
+
+                    lane_meta.frame_ready = false;
+
+                    if (lane_snapshot.frame_ready && (size_t)slot < lane_frame_offsets.size()) {
+                        if (lane_frames_remaining[(size_t)slot] > 0U) {
+                            lane_frames_remaining[(size_t)slot] -= 1U;
+                        }
+                        lane_frame_offsets[(size_t)slot] += 1U;
+                        // Stage 2: Consume from forward_ring when ingesting into wheel
+                        auto &slot_state_consume = state->u.fftdiv.stream_slots[(size_t)slot];
+                        if (slot_state_consume.forward_ring_filled > 0U && slot_state_consume.forward_ring_capacity_frames > 0U) {
+                            slot_state_consume.forward_ring_read =
+                                (slot_state_consume.forward_ring_read + 1U) % slot_state_consume.forward_ring_capacity_frames;
+                            slot_state_consume.forward_ring_filled -= 1U;
+                            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                                       "[STAGE2-CONSUME] slot=%d read=%zu filled=%zu remaining=%zu\n",
+                                       slot,
+                                       (size_t)slot_state_consume.forward_ring_read,
+                                       (size_t)slot_state_consume.forward_ring_filled,
+                                       lane_frames_remaining[(size_t)slot]);
+                        }
                     }
                 }
+
+                if (wheel_length > 0) {
+                    auto &meta = state->u.fftdiv.wheel_slice_metadata;
+                    if (meta.size() < (size_t)wheel_length) {
+                        meta.resize((size_t)wheel_length);
+                    }
+                    FftDivFilledSlice &slot_meta = meta[(size_t)tensor_slice_iter];
+                    slot_meta = std::move(slice);
+                    slot_meta.valid = true;
+                    slot_meta.stage4_emitted = false;
+                    filled_slices.push_back(&slot_meta);
+                } else {
+                    filled_slices.push_back(nullptr);
+                }
+
             } else {
                 if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                               "[STAGE3-SKIP] idx=%d tensor_slice=%d invalid active window\n",
+                               "[STAGE4-SKIP] idx=%d tensor_slice=%d invalid active window\n",
                                idx,
                                slice.tensor_slice);
                 }
@@ -2989,194 +3033,9 @@ static int fftdiv_execute_block(
         }
         if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
             FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                       "[STAGE3-END] visited=%d\n",
-                       visited);
-        }
-    }
-
-    if (stage4_unlocked) {
-        // Stage4: iterate wheel metadata in FIFO order from tail, stopping after one hop span
-        auto &meta = state->u.fftdiv.wheel_slice_metadata;
-        const int stop_count = (wheel_hop > 0) ? wheel_hop : 1;
-        int visited = 0;
-        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                       "[STAGE4-START] FIFO walk tail=%d hop=%d len=%d stop_count=%d\n",
-                       wheel_tail_cursor, wheel_hop, wheel_length, stop_count);
-        }
-        std::vector<size_t> lane_frames_consumed(static_cast<size_t>(slot_count), 0U);
-        for (int i = 0; i < stop_count && wheel_length > 0; ++i) {
-            const int idx = (wheel_tail_cursor + i) % wheel_length;
-            if ((size_t)idx >= meta.size()) {
-                break;
-            }
-            FftDivFilledSlice *slice_ptr = meta[idx].valid ? &meta[idx] : nullptr;
-            visited += 1;
-            if (slice_ptr == nullptr) {
-                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                               "[STAGE4-SKIP] idx=%d null entry\n",
-                               idx);
-                }
-                continue;
-            }
-            auto &slice = *slice_ptr;
-            if (slice.stage4_emitted) {
-                if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                               "[STAGE4-SKIP] idx=%d already emitted\n",
-                               idx);
-                }
-                continue;
-            }
-            if (!slice.working_tensor_updated) {
-                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                           "[STAGE4-SKIP] idx=%d tensor slice=%d pending operator update\n",
-                           idx, slice.tensor_slice);
-                continue;
-            }
-            /* Debug: correlate Stage2 slice index with Stage3 window span and offsets */
-            if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                           "[STAGE3-CONTEXT] tensor_slice=%d view_filled=%d wheel(head=%d tail=%d len=%d hop=%d) frame=%lld\n",
-                           slice.tensor_slice,
-                           slice.view_filled_override,
-                           slice.wheel_head,
-                           slice.wheel_tail,
-                           wheel_length,
-                           wheel_hop,
-                           (long long)slice.frame_index);
-                if (!slice.lane_frame_offsets.empty()) {
-                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                               "[STAGE3-CONTEXT] lane0 assigned_offset=%zu\n",
-                               slice.lane_frame_offsets[0]);
-                }
-            }
-            const int tensor_slice_iter = slice.tensor_slice;
-            const int scratch_slice_iter = slice.scratch_slice;
-            const int64_t frame_index_iter = slice.frame_index;
-            const size_t base_output_index = (slice.pcm_sample_index >= 0)
-                ? (size_t)slice.pcm_sample_index
-                : 0U;
-
-            for (int slot = 0; slot < slot_count; ++slot) {
-                size_t data_idx = base_output_index + (size_t)slot;
-                if (data_idx >= (size_t)slot_count * (size_t)frames) {
-                    break;
-                }
-                auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
-                const size_t assigned_offset = (slice.lane_frame_offsets.size() > (size_t)slot)
-                    ? slice.lane_frame_offsets[(size_t)slot]
-                    : 0U;
-                const size_t consumed_so_far = (lane_frames_consumed.size() > (size_t)slot)
-                    ? lane_frames_consumed[(size_t)slot]
-                    : 0U;
-                const size_t relative_offset = (assigned_offset >= consumed_so_far)
-                    ? (assigned_offset - consumed_so_far)
-                    : 0U;
-                auto &lane = state->u.fftdiv.lane_plan[(size_t)slot];
-                auto &lane_snapshot = slice.lanes[(size_t)slot];
-                const int tensor_lane = (lane.tensor_lane >= 0) ? lane.tensor_lane : slot;
-                const double *released_real = lane_snapshot.spectral_real.empty()
-                    ? nullptr
-                    : lane_snapshot.spectral_real.data();
-                const double *released_imag = lane_snapshot.spectral_imag.empty()
-                    ? nullptr
-                    : lane_snapshot.spectral_imag.data();
-
-                if (!(lane_snapshot.frame_ready && lane.active)) {
-                    if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                                   "[STAGE4-SKIP] idx=%d slot=%d frame_ready=%d lane_active=%d\n",
-                                   idx,
-                                   slot,
-                                   lane_snapshot.frame_ready ? 1 : 0,
-                                   lane.active ? 1 : 0);
-                    }
-                }
-                if (!(released_real != nullptr && released_imag != nullptr)) {
-                    if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-                        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                                   "[STAGE4-SKIP] idx=%d slot=%d missing spectral buffers\n",
-                                   idx,
-                                   slot);
-                    }
-                }
-                    if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
-                        if (lane.enable_spectral_out) {
-                            if (lane_snapshot.expect_signal) {
-                                fftdiv_stage_assert_complex_output(
-                                    state,
-                                    "stage4",
-                                    slot,
-                                    released_real,
-                                    released_imag,
-                                    (size_t)window_size,
-                                    slice.frame_index // Pass frame number
-                                );
-                            }
-                            /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
-                            const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
-                            stage_emit_spectral(
-                                state,
-                            const_cast<double *>(released_real),
-                            const_cast<double *>(released_imag),
-                            window_size,
-                            slot,
-                            emit_frame_index,
-                            working_tensor,
-                            tensor_page,
-                            tensor_lane,
-                            tensor_slice_iter,
-                            tensor_freq_bins);
-                        /* Stage 4 (Spectral Out): we just emitted to spectral mailbox for this frame */
-                        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
-                                   "[STAGE4-SPEC-OUT] slot=%d frame=%lld emit_row=%d bins=%d\n",
-                                   slot, (long long)slice.frame_index, emit_frame_index, window_size);
-                    }
-
-                    if (lane.enable_pcm_out) {
-                        // Stage 3 enqueues spectrum for deferred inverse in Stage 5
-                            if (released_real != nullptr && released_imag != nullptr) {
-                                decltype(slot_state.pending_spectra)::value_type pending;
-                                try {
-                                    pending.real.assign(released_real, released_real + (size_t)window_size);
-                                    pending.imag.assign(released_imag, released_imag + (size_t)window_size);
-                                    pending.expect_signal = lane_snapshot.expect_signal;
-                                    // Compute absolute spectral frame index for this pending spectrum.
-                                    // Use slice.frame_index (the base spectral frame for this slice)
-                                    // plus the relative_offset for this lane to map to the correct
-                                    // FFT window index. This avoids using PCM frame indexes.
-                                    pending.frame_index = static_cast<int64_t>(slice.frame_index) + static_cast<int64_t>(relative_offset);
-                                    slot_state.pending_spectra.push_back(std::move(pending));
-                                } catch (...) {
-                                    // Allocation failure: drop this frame; Stage 5 will still drain what exists
-                                }
-                            }
-                    }
-                }
-            }
-            slice.stage4_emitted = true;
-            if (wheel_length > 0) {
-                // Call tail-release helper (now a no-op). We intentionally
-                // avoid emitting STAGE4 tail notices or mutating wheel cursors
-                // here so Stage-1 zero-tail mechanics remain authoritative.
-                fftdiv_window_release_tail(
-                    state,
-                    wheel_length,
-                    &wheel_tail_cursor,
-                    &wheel_filled_cursor,
-                    "stage4-inline");
-            }
-        }
-        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
-            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                        "[STAGE4-END] visited=%d\n",
                        visited);
         }
-        // Write back cursors to global state so Stage 2 sees the updated capacity on next pass
-        wheel_tail = wheel_tail_cursor;
-        wheel_filled = wheel_filled_cursor;
     } else {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                    "[STAGE4-SKIP] snapshot locked, deferring spectral emission\n");
@@ -3591,7 +3450,7 @@ static bool fftdiv_stage1_zero_insertion_active(const node_state_t *state) {
     }
     if (!zero_tail_enqueued) {
         return false;
-    }
+       }
     const FftDivStageLockSnapshot snapshot = fftdiv_snapshot_stage_locks(state);
     return fftdiv_stage_snapshot_any_ready(snapshot);
 }
@@ -3850,7 +3709,7 @@ static bool fftdiv_worker_process_command(
     const size_t runtime_pcm_block = command->task.frames > 0
         ? static_cast<size_t>(command->task.frames)
         : 1U;
-    const FftDivStageLockSnapshot *locks_to_use = stage_locks;
+    const FftDivStageLockSnapshot *locks_to_use = nullptr;
     const EdgeRunnerNodeInputs *inputs_arg = command->task.inputs;
     EdgeRunnerNodeInputs inputs_copy{};
     if (command->input_consumed_once && inputs_arg != nullptr) {

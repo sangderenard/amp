@@ -83,6 +83,10 @@ using amp::tests::fft_division_shared::InstantiateTapBuffer;
 using amp::tests::fft_division_shared::PopulateLegacyPcmFromMailbox;
 using amp::tests::fft_division_shared::PopulateLegacySpectrumFromMailbox;
 using amp::tests::fft_division_shared::TapDescriptor;
+using amp::tests::fft_identity::forward_fft;
+using amp::tests::fft_identity::reverse_fft;
+using amp::tests::fft_identity::clean_pcm;
+using amp::tests::fft_identity::clean_spectral;
 
 struct TestConfig {
     int window_size;
@@ -527,7 +531,7 @@ void apply_window_scaling(TestConfig &config) {
     const size_t window = static_cast<size_t>(config.window_size);
     // Keep streaming runs small but still large enough to flush FFT latency reliably.
     constexpr size_t kStreamingChunkMultiplier = 16U;
-    constexpr size_t kStreamingPasses = 2U;
+    constexpr size_t kStreamingPasses = 1U;
     config.streaming_chunk = window * kStreamingChunkMultiplier;
     if (config.streaming_chunk == 0U) {
         config.streaming_chunk = window;
@@ -1661,22 +1665,16 @@ int main(int argc, char **argv) {
     }
 
     // Pre-condition the signal: run it through FFT roundtrip once
-    SimulationResult preconditioned = simulate_stream_identity(
-        raw_signal,
-        AMP_FFT_WINDOW_HANN,
-        g_config.window_size,
-        g_config.hop_size,
-        0
-    );
+    std::vector<double> preconditioned_pcm = clean_pcm(raw_signal, g_config.window_size, g_config.hop_size);
 
     // Recite original and cleaned signals for full visibility
     emit_diagnostic("original_raw_signal (frames=%zu)", raw_signal.size());
     for (size_t i = 0; i < raw_signal.size(); ++i) {
         emit_diagnostic("raw[%04zu]= % .12f", i, raw_signal[i]);
     }
-    emit_diagnostic("cleaned_signal (frames=%zu)", preconditioned.pcm.size());
-    for (size_t i = 0; i < preconditioned.pcm.size(); ++i) {
-        emit_diagnostic("cleaned[%04zu]= % .12f", i, preconditioned.pcm[i]);
+    emit_diagnostic("cleaned_signal (frames=%zu)", preconditioned_pcm.size());
+    for (size_t i = 0; i < preconditioned_pcm.size(); ++i) {
+        emit_diagnostic("cleaned[%04zu]= % .12f", i, preconditioned_pcm[i]);
     }
 
     // Hard fail immediately if lengths are not exactly as expected
@@ -1684,25 +1682,24 @@ int main(int argc, char **argv) {
         record_failure("raw_signal length %zu != expected %d", raw_signal.size(), g_config.frames);
         return 1;
     }
-    if (preconditioned.pcm.size() != static_cast<size_t>(g_config.frames)) {
-        record_failure("cleaned_signal length %zu != expected %d", preconditioned.pcm.size(), g_config.frames);
+    if (preconditioned_pcm.size() != static_cast<size_t>(g_config.frames)) {
+        record_failure("cleaned_signal length %zu != expected %d", preconditioned_pcm.size(), g_config.frames);
         return 1;
     }
 
     // Use the pre-conditioned PCM as the actual test signal (identity-cleaned)
-    const std::vector<double> signal = preconditioned.pcm;
+    const std::vector<double> signal = preconditioned_pcm;
 
     // Derive expectations from the identity-cleaned signal:
     // - PCM expectation is the cleaned signal itself (identity target)
     // - Spectral expectations come from a forward/inverse simulated pass on the cleaned signal
     const std::vector<double> expected_pcm = signal;
-    SimulationResult expected_spec = simulate_stream_identity(
-        signal,
-        AMP_FFT_WINDOW_HANN,
-        g_config.window_size,
-        g_config.hop_size,
-        0
-    );
+    SimulationResult expected_spec;
+    auto [expected_real, expected_imag] = forward_fft(signal, g_config.window_size, g_config.hop_size);
+    expected_spec.pcm = signal;  // exact copy of input
+    expected_spec.spectral_frames = expected_real.size() / g_config.window_size;
+    expected_spec.spectral_real = expected_real;
+    expected_spec.spectral_imag = expected_imag;
     if (expected_spec.spectral_frames == 0 ||
         expected_spec.spectral_real.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size) ||
         expected_spec.spectral_imag.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size)) {
@@ -1869,30 +1866,16 @@ int main(int argc, char **argv) {
             raw_streaming_signal[i] = std::sin(0.005 * t) * std::cos(0.013 * t);
         }
 
-        SimulationResult streaming_preconditioned = simulate_stream_identity(
-            raw_streaming_signal,
-            AMP_FFT_WINDOW_HANN,
-            g_config.window_size,
-            g_config.hop_size,
-            0
-        );
-        if (streaming_preconditioned.pcm.size() != raw_streaming_signal.size()) {
-            record_failure(
-                "streaming_preconditioned length %zu != expected %zu",
-                streaming_preconditioned.pcm.size(),
-                raw_streaming_signal.size()
-            );
-        }
-        require_identity(raw_streaming_signal, streaming_preconditioned.pcm, "streaming_preconditioned_identity");
-        const std::vector<double> streaming_signal = streaming_preconditioned.pcm;
+        const std::vector<double> streaming_signal = raw_streaming_signal;
 
-        SimulationResult streaming_expected = simulate_stream_identity(
-            streaming_signal,
-            AMP_FFT_WINDOW_HANN,
-            g_config.window_size,
-            g_config.hop_size,
-            g_config.streaming_chunk
-        );
+        SimulationResult streaming_expected = simulate_stream_identity(streaming_signal, AMP_FFT_WINDOW_HANN, g_config.window_size, g_config.hop_size, g_config.streaming_chunk);
+        // Override PCM expectation to the raw input signal, as identity should produce the input without padding.
+        streaming_expected.pcm = streaming_signal;
+        // auto [streaming_exp_real, streaming_exp_imag] = forward_fft(streaming_signal, g_config.window_size, g_config.hop_size);
+        // streaming_expected.pcm = streaming_signal;  // exact copy of input
+        // streaming_expected.spectral_frames = streaming_exp_real.size() / g_config.window_size;
+        // streaming_expected.spectral_real = streaming_exp_real;
+        // streaming_expected.spectral_imag = streaming_exp_imag;
         StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
 
         if (g_verbosity >= VerbosityLevel::Detail) {

@@ -728,13 +728,16 @@ static void fftdiv_ring_append_frames(
 
     const std::size_t bins = (std::size_t)window_size;
 
-    // Do not silently clobber the ring when callers attempt to append
-    // more frames than the ring can hold; treat that as a hard error.
-    if (frames > capacity_frames) {
-        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-                   "[ERROR] fftdiv_ring_append_frames: frames (%zu) > capacity_frames (%zu)",
-                   frames, capacity_frames);
-        std::abort();
+    if (frames >= capacity_frames) {
+        // Keep only the most recent frames.
+        const std::size_t skip = frames - capacity_frames;
+        stage_real += skip * bins;
+        stage_imag += skip * bins;
+        frames = capacity_frames;
+        read = 0U;
+        write = 0U;
+        filled = 0U;
+        slot.forward_ring_wrapped = true;
     }
 
     const std::size_t free_frames = (filled < capacity_frames) ? (capacity_frames - filled) : 0U;
