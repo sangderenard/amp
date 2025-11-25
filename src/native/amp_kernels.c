@@ -1857,8 +1857,8 @@ typedef union {
                 };
                 std::deque<PendingSpectrum> pending_spectra;
                 std::vector<double> pcm_backlog;
-                std::vector<uint8_t> pcm_backlog_mask;
                 std::size_t pcm_consumed_samples{0U};
+                std::size_t pcm_push_cursor{0U};
                 std::size_t input_frame_cursor{0U};
                 int64_t next_spectral_frame_index{0};
                 bool warmup_complete{false};

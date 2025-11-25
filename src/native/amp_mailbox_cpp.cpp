@@ -272,32 +272,54 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
     auto predicate = [&]() {
         return tap_chain_length_locked(w, tap, tap_name, nullptr, nullptr) >= expected;
     };
+    size_t last_available = 0;
+    int stagnant_checks = 0;
     bool ready = false;
-    // Implement explicit wait loops so we can log the available length each check.
-    if (timeout_ms == 0) {
-        while (!predicate()) {
-            size_t available_now = tap_chain_length_locked(w, tap, tap_name, nullptr, nullptr);
-            long long _ms = now_ms_since_start();
+    auto stalled = [&]() -> bool { return stagnant_checks > 100; };
+    auto wait_once = [&](std::chrono::milliseconds remaining) {
+        if (remaining.count() < 0) {
+            remaining = std::chrono::milliseconds(0);
+        }
+        if (timeout_ms == 0) {
+            w->cv.wait(lock);
+        } else {
+            w->cv.wait_for(lock, remaining);
+        }
+    };
+    while (!predicate()) {
+        size_t available_now = tap_chain_length_locked(w, tap, tap_name, nullptr, nullptr);
+        long long _ms = now_ms_since_start();
+        if (timeout_ms == 0) {
             fprintf(stderr, "[TAP-WAIT-CHECK] t=%lldms tap=%p tap_name='%s' available=%zu expected=%zu\n",
                     _ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", available_now, expected);
-            w->cv.wait(lock);
-        }
-        ready = true;
-    } else {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        while (!predicate()) {
-            size_t available_now = tap_chain_length_locked(w, tap, tap_name, nullptr, nullptr);
-            long long _ms = now_ms_since_start();
+        } else {
             fprintf(stderr, "[TAP-WAIT-CHECK] t=%lldms tap=%p tap_name='%s' available=%zu expected=%zu deadline_ms=%llu\n",
                     _ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", available_now, expected,
                     static_cast<unsigned long long>(timeout_ms));
-            if (w->cv.wait_until(lock, deadline) == std::cv_status::timeout) {
-                // timed out
+        }
+        stagnant_checks = (available_now == last_available) ? (stagnant_checks + 1) : 0;
+        last_available = available_now;
+        if (stalled()) {
+            fprintf(stderr, "[TAP-WAIT-STALL] tap=%p tap_name='%s' available=%zu expected=%zu stalled_checks=%d\n",
+                    reinterpret_cast<void*>(tap),
+                    tap_name ? tap_name : "(null)",
+                    available_now,
+                    expected,
+                    stagnant_checks);
+            break;
+        }
+        if (timeout_ms > 0) {
+            auto elapsed = std::chrono::steady_clock::now() - _start_time;
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+            if (elapsed_ms >= static_cast<long long>(timeout_ms)) {
                 break;
             }
+            wait_once(std::chrono::milliseconds(timeout_ms - elapsed_ms));
+        } else {
+            wait_once(std::chrono::milliseconds(0));
         }
-        ready = predicate();
     }
+    ready = predicate();
 
     std::string resolved_name;
     MailboxChainHead* chain = nullptr;

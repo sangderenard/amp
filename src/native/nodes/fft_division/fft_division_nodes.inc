@@ -657,7 +657,6 @@ static size_t fftdiv_pcm_backlog_limit(const node_state_t *state) {
 static void fftdiv_trim_pcm_backlog(
     node_state_t *state,
     std::vector<double> &pcm_backlog,
-    std::vector<uint8_t> &pcm_backlog_mask,
     std::size_t &pcm_consumed_samples,
     size_t window_size
 ) {
@@ -680,9 +679,6 @@ static void fftdiv_trim_pcm_backlog(
         trim_target = pcm_backlog.size();
     }
     pcm_backlog.erase(pcm_backlog.begin(), pcm_backlog.begin() + trim_target);
-    if (!pcm_backlog_mask.empty() && pcm_backlog_mask.size() >= trim_target) {
-        pcm_backlog_mask.erase(pcm_backlog_mask.begin(), pcm_backlog_mask.begin() + trim_target);
-    }
     pcm_consumed_samples -= trim_target;
 }
 #endif
@@ -914,7 +910,6 @@ static void fftdiv_stage1_append_zero_tail(
         }
     }
     slot.pcm_backlog.insert(slot.pcm_backlog.end(), tail_frames, 0.0);
-    slot.pcm_backlog_mask.insert(slot.pcm_backlog_mask.end(), tail_frames, 1U);
     slot.total_ingested_samples += tail_frames;
     slot.tail_injected_samples = tail_frames;
     slot.zero_tail_enqueued = true;
@@ -2020,7 +2015,6 @@ static int fftdiv_execute_block(
                 }
                 pcm_cursor[frame_cursor] = input_sample;
                 slot_state.pcm_backlog.push_back(input_sample);
-                slot_state.pcm_backlog_mask.push_back(1U);
             }
                     const size_t backlog_after = slot_state.pcm_backlog.size();
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
@@ -2084,13 +2078,8 @@ static int fftdiv_execute_block(
                         }
                     }
                 }
-                size_t first_pending = 0U;
-                while (first_pending < slot_state.pcm_backlog_mask.size() &&
-                       slot_state.pcm_backlog_mask[first_pending] == 0U) {
-                    ++first_pending;
-                }
-                const size_t pending_samples = (first_pending < slot_state.pcm_backlog.size())
-                    ? (slot_state.pcm_backlog.size() - first_pending)
+                const size_t pending_samples = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor)
+                    ? (slot_state.pcm_backlog.size() - (slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor))
                     : 0U;
                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                            "[STAGE1-PCM-PENDING] slot=%d pending_samples=%zu consumed=%zu backlog_size=%zu\n",
@@ -2150,9 +2139,10 @@ static int fftdiv_execute_block(
                     slot_state.forward_frame_capacity = stage_capacity_frames;
                     slot_spectral_real = slot_state.forward_stage_real.empty() ? NULL : slot_state.forward_stage_real.data();
                     slot_spectral_imag = slot_state.forward_stage_imag.empty() ? NULL : slot_state.forward_stage_imag.data();
-                    const double *pcm_source = (slot_state.pcm_backlog.empty() || first_pending >= slot_state.pcm_backlog.size())
+                    const size_t source_index = slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor;
+                    const double *pcm_source = (slot_state.pcm_backlog.empty() || source_index >= slot_state.pcm_backlog.size())
                         ? NULL
-                        : slot_state.pcm_backlog.data() + first_pending;
+                        : slot_state.pcm_backlog.data() + source_index;
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                                "[STAGE1-INPUT] slot=%d\n"
                                "  PCM calling code put into command: pcm_backlog.size()=%zu\n"
@@ -2352,36 +2342,31 @@ static int fftdiv_execute_block(
                         // pending counter can under-report progress when the backend drains while
                         // we are pushing, which caused the same PCM to be re-sent and the single-
                         // shot loop to spin indefinitely.
-                        const size_t samples_sent = (pushed_to_backend && frames_emitted > 0U)
-                            ? pending_samples
-                            : 0U;
-                        if (samples_sent > 0U) {
-                            const size_t backlog_size = slot_state.pcm_backlog.size();
-                            const size_t consumed_now = (slot_state.pcm_consumed_samples + samples_sent > backlog_size)
-                                ? backlog_size
-                                : (slot_state.pcm_consumed_samples + samples_sent);
-                            // Mark sent samples in the mask.
-                            size_t mark_start = first_pending;
-                            size_t mark_end = mark_start + samples_sent;
-                            if (mark_end > slot_state.pcm_backlog_mask.size()) {
-                                mark_end = slot_state.pcm_backlog_mask.size();
-                            }
-                            for (size_t idx = mark_start; idx < mark_end; ++idx) {
-                                slot_state.pcm_backlog_mask[idx] = 0U;
-                            }
-                            // Advance consumed pointer if mask front is clear.
-                            while (slot_state.pcm_consumed_samples < slot_state.pcm_backlog_mask.size() &&
-                                   slot_state.pcm_backlog_mask[slot_state.pcm_consumed_samples] == 0U) {
-                                slot_state.pcm_consumed_samples += 1U;
-                            }
-                            if (slot_state.pcm_consumed_samples > backlog_size) {
-                                slot_state.pcm_consumed_samples = backlog_size;
+                        size_t samples_per_frame = (size_t)((window_size > 0) ? window_size : 1);
+                        size_t samples_sent = 0U;
+                        if (pushed_to_backend && frames_emitted > 0U) {
+                            const size_t max_push = frames_emitted * samples_per_frame;
+                            samples_sent = (pending_samples < max_push) ? pending_samples : max_push;
+                        }
+                        slot_state.pcm_push_cursor += samples_sent;
+                        // Advance consumed pointer when the push cursor overtakes the backlog.
+                        if (slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor > slot_state.pcm_backlog.size()) {
+                            slot_state.pcm_push_cursor = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
+                                ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
+                                : 0U;
+                        }
+                        if (slot_state.pcm_push_cursor > 0U && slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor <= slot_state.pcm_backlog.size()) {
+                            // If everything pending was sent, fold the cursor into consumed.
+                            if (slot_state.pcm_push_cursor >= pending_samples) {
+                                slot_state.pcm_consumed_samples += slot_state.pcm_push_cursor;
+                                slot_state.pcm_push_cursor = 0U;
                             }
                         }
                     } else {
                         slot_state.pcm_consumed_samples = slot_state.pcm_backlog.size();
+                        slot_state.pcm_push_cursor = 0U;
                     }
-                    fftdiv_trim_pcm_backlog(state, slot_state.pcm_backlog, slot_state.pcm_backlog_mask, slot_state.pcm_consumed_samples, (size_t)window_size);
+                    fftdiv_trim_pcm_backlog(state, slot_state.pcm_backlog, slot_state.pcm_consumed_samples, (size_t)window_size);
                 }
             }
             lane_frames_emitted[(size_t)slot] = frames_emitted;
