@@ -531,7 +531,7 @@ void apply_window_scaling(TestConfig &config) {
     const size_t window = static_cast<size_t>(config.window_size);
     // Keep streaming runs small but still large enough to flush FFT latency reliably.
     constexpr size_t kStreamingChunkMultiplier = 16U;
-    constexpr size_t kStreamingPasses = 1U;
+    constexpr size_t kStreamingPasses = 4U;
     config.streaming_chunk = window * kStreamingChunkMultiplier;
     if (config.streaming_chunk == 0U) {
         config.streaming_chunk = window;

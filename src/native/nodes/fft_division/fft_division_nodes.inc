@@ -1904,7 +1904,13 @@ static int fftdiv_execute_block(
 
     const int64_t frame_counter = state->u.fftdiv.wheel_frame_counter;
     int frame_index_int = (int)frame_counter;
+    // Input buffer indexing stays local to the current call (base_index = 0),
+    // but PCM mailboxes and diagnostics need the absolute frame offset so
+    // downstream consumers can stitch together streaming chunks correctly.
     size_t base_index = 0;
+    const size_t pcm_frame_offset = (frame_counter > 0)
+        ? static_cast<size_t>(frame_counter)
+        : 0U;
     int metrics_window_span = 0;
 #if defined(__cplusplus)
         fftdiv_prepare_operator_frame(state);
@@ -1989,35 +1995,36 @@ static int fftdiv_execute_block(
                 const size_t hop = (size_t)slot_count;
                 double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
                 if (audio_base != NULL && frames > 0) {
-                    const size_t backlog_growth = (size_t)frames;
-                    const size_t backlog_before = slot_state.pcm_backlog.size();
-                    const size_t reserve_target = backlog_before + backlog_growth;
-                    const size_t pending_before = (backlog_before > slot_state.pcm_consumed_samples)
-                        ? (backlog_before - slot_state.pcm_consumed_samples)
-                        : 0U;
-                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                               "[STAGE1-PCM-BACKLOG] slot=%d backlog_before=%zu pending_before=%zu reserve_target=%zu\n",
-                               slot,
-                               backlog_before,
-                               pending_before,
-                               reserve_target);
-                    if (reserve_target > slot_state.pcm_backlog.capacity()) {
-                        try {
-                            slot_state.pcm_backlog.reserve(reserve_target);
-                        } catch (...) {
-                            // Ignore reserve failures; push_back will retry allocations as needed.
-                        }
-                    }
-                    for (int frame_cursor = 0; frame_cursor < frames; ++frame_cursor) {
-                        const size_t source_frame = slot_state.input_frame_cursor + (size_t)frame_cursor;
-                        const size_t audio_index = source_frame * hop + (size_t)slot;
-                        double input_sample = 0.0;
-                        if (audio_index < (size_t)slot_count * (size_t)frames) {
-                            input_sample = audio_base[audio_index];
-                        }
-                        pcm_cursor[frame_cursor] = input_sample;
-                        slot_state.pcm_backlog.push_back(input_sample);
-                    }
+            const size_t backlog_growth = (size_t)frames;
+            const size_t backlog_before = slot_state.pcm_backlog.size();
+            const size_t reserve_target = backlog_before + backlog_growth;
+            const size_t pending_before = (backlog_before > slot_state.pcm_consumed_samples)
+                ? (backlog_before - slot_state.pcm_consumed_samples)
+                : 0U;
+            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                       "[STAGE1-PCM-BACKLOG] slot=%d backlog_before=%zu pending_before=%zu reserve_target=%zu\n",
+                       slot,
+                       backlog_before,
+                       pending_before,
+                       reserve_target);
+            if (reserve_target > slot_state.pcm_backlog.capacity()) {
+                try {
+                    slot_state.pcm_backlog.reserve(reserve_target);
+                } catch (...) {
+                    // Ignore reserve failures; push_back will retry allocations as needed.
+                }
+            }
+            for (int frame_cursor = 0; frame_cursor < frames; ++frame_cursor) {
+                const size_t source_frame = slot_state.input_frame_cursor + (size_t)frame_cursor;
+                // Index into the chunk-local buffer; audio_base only spans `frames` samples
+                const size_t audio_index = (size_t)frame_cursor * hop + (size_t)slot;
+                double input_sample = 0.0;
+                if (audio_index < (size_t)slot_count * (size_t)frames) {
+                    input_sample = audio_base[audio_index];
+                }
+                pcm_cursor[frame_cursor] = input_sample;
+                slot_state.pcm_backlog.push_back(input_sample);
+            }
                     const size_t backlog_after = slot_state.pcm_backlog.size();
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                                "[STAGE1-PCM-BACKLOG] slot=%d appended=%zu backlog_after=%zu push_range=[%zu,%zu)\n",
@@ -2026,7 +2033,7 @@ static int fftdiv_execute_block(
                                backlog_after,
                                backlog_before,
                                backlog_after);
-                    slot_state.input_frame_cursor += (size_t)frames;
+            slot_state.input_frame_cursor += (size_t)frames;
                     slot_state.total_ingested_samples += backlog_growth;
                 }
                 // Append tail zeros immediately after input PCM, before calculating pending_samples
@@ -2695,7 +2702,7 @@ static int fftdiv_execute_block(
         slice.wheel_head = wheel_head_cursor;
         slice.wheel_tail = wheel_tail_cursor;
         slice.frame_index = frame_index_iter;
-        slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)slot_count;
+        slice.pcm_sample_index = frame_index_iter * (int64_t)slot_count;
         slice.slice_index = next_slice_index;
         slice.timeline_seconds = timeline_cursor;
         slice.working_tensor_updated = iteration_updated;
@@ -3252,7 +3259,7 @@ static int fftdiv_execute_block(
                 double sample_value = slot_state.inverse_queue.front();
                 const bool stage5_pcm_assert_enabled = (stage5_pcm_assert_base && pending_expect_signal);
                 if (stage5_pcm_assert_enabled) {
-                    const size_t pcm_frame_number = base_index + buffer_offset;
+                    const size_t pcm_frame_number = pcm_frame_offset + buffer_offset;
                     fftdiv_stage_assert_real_output(state, "stage5", slot, &sample_value, 1U, pcm_frame_number);
                 }
                 buffer[buffer_offset] = sample_value;
@@ -3345,7 +3352,7 @@ static int fftdiv_execute_block(
     // For multi-channel output we append samples in channel order for each frame.
     for (size_t i = 0; i < frames_to_push; ++i) {
         size_t frame_base = i * (size_t)input_channels;
-        int frame_index_for_node = (int)(base_index + i);
+        int frame_index_for_node = (int)(pcm_frame_offset + i);
         for (int ch = 0; ch < input_channels; ++ch) {
             double sample = buffer[frame_base + (size_t)ch];
             AmpMailboxNode pcm_node = amp_mailbox_create_pcm_node(sample, frame_index_for_node);
