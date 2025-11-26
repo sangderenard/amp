@@ -3442,7 +3442,7 @@ static int fftdiv_execute_block(
     // Push one mailbox entry per frame (only push what was actually written)
     size_t frames_to_push = pcm_written_samples;
     /* Accumulate persistent total (across rounds) for diagnostic purposes */
-    state->u.fftdiv.total_pcm_emitted += frames_to_push;
+    const size_t pcm_frame_base = state->u.fftdiv.total_pcm_emitted;
     if (pcm_written_samples == 0) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu (no-output)\n",
@@ -3457,7 +3457,7 @@ static int fftdiv_execute_block(
     // For multi-channel output we append samples in channel order for each frame.
     for (size_t i = 0; i < frames_to_push; ++i) {
         size_t frame_base = i * (size_t)input_channels;
-        int frame_index_for_node = (int)(state->u.fftdiv.total_pcm_emitted + i);
+        int frame_index_for_node = (int)(pcm_frame_base + i);
         for (int ch = 0; ch < input_channels; ++ch) {
             double sample = buffer[frame_base + (size_t)ch];
             AmpMailboxNode pcm_node = amp_mailbox_create_pcm_node(sample, frame_index_for_node);
