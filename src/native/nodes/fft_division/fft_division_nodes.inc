@@ -4496,14 +4496,29 @@ static void fftdiv_worker_main(node_state_t *state) {
                                         int fi = idx - base_frame;
                                         if (fi >= 0) {
                                             auto &vec = rows[fi];
-                                            // collect bins up to window
-                                            for (int b = 0; b < amp_mailbox_node_window_size(n) && (size_t)b < window; ++b) {
-                                                double rv = amp_mailbox_node_real(n); (void)rv;
-                                                // the C API exposes one spectral value per node for legacy layout
-                                                // Fallback: use amp_mailbox_node_spectral_value for single-value nodes
+                                            // collect bins up to window. Prefer reading the full
+                                            // per-node spectral bin arrays when the internal
+                                            // PersistentMailboxNode exposes them; otherwise fall
+                                            // back to the C API single-value helpers.
+                                            {
+                                                const size_t node_window = (amp_mailbox_node_window_size(n) > 0) ? static_cast<size_t>(amp_mailbox_node_window_size(n)) : 1U;
+                                                const size_t bins_to_collect = (node_window < window) ? node_window : window;
+                                                amp::tests::fft_division_shared::PersistentMailboxNode *pn = reinterpret_cast<amp::tests::fft_division_shared::PersistentMailboxNode*>(n);
+                                                if (pn != nullptr) {
+                                                    const auto &real_bins = pn->spectral_real_bins;
+                                                    const auto &imag_bins = pn->spectral_imag_bins;
+                                                    for (size_t b = 0; b < bins_to_collect; ++b) {
+                                                        double re = (b < real_bins.size()) ? real_bins[b] : amp_mailbox_node_real(n);
+                                                        double im = (b < imag_bins.size()) ? imag_bins[b] : amp_mailbox_node_imag(n);
+                                                        rows[fi].push_back(std::make_pair(re, im));
+                                                    }
+                                                } else {
+                                                    // Fallback: the C API exposes only a single
+                                                    // spectral scalar per node in legacy layouts.
+                                                    // Emit that value for the (single) bin.
+                                                    rows[fi].push_back(std::make_pair(amp_mailbox_node_real(n), amp_mailbox_node_imag(n)));
+                                                }
                                             }
-                                            // store one representative complex value for diagnostics
-                                            rows[fi].push_back(std::make_pair(amp_mailbox_node_real(n), amp_mailbox_node_imag(n)));
                                         }
                                     }
                                 }
