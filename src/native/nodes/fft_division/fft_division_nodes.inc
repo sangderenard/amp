@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <vector>
 #include <map>
+#include <unordered_set>
 #include <string>
 #include "amp_native_mailbox_chain.hpp"
 #include "fft_division_mailbox_helpers.h"
@@ -3456,7 +3457,7 @@ static int fftdiv_execute_block(
     // For multi-channel output we append samples in channel order for each frame.
     for (size_t i = 0; i < frames_to_push; ++i) {
         size_t frame_base = i * (size_t)input_channels;
-        int frame_index_for_node = (int)(pcm_frame_offset + i);
+        int frame_index_for_node = (int)(state->u.fftdiv.total_pcm_emitted + i);
         for (int ch = 0; ch < input_channels; ++ch) {
             double sample = buffer[frame_base + (size_t)ch];
             AmpMailboxNode pcm_node = amp_mailbox_create_pcm_node(sample, frame_index_for_node);
@@ -3467,6 +3468,7 @@ static int fftdiv_execute_block(
             amp_mailbox_append_pcm_node((void*)state, pcm_node);
         }
     }
+    state->u.fftdiv.total_pcm_emitted += frames_to_push;
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                "[STAGE5-PCM-EMIT] pushed %zu individual frame entries\n",
                frames_to_push);
@@ -4413,16 +4415,30 @@ static void fftdiv_worker_main(node_state_t *state) {
                         if (pcm_head) {
                             // scan to find base frame
                             int base_frame = (std::numeric_limits<int>::max)();
+                            std::unordered_set<int> pcm_indices_seen;
                             for (AmpMailboxNode n = pcm_head; n; n = amp_mailbox_node_next(n)) {
                                 if (amp_mailbox_node_is_pcm(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                    base_frame = (std::min)(base_frame, amp_mailbox_node_frame_index(n));
+                                    int idx = amp_mailbox_node_frame_index(n);
+                                    if (!pcm_indices_seen.insert(idx).second) {
+                                        fprintf(stdout, "[PANIC] Duplicate PCM frame_index %d detected in mailbox chain!\n", idx);
+                                        fflush(stdout);
+                                        std::_Exit(1);
+                                    }
+                                    base_frame = (std::min)(base_frame, idx);
                                 }
                             }
                             if (base_frame != (std::numeric_limits<int>::max)()) {
                                 std::vector<double> pcm_vals;
+                                pcm_indices_seen.clear();
                                 for (AmpMailboxNode n = pcm_head; n; n = amp_mailbox_node_next(n)) {
-                                        if (amp_mailbox_node_is_pcm(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                        int fi = amp_mailbox_node_frame_index(n) - base_frame;
+                                    if (amp_mailbox_node_is_pcm(n) && amp_mailbox_node_frame_index(n) >= 0) {
+                                        int idx = amp_mailbox_node_frame_index(n);
+                                        if (!pcm_indices_seen.insert(idx).second) {
+                                            fprintf(stdout, "[PANIC] Duplicate PCM frame_index %d detected in mailbox chain!\n", idx);
+                                            fflush(stdout);
+                                            std::_Exit(1);
+                                        }
+                                        int fi = idx - base_frame;
                                         if (fi >= 0) {
                                             if ((size_t)fi >= pcm_vals.size()) pcm_vals.resize((size_t)fi + 1, 0.0);
                                             pcm_vals[(size_t)fi] = amp_mailbox_node_pcm_sample(n);
@@ -4452,18 +4468,32 @@ static void fftdiv_worker_main(node_state_t *state) {
                         if (spec_head) {
                             int base_frame = (std::numeric_limits<int>::max)();
                             size_t window = 0;
+                            std::unordered_set<int> spec_indices_seen;
                             for (AmpMailboxNode n = spec_head; n; n = amp_mailbox_node_next(n)) {
                                 if (amp_mailbox_node_is_spectral(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                    base_frame = (std::min)(base_frame, amp_mailbox_node_frame_index(n));
+                                    int idx = amp_mailbox_node_frame_index(n);
+                                    if (!spec_indices_seen.insert(idx).second) {
+                                        fprintf(stdout, "[PANIC] Duplicate SPECTRAL frame_index %d detected in mailbox chain!\n", idx);
+                                        fflush(stdout);
+                                        std::_Exit(1);
+                                    }
+                                    base_frame = (std::min)(base_frame, idx);
                                     if (window == 0) window = (size_t)amp_mailbox_node_window_size(n);
                                 }
                             }
                             if (base_frame != (std::numeric_limits<int>::max)() && window > 0) {
                                 // collect up to a few rows
                                 std::map<int, std::vector<std::pair<double,double>>> rows;
+                                spec_indices_seen.clear();
                                 for (AmpMailboxNode n = spec_head; n; n = amp_mailbox_node_next(n)) {
                                     if (amp_mailbox_node_is_spectral(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                        int fi = amp_mailbox_node_frame_index(n) - base_frame;
+                                        int idx = amp_mailbox_node_frame_index(n);
+                                        if (!spec_indices_seen.insert(idx).second) {
+                                            fprintf(stdout, "[PANIC] Duplicate SPECTRAL frame_index %d detected in mailbox chain!\n", idx);
+                                            fflush(stdout);
+                                            std::_Exit(1);
+                                        }
+                                        int fi = idx - base_frame;
                                         if (fi >= 0) {
                                             auto &vec = rows[fi];
                                             // collect bins up to window
