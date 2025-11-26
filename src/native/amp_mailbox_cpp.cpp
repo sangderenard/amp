@@ -514,7 +514,7 @@ void amp_mailbox_attach_spectral_node(void* state, const char* tap_name, AmpMail
     // update instrumentation
     w->spectral_counts[std::string(tap_name)] = EdgeRunnerTapMailboxChain::count_nodes(chain.head);
     ++w->total_spectral_appends;
-    fprintf(stderr, "[MAILBOX-APPEND] spectral tap='%s' frame=%d appended total=%zu total_appends=%zu\n",
+        fprintf(stderr, "[MAILBOX-APPEND] spectral tap='%s' spectral_frame_index=%d appended total=%zu total_appends=%zu\n",
             tap_name ? tap_name : "(null)", n ? n->frame_index : -1,
             w->spectral_counts[std::string(tap_name)], w->total_spectral_appends);
     w->cv.notify_all();
@@ -545,7 +545,7 @@ void amp_mailbox_append_pcm_node(void* state, AmpMailboxNode node) {
     if (w->pcm_read_cursor == nullptr) {
         w->pcm_read_cursor = chain.head;
     }
-    fprintf(stderr, "[MAILBOX-APPEND] pcm frame=%d appended pcm_count=%zu total_pcm_appends=%zu\n",
+        fprintf(stderr, "[MAILBOX-APPEND] pcm pcm_sample_index=%d appended pcm_count=%zu total_pcm_appends=%zu\n",
             n ? n->frame_index : -1, w->pcm_count, w->total_pcm_appends);
     w->cv.notify_all();
     // Also notify the node worker (if any) so long-running workers that
@@ -611,7 +611,7 @@ void amp_mailbox_log_stats(void* state) {
         const std::string &tap = kv.first;
         size_t cnt = EdgeRunnerTapMailboxChain::count_nodes(kv.second.head);
         int last_frame = kv.second.tail ? kv.second.tail->frame_index : -1;
-        fprintf(stderr, "[MAILBOX-STATS] spectral tap='%s' len=%zu tail_frame=%d\n", tap.c_str(), cnt, last_frame);
+        fprintf(stderr, "[MAILBOX-STATS] spectral tap='%s' len=%zu tail_spectral_frame=%d\n", tap.c_str(), cnt, last_frame);
     }
 }
 

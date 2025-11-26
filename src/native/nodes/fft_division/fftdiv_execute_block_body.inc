@@ -1030,7 +1030,15 @@
         slice.wheel_head = wheel_head_cursor;
         slice.wheel_tail = wheel_tail_cursor;
         slice.frame_index = frame_index_iter;
-        slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)slot_count;
+        /* Convert spectral frame index to PCM-sample index using backend_hop.
+           This keeps the timebase for pcm_sample_index strictly in PCM samples
+           (mono, non-interleaved), avoiding confusion with spectral-frame indices. */
+        {
+            const int backend_hop_local = (state->u.fftdiv.backend_hop > 0)
+                ? state->u.fftdiv.backend_hop
+                : 1;
+            slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)backend_hop_local;
+        }
         slice.slice_index = next_slice_index;
         slice.timeline_seconds = timeline_cursor;
         slice.working_tensor_updated = iteration_updated;
@@ -1199,6 +1207,13 @@
                                "[STAGE3-CONTEXT] lane0 assigned_offset=%zu\n",
                                slice.lane_frame_offsets[0]);
                 }
+                    /* Provide a concise, stage-prefixed context line containing
+                       execution parameters relevant to Stage 3 (spectral->PCM
+                       alignment). Keep this stage-prefixed so logs remain
+                       queryable by stage. */
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+                               "[STAGE3-CTX] wheel_length=%d wheel_filled=%d wheel_hop=%d window_size=%d backend_hop=%d input_channels=%d\n",
+                               wheel_length, wheel_filled, wheel_hop, window_size, (int)state->u.fftdiv.backend_hop, input_channels);
             }
             const int tensor_slice_iter = slice.tensor_slice;
             const int scratch_slice_iter = slice.scratch_slice;
@@ -1429,6 +1444,34 @@
     }
     
     // Push one mailbox entry per frame (only push what was actually written)
+    // Stage5-specific debug: how many PCM samples were produced this round
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[STAGE5-PCM-DBG] pcm_written=%zu\n",
+               pcm_written_samples);
+    for (size_t s = 0; s < state->u.fftdiv.stream_slots.size(); ++s) {
+        const auto &slot = state->u.fftdiv.stream_slots[s];
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[STAGE5-PCM-SLOT] idx=%zu forward_pending_frames=%zu forward_ring_filled=%zu pending_spectra=%zu inverse_queue=%zu forward_handle=%p forward_pending_base=%lld expect_signal=%d\n",
+                   s,
+                   slot.forward_pending_frames,
+                   slot.forward_ring_filled,
+                   slot.pending_spectra.size(),
+                   slot.inverse_queue.size(),
+                   (void*)slot.forward_handle,
+                   (long long)slot.forward_pending_frame_index_base,
+                   slot.forward_pending_expect_signal ? 1 : 0);
+    }
+    // Dump wheel slice metadata flags
+    for (size_t si = 0; si < state->u.fftdiv.wheel_slice_metadata.size(); ++si) {
+        const auto &slice = state->u.fftdiv.wheel_slice_metadata[si];
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[STAGE5-PCM-SLICE] idx=%zu valid=%d stage4_emitted=%d lanes=%zu frame_index=%lld\n",
+                   si,
+                   slice.valid ? 1 : 0,
+                   slice.stage4_emitted ? 1 : 0,
+                   slice.lanes.size(),
+                   (long long)slice.frame_index_base);
+    }
     size_t frames_to_push = pcm_written_samples;
     if (pcm_written_samples == 0) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
@@ -1449,6 +1492,10 @@
         int frame_index = (int)(state->u.fftdiv.wheel_frame_counter + (int)i);
         AmpMailboxNode pcm_node = amp_mailbox_create_pcm_node(pcm_sample, frame_index);
         amp_mailbox_append_pcm_node((void*)state, pcm_node);
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                   "[STAGE5-PCM-MAILBOX] frame=%d appended sample=%.6g\n",
+                   frame_index,
+                   pcm_sample);
     }
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                "[STAGE5-PCM-EMIT] pushed %zu individual frame entries\n",

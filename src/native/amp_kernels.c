@@ -1856,6 +1856,12 @@ typedef union {
                     int64_t frame_index{0};
                 };
                 std::deque<PendingSpectrum> pending_spectra;
+                // Forward staging buffer: backend may produce many frames at once.
+                std::vector<double> forward_pending_real;
+                std::vector<double> forward_pending_imag;
+                std::size_t forward_pending_frames{0U};
+                bool forward_pending_expect_signal{false};
+                int64_t forward_pending_frame_index_base{0};
                 std::vector<double> pcm_backlog;
                 std::size_t pcm_consumed_samples{0U};
                 std::size_t pcm_push_cursor{0U};
@@ -3449,6 +3455,11 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.forward_stage_imag.clear();
         slot.forward_real.clear();
         slot.forward_imag.clear();
+        slot.forward_pending_real.clear();
+        slot.forward_pending_imag.clear();
+        slot.forward_pending_frames = 0U;
+        slot.forward_pending_expect_signal = false;
+        slot.forward_pending_frame_index_base = 0;
         slot.forward_frame_capacity = 0U;
         slot.forward_ring_capacity_frames = 0U;
         slot.forward_ring_write = 0U;
@@ -3617,6 +3628,11 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.forward_stage_imag.assign(stage_capacity, 0.0);
             slot.forward_real.assign(spectral_capacity, 0.0);
             slot.forward_imag.assign(spectral_capacity, 0.0);
+            slot.forward_pending_real.clear();
+            slot.forward_pending_imag.clear();
+            slot.forward_pending_frames = 0U;
+            slot.forward_pending_expect_signal = false;
+            slot.forward_pending_frame_index_base = 0;
             slot.forward_frame_capacity = stage_frames;
             slot.forward_ring_capacity_frames = ring_frames;
             slot.forward_ring_write = 0U;

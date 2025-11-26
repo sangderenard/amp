@@ -84,6 +84,8 @@
         "future": "cpp",
         "numeric": "cpp",
         "valarray": "cpp",
-        "fft": "cpp"
+        "fft": "cpp",
+        "*.expression": "cpp",
+        "alignedvector3": "cpp"
     }
 }

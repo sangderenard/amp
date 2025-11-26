@@ -36,6 +36,8 @@ extern "C" {
 #include "amp_mailbox_capi.h"
 }
 
+#include "amp_native_mailbox_chain.hpp"
+
 #include "fft_division_test_helpers.h"
 
 namespace {
@@ -531,7 +533,7 @@ void apply_window_scaling(TestConfig &config) {
     const size_t window = static_cast<size_t>(config.window_size);
     // Keep streaming runs small but still large enough to flush FFT latency reliably.
     constexpr size_t kStreamingChunkMultiplier = 16U;
-    constexpr size_t kStreamingPasses = 3U;
+    constexpr size_t kStreamingPasses = 4U;
     config.streaming_chunk = window * kStreamingChunkMultiplier;
     if (config.streaming_chunk == 0U) {
         config.streaming_chunk = window;
@@ -600,14 +602,14 @@ void emit_diagnostic(const char *fmt, ...) {
     if (g_quiet || g_verbosity == VerbosityLevel::Silent) {
         return;
     }
-    std::fprintf(stderr, "[fft_division_node][diag] ");
+    std::fprintf(stdout, "[fft_division_node][diag] ");
 
     va_list args;
     va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
+    std::vfprintf(stdout, fmt, args);
     va_end(args);
 
-    std::fprintf(stderr, "\n");
+    std::fprintf(stdout, "\n");
 }
 
 void record_failure(const char *fmt, ...) {
@@ -615,14 +617,14 @@ void record_failure(const char *fmt, ...) {
     if (g_quiet || g_verbosity == VerbosityLevel::Silent) {
         return;
     }
-    std::fprintf(stderr, "[fft_division_node] ");
+    std::fprintf(stdout, "[fft_division_node] ");
 
     va_list args;
     va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
+    std::vfprintf(stdout, fmt, args);
     va_end(args);
 
-    std::fprintf(stderr, "\n");
+    std::fprintf(stdout, "\n");
 }
 
 bool nearly_equal(double a, double b, double tol = -1.0) {
@@ -740,6 +742,61 @@ void log_vector_segment(
             diff
         );
     }
+}
+
+// Dump mailbox chain heads and a small prefix of nodes for diagnostics.
+static void dump_mailbox_chain_snapshot(void * /*state*/, EdgeRunnerTapBuffer *taps, size_t tap_count, size_t chunk_index, size_t start_frame) {
+    const size_t max_nodes = 24;
+    using amp::tests::fft_division_shared::PersistentMailboxNode;
+    using amp::tests::fft_division_shared::EdgeRunnerTapMailboxChain;
+
+    // Spectral tap is at index 0 in our tap array
+    PersistentMailboxNode *head = nullptr;
+    if (tap_count > 0 && taps != nullptr) {
+        head = EdgeRunnerTapMailboxChain::get_head(taps[0]);
+    }
+    std::fprintf(stdout, "[MAILBOX-DUMP] chunk=%zu start_frame=%zu spectral_head=%p\n", chunk_index, start_frame, reinterpret_cast<void*>(head));
+    size_t seen = 0;
+    PersistentMailboxNode *node = head;
+    while (node && seen < max_nodes) {
+        int frame_idx = node->frame_index;
+        int is_spectral = (node->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) ? 1 : 0;
+        double real0 = node->spectral_real;
+        double imag0 = node->spectral_imag;
+        std::fprintf(stdout, "[MAILBOX-DUMP] spectral node[%zu] ptr=%p frame=%d spectral=%d real0=% .12f imag0=% .12f\n",
+                seen, reinterpret_cast<void*>(node), frame_idx, is_spectral, real0, imag0);
+        node = node->next;
+        ++seen;
+    }
+    if (!node) {
+        std::fprintf(stdout, "[MAILBOX-DUMP] spectral chain ended after %zu nodes\n", seen);
+    } else {
+        std::fprintf(stdout, "[MAILBOX-DUMP] spectral chain truncated after %zu nodes (more exist)\n", seen);
+    }
+
+    // PCM tap at index 2
+    PersistentMailboxNode *pcm_head = nullptr;
+    if (tap_count > 2 && taps != nullptr) {
+        pcm_head = EdgeRunnerTapMailboxChain::get_head(taps[2]);
+    }
+    std::fprintf(stdout, "[MAILBOX-DUMP] chunk=%zu pcm_head=%p\n", chunk_index, reinterpret_cast<void*>(pcm_head));
+    seen = 0;
+    node = pcm_head;
+    while (node && seen < max_nodes) {
+        int frame_idx = node->frame_index;
+        int is_pcm = (node->node_kind == PersistentMailboxNode::NodeKind::PCM) ? 1 : 0;
+        double pcmv = node->pcm_sample;
+        std::fprintf(stdout, "[MAILBOX-DUMP] pcm node[%zu] ptr=%p frame=%d pcm=% .12f is_pcm=%d\n",
+                seen, reinterpret_cast<void*>(node), frame_idx, pcmv, is_pcm);
+        node = node->next;
+        ++seen;
+    }
+    if (!node) {
+        std::fprintf(stdout, "[MAILBOX-DUMP] pcm chain ended after %zu nodes\n", seen);
+    } else {
+        std::fprintf(stdout, "[MAILBOX-DUMP] pcm chain truncated after %zu nodes (more exist)\n", seen);
+    }
+    fflush(stdout);
 }
 
 struct RunResult {
@@ -967,28 +1024,28 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
 
     // Diagnostic: report tap pointers and buffers immediately before population
-    std::fprintf(stderr, "[TEST-DIAG] before_populate pcm_tap=%p mailbox_head=%p cache=%p data=%p\n",
+    std::fprintf(stdout, "[TEST-DIAG] before_populate pcm_tap=%p mailbox_head=%p cache=%p data=%p\n",
                  reinterpret_cast<void*>(&tap_buffers[2]), reinterpret_cast<void*>(tap_buffers[2].mailbox_head),
                  reinterpret_cast<void*>(tap_buffers[2].cache_data), reinterpret_cast<void*>(tap_buffers[2].data));
-    fflush(stderr);
+    fflush(stdout);
 
     const auto pcm_read = PopulateLegacyPcmFromMailbox(
         tap_buffers[2],
         result.pcm.data(),
         result.pcm.size()
     );
-    std::fprintf(stderr, "[TEST-DIAG] after_populate pcm_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
+    std::fprintf(stdout, "[TEST-DIAG] after_populate pcm_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
                  pcm_read.frames_committed, pcm_read.values_written, pcm_read.copied_from_mailbox ? 1 : 0, pcm_read.aliased_legacy_buffer ? 1 : 0);
-    fflush(stderr);
+    fflush(stdout);
     if (pcm_read.frames_committed > 0) {
-        std::fprintf(stderr, "[TEST-DIAG] advancing pcm cursor by=%zu\n", pcm_read.frames_committed);
-        fflush(stderr);
+        std::fprintf(stdout, "[TEST-DIAG] advancing pcm cursor by=%zu\n", pcm_read.frames_committed);
+        fflush(stdout);
         (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
     }
-    std::fprintf(stderr, "[TEST-DIAG] before_populate spectral_tap_real=%p mailbox_head=%p cache=%p data=%p\n",
+    std::fprintf(stdout, "[TEST-DIAG] before_populate spectral_tap_real=%p mailbox_head=%p cache=%p data=%p\n",
                  reinterpret_cast<void*>(&tap_buffers[0]), reinterpret_cast<void*>(tap_buffers[0].mailbox_head),
                  reinterpret_cast<void*>(tap_buffers[0].cache_data), reinterpret_cast<void*>(tap_buffers[0].data));
-    fflush(stderr);
+    fflush(stdout);
 
     const auto spectral_read = PopulateLegacySpectrumFromMailbox(
         tap_buffers[0],
@@ -997,9 +1054,9 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         result.spectral_imag.data(),
         result.spectral_real.size()
     );
-    std::fprintf(stderr, "[TEST-DIAG] after_populate spectral_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
+    std::fprintf(stdout, "[TEST-DIAG] after_populate spectral_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
                  spectral_read.frames_committed, spectral_read.values_written, spectral_read.copied_from_mailbox ? 1 : 0, spectral_read.aliased_legacy_buffer ? 1 : 0);
-    fflush(stderr);
+    fflush(stdout);
 
     result.pcm_frames_committed = pcm_read.frames_committed;
     result.spectral_rows_committed = spectral_read.frames_committed;
@@ -1142,6 +1199,11 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         result.call_count = chunk_index;
         result.metrics_per_call.push_back(metrics);
         result.state_allocated = result.state_allocated || (state != nullptr);
+        if (g_verbosity >= VerbosityLevel::Trace) {
+            // Dump mailbox chain right after this chunk was processed so we can
+            // conclusively observe whether nodes for this chunk were appended.
+            dump_mailbox_chain_snapshot(state, tap_buffers.data(), tap_set.count, (chunk_index > 0) ? (chunk_index - 1) : 0, start_frame);
+        }
     }
 
     // After all chunks (including the final flag), wait for mailbox chains to
@@ -1365,7 +1427,7 @@ void verify_metrics(const AmpNodeMetrics &metrics, const char *label, int expect
     // demand-driven flush and zero-tail adjustments.
     if (!g_quiet) {
         std::fprintf(
-            stderr,
+            stdout,
             "[%s] observed delay=%u (expected=%d ignored)\n",
             label,
             metrics.measured_delay_frames,
