@@ -2932,6 +2932,29 @@ static int fftdiv_execute_block(
         }
     } else {
         // Stage3: iterate wheel metadata in FIFO order from tail, stopping after one hop span
+        size_t s34_unemitted = 0;
+        for (size_t s = 0; s < state->u.fftdiv.stream_slots.size(); ++s) {
+            const auto &slot = state->u.fftdiv.stream_slots[s];
+            const size_t pending_pcm = (slot.pcm_backlog.size() > slot.pcm_consumed_samples)
+                ? (slot.pcm_backlog.size() - slot.pcm_consumed_samples)
+                : 0U;
+            const size_t ring_filled = slot.forward_ring_filled;
+            const size_t spectra_pending = slot.pending_spectra.size();
+            const size_t pcm_queue = slot.inverse_queue.size();
+            size_t s34_unemitted = 0;
+            for (const auto &slice : state->u.fftdiv.wheel_slice_metadata) {
+                if (!slice.valid || slice.stage4_emitted) continue;
+                if (slice.lanes.size() > s) {
+                    const auto &lane_snap = slice.lanes[s];
+                    if (lane_snap.frame_ready) {
+                        s34_unemitted += 1;
+                    }
+                }
+            }
+        }
+        if( s34_unemitted > 0 ){
+            wheel_tail_cursor = (wheel_tail_cursor + wheel_length - s34_unemitted) % wheel_length;
+        }
         auto &meta = state->u.fftdiv.wheel_slice_metadata;
         const int stop_count = (wheel_hop > 0) ? wheel_hop : 1;
         int visited = 0;
@@ -2975,6 +2998,7 @@ static int fftdiv_execute_block(
                 continue;
             }
             auto &slice = *slice_ptr;
+            bool slice_emitted_any = false;
 
             FftDivActiveWindowView active_window_view = fftdiv_build_active_window_view_internal(
                 state,
@@ -3116,6 +3140,17 @@ static int fftdiv_execute_block(
                        "[STAGE4-START] FIFO walk tail=%d hop=%d len=%d stop_count=%d\n",
                        wheel_tail_cursor, wheel_hop, wheel_length, stop_count);
         }
+        if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+            // Emit per-slot pending queue summary whenever Stage 4 is unlocked
+            for (size_t si = 0; si < state->u.fftdiv.stream_slots.size(); ++si) {
+                const auto &s = state->u.fftdiv.stream_slots[si];
+                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                           "[STAGE4-STATUS] slot=%zu pending_spectra=%zu inverse_queue=%zu\n",
+                           si,
+                           s.pending_spectra.size(),
+                           s.inverse_queue.size());
+            }
+        }
         std::vector<size_t> lane_frames_consumed(static_cast<size_t>(slot_count), 0U);
         for (int i = 0; i < stop_count && wheel_length > 0; ++i) {
             const int idx = (wheel_tail_cursor + i) % wheel_length;
@@ -3133,6 +3168,7 @@ static int fftdiv_execute_block(
                 continue;
             }
             auto &slice = *slice_ptr;
+            bool slice_emitted_any = false;
             if (slice.stage4_emitted) {
                 if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
@@ -3173,9 +3209,10 @@ static int fftdiv_execute_block(
 
             for (int slot = 0; slot < slot_count; ++slot) {
                 size_t data_idx = base_output_index + (size_t)slot;
-                if (data_idx >= (size_t)slot_count * (size_t)frames) {
-                    break;
-                }
+                //this breaks the streaming mode
+                //if (data_idx >= (size_t)slot_count * (size_t)frames) {
+                //    break;
+                //}
                 auto &slot_state = state->u.fftdiv.stream_slots[(size_t)slot];
                 const size_t assigned_offset = (slice.lane_frame_offsets.size() > (size_t)slot)
                     ? slice.lane_frame_offsets[(size_t)slot]
@@ -3214,23 +3251,37 @@ static int fftdiv_execute_block(
                                    slot);
                     }
                 }
-                    if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
-                        if (lane.enable_spectral_out) {
-                            if (lane_snapshot.expect_signal) {
-                                fftdiv_stage_assert_complex_output(
-                                    state,
-                                    "stage4",
-                                    slot,
-                                    released_real,
-                                    released_imag,
-                                    (size_t)window_size,
-                                    slice.frame_index // Pass frame number
-                                );
-                            }
-                            /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
-                            const int emit_frame_index = (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
-                            stage_emit_spectral(
+
+                fprintf(stderr, "FINDFLAG: stage4 slot=%d frame=%lld ready=%d active=%d real=%p imag=%p\n",
+                        slot,
+                        (long long)slice.frame_index,
+                        lane_snapshot.frame_ready ? 1 : 0,
+                        lane.active ? 1 : 0,
+                        (void *)released_real,
+                        (void *)released_imag);
+
+                if (lane_snapshot.frame_ready && lane.active && released_real != nullptr && released_imag != nullptr) {
+                    fprintf(stderr, "FINDFLAG: %d\n", lane.enable_spectral_out);
+
+                    if (lane.enable_spectral_out) {
+                        if (lane_snapshot.expect_signal) {
+                            fftdiv_stage_assert_complex_output(
                                 state,
+                                "stage4",
+                                slot,
+                                released_real,
+                                released_imag,
+                                (size_t)window_size,
+                                slice.frame_index /* Pass frame number */
+                            );
+                        }
+
+                        /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
+                        const int emit_frame_index =
+                            (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
+
+                        stage_emit_spectral(
+                            state,
                             const_cast<double *>(released_real),
                             const_cast<double *>(released_imag),
                             window_size,
@@ -3241,6 +3292,10 @@ static int fftdiv_execute_block(
                             tensor_lane,
                             tensor_slice_iter,
                             tensor_freq_bins);
+
+                        /* Mark that we actually emitted something for this slice */
+                        slice_emitted_any = true;
+
                         /* Stage 4 (Spectral Out): we just emitted to spectral mailbox for this frame */
                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                                    "[STAGE4-SPEC-OUT] slot=%d frame=%lld emit_row=%d bins=%d\n",
@@ -3248,37 +3303,48 @@ static int fftdiv_execute_block(
                     }
 
                     if (lane.enable_pcm_out) {
-                        // Stage 3 enqueues spectrum for deferred inverse in Stage 5
-                            if (released_real != nullptr && released_imag != nullptr) {
-                                decltype(slot_state.pending_spectra)::value_type pending;
-                                try {
-                                    pending.real.assign(released_real, released_real + (size_t)window_size);
-                                    pending.imag.assign(released_imag, released_imag + (size_t)window_size);
-                                    pending.expect_signal = lane_snapshot.expect_signal;
-                                    // Compute absolute spectral frame index for this pending spectrum.
-                                    // Use slice.frame_index (the base spectral frame for this slice)
-                                    // plus the relative_offset for this lane to map to the correct
-                                    // FFT window index. This avoids using PCM frame indexes.
-                                    pending.frame_index = static_cast<int64_t>(slice.frame_index) + static_cast<int64_t>(relative_offset);
-                                    slot_state.pending_spectra.push_back(std::move(pending));
-                                } catch (...) {
-                                    // Allocation failure: drop this frame; Stage 5 will still drain what exists
-                                }
+                        /* Stage 3 enqueues spectrum for deferred inverse in Stage 5 */
+                        if (released_real != nullptr && released_imag != nullptr) {
+                            decltype(slot_state.pending_spectra)::value_type pending;
+                            try {
+                                pending.real.assign(released_real, released_real + (size_t)window_size);
+                                pending.imag.assign(released_imag, released_imag + (size_t)window_size);
+                                pending.expect_signal = lane_snapshot.expect_signal;
+
+                                /* Compute absolute spectral frame index for this pending spectrum.
+                                   Use slice.frame_index (the base spectral frame for this slice)
+                                   plus the relative_offset for this lane to map to the correct
+                                   FFT window index. This avoids using PCM frame indexes. */
+                                pending.frame_index = static_cast<int64_t>(slice.frame_index) +
+                                                      static_cast<int64_t>(relative_offset);
+                                slot_state.pending_spectra.push_back(std::move(pending));
+
+                                /* We successfully queued a pending spectrum for Stage 5 */
+                                slice_emitted_any = true;
+                            } catch (...) {
+                                /* Allocation failure: drop this frame; Stage 5 will still drain what exists */
+                                fprintf(stderr,
+                                        "[fftx][fftdiv][error] stage4: failed to enqueue pending spectrum for slot=%d frame=%lld\n",
+                                        slot,
+                                        (long long)slice.frame_index);
                             }
+                        }
                     }
                 }
             }
-            slice.stage4_emitted = true;
-            if (wheel_length > 0) {
-                // Call tail-release helper (now a no-op). We intentionally
-                // avoid emitting STAGE4 tail notices or mutating wheel cursors
-                // here so Stage-1 zero-tail mechanics remain authoritative.
-                fftdiv_window_release_tail(
-                    state,
-                    wheel_length,
-                    &wheel_tail_cursor,
-                    &wheel_filled_cursor,
-                    "stage4-inline");
+            if (slice_emitted_any) {
+                slice.stage4_emitted = true;
+                if (wheel_length > 0) {
+                    // Call tail-release helper (now a no-op). We intentionally
+                    // avoid emitting STAGE4 tail notices or mutating wheel cursors
+                    // here so Stage-1 zero-tail mechanics remain authoritative.
+                    fftdiv_window_release_tail(
+                        state,
+                        wheel_length,
+                        &wheel_tail_cursor,
+                        &wheel_filled_cursor,
+                        "stage4-inline");
+                }
             }
         }
         if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
