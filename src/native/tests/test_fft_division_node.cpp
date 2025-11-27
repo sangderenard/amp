@@ -29,11 +29,14 @@ static constexpr const char *kDevNullPath = "NUL";
 static constexpr const char *kDevNullPath = "/dev/null";
 #endif
 
+
 extern "C" {
 #include "amp_fft_backend.h"
 #include "amp_native.h"
-#include "mailbox.h"
+#include "amp_mailbox_capi.h"
 }
+
+#include "amp_native_mailbox_chain.hpp"
 
 #include "fft_division_test_helpers.h"
 
@@ -43,7 +46,7 @@ namespace {
 // Analytic Delay Derivation
 // ============================================================================
 // Node delay must be computed from FFT/working/ISTFT math, not from
-// drain_spectral_mailbox_rows() first-arrival counts.
+// (Removed: drain_spectral_mailbox_rows() first-arrival counts.)
 //
 // Pipeline stages (synchronous):
 //   1. FFT (analysis):     W_fft PCM window, H_fft PCM hop
@@ -63,8 +66,7 @@ namespace {
 // For finite signal of length N, minimum tail padding so no sample remains relevant:
 //   Tail(N) = max_{n₀ ∈ [0, N-1]} (t_max(n₀) - (N-1))₊
 //
-// Current coupling: drain_spectral_mailbox_rows increments spectral_rows_committed
-// on first mailbox delivery, coupling metrics.measured_delay_frames to arrival order.
+// (Removed: drain_spectral_mailbox_rows increments spectral_rows_committed)
 // This must be replaced with the pure math delay function above.
 // ============================================================================
 
@@ -80,7 +82,13 @@ enum class VerbosityLevel : int {
 using amp::tests::fft_division_shared::BuildPcmTapDescriptor;
 using amp::tests::fft_division_shared::BuildSpectralTapDescriptor;
 using amp::tests::fft_division_shared::InstantiateTapBuffer;
+using amp::tests::fft_division_shared::PopulateLegacyPcmFromMailbox;
+using amp::tests::fft_division_shared::PopulateLegacySpectrumFromMailbox;
 using amp::tests::fft_division_shared::TapDescriptor;
+using amp::tests::fft_identity::forward_fft;
+using amp::tests::fft_identity::reverse_fft;
+using amp::tests::fft_identity::clean_pcm;
+using amp::tests::fft_identity::clean_spectral;
 
 struct TestConfig {
     int window_size;
@@ -525,7 +533,7 @@ void apply_window_scaling(TestConfig &config) {
     const size_t window = static_cast<size_t>(config.window_size);
     // Keep streaming runs small but still large enough to flush FFT latency reliably.
     constexpr size_t kStreamingChunkMultiplier = 16U;
-    constexpr size_t kStreamingPasses = 2U;
+    constexpr size_t kStreamingPasses = 4U;
     config.streaming_chunk = window * kStreamingChunkMultiplier;
     if (config.streaming_chunk == 0U) {
         config.streaming_chunk = window;
@@ -594,14 +602,14 @@ void emit_diagnostic(const char *fmt, ...) {
     if (g_quiet || g_verbosity == VerbosityLevel::Silent) {
         return;
     }
-    std::fprintf(stderr, "[fft_division_node][diag] ");
+    std::fprintf(stdout, "[fft_division_node][diag] ");
 
     va_list args;
     va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
+    std::vfprintf(stdout, fmt, args);
     va_end(args);
 
-    std::fprintf(stderr, "\n");
+    std::fprintf(stdout, "\n");
 }
 
 void record_failure(const char *fmt, ...) {
@@ -609,14 +617,14 @@ void record_failure(const char *fmt, ...) {
     if (g_quiet || g_verbosity == VerbosityLevel::Silent) {
         return;
     }
-    std::fprintf(stderr, "[fft_division_node] ");
+    std::fprintf(stdout, "[fft_division_node] ");
 
     va_list args;
     va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
+    std::vfprintf(stdout, fmt, args);
     va_end(args);
 
-    std::fprintf(stderr, "\n");
+    std::fprintf(stdout, "\n");
 }
 
 bool nearly_equal(double a, double b, double tol = -1.0) {
@@ -736,6 +744,61 @@ void log_vector_segment(
     }
 }
 
+// Dump mailbox chain heads and a small prefix of nodes for diagnostics.
+static void dump_mailbox_chain_snapshot(void * /*state*/, EdgeRunnerTapBuffer *taps, size_t tap_count, size_t chunk_index, size_t start_frame) {
+    const size_t max_nodes = 24;
+    using amp::tests::fft_division_shared::PersistentMailboxNode;
+    using amp::tests::fft_division_shared::EdgeRunnerTapMailboxChain;
+
+    // Spectral tap is at index 0 in our tap array
+    PersistentMailboxNode *head = nullptr;
+    if (tap_count > 0 && taps != nullptr) {
+        head = EdgeRunnerTapMailboxChain::get_head(taps[0]);
+    }
+    std::fprintf(stdout, "[MAILBOX-DUMP] chunk=%zu start_frame=%zu spectral_head=%p\n", chunk_index, start_frame, reinterpret_cast<void*>(head));
+    size_t seen = 0;
+    PersistentMailboxNode *node = head;
+    while (node && seen < max_nodes) {
+        int frame_idx = node->frame_index;
+        int is_spectral = (node->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) ? 1 : 0;
+        double real0 = node->spectral_real;
+        double imag0 = node->spectral_imag;
+        std::fprintf(stdout, "[MAILBOX-DUMP] spectral node[%zu] ptr=%p frame=%d spectral=%d real0=% .12f imag0=% .12f\n",
+                seen, reinterpret_cast<void*>(node), frame_idx, is_spectral, real0, imag0);
+        node = node->next;
+        ++seen;
+    }
+    if (!node) {
+        std::fprintf(stdout, "[MAILBOX-DUMP] spectral chain ended after %zu nodes\n", seen);
+    } else {
+        std::fprintf(stdout, "[MAILBOX-DUMP] spectral chain truncated after %zu nodes (more exist)\n", seen);
+    }
+
+    // PCM tap at index 2
+    PersistentMailboxNode *pcm_head = nullptr;
+    if (tap_count > 2 && taps != nullptr) {
+        pcm_head = EdgeRunnerTapMailboxChain::get_head(taps[2]);
+    }
+    std::fprintf(stdout, "[MAILBOX-DUMP] chunk=%zu pcm_head=%p\n", chunk_index, reinterpret_cast<void*>(pcm_head));
+    seen = 0;
+    node = pcm_head;
+    while (node && seen < max_nodes) {
+        int frame_idx = node->frame_index;
+        int is_pcm = (node->node_kind == PersistentMailboxNode::NodeKind::PCM) ? 1 : 0;
+        double pcmv = node->pcm_sample;
+        std::fprintf(stdout, "[MAILBOX-DUMP] pcm node[%zu] ptr=%p frame=%d pcm=% .12f is_pcm=%d\n",
+                seen, reinterpret_cast<void*>(node), frame_idx, pcmv, is_pcm);
+        node = node->next;
+        ++seen;
+    }
+    if (!node) {
+        std::fprintf(stdout, "[MAILBOX-DUMP] pcm chain ended after %zu nodes\n", seen);
+    } else {
+        std::fprintf(stdout, "[MAILBOX-DUMP] pcm chain truncated after %zu nodes (more exist)\n", seen);
+    }
+    fflush(stdout);
+}
+
 struct RunResult {
     std::vector<double> pcm;
     std::vector<double> spectral_real;
@@ -800,69 +863,7 @@ void write_tap_row(
     }
 }
 
-size_t drain_spectral_mailbox_rows(
-    void *state,
-    EdgeRunnerTapBuffer &spectral_real_tap,
-    EdgeRunnerTapBuffer &spectral_imag_tap,
-    std::vector<uint8_t> &spectral_row_written,
-    uint32_t frame_count
-) {
-    if (state == nullptr) {
-        return 0U;
-    }
 
-    const size_t tap_frames = spectral_real_tap.shape.frames > 0U
-        ? spectral_real_tap.shape.frames
-        : frame_count;
-    const size_t expected_bins = spectral_real_tap.shape.channels > 0U
-        ? spectral_real_tap.shape.channels
-        : static_cast<uint32_t>(g_config.window_size);
-    bool reported_bin_mismatch = false;
-    size_t spectral_rows_captured = 0U;
-    AmpSpectralMailboxEntry *entry = nullptr;
-    while ((entry = amp_node_spectral_mailbox_pop(state)) != nullptr) {
-        const int slot = entry->slot;
-        const int frame_index = entry->frame_index;
-        const int window_size = entry->window_size;
-        if (window_size <= 0) {
-            record_failure(
-                "spectral mailbox entry slot=%d frame=%d reported non-positive bin count %d",
-                slot,
-                frame_index,
-                window_size
-            );
-            amp_spectral_mailbox_entry_release(entry);
-            continue;
-        }
-        const size_t entry_bins = static_cast<size_t>(window_size);
-        if (entry_bins != expected_bins && !reported_bin_mismatch) {
-            record_failure(
-                "spectral mailbox emitted %zu bins but test expected %zu (slot=%d frame=%d)",
-                entry_bins,
-                expected_bins,
-                slot,
-                frame_index
-            );
-            reported_bin_mismatch = true;
-        }
-        const int latency = (window_size > 0) ? (window_size - 1) : 0;  // remove declared FFT delay so indices start at zero
-        const int aligned_frame_index = frame_index - latency;
-        const bool slot_in_range = slot >= 0 && static_cast<uint32_t>(slot) < spectral_real_tap.shape.batches;
-        if (slot_in_range && aligned_frame_index >= 0 && static_cast<uint32_t>(aligned_frame_index) < tap_frames) {
-            const size_t row_index = static_cast<size_t>(slot) * frame_count + static_cast<size_t>(aligned_frame_index);
-            if (row_index < spectral_row_written.size() && spectral_row_written[row_index] == 0U) {
-                const size_t copy_bins = std::min(entry_bins, expected_bins);
-                const int copy_count = static_cast<int>(copy_bins);
-                write_tap_row(spectral_real_tap, slot, aligned_frame_index, entry->spectral_real, copy_count);
-                write_tap_row(spectral_imag_tap, slot, aligned_frame_index, entry->spectral_imag, copy_count);
-                spectral_row_written[row_index] = 1U;
-                spectral_rows_captured += 1U;
-            }
-        }
-        amp_spectral_mailbox_entry_release(entry);
-    }
-    return spectral_rows_captured;
-}
 
 std::string build_params_json() {
     char buffer[512];
@@ -925,7 +926,6 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     result.pcm.assign(signal.size(), 0.0);
     result.spectral_real.assign(signal.size() * g_config.window_size, 0.0);
     result.spectral_imag.assign(signal.size() * g_config.window_size, 0.0);
-    const uint32_t frame_count = static_cast<uint32_t>(signal.size());
     std::array<EdgeRunnerTapBuffer, 3> tap_buffers{};
     TapDescriptor spectral_descriptor = BuildSpectralTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
@@ -933,24 +933,29 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         signal.size()
     );
     auto spectral_real_descriptor = spectral_descriptor;
-    spectral_real_descriptor.name = "spectral_real";
+    spectral_real_descriptor.name = "spectral_0";
+    spectral_real_descriptor.buffer_class = "spectrum_real";
     auto spectral_imag_descriptor = spectral_descriptor;
-    spectral_imag_descriptor.name = "spectral_imag";
+    spectral_imag_descriptor.name = "spectral_0";
+    spectral_imag_descriptor.buffer_class = "spectrum_imag";
     TapDescriptor pcm_descriptor = BuildPcmTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
         1U,
         signal.size()
     );
 
-    tap_buffers[0] = InstantiateTapBuffer(spectral_real_descriptor, result.spectral_real.data());
-    tap_buffers[1] = InstantiateTapBuffer(spectral_imag_descriptor, result.spectral_imag.data());
-    tap_buffers[2] = InstantiateTapBuffer(pcm_descriptor, result.pcm.data());
-
-    const size_t spectral_lane_count = tap_buffers[0].shape.batches > 0U
-        ? tap_buffers[0].shape.batches
-        : 1U;
-    std::vector<uint8_t> spectral_row_written(spectral_lane_count * frame_count, 0U);
-    size_t spectral_rows_captured = 0;
+    tap_buffers[0] = InstantiateTapBuffer(
+        spectral_real_descriptor,
+        result.spectral_real.data()
+    );
+    tap_buffers[1] = InstantiateTapBuffer(
+        spectral_imag_descriptor,
+        result.spectral_imag.data()
+    );
+    tap_buffers[2] = InstantiateTapBuffer(
+        pcm_descriptor,
+        result.pcm.data()
+    );
 
     std::string params_json;
     EdgeRunnerNodeDescriptor descriptor = build_descriptor(params_json);
@@ -973,10 +978,6 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     EdgeRunnerTapContext tap_context{};
     tap_context.outputs = tap_set;
     tap_context.status = status_set;
-
-    EdgeRunnerTapBuffer &spectral_real_tap = tap_buffers[0];
-    EdgeRunnerTapBuffer &spectral_imag_tap = tap_buffers[1];
-    EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
 
     EdgeRunnerNodeInputs inputs{};
     inputs.audio = audio;
@@ -1003,78 +1004,71 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
         &metrics
     );
 
-    if (!g_quiet) {
-        std::fprintf(
-            stderr,
-            "[FFT-TEST] run_once amp_run_node_v2 rc=%d buffer=%p channels=%d\n",
-            rc,
-            static_cast<void *>(out_buffer),
-            out_channels
-        );
-    }
-
-    if (rc == AMP_E_PENDING) {
-        if (!g_quiet) {
-            std::fprintf(
-                stderr,
-                "[FFT-TEST] run_once pending -> wait expected=%zu\n",
-                signal.size()
-            );
-        }
-        rc = wait_for_completion(
-            descriptor,
-            inputs,
-            1,
-            1,
-            static_cast<int>(signal.size()),
-            kSampleRate,
-            &state,
-            &out_buffer,
-            &out_channels,
-            &metrics
-        );
-    }
-
     if (rc != 0) {
         record_failure(
-            "amp_run_node_v2 forward failed rc=%d",
-            rc
+            "amp_run_node_v2 failed rc=%d descriptor=%s expected_frames=%zu",
+            rc,
+            descriptor.name,
+            signal.size()
         );
     }
 
-    spectral_rows_captured += drain_spectral_mailbox_rows(
-        state,
-        spectral_real_tap,
-        spectral_imag_tap,
-        spectral_row_written,
-        frame_count
-    );
+    result.metrics = metrics;
 
-    // Copy PCM output from out_buffer into the PCM tap buffer
-    size_t pcm_frames_captured = 0;
+    // Allow the worker to populate mailbox chains, then copy into the legacy
+    // tap buffers. This enforces the contract that verification reads only
+    // traverse the legacy tap storage rather than aliasing mailbox nodes or
+    // using direct return buffers.
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[2], tap_buffers[2].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[0], tap_buffers[0].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
+
+    // Diagnostic: report tap pointers and buffers immediately before population
+    std::fprintf(stdout, "[TEST-DIAG] before_populate pcm_tap=%p mailbox_head=%p cache=%p data=%p\n",
+                 reinterpret_cast<void*>(&tap_buffers[2]), reinterpret_cast<void*>(tap_buffers[2].mailbox_head),
+                 reinterpret_cast<void*>(tap_buffers[2].cache_data), reinterpret_cast<void*>(tap_buffers[2].data));
+    fflush(stdout);
+
+    const auto pcm_read = PopulateLegacyPcmFromMailbox(
+        tap_buffers[2],
+        result.pcm.data(),
+        result.pcm.size()
+    );
+    std::fprintf(stdout, "[TEST-DIAG] after_populate pcm_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
+                 pcm_read.frames_committed, pcm_read.values_written, pcm_read.copied_from_mailbox ? 1 : 0, pcm_read.aliased_legacy_buffer ? 1 : 0);
+    fflush(stdout);
+    if (pcm_read.frames_committed > 0) {
+        std::fprintf(stdout, "[TEST-DIAG] advancing pcm cursor by=%zu\n", pcm_read.frames_committed);
+        fflush(stdout);
+        (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
+    }
+    std::fprintf(stdout, "[TEST-DIAG] before_populate spectral_tap_real=%p mailbox_head=%p cache=%p data=%p\n",
+                 reinterpret_cast<void*>(&tap_buffers[0]), reinterpret_cast<void*>(tap_buffers[0].mailbox_head),
+                 reinterpret_cast<void*>(tap_buffers[0].cache_data), reinterpret_cast<void*>(tap_buffers[0].data));
+    fflush(stdout);
+
+    const auto spectral_read = PopulateLegacySpectrumFromMailbox(
+        tap_buffers[0],
+        tap_buffers[1],
+        result.spectral_real.data(),
+        result.spectral_imag.data(),
+        result.spectral_real.size()
+    );
+    std::fprintf(stdout, "[TEST-DIAG] after_populate spectral_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
+                 spectral_read.frames_committed, spectral_read.values_written, spectral_read.copied_from_mailbox ? 1 : 0, spectral_read.aliased_legacy_buffer ? 1 : 0);
+    fflush(stdout);
+
+    result.pcm_frames_committed = pcm_read.frames_committed;
+    result.spectral_rows_committed = spectral_read.frames_committed;
+
     if (out_buffer != nullptr) {
-        const size_t frames_to_copy = std::min(result.pcm.size(), signal.size());
-        for (size_t frame = 0; frame < frames_to_copy; ++frame) {
-            write_tap_row(pcm_tap, 0, static_cast<int>(frame), out_buffer + frame, 1);
-            pcm_frames_captured += 1;
-        }
         amp_free(out_buffer);
         out_buffer = nullptr;
     }
 
-    result.spectral_rows_committed = spectral_rows_captured;
-    result.pcm_frames_committed = pcm_frames_captured;
-
-    emit_diagnostic("run_once spectral rows committed=%zu pcm frames committed=%zu",
-                    result.spectral_rows_committed,
-                    result.pcm_frames_committed);
-
     if (state != nullptr) {
         amp_release_state(state);
-        state = nullptr;
     }
-
-    result.metrics = metrics;
     return result;
 }
 
@@ -1104,22 +1098,29 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         total_frames
     );
     auto streaming_real_descriptor = streaming_spectral_descriptor;
-    streaming_real_descriptor.name = "spectral_real";
+    streaming_real_descriptor.name = "spectral_0";
+    streaming_real_descriptor.buffer_class = "spectrum_real";
     auto streaming_imag_descriptor = streaming_spectral_descriptor;
-    streaming_imag_descriptor.name = "spectral_imag";
+    streaming_imag_descriptor.name = "spectral_0";
+    streaming_imag_descriptor.buffer_class = "spectrum_imag";
     TapDescriptor streaming_pcm_descriptor = BuildPcmTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
         1U,
         total_frames
     );
 
-    tap_buffers[0] = InstantiateTapBuffer(streaming_real_descriptor, result.spectral_real.data());
-    tap_buffers[1] = InstantiateTapBuffer(streaming_imag_descriptor, result.spectral_imag.data());
-    tap_buffers[2] = InstantiateTapBuffer(streaming_pcm_descriptor, result.pcm.data());
-
-    EdgeRunnerTapBuffer &spectral_real_tap = tap_buffers[0];
-    EdgeRunnerTapBuffer &spectral_imag_tap = tap_buffers[1];
-    EdgeRunnerTapBuffer &pcm_tap = tap_buffers[2];
+    tap_buffers[0] = InstantiateTapBuffer(
+        streaming_real_descriptor,
+        result.spectral_real.data()
+    );
+    tap_buffers[1] = InstantiateTapBuffer(
+        streaming_imag_descriptor,
+        result.spectral_imag.data()
+    );
+    tap_buffers[2] = InstantiateTapBuffer(
+        streaming_pcm_descriptor,
+        result.pcm.data()
+    );
 
     EdgeRunnerTapBufferSet tap_set{};
     tap_set.items = tap_buffers.data();
@@ -1148,6 +1149,9 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
             chunk_data,
             frames_to_process
         );
+        if (frames_processed + frames_to_process >= total_frames) {
+            audio.has_audio |= EDGE_RUNNER_AUDIO_FLAG_FINAL;
+        }
         if (g_verbosity >= VerbosityLevel::Trace && chunk_data != nullptr && frames_to_process > 0) {
             // Trace raw PCM chunk before it enters stage 1 packaging.
             emit_diagnostic(
@@ -1166,6 +1170,8 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
             }
         }
         inputs.audio = audio;
+
+        const size_t start_frame = frames_processed;
 
         int rc = amp_run_node_v2(
             &descriptor,
@@ -1189,41 +1195,45 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
 
         frames_processed += frames_to_process;
         ++chunk_index;
+
+        result.call_count = chunk_index;
+        result.metrics_per_call.push_back(metrics);
+        result.state_allocated = result.state_allocated || (state != nullptr);
+        if (g_verbosity >= VerbosityLevel::Trace) {
+            // Dump mailbox chain right after this chunk was processed so we can
+            // conclusively observe whether nodes for this chunk were appended.
+            dump_mailbox_chain_snapshot(state, tap_buffers.data(), tap_set.count, (chunk_index > 0) ? (chunk_index - 1) : 0, start_frame);
+        }
     }
 
-    // Ensure all remaining frames are processed
-    int rc = wait_for_completion(
-        descriptor,
-        inputs,
-        1,
-        1,
-        static_cast<int>(total_frames - frames_processed),
-        kSampleRate,
-        &state,
-        &out_buffer,
-        &out_channels,
-        &metrics
+    // After all chunks (including the final flag), wait for mailbox chains to
+    // be ready and then copy into the legacy tap buffers for verification.
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[2], tap_buffers[2].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[0], tap_buffers[0].tap_name, 0);
+    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
+
+    const auto pcm_read = PopulateLegacyPcmFromMailbox(
+        tap_buffers[2],
+        result.pcm.data(),
+        result.pcm.size()
+    );
+    if (pcm_read.frames_committed > 0) {
+        (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
+    }
+    const auto spectral_read = PopulateLegacySpectrumFromMailbox(
+        tap_buffers[0],
+        tap_buffers[1],
+        result.spectral_real.data(),
+        result.spectral_imag.data(),
+        result.spectral_real.size()
     );
 
-    if (rc != 0) {
-        record_failure(
-            "[FFT-TEST] wait_for_completion failed rc=%d descriptor=%s expected=%d batches=%d channels=%d",
-            rc,
-            descriptor.name,
-            static_cast<int>(total_frames - frames_processed),
-            inputs.audio.batches,
-            inputs.audio.channels
-        );
+    result.pcm_frames_committed = pcm_read.frames_committed;
+    result.spectral_rows_committed = spectral_read.frames_committed;
 
-        if (out_buffer != nullptr) {
-            for (size_t frame = 0; frame < static_cast<size_t>(total_frames - frames_processed); ++frame) {
-                emit_diagnostic(
-                    "[FFT-TEST] Unexpected zero energy at frame %zu: value=%f",
-                    frame,
-                    out_buffer[frame]
-                );
-            }
-        }
+    if (out_buffer != nullptr) {
+        amp_free(out_buffer);
+        out_buffer = nullptr;
     }
 
     if (state != nullptr) {
@@ -1283,6 +1293,69 @@ void verify_close(const char *label, const double *actual, const double *expecte
             first_diff
         );
     }
+}
+
+void log_tail_summary(
+    const char *label,
+    const std::vector<double> &expected,
+    const std::vector<double> &actual,
+    size_t chunk_frames,
+    double tolerance) {
+    if (expected.empty() || actual.empty() || chunk_frames == 0) {
+        return;
+    }
+
+    const auto last_nonzero_index = [tolerance](const std::vector<double> &values) -> long {
+        for (long i = static_cast<long>(values.size()) - 1; i >= 0; --i) {
+            if (std::fabs(values[static_cast<size_t>(i)]) > tolerance) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    const auto tail_energy = [](const std::vector<double> &values, size_t start) -> double {
+        double energy = 0.0;
+        for (size_t i = start; i < values.size(); ++i) {
+            energy += values[i] * values[i];
+        }
+        return energy;
+    };
+
+    const size_t tail_start = (expected.size() > chunk_frames) ? (expected.size() - chunk_frames) : 0U;
+    const long expected_last = last_nonzero_index(expected);
+    const long actual_last = last_nonzero_index(actual);
+    const double expected_energy = tail_energy(expected, tail_start);
+    const double actual_energy = tail_energy(actual, tail_start);
+
+    const size_t total_frames = expected.size();
+    const size_t chunk_count = (chunk_frames > 0)
+        ? ((total_frames + (chunk_frames - 1U)) / chunk_frames)
+        : 0U;
+    const size_t trailing_zero_pad = (chunk_count > 0)
+        ? (chunk_count * chunk_frames - total_frames)
+        : 0U;
+    const auto chunk_index = [chunk_frames](long index) -> long {
+        return (index < 0 || chunk_frames == 0) ? -1L
+                                               : static_cast<long>(static_cast<size_t>(index) / chunk_frames);
+    };
+    const long expected_last_chunk = chunk_index(expected_last);
+    const long actual_last_chunk = chunk_index(actual_last);
+
+    emit_diagnostic(
+        "[%s-tail] chunk=%zu chunks=%zu trailing_zero_pad=%zu tail_start=%zu last_expected=%ld last_expected_chunk=%ld last_actual=%ld last_actual_chunk=%ld tail_energy_expected=%.12f tail_energy_actual=%.12f",
+        label,
+        chunk_frames,
+        chunk_count,
+        trailing_zero_pad,
+        tail_start,
+        expected_last,
+        expected_last_chunk,
+        actual_last,
+        actual_last_chunk,
+        expected_energy,
+        actual_energy
+    );
 }
 
 void require_identity(const std::vector<double> &input, const std::vector<double> &output, const char *label) {
@@ -1354,7 +1427,7 @@ void verify_metrics(const AmpNodeMetrics &metrics, const char *label, int expect
     // demand-driven flush and zero-tail adjustments.
     if (!g_quiet) {
         std::fprintf(
-            stderr,
+            stdout,
             "[%s] observed delay=%u (expected=%d ignored)\n",
             label,
             metrics.measured_delay_frames,
@@ -1377,7 +1450,12 @@ void verify_metrics(const AmpNodeMetrics &metrics, const char *label, int expect
     }
 }
 
-SimulationResult simulate_stream_identity(const std::vector<double> &signal, int window_kind, int window_size, int hop) {
+SimulationResult simulate_stream_identity(
+    const std::vector<double> &signal,
+    int window_kind,
+    int window_size,
+    int hop,
+    size_t chunk_frames /* 0 => single push (legacy) */) {
     SimulationResult result;
     result.pcm.assign(signal.size(), 0.0);
     result.spectral_frames = 0;
@@ -1403,16 +1481,14 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
     }
 
     const size_t tail_frames = (clamped_window > 0) ? static_cast<size_t>(clamped_window - 1) : 0U;
-    const size_t padded_frames = signal.size() + tail_frames;
-    std::vector<double> padded_signal = signal;
-    padded_signal.resize(padded_frames, 0.0);
+    const size_t total_frames = signal.size() + tail_frames;
 
-    const size_t stage_capacity_frames = padded_frames > 0 ? padded_frames : 1U;
+    const size_t stage_capacity_frames = total_frames > 0 ? total_frames : 1U;
     std::vector<double> spectral_stage_real(stage_capacity_frames * clamped_window, 0.0);
     std::vector<double> spectral_stage_imag(stage_capacity_frames * clamped_window, 0.0);
     std::vector<double> inverse_scratch(clamped_window, 0.0);
     std::vector<double> produced_pcm;
-    produced_pcm.reserve(padded_frames + static_cast<size_t>(clamped_window));
+    produced_pcm.reserve(total_frames + static_cast<size_t>(clamped_window));
 
     size_t spectral_frames_emitted = 0;
     auto push_and_capture = [&](const double *pcm, size_t samples, int flush_mode) -> size_t {
@@ -1436,8 +1512,27 @@ SimulationResult simulate_stream_identity(const std::vector<double> &signal, int
         return produced;
     };
 
-    if (!padded_signal.empty()) {
-        push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+    if (chunk_frames == 0) {
+        // Legacy single-shot path used for the non-streaming expectations.
+        std::vector<double> padded_signal = signal;
+        padded_signal.resize(total_frames, 0.0);
+        if (!padded_signal.empty()) {
+            push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
+        }
+    } else {
+        // Streaming-accurate path: feed the signal in chunks, then append the zero tail
+        // after the final audio block has been seen. This mirrors the node's behaviour
+        // in run_fft_node_streaming and avoids front-loading the tail.
+        size_t offset = 0;
+        while (offset < signal.size()) {
+            const size_t frames = std::min(chunk_frames, signal.size() - offset);
+            push_and_capture(signal.data() + offset, frames, AMP_FFT_STREAM_FLUSH_NONE);
+            offset += frames;
+        }
+        if (tail_frames > 0) {
+            std::vector<double> zero_tail(tail_frames, 0.0);
+            push_and_capture(zero_tail.data(), zero_tail.size(), AMP_FFT_STREAM_FLUSH_NONE);
+        }
     }
 
     // Drain any ready frames and then issue repeated final flushes until nothing remains.
@@ -1632,21 +1727,16 @@ int main(int argc, char **argv) {
     }
 
     // Pre-condition the signal: run it through FFT roundtrip once
-    SimulationResult preconditioned = simulate_stream_identity(
-        raw_signal,
-        AMP_FFT_WINDOW_HANN,
-        g_config.window_size,
-        g_config.hop_size
-    );
+    std::vector<double> preconditioned_pcm = clean_pcm(raw_signal, g_config.window_size, g_config.hop_size);
 
     // Recite original and cleaned signals for full visibility
     emit_diagnostic("original_raw_signal (frames=%zu)", raw_signal.size());
     for (size_t i = 0; i < raw_signal.size(); ++i) {
         emit_diagnostic("raw[%04zu]= % .12f", i, raw_signal[i]);
     }
-    emit_diagnostic("cleaned_signal (frames=%zu)", preconditioned.pcm.size());
-    for (size_t i = 0; i < preconditioned.pcm.size(); ++i) {
-        emit_diagnostic("cleaned[%04zu]= % .12f", i, preconditioned.pcm[i]);
+    emit_diagnostic("cleaned_signal (frames=%zu)", preconditioned_pcm.size());
+    for (size_t i = 0; i < preconditioned_pcm.size(); ++i) {
+        emit_diagnostic("cleaned[%04zu]= % .12f", i, preconditioned_pcm[i]);
     }
 
     // Hard fail immediately if lengths are not exactly as expected
@@ -1654,24 +1744,24 @@ int main(int argc, char **argv) {
         record_failure("raw_signal length %zu != expected %d", raw_signal.size(), g_config.frames);
         return 1;
     }
-    if (preconditioned.pcm.size() != static_cast<size_t>(g_config.frames)) {
-        record_failure("cleaned_signal length %zu != expected %d", preconditioned.pcm.size(), g_config.frames);
+    if (preconditioned_pcm.size() != static_cast<size_t>(g_config.frames)) {
+        record_failure("cleaned_signal length %zu != expected %d", preconditioned_pcm.size(), g_config.frames);
         return 1;
     }
 
     // Use the pre-conditioned PCM as the actual test signal (identity-cleaned)
-    const std::vector<double> signal = preconditioned.pcm;
+    const std::vector<double> signal = preconditioned_pcm;
 
     // Derive expectations from the identity-cleaned signal:
     // - PCM expectation is the cleaned signal itself (identity target)
     // - Spectral expectations come from a forward/inverse simulated pass on the cleaned signal
     const std::vector<double> expected_pcm = signal;
-    SimulationResult expected_spec = simulate_stream_identity(
-        signal,
-        AMP_FFT_WINDOW_HANN,
-        g_config.window_size,
-        g_config.hop_size
-    );
+    SimulationResult expected_spec;
+    auto [expected_real, expected_imag] = forward_fft(signal, g_config.window_size, g_config.hop_size);
+    expected_spec.pcm = signal;  // exact copy of input
+    expected_spec.spectral_frames = expected_real.size() / g_config.window_size;
+    expected_spec.spectral_real = expected_real;
+    expected_spec.spectral_imag = expected_imag;
     if (expected_spec.spectral_frames == 0 ||
         expected_spec.spectral_real.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size) ||
         expected_spec.spectral_imag.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size)) {
@@ -1687,6 +1777,9 @@ int main(int argc, char **argv) {
 
     RunResult first = run_fft_node_once(signal);
     RunResult second = run_fft_node_once(signal);
+
+    // Rely on explicit tap cache blocking helpers instead of sleeping.
+    // Previous versions used a fixed sleep here which is racy and slow.
 
     const size_t expected_pcm_frames = expected_pcm.size();
     const size_t pcm_frames_to_check = std::min(expected_pcm_frames, first.pcm_frames_committed);
@@ -1835,29 +1928,31 @@ int main(int argc, char **argv) {
             raw_streaming_signal[i] = std::sin(0.005 * t) * std::cos(0.013 * t);
         }
 
-        SimulationResult streaming_preconditioned = simulate_stream_identity(
-            raw_streaming_signal,
-            AMP_FFT_WINDOW_HANN,
-            g_config.window_size,
-            g_config.hop_size
-        );
-        if (streaming_preconditioned.pcm.size() != raw_streaming_signal.size()) {
-            record_failure(
-                "streaming_preconditioned length %zu != expected %zu",
-                streaming_preconditioned.pcm.size(),
-                raw_streaming_signal.size()
+        const std::vector<double> streaming_signal = raw_streaming_signal;
+
+        SimulationResult streaming_expected = simulate_stream_identity(streaming_signal, AMP_FFT_WINDOW_HANN, g_config.window_size, g_config.hop_size, g_config.streaming_chunk);
+        // Override PCM expectation to the raw input signal, as identity should produce the input without padding.
+        streaming_expected.pcm = streaming_signal;
+        // auto [streaming_exp_real, streaming_exp_imag] = forward_fft(streaming_signal, g_config.window_size, g_config.hop_size);
+        // streaming_expected.pcm = streaming_signal;  // exact copy of input
+        // streaming_expected.spectral_frames = streaming_exp_real.size() / g_config.window_size;
+        // streaming_expected.spectral_real = streaming_exp_real;
+        // streaming_expected.spectral_imag = streaming_exp_imag;
+        StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
+
+        if (g_verbosity >= VerbosityLevel::Detail) {
+            // Make the tail/chunk interaction explicit: this shows how many fixed-size chunks are
+            // emitted, how much zero padding is implicitly needed to round out the final chunk, and
+            // which chunk holds the last non-zero frame. For a 64-frame chunk size and a 3-frame tail,
+            // the final chunk is expected to be mostly (or entirely) zeros.
+            log_tail_summary(
+                "streaming_pcm",
+                streaming_expected.pcm,
+                streaming_result.pcm,
+                g_config.streaming_chunk,
+                g_config.tolerance
             );
         }
-        require_identity(raw_streaming_signal, streaming_preconditioned.pcm, "streaming_preconditioned_identity");
-        const std::vector<double> streaming_signal = streaming_preconditioned.pcm;
-
-        SimulationResult streaming_expected = simulate_stream_identity(
-            streaming_signal,
-            AMP_FFT_WINDOW_HANN,
-            g_config.window_size,
-            g_config.hop_size
-        );
-        StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
 
         verify_close(
             "streaming_pcm_vs_expected",

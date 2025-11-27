@@ -1,0 +1,13 @@
+[fft_division_node][diag] config: window_size=4 frames=8 tolerance=0.0001 streaming_chunk=64 streaming_frames=4096 hop=2 overlap=0.500
+[FFT-TEST] wait_for_completion descriptor=fft_division_node expected=8 batches=1 channels=1
+[stream-trace] chunk=0 start_frame=0 frames=64
+[stream-trace] chunk=0 pcm[0000]= 0.000000000000
+[stream-trace] chunk=0 pcm[0001]= 0.123456789012
+[TEST-DIAG] before_populate pcm_tap=0x123 mailbox_head=0x0 cache=0x0 data=0x456
+[TEST-DIAG] after_populate pcm_read frames_committed=8 values_written=8 copied=0 aliased=0
+[TEST-DIAG] after_populate spectral_read frames_committed=2 values_written=8 copied=0 aliased=0
+[forward_metrics] observed delay=3 (expected=3 ignored)
+[streaming_metrics] observed delay=3 (expected=3 ignored)
+[MAILBOX-DUMP] chunk=0 start_frame=0 spectral_head=0x0
+[MAILBOX-DUMP] spectral node[0] ptr=0xabc frame=0 spectral=1 real0=0.123456 imag0=0.654321
+[fft_division_node][diag] frame expectations: N=8 W=4 H=2 first_pass_ready=3 simulator_total=4 committed=2
