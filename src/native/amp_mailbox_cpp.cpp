@@ -715,3 +715,77 @@ double amp_mailbox_node_pcm_sample(AmpMailboxNode node) {
 }
 
 #endif
+
+extern "C" AMP_CAPI void amp_mailbox_release_state(void* state) {
+    if (!state) return;
+    std::lock_guard<std::mutex> lock(g_states_mtx);
+    auto it = g_states.find(state);
+    if (it == g_states.end()) return;
+    MailboxStateWrapper* w = it->second;
+    // Free spectral chains
+    for (auto &kv : w->spectral_mailbox_chains) {
+        MailboxChainHead &head = kv.second;
+        PersistentMailboxNode* cur = head.head;
+        while (cur) {
+            PersistentMailboxNode* next = cur->next;
+            delete cur;
+            cur = next;
+        }
+        head.head = nullptr;
+        head.tail = nullptr;
+    }
+    // Free PCM chain
+    {
+        PersistentMailboxNode* cur = w->pcm_mailbox_chain.head;
+        while (cur) {
+            PersistentMailboxNode* next = cur->next;
+            delete cur;
+            cur = next;
+        }
+        w->pcm_mailbox_chain.head = nullptr;
+        w->pcm_mailbox_chain.tail = nullptr;
+    }
+    // Erase wrapper entry and delete wrapper
+    g_states.erase(it);
+    delete w;
+}
+
+extern "C" AMP_CAPI void amp_mailbox_global_reset(void) {
+    std::lock_guard<std::mutex> lock(g_states_mtx);
+    // Free all mailbox wrappers and their nodes
+    for (auto &kv : g_states) {
+        MailboxStateWrapper* w = kv.second;
+        // Free spectral chains
+        for (auto &s : w->spectral_mailbox_chains) {
+            MailboxChainHead &head = s.second;
+            PersistentMailboxNode* cur = head.head;
+            while (cur) {
+                PersistentMailboxNode* next = cur->next;
+                delete cur;
+                cur = next;
+            }
+            head.head = nullptr;
+            head.tail = nullptr;
+        }
+        // Free PCM chain
+        {
+            PersistentMailboxNode* cur = w->pcm_mailbox_chain.head;
+            while (cur) {
+                PersistentMailboxNode* next = cur->next;
+                delete cur;
+                cur = next;
+            }
+            w->pcm_mailbox_chain.head = nullptr;
+            w->pcm_mailbox_chain.tail = nullptr;
+        }
+        delete w;
+    }
+    g_states.clear();
+
+    // Free any mailbox-owned cache buffers
+    for (auto &kv : g_owned_cache_buffers) {
+        double *ptr = kv.second;
+        if (ptr) delete [] ptr;
+    }
+    g_owned_cache_buffers.clear();
+}

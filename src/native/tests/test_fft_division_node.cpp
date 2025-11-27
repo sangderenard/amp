@@ -1938,6 +1938,10 @@ int main(int argc, char **argv) {
         // streaming_expected.spectral_frames = streaming_exp_real.size() / g_config.window_size;
         // streaming_expected.spectral_real = streaming_exp_real;
         // streaming_expected.spectral_imag = streaming_exp_imag;
+        // Perform a full mailbox/global reset between single-shot and streaming
+        // to ensure no persistent chains,-owned buffers, or other mailbox
+        // artifacts survive into the streaming run.
+        amp_mailbox_global_reset();
         StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
 
         if (g_verbosity >= VerbosityLevel::Detail) {

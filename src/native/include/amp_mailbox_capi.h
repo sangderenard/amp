@@ -26,6 +26,17 @@ void amp_mailbox_append_pcm_node(void* state, AmpMailboxNode node);
 void amp_mailbox_set_tap_cursor(void* state, const char* tap_name, AmpMailboxNode node);
 AmpMailboxNode amp_mailbox_get_tap_cursor(void* state, const char* tap_name);
 
+// Release and free any persistent mailbox wrapper/state associated with
+// the given runtime `state` pointer. This removes internal persistent
+// chains so that newly-allocated node states that reuse the same
+// pointer address do not observe stale mailbox entries.
+AMP_CAPI void amp_mailbox_release_state(void* state);
+
+// Clear all persistent mailbox wrappers and mailbox-owned cache buffers.
+// Use this when you need a total reconstruction of mailbox/global state
+// (for example, between single-shot and streaming test phases).
+AMP_CAPI void amp_mailbox_global_reset(void);
+
 // Introspection / instrumentation
 // Return the number of nodes currently attached to the spectral chain for `tap_name`.
 size_t amp_mailbox_spectral_chain_length(void* state, const char* tap_name);

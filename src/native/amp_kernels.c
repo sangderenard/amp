@@ -2323,6 +2323,12 @@ static void release_node_state(node_state_t *state) {
     amp_node_mailbox_clear(state);
     amp_node_spectral_mailbox_clear(state);
 #if defined(__cplusplus)
+    // Ensure the persistent mailbox wrapper (used by test helpers) is
+    // released so its chains are not observed by subsequent node state
+    // allocations that may reuse the same pointer address.
+    amp_mailbox_release_state(state);
+#endif
+#if defined(__cplusplus)
     delete state;
 #else
     free(state);
