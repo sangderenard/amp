@@ -1,0 +1,1536 @@
+[fft_division_node][diag] config: window_size=4 frames=8 tolerance=0.0001 streaming_chunk=64 streaming_frames=128 hop=2 overlap=0.500
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[fft_stream_push_pcm] samples=11 W=4 H=2 offset=0 buf_size=11
+[fft_stream_push_pcm] backlog=11 available_frames=4 flush_mode=0 max_frames=11
+[fft_division_node][diag] original_raw_signal (frames=8)
+[fft_division_node][diag] raw[0000]=  0.000000000000
+[fft_division_node][diag] raw[0001]=  0.433883739118
+[fft_division_node][diag] raw[0002]=  0.781831482468
+[fft_division_node][diag] raw[0003]=  0.974927912182
+[fft_division_node][diag] raw[0004]=  0.974927912182
+[fft_division_node][diag] raw[0005]=  0.781831482468
+[fft_division_node][diag] raw[0006]=  0.433883739118
+[fft_division_node][diag] raw[0007]=  0.000000000000
+[fft_division_node][diag] cleaned_signal (frames=8)
+[fft_division_node][diag] cleaned[0000]=  0.000000000000
+[fft_division_node][diag] cleaned[0001]=  0.433883756399
+[fft_division_node][diag] cleaned[0002]=  0.781831502914
+[fft_division_node][diag] cleaned[0003]=  0.974927902222
+[fft_division_node][diag] cleaned[0004]=  0.974927902222
+[fft_division_node][diag] cleaned[0005]=  0.781831502914
+[fft_division_node][diag] cleaned[0006]=  0.433883756399
+[fft_division_node][diag] cleaned[0007]=  0.000000000000
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[fft_stream_push_pcm] samples=11 W=4 H=2 offset=0 buf_size=11
+[fft_stream_push_pcm] backlog=11 available_frames=4 flush_mode=0 max_frames=11
+[DIAG] run_fft_division_node: entry descriptor=000000660C6FE918 name=fft_division_node state=000001DFEDCA5780 frames=8
+[DIAG] fftdiv_start_worker: started thread 000001DFEDCA59D0
+[DIAG] run_fft_division_node: fftdiv_start_worker succeeded state=000001DFEDCA5780
+[DIAG] run_fft_division_node: pushed command pending=1 expected_entries=0 state=000001DFEDCA5780
+[DIAG] fftdiv_worker_main: started state=000001DFEDCA5780
+[DIAG] process_ready_work: thread_started=1 pending=1 active_command=0000000000000000 cached_valid=0
+[DIAG] process_ready_work: after-pop pending=0 active_command=000001DFEDCA50A0
+[STAGE0-WORKER] Processing command frames=8
+[STAGE0-WORKER] input.has_audio=0x00000003 frames=8 data=000001DFEDCA52F0
+[STAGE0-WORKER] input(has_audio=0x00000003, frames=8, data=000001DFEDCA52F0) consumed_once=0
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=0 wheel_len=2
+[FFT-STREAM-CREATE] slots=1 W=4 H=2 stage_frames=8 ring_frames=8
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[diag] fft_init_full: N=4 threads=1 lanes=1 allow_outer=0 allow_inner=0 inner_threads=0 pool_sz=0
+[STAGE1-FINAL-FLAG] W_fft=4 H_fft=2 H_work=1 L_istft=1 frame0_delay=3
+[LANE-PLAN] slot=0 ring=0 backlog=0 wheel_ready=0 pending_out=0
+[STAGE-LOCKS] frame_index=0 s1=1 s2=1 s3=1 s4=1 s5=1
+[STAGE1-START] frame_index=0 frames=8 slot_count=1 final_delivery=1
+[STAGE1-PROCESS] frame_index=0 slot=0
+[STAGE1-PCM-BACKLOG] slot=0 backlog_before=0 pending_before=0 reserve_target=8
+[STAGE1-PCM-BACKLOG] slot=0 appended=8 backlog_after=8 push_range=[0,8)
+[STAGE1-ZERO-TAIL] slot=0 tail_frames=2 total_ingested=10
+[STAGE1-PCM-PENDING] slot=0 pending_samples=10 consumed=0 backlog_size=10
+[STAGE1-INPUT] slot=0
+  PCM calling code put into command: pcm_backlog.size()=10
+  PCM stage 1 actually put into backend: pcm_consumed_samples=0
+  Samples pending to push to backend: pending_samples=10
+  Forward handle: 000001DFEDCA1E30
+[STAGE1-PCM] slot=0 frame=0 sample=0 value=0.000000
+[STAGE1-PCM] slot=0 frame=0 sample=1 value=0.433884
+[STAGE1-PCM] slot=0 frame=0 sample=2 value=0.781832
+[STAGE1-PCM] slot=0 frame=0 sample=3 value=0.974928
+[STAGE1-PCM] slot=0 frame=0 sample=4 value=0.974928
+[STAGE1-PCM] slot=0 frame=0 sample=5 value=0.781832
+[STAGE1-PCM] slot=0 frame=0 sample=6 value=0.433884
+[STAGE1-PCM] slot=0 frame=0 sample=7 value=0.000000
+[STAGE1-PCM] slot=0 frame=0 sample=8 value=0.000000
+[STAGE1-PCM] slot=0 frame=0 sample=9 value=0.000000
+[STAGE1-FFT-PREP] slot=0 input_samples=10 stage_capacity=8
+[fft_stream_push_pcm] samples=10 W=4 H=2 offset=0 buf_size=10
+[fft_stream_push_pcm] backlog=10 available_frames=4 flush_mode=0 max_frames=8
+[STAGE1-FFT] slot=0
+  Spectral data removed from backend: frames_emitted=4
+  FFT waiting in ring for Stage 2: forward_ring_filled=0
+[STAGE1-READY] slot=0
+  Spectral data made ready for Stage 2: forward_frames_ready=4
+[STAGE1-RING] slot=0 frames_ready=4 read=0 write=4 filled=4 capacity=8
+[STAGE2-START] frame_index=0 wheel_head=0 wheel_tail=0 wheel_filled=0 wheel_len=2 active_span=1
+[STAGE2-PROCESS] slot=0 frame=0
+[STAGE2-LANE] slot=0 active=1 ring_filled=4 remaining=4 frame_ready=1
+[STAGE2-BARRIER] ready=1 active=1 satisfied=1
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=0 re=0.911786 im=0
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=1 re=-0.586374 im=-0.325413
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=2 re=0.260961 im=0
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=3 re=-0.586374 im=0.325413
+[STAGE2-CONSUME] slot=0 read=1 filled=3 remaining=3
+[STAGE2-BACKPRESSURE] waiting head=1 tail=0 filled=1 span=1 len=2
+[STAGE3-START] FIFO walk tail=0 hop=1 len=2 stop_count=1
+[STAGE3-OP] t=0 lane=0 bin=0 re=0.911786 im=0
+[STAGE3-OP] t=0 lane=0 bin=1 re=-0.586374 im=-0.325413
+[STAGE3-OP] t=0 lane=0 bin=2 re=0.260961 im=0
+[STAGE3-OP] t=0 lane=0 bin=3 re=-0.586374 im=0.325413
+[STAGE3-END] visited=1
+[STAGE4-START] FIFO walk tail=0 hop=1 len=2 stop_count=1
+[STAGE3-CONTEXT] tensor_slice=0 view_filled=1 wheel(head=0 tail=0 len=2 hop=1) frame=0
+[STAGE3-CONTEXT] lane0 assigned_offset=0
+[STAGE4-EMIT-PRE] frame=3 slot=0 before_copy re[0]=0.911786 im[0]=0
+[STAGE4-EMIT-TENSOR] frame=3 slot=0 tensor=000001DFEDC9BE40 bins=4 page=0 lane=0 slice=0
+[STAGE4-EMIT-COPY] frame=3 slot=0 bin=0 tensor_re=0.911786 tensor_im=0
+[STAGE4-EMIT-COPY] frame=3 slot=0 bin=1 tensor_re=-0.586374 tensor_im=-0.325413
+[STAGE4-EMIT-COPY] frame=3 slot=0 bin=2 tensor_re=0.260961 tensor_im=0
+[STAGE4-EMIT-COPY] frame=3 slot=0 bin=3 tensor_re=-0.586374 tensor_im=0.325413
+[STAGE4-EMIT-POST] frame=3 slot=0 after_copy re[0]=0.911786 im[0]=0
+[MAILBOX-APPEND] spectral tap='spectral_0' frame=3 appended total=1 total_appends=1
+[STAGE4-SPEC-OUT] slot=0 frame=0 emit_row=3 bins=4
+[STAGE4-WHEEL-DELIVERY] reason=stage4-inline tail=1 filled=0 len=2
+[STAGE4-END] visited=1
+[STAGE5-PCM-ISTFT] slot=0 produced_pcm=2
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=0 value=0 queue_remaining=1
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=1 value=0.433884 queue_remaining=0
+[FFT-LATENCY] sample=0 W_fft=4 H_fft=2 H_work=1 delay=3
+[MAILBOX-APPEND] pcm frame=0 appended pcm_count=1 total_pcm_appends=1
+[MAILBOX-APPEND] pcm frame=1 appended pcm_count=2 total_pcm_appends=2
+[STAGE5-PCM-EMIT] pushed 2 individual frame entries
+[PIPELINE-ROUND] pcm_out=2 total_out=2 wheel_filled=0 unemitted=0
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=3 s34_unem=0 s5_spec=0 s5_pcmq=0 s5_out=2
+[STAGE5-PCM-MAILBOX] status=0 buffer=0000000000000000 channels=0
+[PUBLISH-ENTRY-DBG] buffer=0000000000000000 frames=8 channels=0 status=0 state=000001DFEDCA5780
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=8 wheel_len=2
+[LANE-PLAN] slot=0 ring=3 backlog=0 wheel_ready=0 pending_out=0
+[STAGE-LOCKS] frame_index=1 s1=1 s2=1 s3=0 s4=0 s5=0
+[STAGE1-START] frame_index=1 frames=8 slot_count=1 final_delivery=0
+[STAGE1-PROCESS] frame_index=1 slot=0
+[STAGE1-PCM-PENDING] slot=0 pending_samples=0 consumed=4 backlog_size=4
+[STAGE1-RING] slot=0 frames_ready=3 read=1 write=4 filled=3 capacity=8
+[STAGE2-START] frame_index=1 wheel_head=1 wheel_tail=1 wheel_filled=0 wheel_len=2 active_span=1
+[STAGE2-PROCESS] slot=0 frame=1
+[STAGE2-LANE] slot=0 active=1 ring_filled=3 remaining=3 frame_ready=1
+[STAGE2-BARRIER] ready=1 active=1 satisfied=1
+[STAGE2-SPEC-IN] slot=0 slice=1 bin=0 re=1.46239 im=0
+[STAGE2-SPEC-IN] slot=0 slice=1 bin=1 re=-0.731196 im=-0.731196
+[STAGE2-SPEC-IN] slot=0 slice=1 bin=3 re=-0.731196 im=0.731196
+[STAGE2-CONSUME] slot=0 read=2 filled=2 remaining=2
+[STAGE2-BACKPRESSURE] waiting head=0 tail=1 filled=1 span=1 len=2
+[STAGE3-SKIP] snapshot locked, deferring operator execution
+[STAGE4-SKIP] snapshot locked, deferring spectral emission
+[STAGE5-SKIP] snapshot locked, deferring ISTFT/PCM emit
+[STAGE5-PCM-DISPATCH] pcm_written=0 frames_to_push=0 (no-output)
+[STAGE5-PCM-EMIT] pushed 0 individual frame entries
+[PIPELINE-ROUND] pcm_out=0 total_out=2 wheel_filled=1 unemitted=1
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=2 s34_unem=1 s5_spec=0 s5_pcmq=0 s5_out=0
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=8 wheel_len=2
+[LANE-PLAN] slot=0 ring=2 backlog=0 wheel_ready=1 pending_out=0
+[STAGE-LOCKS] frame_index=2 s1=1 s2=1 s3=1 s4=1 s5=0
+[STAGE1-START] frame_index=2 frames=8 slot_count=1 final_delivery=0
+[STAGE1-PROCESS] frame_index=2 slot=0
+[STAGE1-PCM-PENDING] slot=0 pending_samples=0 consumed=4 backlog_size=4
+[STAGE1-RING] slot=0 frames_ready=2 read=2 write=4 filled=2 capacity=8
+[STAGE2-START] frame_index=2 wheel_head=0 wheel_tail=1 wheel_filled=1 wheel_len=2 active_span=1
+[STAGE2-BACKPRESSURE] waiting head=0 tail=1 filled=1 span=1 len=2
+[STAGE3-START] FIFO walk tail=1 hop=1 len=2 stop_count=1
+[STAGE3-OP] t=0 lane=0 bin=0 re=1.46239 im=0
+[STAGE3-OP] t=0 lane=0 bin=1 re=-0.731196 im=-0.731196
+[STAGE3-OP] t=0 lane=0 bin=3 re=-0.731196 im=0.731196
+[STAGE3-END] visited=1
+[STAGE4-START] FIFO walk tail=1 hop=1 len=2 stop_count=1
+[STAGE3-CONTEXT] tensor_slice=1 view_filled=1 wheel(head=1 tail=1 len=2 hop=1) frame=1
+[STAGE3-CONTEXT] lane0 assigned_offset=0
+[STAGE4-EMIT-PRE] frame=4 slot=0 before_copy re[0]=1.46239 im[0]=0
+[STAGE4-EMIT-TENSOR] frame=4 slot=0 tensor=000001DFEDC9BE40 bins=4 page=0 lane=0 slice=1
+[STAGE4-EMIT-COPY] frame=4 slot=0 bin=0 tensor_re=1.46239 tensor_im=0
+[STAGE4-EMIT-COPY] frame=4 slot=0 bin=1 tensor_re=-0.731196 tensor_im=-0.731196
+[STAGE4-EMIT-COPY] frame=4 slot=0 bin=2 tensor_re=0 tensor_im=0
+[STAGE4-EMIT-COPY] frame=4 slot=0 bin=3 tensor_re=-0.731196 tensor_im=0.731196
+[STAGE4-EMIT-POST] frame=4 slot=0 after_copy re[0]=1.46239 im[0]=0
+[MAILBOX-APPEND] spectral tap='spectral_0' frame=4 appended total=2 total_appends=2
+[STAGE4-SPEC-OUT] slot=0 frame=1 emit_row=4 bins=4
+[STAGE4-WHEEL-DELIVERY] reason=stage4-inline tail=0 filled=0 len=2
+[STAGE4-END] visited=1
+[STAGE5-SKIP] snapshot locked, deferring ISTFT/PCM emit
+[STAGE5-PCM-DISPATCH] pcm_written=0 frames_to_push=0 (no-output)
+[STAGE5-PCM-EMIT] pushed 0 individual frame entries
+[PIPELINE-ROUND] pcm_out=0 total_out=2 wheel_filled=0 unemitted=0
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=2 s34_unem=0 s5_spec=1 s5_pcmq=0 s5_out=0
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=8 wheel_len=2
+[LANE-PLAN] slot=0 ring=2 backlog=0 wheel_ready=0 pending_out=1
+[STAGE-LOCKS] frame_index=2 s1=1 s2=1 s3=0 s4=0 s5=1
+[STAGE1-START] frame_index=2 frames=8 slot_count=1 final_delivery=0
+[STAGE1-PROCESS] frame_index=2 slot=0
+[STAGE1-PCM-PENDING] slot=0 pending_samples=0 consumed=4 backlog_size=4
+[STAGE1-RING] slot=0 frames_ready=2 read=2 write=4 filled=2 capacity=8
+[STAGE2-START] frame_index=2 wheel_head=0 wheel_tail=0 wheel_filled=0 wheel_len=2 active_span=1
+[STAGE2-PROCESS] slot=0 frame=2
+[STAGE2-LANE] slot=0 active=1 ring_filled=2 remaining=2 frame_ready=1
+[STAGE2-BARRIER] ready=1 active=1 satisfied=1
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=0 re=0.911786 im=0
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=1 re=-0.325413 im=-0.586374
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=2 re=-0.260961 im=0
+[STAGE2-SPEC-IN] slot=0 slice=0 bin=3 re=-0.325413 im=0.586374
+[STAGE2-CONSUME] slot=0 read=3 filled=1 remaining=1
+[STAGE2-BACKPRESSURE] waiting head=1 tail=0 filled=1 span=1 len=2
+[STAGE3-SKIP] snapshot locked, deferring operator execution
+[STAGE4-SKIP] snapshot locked, deferring spectral emission
+[STAGE5-PCM-ISTFT] slot=0 produced_pcm=2
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=0 value=0.781832 queue_remaining=1
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=1 value=0.974928 queue_remaining=0
+[MAILBOX-APPEND] pcm frame=0 appended pcm_count=3 total_pcm_appends=3
+[MAILBOX-APPEND] pcm frame=1 appended pcm_count=4 total_pcm_appends=4
+[STAGE5-PCM-EMIT] pushed 2 individual frame entries
+[PIPELINE-ROUND] pcm_out=2 total_out=4 wheel_filled=1 unemitted=1
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=1 s34_unem=1 s5_spec=0 s5_pcmq=0 s5_out=2
+[PUBLISH-ENTRY-DBG] buffer=0000000000000000 frames=8 channels=0 status=0 state=000001DFEDCA5780
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=8 wheel_len=2
+[LANE-PLAN] slot=0 ring=1 backlog=0 wheel_ready=1 pending_out=0
+[STAGE-LOCKS] frame_index=3 s1=1 s2=1 s3=1 s4=1 s5=0
+[STAGE1-START] frame_index=3 frames=8 slot_count=1 final_delivery=0
+[STAGE1-PROCESS] frame_index=3 slot=0
+[STAGE1-PCM-PENDING] slot=0 pending_samples=0 consumed=4 backlog_size=4
+[STAGE1-RING] slot=0 frames_ready=1 read=3 write=4 filled=1 capacity=8
+[STAGE2-START] frame_index=3 wheel_head=1 wheel_tail=0 wheel_filled=1 wheel_len=2 active_span=1
+[STAGE2-BACKPRESSURE] waiting head=1 tail=0 filled=1 span=1 len=2
+[STAGE3-START] FIFO walk tail=0 hop=1 len=2 stop_count=1
+[STAGE3-OP] t=0 lane=0 bin=0 re=0.911786 im=0
+[STAGE3-OP] t=0 lane=0 bin=1 re=-0.325413 im=-0.586374
+[STAGE3-OP] t=0 lane=0 bin=2 re=-0.260961 im=0
+[STAGE3-OP] t=0 lane=0 bin=3 re=-0.325413 im=0.586374
+[STAGE3-END] visited=1
+[STAGE4-START] FIFO walk tail=0 hop=1 len=2 stop_count=1
+[STAGE3-CONTEXT] tensor_slice=0 view_filled=1 wheel(head=0 tail=0 len=2 hop=1) frame=2
+[STAGE3-CONTEXT] lane0 assigned_offset=0
+[STAGE4-EMIT-PRE] frame=5 slot=0 before_copy re[0]=0.911786 im[0]=0
+[STAGE4-EMIT-TENSOR] frame=5 slot=0 tensor=000001DFEDC9BE40 bins=4 page=0 lane=0 slice=0
+[STAGE4-EMIT-COPY] frame=5 slot=0 bin=0 tensor_re=0.911786 tensor_im=0
+[STAGE4-EMIT-COPY] frame=5 slot=0 bin=1 tensor_re=-0.325413 tensor_im=-0.586374
+[STAGE4-EMIT-COPY] frame=5 slot=0 bin=2 tensor_re=-0.260961 tensor_im=0
+[STAGE4-EMIT-COPY] frame=5 slot=0 bin=3 tensor_re=-0.325413 tensor_im=0.586374
+[STAGE4-EMIT-POST] frame=5 slot=0 after_copy re[0]=0.911786 im[0]=0
+[MAILBOX-APPEND] spectral tap='spectral_0' frame=5 appended total=3 total_appends=3
+[STAGE4-SPEC-OUT] slot=0 frame=2 emit_row=5 bins=4
+[STAGE4-WHEEL-DELIVERY] reason=stage4-inline tail=1 filled=0 len=2
+[STAGE4-END] visited=1
+[STAGE5-SKIP] snapshot locked, deferring ISTFT/PCM emit
+[STAGE5-PCM-DISPATCH] pcm_written=0 frames_to_push=0 (no-output)
+[STAGE5-PCM-EMIT] pushed 0 individual frame entries
+[PIPELINE-ROUND] pcm_out=0 total_out=4 wheel_filled=0 unemitted=0
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=1 s34_unem=0 s5_spec=1 s5_pcmq=0 s5_out=0
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=8 wheel_len=2
+[LANE-PLAN] slot=0 ring=1 backlog=0 wheel_ready=0 pending_out=1
+[STAGE-LOCKS] frame_index=3 s1=1 s2=1 s3=0 s4=0 s5=1
+[STAGE1-START] frame_index=3 frames=8 slot_count=1 final_delivery=0
+[STAGE1-PROCESS] frame_index=3 slot=0
+[STAGE1-PCM-PENDING] slot=0 pending_samples=0 consumed=4 backlog_size=4
+[STAGE1-RING] slot=0 frames_ready=1 read=3 write=4 filled=1 capacity=8
+[STAGE2-START] frame_index=3 wheel_head=1 wheel_tail=1 wheel_filled=0 wheel_len=2 active_span=1
+[STAGE2-PROCESS] slot=0 frame=3
+[STAGE2-LANE] slot=0 active=1 ring_filled=1 remaining=1 frame_ready=1
+[STAGE2-BARRIER] ready=1 active=1 satisfied=1
+[STAGE2-SPEC-IN] slot=0 slice=1 bin=0 re=9.18485e-17 im=0
+[STAGE2-SPEC-IN] slot=0 slice=1 bin=1 re=-4.01483e-24 im=-9.18485e-17
+[STAGE2-SPEC-IN] slot=0 slice=1 bin=2 re=-9.18485e-17 im=0
+[STAGE2-SPEC-IN] slot=0 slice=1 bin=3 re=4.01483e-24 im=9.18485e-17
+[STAGE2-CONSUME] slot=0 read=4 filled=0 remaining=0
+[STAGE2-BACKPRESSURE] waiting head=0 tail=1 filled=1 span=1 len=2
+[STAGE3-SKIP] snapshot locked, deferring operator execution
+[STAGE4-SKIP] snapshot locked, deferring spectral emission
+[STAGE5-PCM-ISTFT] slot=0 produced_pcm=2
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=0 value=0.974928 queue_remaining=1
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=1 value=0.781832 queue_remaining=0
+[MAILBOX-APPEND] pcm frame=0 appended pcm_count=5 total_pcm_appends=5
+[MAILBOX-APPEND] pcm frame=1 appended pcm_count=6 total_pcm_appends=6
+[STAGE5-PCM-EMIT] pushed 2 individual frame entries
+[PIPELINE-ROUND] pcm_out=2 total_out=6 wheel_filled=1 unemitted=1
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=0 s34_unem=1 s5_spec=0 s5_pcmq=0 s5_out=2
+[PUBLISH-ENTRY-DBG] buffer=0000000000000000 frames=8 channels=0 status=0 state=000001DFEDCA5780
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=8 wheel_len=2
+[LANE-PLAN] slot=0 ring=0 backlog=0 wheel_ready=1 pending_out=0
+[STAGE-LOCKS] frame_index=4 s1=0 s2=0 s3=1 s4=1 s5=0
+[STAGE1-SKIP] snapshot locked, deferring PCM -> FFT ingest
+[STAGE2-SKIP] snapshot locked, deferring wheel ingestion
+[STAGE3-START] FIFO walk tail=1 hop=1 len=2 stop_count=1
+[STAGE3-OP] t=0 lane=0 bin=0 re=9.18485e-17 im=0
+[STAGE3-OP] t=0 lane=0 bin=1 re=-4.01483e-24 im=-9.18485e-17
+[STAGE3-OP] t=0 lane=0 bin=2 re=-9.18485e-17 im=0
+[STAGE3-OP] t=0 lane=0 bin=3 re=4.01483e-24 im=9.18485e-17
+[STAGE3-END] visited=1
+[STAGE4-START] FIFO walk tail=1 hop=1 len=2 stop_count=1
+[STAGE3-CONTEXT] tensor_slice=1 view_filled=1 wheel(head=1 tail=1 len=2 hop=1) frame=3
+[STAGE3-CONTEXT] lane0 assigned_offset=0
+[STAGE4-EMIT-PRE] frame=6 slot=0 before_copy re[0]=9.18485e-17 im[0]=0
+[STAGE4-EMIT-TENSOR] frame=6 slot=0 tensor=000001DFEDC9BE40 bins=4 page=0 lane=0 slice=1
+[STAGE4-EMIT-COPY] frame=6 slot=0 bin=0 tensor_re=9.18485e-17 tensor_im=0
+[STAGE4-EMIT-COPY] frame=6 slot=0 bin=1 tensor_re=-4.01483e-24 tensor_im=-9.18485e-17
+[STAGE4-EMIT-COPY] frame=6 slot=0 bin=2 tensor_re=-9.18485e-17 tensor_im=0
+[STAGE4-EMIT-COPY] frame=6 slot=0 bin=3 tensor_re=4.01483e-24 tensor_im=9.18485e-17
+[STAGE4-EMIT-POST] frame=6 slot=0 after_copy re[0]=9.18485e-17 im[0]=0
+[MAILBOX-APPEND] spectral tap='spectral_0' frame=6 appended total=4 total_appends=4
+[STAGE4-SPEC-OUT] slot=0 frame=3 emit_row=6 bins=4
+[STAGE4-WHEEL-DELIVERY] reason=stage4-inline tail=0 filled=0 len=2
+[STAGE4-END] visited=1
+[STAGE5-SKIP] snapshot locked, deferring ISTFT/PCM emit
+[STAGE5-PCM-DISPATCH] pcm_written=0 frames_to_push=0 (no-output)
+[STAGE5-PCM-EMIT] pushed 0 individual frame entries
+[PIPELINE-ROUND] pcm_out=0 total_out=6 wheel_filled=0 unemitted=0
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=0 s34_unem=0 s5_spec=1 s5_pcmq=0 s5_out=0
+[FFT-CONFIG] W=4 working_freq_bins=4 working_time_slices=2 working_hop=1 backend_hop=2 pcm_block=8 stage_frames=8 ring_frames=8 wheel_len=2
+[LANE-PLAN] slot=0 ring=0 backlog=0 wheel_ready=0 pending_out=1
+[STAGE-LOCKS] frame_index=4 s1=0 s2=0 s3=0 s4=0 s5=1
+[STAGE1-SKIP] snapshot locked, deferring PCM -> FFT ingest
+[STAGE2-SKIP] snapshot locked, deferring wheel ingestion
+[STAGE3-SKIP] snapshot locked, deferring operator execution
+[STAGE4-SKIP] snapshot locked, deferring spectral emission
+[STAGE5-PCM-ISTFT] slot=0 produced_pcm=2
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=0 value=0.433884 queue_remaining=1
+[STAGE5-PCM-QUEUE] slot=0 buffer_idx=1 value=1.22465e-16 queue_remaining=0
+[MAILBOX-APPEND] pcm frame=0 appended pcm_count=7 total_pcm_appends=7
+[MAILBOX-APPEND] pcm frame=1 appended pcm_count=8 total_pcm_appends=8
+[STAGE5-PCM-EMIT] pushed 2 individual frame entries
+[PIPELINE-ROUND] pcm_out=2 total_out=8 wheel_filled=0 unemitted=0
+[PIPELINE-SLOT] idx=0 s1_pcm=0 s1_ring=0 s34_unem=0 s5_spec=0 s5_pcmq=0 s5_out=2
+[TAP-BLOCK-INIT] t=213ms tap=000000660C6FE540 tap_name='pcm' mailbox_head=000001DFEDC9BC10 cache=0000000000000000 owned=0 expected=8 available=8 ready=1
+[PUBLISH-ENTRY-DBG] buffer=0000000000000000 frames=8 channels=0 status=0 state=000001DFEDCA5780
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[TAP-ALLOC] t=215ms tap_name='pcm' tap=000000660C6FE540 buf=000001DFEDCA0C90 len=8 mailbox_owned=1
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[TAP-FILL] t=3588311523ms tap=000000660C6FE540 cache=000001DFEDCA0C90 owned=1 written=8 capacity=8 from_head=000001DFEDC9BC10
+[TAP-BLOCK] t=221ms tap_name='pcm' resolved='' expected=8 available=8 ready=1 filled=8 elapsed_ms=221
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: timed-wait expired state=000001DFEDCA5780 pending=0 pipeline_can_advance=0
+[DIAG] fftdiv_worker_main: woke from cv state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: loop did_work=0 pending=0 active=0000000000000000
+[DIAG] process_ready_work: thread_started=1 pending=0 active_command=0000000000000000 cached_valid=1
+[DIAG] process_ready_work: after-pop pending=0 active_command=0000000000000000
+[STAGE-LOCKS] s1=0 s2=0 s3=0 s4=0 s5=0
+[DIAG] fftdiv_worker_main: about to wait state=000001DFEDCA5780 stop_requested=0 active_command=0000000000000000 pending=0 pipeline_can_advance=0

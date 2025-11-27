@@ -489,13 +489,42 @@
                         final_tail_plan.window_size,
                         final_tail_plan.istft_tail_frames);
                     if (tail_frames > 0U) {
+                        slot_state.pending_zero_tail_frames = tail_frames;
+                        slot_state.ingest_finalized = true;
+                    }
+                }
+                // If a pending tail is registered, append it only when no real input
+                // is waiting and capacity permits, so tail always sits behind data.
+                const size_t pending_samples_before_tail = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
+                    ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
+                    : 0U;
+                const bool tail_can_append = (slot_state.pending_zero_tail_frames > 0U)
+                    && (pending_samples_before_tail == 0U)
+                    && (slot_state.forward_ring_filled == 0U)
+                    && (slot_state.forward_handle == NULL
+                        || amp_fft_backend_stream_pending_pcm(slot_state.forward_handle) == 0U);
+                if (tail_can_append) {
+                    const size_t backlog_limit = fftdiv_pcm_backlog_limit(state);
+                    const size_t backlog_size = slot_state.pcm_backlog.size();
+                    size_t capacity = 0U;
+                    if (backlog_limit == 0U || backlog_size < backlog_limit) {
+                        const size_t available = (backlog_limit > 0U && backlog_limit > backlog_size)
+                            ? (backlog_limit - backlog_size)
+                            : slot_state.pending_zero_tail_frames;
+                        capacity = available;
+                    }
+                    if (capacity > slot_state.pending_zero_tail_frames) {
+                        capacity = slot_state.pending_zero_tail_frames;
+                    }
+                    if (capacity > 0U) {
                         const bool already_enqueued = slot_state.zero_tail_enqueued;
-                        fftdiv_stage1_append_zero_tail(state, slot_state, tail_frames);
+                        fftdiv_stage1_append_zero_tail(state, slot_state, capacity);
+                        slot_state.pending_zero_tail_frames -= capacity;
                         if (!already_enqueued && slot_state.zero_tail_enqueued) {
                             FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                                        "[STAGE1-ZERO-TAIL] slot=%d tail_frames=%zu total_ingested=%zu\n",
                                        slot,
-                                       tail_frames,
+                                       capacity,
                                        slot_state.total_ingested_samples);
                         }
                     }
@@ -621,6 +650,10 @@
                                    slot,
                                    pending_samples,
                                    stage_capacity_frames);
+                        const bool stage1_expect_signal =
+                            (pcm_source != NULL)
+                            ? fftdiv_block_has_signal(pcm_source, pending_samples)
+                            : false;
                         frames_emitted = amp_fft_backend_stream_push(
                             slot_state.forward_handle,
                             pcm_source,
@@ -644,7 +677,8 @@
                                 slot_spectral_real,
                                 slot_spectral_imag,
                                 frames_emitted,
-                                window_size);
+                                window_size,
+                                stage1_expect_signal);
                             const double *ring_real = fftdiv_ring_frame_real(slot_state, 0U, window_size);
                             const double *ring_imag = fftdiv_ring_frame_imag(slot_state, 0U, window_size);
                             if (ring_real != NULL && ring_imag != NULL) {
@@ -996,7 +1030,15 @@
         slice.wheel_head = wheel_head_cursor;
         slice.wheel_tail = wheel_tail_cursor;
         slice.frame_index = frame_index_iter;
-        slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)slot_count;
+        /* Convert spectral frame index to PCM-sample index using backend_hop.
+           This keeps the timebase for pcm_sample_index strictly in PCM samples
+           (mono, non-interleaved), avoiding confusion with spectral-frame indices. */
+        {
+            const int backend_hop_local = (state->u.fftdiv.backend_hop > 0)
+                ? state->u.fftdiv.backend_hop
+                : 1;
+            slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)backend_hop_local;
+        }
         slice.slice_index = next_slice_index;
         slice.timeline_seconds = timeline_cursor;
         slice.working_tensor_updated = iteration_updated;
@@ -1007,6 +1049,14 @@
             auto &lane_meta = state->u.fftdiv.lane_plan[(size_t)slot];
             auto &lane_snapshot = slice.lanes[(size_t)slot];
             lane_snapshot.frame_ready = lane_meta.frame_ready;
+            if (lane_snapshot.frame_ready) {
+                const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
+                    ? lane_frame_offsets[(size_t)slot]
+                    : 0U;
+                lane_snapshot.expect_signal = fftdiv_ring_frame_expect_signal(
+                    state->u.fftdiv.stream_slots[(size_t)slot],
+                    frame_offset);
+            }
             if ((size_t)slot < slice.lane_frame_offsets.size()) {
                 const size_t frame_offset = (size_t)slot < lane_frame_offsets.size()
                     ? lane_frame_offsets[(size_t)slot]
@@ -1157,6 +1207,13 @@
                                "[STAGE3-CONTEXT] lane0 assigned_offset=%zu\n",
                                slice.lane_frame_offsets[0]);
                 }
+                    /* Provide a concise, stage-prefixed context line containing
+                       execution parameters relevant to Stage 3 (spectral->PCM
+                       alignment). Keep this stage-prefixed so logs remain
+                       queryable by stage. */
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+                               "[STAGE3-CTX] wheel_length=%d wheel_filled=%d wheel_hop=%d window_size=%d backend_hop=%d input_channels=%d\n",
+                               wheel_length, wheel_filled, wheel_hop, window_size, (int)state->u.fftdiv.backend_hop, input_channels);
             }
             const int tensor_slice_iter = slice.tensor_slice;
             const int scratch_slice_iter = slice.scratch_slice;
@@ -1387,37 +1444,58 @@
     }
     
     // Push one mailbox entry per frame (only push what was actually written)
+    // Stage5-specific debug: how many PCM samples were produced this round
+    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[STAGE5-PCM-DBG] pcm_written=%zu\n",
+               pcm_written_samples);
+    for (size_t s = 0; s < state->u.fftdiv.stream_slots.size(); ++s) {
+        const auto &slot = state->u.fftdiv.stream_slots[s];
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[STAGE5-PCM-SLOT] idx=%zu forward_pending_frames=%zu forward_ring_filled=%zu pending_spectra=%zu inverse_queue=%zu forward_handle=%p forward_pending_base=%lld expect_signal=%d\n",
+                   s,
+                   slot.forward_pending_frames,
+                   slot.forward_ring_filled,
+                   slot.pending_spectra.size(),
+                   slot.inverse_queue.size(),
+                   (void*)slot.forward_handle,
+                   (long long)slot.forward_pending_frame_index_base,
+                   slot.forward_pending_expect_signal ? 1 : 0);
+    }
+    // Dump wheel slice metadata flags
+    for (size_t si = 0; si < state->u.fftdiv.wheel_slice_metadata.size(); ++si) {
+        const auto &slice = state->u.fftdiv.wheel_slice_metadata[si];
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
+                   "[STAGE5-PCM-SLICE] idx=%zu valid=%d stage4_emitted=%d lanes=%zu frame_index=%lld\n",
+                   si,
+                   slice.valid ? 1 : 0,
+                   slice.stage4_emitted ? 1 : 0,
+                   slice.lanes.size(),
+                   (long long)slice.frame_index_base);
+    }
     size_t frames_to_push = pcm_written_samples;
-    if (pcm_written_samples == 0 || pcm_written_samples > 1000) {
+    if (pcm_written_samples == 0) {
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
+               "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu (no-output)\n",
+                   pcm_written_samples, frames_to_push);
+    } else if (pcm_written_samples > 1000) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu ANOMALY\n",
                    pcm_written_samples, frames_to_push);
     }
+    // Emit persistent PCM mailbox nodes only. Tests/harness should not rely
+    // on legacy AmpMailboxEntry list anymore — taps read from the persistent
+    // pcm mailbox chain owned by the node.
     for (size_t i = 0; i < frames_to_push; ++i) {
-        double *frame_buffer = (double *)malloc(input_channels * sizeof(double));
-        if (frame_buffer == NULL) {
-            free(buffer);
-            return -1;
-        }
-        for (int ch = 0; ch < input_channels; ++ch) {
-            frame_buffer[ch] = buffer[i * input_channels + ch];
-        }
-        AmpMailboxEntry *entry = amp_mailbox_entry_create(
-            frame_buffer,
-            input_channels,
-            1,  // One frame per entry
-            0,
-            metrics,
-            NULL,
-            NULL
-        );
-        if (entry != NULL) {
-            amp_node_mailbox_push(state, entry);
-        } else {
-            free(frame_buffer);
-            free(buffer);
-            return -1;
-        }
+        // Choose first channel sample as the PCM value for persistent node.
+        double pcm_sample = buffer[i * input_channels + 0];
+        // Use absolute frame index based on wheel_frame_counter as the frame id.
+        int frame_index = (int)(state->u.fftdiv.wheel_frame_counter + (int)i);
+        AmpMailboxNode pcm_node = amp_mailbox_create_pcm_node(pcm_sample, frame_index);
+        amp_mailbox_append_pcm_node((void*)state, pcm_node);
+        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                   "[STAGE5-PCM-MAILBOX] frame=%d appended sample=%.6g\n",
+                   frame_index,
+                   pcm_sample);
     }
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                "[STAGE5-PCM-EMIT] pushed %zu individual frame entries\n",

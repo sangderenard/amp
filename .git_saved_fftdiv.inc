@@ -1,7 +1,4 @@
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include "fft_division_delay_math.h"
 #include "amp_native.h" // for EdgeRunnerParamView, node_state_t
 
@@ -12,10 +9,8 @@
 #include <algorithm>
 #include <vector>
 #include <map>
-#include <unordered_set>
 #include <string>
 #include "amp_native_mailbox_chain.hpp"
-#include "fft_division_mailbox_helpers.h"
 // C++-only: Per-tap mailbox read cursor state
 // C++-only: Extend node state for tap mailbox cursors
 // (You may need to add this to the actual node state struct in the header; here we assume it's available as state->u.fftdiv.tap_mailbox_cursors)
@@ -85,8 +80,8 @@ typedef struct {
 #if FFTDIV_TRACE_ENABLED
 #define FFTDIV_TRACE(...)                                                        \
     do {                                                                         \
-        fprintf(stdout, __VA_ARGS__);                                            \
-        fprintf(stdout, "\n");                                                \
+        fprintf(stderr, __VA_ARGS__);                                            \
+        fprintf(stderr, "\n");                                                \
         fflush(stderr);                                                          \
     } while (0)
 #else
@@ -161,7 +156,7 @@ static int fftdiv_should_log(const node_state_t *state, int required_level) {
 #define FFTDIV_LOG(state_ptr, level, ...)                                      \
     do {                                                                       \
         if (fftdiv_should_log((state_ptr), (level))) {                          \
-            fprintf(stdout, __VA_ARGS__);                                       \
+            fprintf(stderr, __VA_ARGS__);                                       \
         }                                                                      \
     } while (0)
 
@@ -190,7 +185,7 @@ static void fftdiv_abort_if_halt_requested(node_state_t *state, const char *cont
         return;
     }
     if (context != nullptr) {
-        fprintf(stdout, "[fftdiv-halt] context=%s aborting immediately\n", context);
+        fprintf(stderr, "[fftdiv-halt] context=%s aborting immediately\n", context);
     }
     abort();
 }
@@ -263,7 +258,7 @@ static void fftdiv_stage_trigger_halt(
                    re,
                    im);
     }
-    fprintf(stdout,
+    fprintf(stderr,
             "[fftdiv-stage-halt] stage=%s slot=%d frame=%zu reason=%s samples=%zu\n",
             stage_name,
             slot,
@@ -273,7 +268,7 @@ static void fftdiv_stage_trigger_halt(
     for (size_t i = 0; i < sample_cap; ++i) {
         const double re = (probe_real != NULL) ? probe_real[i] : 0.0;
         const double im = (probe_imag != NULL) ? probe_imag[i] : 0.0;
-        fprintf(stdout,
+        fprintf(stderr,
                 "[fftdiv-stage-halt] sample[%zu]=%.12g%+.12gi\n",
                 i,
                 re,
@@ -549,14 +544,14 @@ static void tap_buffer_write_row(
     double *frame_ptr = buffer->data + (size_t)frame_index * stride;
     double *batch_ptr = frame_ptr + (size_t)batch * channels;
 #if FFTDIV_TRACE_ENABLED
-        fprintf(stdout, "[TAP-WRITE] buf=%p frames=%u chans=%u stride=%zu batch=%d frame=%d dst=%p copy=%zu src=%p\n",
+        fprintf(stderr, "[TAP-WRITE] buf=%p frames=%u chans=%u stride=%zu batch=%d frame=%d dst=%p copy=%zu src=%p\n",
             (void*)buffer->data, buffer->shape.frames, buffer->shape.channels, stride, batch, frame_index, (void*)batch_ptr, (size_t)(value_count <= (int)channels ? value_count : channels), (const void*)src);
         double before0 = batch_ptr[0];
 #endif
         memcpy(batch_ptr, src, copy * sizeof(double));
 #if FFTDIV_TRACE_ENABLED
         double after0 = batch_ptr[0];
-        fprintf(stdout, "[TAP-WRITE-VERIFY] frame=%d dst[0] before=%.6g after=%.6g src0=%.6g\n",
+        fprintf(stderr, "[TAP-WRITE-VERIFY] frame=%d dst[0] before=%.6g after=%.6g src0=%.6g\n",
             frame_index, before0, after0, src[0]);
 #endif
     if (copy < channels) {
@@ -670,9 +665,18 @@ static void fftdiv_trim_pcm_backlog(
     }
     const size_t guard = window_size;
     size_t trim_target = 0U;
-    // Only trim already-consumed history beyond a one-window guard.
     if (pcm_consumed_samples > guard) {
         trim_target = pcm_consumed_samples - guard;
+    }
+    size_t backlog_limit = fftdiv_pcm_backlog_limit(state);
+    if (backlog_limit > 0U && backlog_limit < guard) {
+        backlog_limit = guard;
+    }
+    if (backlog_limit > 0U && pcm_backlog.size() > backlog_limit) {
+        const size_t overflow = pcm_backlog.size() - backlog_limit;
+        if (overflow > trim_target) {
+            trim_target = overflow;
+        }
     }
     if (trim_target == 0U) {
         return;
@@ -724,13 +728,16 @@ static void fftdiv_ring_append_frames(
 
     const std::size_t bins = (std::size_t)window_size;
 
-    // Do not silently clobber the ring when callers attempt to append
-    // more frames than the ring can hold; treat that as a hard error.
-    if (frames > capacity_frames) {
-        FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
-                   "[ERROR] fftdiv_ring_append_frames: frames (%zu) > capacity_frames (%zu)",
-                   frames, capacity_frames);
-        std::abort();
+    if (frames >= capacity_frames) {
+        // Keep only the most recent frames.
+        const std::size_t skip = frames - capacity_frames;
+        stage_real += skip * bins;
+        stage_imag += skip * bins;
+        frames = capacity_frames;
+        read = 0U;
+        write = 0U;
+        filled = 0U;
+        slot.forward_ring_wrapped = true;
     }
 
     const std::size_t free_frames = (filled < capacity_frames) ? (capacity_frames - filled) : 0U;
@@ -1416,7 +1423,7 @@ static void fftdiv_prepare_lane_plan(
                     break;
                 }
             }
-            fprintf(stdout,
+            fprintf(stderr,
                     "[LANE-PLAN] slot=%d ring=%zu backlog=%zu wheel_ready=%d pending_out=%d\n",
                     slot,
                     (size_t)slot_state.forward_ring_filled,
@@ -1693,10 +1700,18 @@ static int fftdiv_execute_block(
     );
     size_t backlog_cycles = (backlog_cycles_param > 0) ? (size_t)backlog_cycles_param : 1U;
     state->u.fftdiv.stream_backlog_cycles = backlog_cycles;
-    // Prefer the backend hop for STFT/back-end frame calculations. The
-    // `backend_hop` parameter controls how many PCM samples correspond to
-    // one backend spectral frame; use that to compute frames-per-block and
-    // related capacities. Default to `working_hop` if backend_hop is unset.
+    size_t hop_stride = (size_t)(working_hop > 0 ? working_hop : 1);
+    size_t frames_per_block = (requested_pcm_block + hop_stride - 1U) / hop_stride;
+    if (frames_per_block == 0U) {
+        frames_per_block = 1U;
+    }
+    size_t desired_frame_capacity = frames_per_block * state->u.fftdiv.stream_backlog_cycles;
+    if (desired_frame_capacity == 0U) {
+        desired_frame_capacity = frames_per_block;
+    }
+    state->u.fftdiv.stream_max_pcm_block = requested_pcm_block;
+    state->u.fftdiv.stream_max_fft_frames = desired_frame_capacity;
+    // Configure backend hop: prefer explicit backend_hop; default to working_hop
     int backend_hop = json_get_int(
         descriptor->params_json,
         descriptor->params_len,
@@ -1709,18 +1724,6 @@ static int fftdiv_execute_block(
     if (backend_hop > window_size) {
         backend_hop = window_size;
     }
-    // hop_stride is the number of PCM samples per backend spectral frame
-    size_t hop_stride = (size_t)(backend_hop > 0 ? backend_hop : 1);
-    size_t frames_per_block = (requested_pcm_block + hop_stride - 1U) / hop_stride;
-    if (frames_per_block == 0U) {
-        frames_per_block = 1U;
-    }
-    size_t desired_frame_capacity = frames_per_block * state->u.fftdiv.stream_backlog_cycles;
-    if (desired_frame_capacity == 0U) {
-        desired_frame_capacity = frames_per_block;
-    }
-    state->u.fftdiv.stream_max_pcm_block = requested_pcm_block;
-    state->u.fftdiv.stream_max_fft_frames = desired_frame_capacity;
     state->u.fftdiv.backend_hop = backend_hop;
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
         "[FFT-CONFIG] W=%d working_freq_bins=%d working_time_slices=%d working_hop=%d backend_hop=%d pcm_block=%zu stage_frames=%zu ring_frames=%zu wheel_len=%d\n",
@@ -1904,13 +1907,7 @@ static int fftdiv_execute_block(
 
     const int64_t frame_counter = state->u.fftdiv.wheel_frame_counter;
     int frame_index_int = (int)frame_counter;
-    // Input buffer indexing stays local to the current call (base_index = 0),
-    // but PCM mailboxes and diagnostics need the absolute frame offset so
-    // downstream consumers can stitch together streaming chunks correctly.
     size_t base_index = 0;
-    const size_t pcm_frame_offset = (frame_counter > 0)
-        ? static_cast<size_t>(frame_counter)
-        : 0U;
     int metrics_window_span = 0;
 #if defined(__cplusplus)
         fftdiv_prepare_operator_frame(state);
@@ -1995,36 +1992,35 @@ static int fftdiv_execute_block(
                 const size_t hop = (size_t)slot_count;
                 double *pcm_cursor = lane_pcm_batch.data() + (size_t)slot * (size_t)frames;
                 if (audio_base != NULL && frames > 0) {
-            const size_t backlog_growth = (size_t)frames;
-            const size_t backlog_before = slot_state.pcm_backlog.size();
-            const size_t reserve_target = backlog_before + backlog_growth;
-            const size_t pending_before = (backlog_before > slot_state.pcm_consumed_samples)
-                ? (backlog_before - slot_state.pcm_consumed_samples)
-                : 0U;
-            FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
-                       "[STAGE1-PCM-BACKLOG] slot=%d backlog_before=%zu pending_before=%zu reserve_target=%zu\n",
-                       slot,
-                       backlog_before,
-                       pending_before,
-                       reserve_target);
-            if (reserve_target > slot_state.pcm_backlog.capacity()) {
-                try {
-                    slot_state.pcm_backlog.reserve(reserve_target);
-                } catch (...) {
-                    // Ignore reserve failures; push_back will retry allocations as needed.
-                }
-            }
-            for (int frame_cursor = 0; frame_cursor < frames; ++frame_cursor) {
-                const size_t source_frame = slot_state.input_frame_cursor + (size_t)frame_cursor;
-                // Index into the chunk-local buffer; audio_base only spans `frames` samples
-                const size_t audio_index = (size_t)frame_cursor * hop + (size_t)slot;
-                double input_sample = 0.0;
-                if (audio_index < (size_t)slot_count * (size_t)frames) {
-                    input_sample = audio_base[audio_index];
-                }
-                pcm_cursor[frame_cursor] = input_sample;
-                slot_state.pcm_backlog.push_back(input_sample);
-            }
+                    const size_t backlog_growth = (size_t)frames;
+                    const size_t backlog_before = slot_state.pcm_backlog.size();
+                    const size_t reserve_target = backlog_before + backlog_growth;
+                    const size_t pending_before = (backlog_before > slot_state.pcm_consumed_samples)
+                        ? (backlog_before - slot_state.pcm_consumed_samples)
+                        : 0U;
+                    FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                               "[STAGE1-PCM-BACKLOG] slot=%d backlog_before=%zu pending_before=%zu reserve_target=%zu\n",
+                               slot,
+                               backlog_before,
+                               pending_before,
+                               reserve_target);
+                    if (reserve_target > slot_state.pcm_backlog.capacity()) {
+                        try {
+                            slot_state.pcm_backlog.reserve(reserve_target);
+                        } catch (...) {
+                            // Ignore reserve failures; push_back will retry allocations as needed.
+                        }
+                    }
+                    for (int frame_cursor = 0; frame_cursor < frames; ++frame_cursor) {
+                        const size_t source_frame = slot_state.input_frame_cursor + (size_t)frame_cursor;
+                        const size_t audio_index = source_frame * hop + (size_t)slot;
+                        double input_sample = 0.0;
+                        if (audio_index < (size_t)slot_count * (size_t)frames) {
+                            input_sample = audio_base[audio_index];
+                        }
+                        pcm_cursor[frame_cursor] = input_sample;
+                        slot_state.pcm_backlog.push_back(input_sample);
+                    }
                     const size_t backlog_after = slot_state.pcm_backlog.size();
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                                "[STAGE1-PCM-BACKLOG] slot=%d appended=%zu backlog_after=%zu push_range=[%zu,%zu)\n",
@@ -2033,7 +2029,7 @@ static int fftdiv_execute_block(
                                backlog_after,
                                backlog_before,
                                backlog_after);
-            slot_state.input_frame_cursor += (size_t)frames;
+                    slot_state.input_frame_cursor += (size_t)frames;
                     slot_state.total_ingested_samples += backlog_growth;
                 }
                 // Append tail zeros immediately after input PCM, before calculating pending_samples
@@ -2087,26 +2083,15 @@ static int fftdiv_execute_block(
                         }
                     }
                 }
-                // Clamp cursors after any zero-tail enqueue so pending_samples reflects real backlog.
-                const size_t backlog_size = slot_state.pcm_backlog.size();
-                if (slot_state.pcm_consumed_samples > backlog_size) {
-                    slot_state.pcm_consumed_samples = backlog_size;
-                }
-                const size_t max_push_cursor = (backlog_size > slot_state.pcm_consumed_samples)
-                    ? (backlog_size - slot_state.pcm_consumed_samples)
-                    : 0U;
-                if (slot_state.pcm_push_cursor > max_push_cursor) {
-                    slot_state.pcm_push_cursor = max_push_cursor;
-                }
-                const size_t pending_samples = (backlog_size > slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor)
-                    ? (backlog_size - (slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor))
+                const size_t pending_samples = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
+                    ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
                     : 0U;
                 FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
                            "[STAGE1-PCM-PENDING] slot=%d pending_samples=%zu consumed=%zu backlog_size=%zu\n",
                            slot,
                            pending_samples,
                            slot_state.pcm_consumed_samples,
-                           backlog_size);
+                           slot_state.pcm_backlog.size());
                 if (slot_state.forward_handle != NULL && pending_samples > 0U) {
                     size_t stage_capacity_frames = slot_state.forward_frame_capacity;
                     if (stage_capacity_frames == 0U) {
@@ -2159,10 +2144,9 @@ static int fftdiv_execute_block(
                     slot_state.forward_frame_capacity = stage_capacity_frames;
                     slot_spectral_real = slot_state.forward_stage_real.empty() ? NULL : slot_state.forward_stage_real.data();
                     slot_spectral_imag = slot_state.forward_stage_imag.empty() ? NULL : slot_state.forward_stage_imag.data();
-                    const size_t source_index = slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor;
-                    const double *pcm_source = (slot_state.pcm_backlog.empty() || source_index >= slot_state.pcm_backlog.size())
+                    const double *pcm_source = slot_state.pcm_backlog.empty()
                         ? NULL
-                        : slot_state.pcm_backlog.data() + source_index;
+                        : slot_state.pcm_backlog.data() + slot_state.pcm_consumed_samples;
                     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                                "[STAGE1-INPUT] slot=%d\n"
                                "  PCM calling code put into command: pcm_backlog.size()=%zu\n"
@@ -2221,7 +2205,6 @@ static int fftdiv_execute_block(
                         forward_pending_before = amp_fft_backend_stream_pending_pcm(slot_state.forward_handle);
                     }
 
-                    bool pushed_to_backend = false;
                     if (slot_spectral_real != NULL && slot_spectral_imag != NULL && pcm_source != NULL) {
                         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                                    "[STAGE1-FFT-PREP] slot=%d input_samples=%zu stage_capacity=%zu\n",
@@ -2256,7 +2239,6 @@ static int fftdiv_execute_block(
                                 slot_spectral_imag,
                                 stage_capacity_frames,
                                 flush_mode);
-                            pushed_to_backend = true;
                         }
                         if (frames_emitted > 0 && window_size > 0 && slot_spectral_real != NULL && slot_spectral_imag != NULL) {
                             stage1_expect_signal = (pcm_source != NULL)
@@ -2290,91 +2272,16 @@ static int fftdiv_execute_block(
                                    frames_emitted,
                                    slot_state.forward_ring_filled);
                         if (frames_emitted > 0) {
-                            const size_t produced_frames = frames_emitted;
-                            bool appended_directly = false;
-                            // Try to stage produced spectra into per-slot pending buffers.
-                            try {
-                                const size_t bins = (size_t)window_size;
-                                const size_t total_bins = produced_frames * bins;
-                                // Reserve to avoid repeated reallocations.
-                                slot_state.forward_pending_real.reserve(slot_state.forward_pending_real.size() + total_bins);
-                                slot_state.forward_pending_imag.reserve(slot_state.forward_pending_imag.size() + total_bins);
-                                // Append produced frames into pending buffers.
-                                slot_state.forward_pending_real.insert(
-                                    slot_state.forward_pending_real.end(),
-                                    slot_spectral_real,
-                                    slot_spectral_real + total_bins);
-                                slot_state.forward_pending_imag.insert(
-                                    slot_state.forward_pending_imag.end(),
-                                    slot_spectral_imag,
-                                    slot_spectral_imag + total_bins);
-                                // Update pending metadata
-                                slot_state.forward_pending_frame_index_base = slot_state.next_spectral_frame_index;
-                                slot_state.forward_pending_expect_signal = stage1_expect_signal;
-                                slot_state.forward_pending_frames += produced_frames;
-                            } catch (...) {
-                                // Allocation failed; fall back to direct append into ring to avoid losing data.
-                                fftdiv_ring_append_frames(
-                                    state,
-                                    slot_state,
-                                    slot_spectral_real,
-                                    slot_spectral_imag,
-                                    frames_emitted,
-                                    window_size,
-                                    stage1_expect_signal);
-                                slot_state.next_spectral_frame_index += (int64_t)frames_emitted;
-                                appended_directly = true;
-                            }
-
-                            // Drain as many pending frames into the forward ring as fit without overwriting.
-                            if (!appended_directly) {
-                                while (slot_state.forward_pending_frames > 0U && slot_state.forward_ring_capacity_frames > 0U) {
-                                    const size_t free_frames = (slot_state.forward_ring_filled < slot_state.forward_ring_capacity_frames)
-                                        ? (slot_state.forward_ring_capacity_frames - slot_state.forward_ring_filled)
-                                        : 0U;
-                                    if (free_frames == 0U) {
-                                        break;
-                                    }
-                                    size_t to_append = slot_state.forward_pending_frames;
-                                    if (to_append > free_frames) {
-                                        to_append = free_frames;
-                                    }
-                                    const size_t bins = (size_t)window_size;
-                                    const size_t total_bins = to_append * bins;
-                                    double *pending_real_ptr = slot_state.forward_pending_real.empty() ? NULL : slot_state.forward_pending_real.data();
-                                    double *pending_imag_ptr = slot_state.forward_pending_imag.empty() ? NULL : slot_state.forward_pending_imag.data();
-                                    if (pending_real_ptr == NULL || pending_imag_ptr == NULL) {
-                                        break;
-                                    }
-                                    fftdiv_ring_append_frames(
-                                        state,
-                                        slot_state,
-                                        pending_real_ptr,
-                                        pending_imag_ptr,
-                                        to_append,
-                                        window_size,
-                                        slot_state.forward_pending_expect_signal);
-                                    // Advance spectral index by number of frames actually appended
-                                    slot_state.next_spectral_frame_index += (int64_t)to_append;
-                                    // Erase the consumed portion from pending buffers
-                                    try {
-                                        slot_state.forward_pending_real.erase(
-                                            slot_state.forward_pending_real.begin(),
-                                            slot_state.forward_pending_real.begin() + (ptrdiff_t)total_bins);
-                                        slot_state.forward_pending_imag.erase(
-                                            slot_state.forward_pending_imag.begin(),
-                                            slot_state.forward_pending_imag.begin() + (ptrdiff_t)total_bins);
-                                    } catch (...) {
-                                        // If erase failed catastrophically, clear to avoid inconsistent state.
-                                        slot_state.forward_pending_real.clear();
-                                        slot_state.forward_pending_imag.clear();
-                                        slot_state.forward_pending_frames = 0U;
-                                        break;
-                                    }
-                                    slot_state.forward_pending_frames -= to_append;
-                                }
-                            }
-
+                            fftdiv_ring_append_frames(
+                                state,
+                                slot_state,
+                                slot_spectral_real,
+                                slot_spectral_imag,
+                                frames_emitted,
+                                window_size,
+                                stage1_expect_signal);
+                            // Advance per-slot spectral index by the number of emitted spectral frames.
+                            slot_state.next_spectral_frame_index += (int64_t)frames_emitted;
                             const double *ring_real = fftdiv_ring_frame_real(slot_state, 0U, window_size);
                             const double *ring_imag = fftdiv_ring_frame_imag(slot_state, 0U, window_size);
                             if (ring_real != NULL && ring_imag != NULL) {
@@ -2437,29 +2344,13 @@ static int fftdiv_execute_block(
                         // pending counter can under-report progress when the backend drains while
                         // we are pushing, which caused the same PCM to be re-sent and the single-
                         // shot loop to spin indefinitely.
-                        size_t samples_per_frame = (size_t)((window_size > 0) ? window_size : 1);
-                        size_t samples_sent = 0U;
-                        if (pushed_to_backend && frames_emitted > 0U) {
-                            const size_t max_push = frames_emitted * samples_per_frame;
-                            samples_sent = (pending_samples < max_push) ? pending_samples : max_push;
-                        }
-                        slot_state.pcm_push_cursor += samples_sent;
-                        // Advance consumed pointer when the push cursor overtakes the backlog.
-                        if (slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor > slot_state.pcm_backlog.size()) {
-                            slot_state.pcm_push_cursor = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
-                                ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
-                                : 0U;
-                        }
-                        if (slot_state.pcm_push_cursor > 0U && slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor <= slot_state.pcm_backlog.size()) {
-                            // If everything pending was sent, fold the cursor into consumed.
-                            if (slot_state.pcm_push_cursor >= pending_samples) {
-                                slot_state.pcm_consumed_samples += slot_state.pcm_push_cursor;
-                                slot_state.pcm_push_cursor = 0U;
-                            }
-                        }
+                        const size_t backlog_size = slot_state.pcm_backlog.size();
+                        const size_t consumed_now = (slot_state.pcm_consumed_samples + pending_samples > backlog_size)
+                            ? backlog_size
+                            : (slot_state.pcm_consumed_samples + pending_samples);
+                        slot_state.pcm_consumed_samples = consumed_now;
                     } else {
                         slot_state.pcm_consumed_samples = slot_state.pcm_backlog.size();
-                        slot_state.pcm_push_cursor = 0U;
                     }
                     fftdiv_trim_pcm_backlog(state, slot_state.pcm_backlog, slot_state.pcm_consumed_samples, (size_t)window_size);
                 }
@@ -2807,7 +2698,7 @@ static int fftdiv_execute_block(
         slice.wheel_head = wheel_head_cursor;
         slice.wheel_tail = wheel_tail_cursor;
         slice.frame_index = frame_index_iter;
-        slice.pcm_sample_index = frame_index_iter * (int64_t)slot_count;
+        slice.pcm_sample_index = (int64_t)base_index + frame_index_iter * (int64_t)slot_count;
         slice.slice_index = next_slice_index;
         slice.timeline_seconds = timeline_cursor;
         slice.working_tensor_updated = iteration_updated;
@@ -3364,7 +3255,7 @@ static int fftdiv_execute_block(
                 double sample_value = slot_state.inverse_queue.front();
                 const bool stage5_pcm_assert_enabled = (stage5_pcm_assert_base && pending_expect_signal);
                 if (stage5_pcm_assert_enabled) {
-                    const size_t pcm_frame_number = pcm_frame_offset + buffer_offset;
+                    const size_t pcm_frame_number = base_index + buffer_offset;
                     fftdiv_stage_assert_real_output(state, "stage5", slot, &sample_value, 1U, pcm_frame_number);
                 }
                 buffer[buffer_offset] = sample_value;
@@ -3442,7 +3333,7 @@ static int fftdiv_execute_block(
     // Push one mailbox entry per frame (only push what was actually written)
     size_t frames_to_push = pcm_written_samples;
     /* Accumulate persistent total (across rounds) for diagnostic purposes */
-    const size_t pcm_frame_base = state->u.fftdiv.total_pcm_emitted;
+    state->u.fftdiv.total_pcm_emitted += frames_to_push;
     if (pcm_written_samples == 0) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu (no-output)\n",
@@ -3457,7 +3348,7 @@ static int fftdiv_execute_block(
     // For multi-channel output we append samples in channel order for each frame.
     for (size_t i = 0; i < frames_to_push; ++i) {
         size_t frame_base = i * (size_t)input_channels;
-        int frame_index_for_node = (int)(pcm_frame_base + i);
+        int frame_index_for_node = (int)(base_index + i);
         for (int ch = 0; ch < input_channels; ++ch) {
             double sample = buffer[frame_base + (size_t)ch];
             AmpMailboxNode pcm_node = amp_mailbox_create_pcm_node(sample, frame_index_for_node);
@@ -3468,7 +3359,6 @@ static int fftdiv_execute_block(
             amp_mailbox_append_pcm_node((void*)state, pcm_node);
         }
     }
-    state->u.fftdiv.total_pcm_emitted += frames_to_push;
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
                "[STAGE5-PCM-EMIT] pushed %zu individual frame entries\n",
                frames_to_push);
@@ -3910,7 +3800,7 @@ static void fftdiv_worker_publish_entry(
     }
     // Debug: show publish attempts (legacy publish path)
     if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_DETAIL)) {
-        fprintf(stdout, "[PUBLISH-ENTRY-DBG] buffer=%p frames=%d channels=%d status=%d state=%p\n",
+        fprintf(stderr, "[PUBLISH-ENTRY-DBG] buffer=%p frames=%d channels=%d status=%d state=%p\n",
                 (void*)buffer, frames, channels, status, (void*)state);
     }
     // Legacy mailbox entry creation removed: free any temporary buffer
@@ -4045,8 +3935,6 @@ static bool fftdiv_worker_drain_pending_outputs(node_state_t *state) {
         return false;
     }
     bool did_work = false;
-
-
     while (true) {
         const FftDivStageLockSnapshot snapshot = fftdiv_snapshot_stage_locks(state);
         if (!fftdiv_stage_snapshot_any_ready(snapshot)) {
@@ -4123,7 +4011,7 @@ static void fftdiv_worker_main(node_state_t *state) {
     if (state == nullptr) {
         return;
     }
-    fprintf(stdout, "[DIAG] fftdiv_worker_main: started state=%p\n", (void*)state);
+    fprintf(stderr, "[DIAG] fftdiv_worker_main: started state=%p\n", (void*)state);
     // The FFT division worker is intended to be a "live" stage scheduler that
     // keeps all five pipeline stages moving as long as there is outstanding
     // work anywhere in the internal queues.  Each pass through the loop pulls a
@@ -4148,18 +4036,13 @@ static void fftdiv_worker_main(node_state_t *state) {
     };
 
     std::unique_lock<std::mutex> lock(worker.mutex);
-    // Watchdog: if the worker repeatedly wakes and does no work for
-    // a sustained period, this likely indicates a livelock or missed
-    // notification. Panic to fail fast so tests and CI don't hang.
-    const int kIdlePanicThreshold = 10; // smaller threshold to fail fast (~0.5s)
-    int idle_loop_count = 0;
 
     fftdiv_abort_if_halt_requested(state, "worker-entry");
 
     auto process_ready_work = [&](std::unique_lock<std::mutex> &lock_guard) -> bool {
         std::shared_ptr<FftDivWorkerCommand> command = worker.active_command;
         // DIAGNOSTIC: observe pending command counts and active command presence
-        fprintf(stdout, "[DIAG] process_ready_work: thread_started=%d pending=%zu active_command=%p cached_valid=%d\n",
+        fprintf(stderr, "[DIAG] process_ready_work: thread_started=%d pending=%zu active_command=%p cached_valid=%d\n",
             worker.thread_started ? 1 : 0,
             worker.pending_commands.size(),
             (void*) (worker.active_command ? worker.active_command.get() : nullptr),
@@ -4169,7 +4052,7 @@ static void fftdiv_worker_main(node_state_t *state) {
             worker.pending_commands.pop_front();
             worker.active_command = command;
         }
-        fprintf(stdout, "[DIAG] process_ready_work: after-pop pending=%zu active_command=%p\n",
+        fprintf(stderr, "[DIAG] process_ready_work: after-pop pending=%zu active_command=%p\n",
             worker.pending_commands.size(),
             (void*) (worker.active_command ? worker.active_command.get() : nullptr));
         const FftDivStageLockSnapshot *locks_for_command = nullptr;
@@ -4247,7 +4130,7 @@ static void fftdiv_worker_main(node_state_t *state) {
         }
 
         // Diagnostic: show which predicate values are present before waiting
-        fprintf(stdout, "[DIAG] fftdiv_worker_main: about to wait state=%p stop_requested=%d active_command=%p pending=%zu pipeline_can_advance=%d\n",
+        fprintf(stderr, "[DIAG] fftdiv_worker_main: about to wait state=%p stop_requested=%d active_command=%p pending=%zu pipeline_can_advance=%d\n",
             (void*)state,
             worker.stop_requested ? 1 : 0,
             (void*)(worker.active_command ? worker.active_command.get() : nullptr),
@@ -4259,12 +4142,12 @@ static void fftdiv_worker_main(node_state_t *state) {
         // and the worker's condition variable.
         bool woke = worker.cv_request.wait_for(lock, std::chrono::milliseconds(50), should_wake);
         if (!woke) {
-            fprintf(stdout, "[DIAG] fftdiv_worker_main: timed-wait expired state=%p pending=%zu pipeline_can_advance=%d\n",
+            fprintf(stderr, "[DIAG] fftdiv_worker_main: timed-wait expired state=%p pending=%zu pipeline_can_advance=%d\n",
                 (void*)state,
                 worker.pending_commands.size(),
                 fftdiv_pipeline_can_advance(state) ? 1 : 0);
         }
-        fprintf(stdout, "[DIAG] fftdiv_worker_main: woke from cv state=%p stop_requested=%d active_command=%p pending=%zu pipeline_can_advance=%d\n",
+        fprintf(stderr, "[DIAG] fftdiv_worker_main: woke from cv state=%p stop_requested=%d active_command=%p pending=%zu pipeline_can_advance=%d\n",
             (void*)state,
             worker.stop_requested ? 1 : 0,
             (void*)(worker.active_command ? worker.active_command.get() : nullptr),
@@ -4276,280 +4159,8 @@ static void fftdiv_worker_main(node_state_t *state) {
         }
 
         bool did_work = process_ready_work(lock);
-        fprintf(stdout, "[DIAG] fftdiv_worker_main: loop did_work=%d pending=%zu active=%p\n", did_work ? 1 : 0, worker.pending_commands.size(), (void*)(worker.active_command ? worker.active_command.get() : nullptr));
-
-        // If nothing progressed and there is no reason the pipeline can advance,
-        // increment the idle counter; otherwise reset it. When the counter
-        // exceeds the threshold, abort with a clear diagnostic so test harnesses
-        // can detect and report the failure instead of hanging indefinitely.
-        bool pipeline_adv = fftdiv_pipeline_can_advance(state);
-        const bool no_active = !(worker.active_command ? true : false);
-        const bool no_pending = worker.pending_commands.empty();
-        if (!did_work && !pipeline_adv && no_active && no_pending) {
-            ++idle_loop_count;
-        } else {
-            idle_loop_count = 0;
-        }
-
-        if (idle_loop_count >= kIdlePanicThreshold) {
-            fprintf(stdout, "[PANIC] fftdiv_worker_main: idle loop threshold reached (%d), state=%p pending=%zu pipeline_can_advance=%d active=%p\n",
-                kIdlePanicThreshold,
-                (void*)state,
-                worker.pending_commands.size(),
-                pipeline_adv ? 1 : 0,
-                (void*)(worker.active_command ? worker.active_command.get() : nullptr));
-            fflush(stdout);
-            // Attempt to emit the same mailbox-derived PCM/spectral summaries
-            // that the test harness prints at end-of-stream so failing runs
-            // provide actionable diagnostic data. This is best-effort; if
-            // any step fails, still abort to avoid hanging.
-            try {
-                // Always emit internal counters to aid diagnosis even when
-                // no recent command object is available for mailbox reads.
-                fprintf(stdout, "[PANIC-STATE] mailbox_expected=%zu mailbox_popped=%zu append_invocations=%zu\n",
-                        worker.mailbox_expected_entries,
-                        worker.mailbox_popped_entries,
-                        worker.append_invocations);
-                if (state != nullptr) {
-                    for (size_t si = 0; si < state->u.fftdiv.stream_slots.size(); ++si) {
-                        const auto &s = state->u.fftdiv.stream_slots[si];
-                        size_t invq = s.inverse_queue.size();
-                        size_t pending = s.pending_spectra.size();
-                        size_t ringf = s.forward_ring_filled;
-                        size_t backlog = (s.pcm_backlog.size() > s.pcm_consumed_samples) ? (s.pcm_backlog.size() - s.pcm_consumed_samples) : 0U;
-                        int zero_tail = s.zero_tail_enqueued ? 1 : 0;
-                        size_t inverse_pending = 0;
-                        if (s.inverse_handle) {
-                            inverse_pending = (size_t)amp_fft_backend_stream_pending_pcm(s.inverse_handle);
-                        }
-                        fprintf(stdout, "[PANIC-SLOT] idx=%zu forward_ring_filled=%zu pending_spectra=%zu inverse_queue=%zu inverse_pending=%zu pcm_backlog_pending=%zu pcm_consumed=%zu total_ingested=%zu tail_injected=%zu zero_tail=%d\n",
-                                si, ringf, pending, invq, inverse_pending, backlog, s.pcm_consumed_samples, s.total_ingested_samples, s.tail_injected_samples, zero_tail);
-                    }
-                    // Wheel slice metadata
-                    const auto &meta = state->u.fftdiv.wheel_slice_metadata;
-                    for (size_t m = 0; m < meta.size(); ++m) {
-                        const auto &ms = meta[m];
-                        fprintf(stdout, "[PANIC-WHEEL] slice=%zu valid=%d stage4_emitted=%d lanes=%zu\n",
-                                m, ms.valid ? 1 : 0, ms.stage4_emitted ? 1 : 0, ms.lanes.size());
-                    }
-                }
-                std::shared_ptr<FftDivWorkerCommand> cmd;
-                if (worker.shared_command) {
-                    cmd = worker.shared_command;
-                } else if (worker.active_command) {
-                    cmd = worker.active_command;
-                } else if (!worker.pending_commands.empty()) {
-                    cmd = worker.pending_commands.front();
-                }
-                if (cmd) {
-                    using amp::tests::fft_division_shared::TapMailboxReadResult;
-                    using amp::tests::fft_division_shared::PopulateLegacyPcmFromMailbox;
-                    using amp::tests::fft_division_shared::PopulateLegacySpectrumFromMailbox;
-
-                    // PCM tap is expected to be at outputs index 2 (tests use [real, imag, pcm])
-                    if (cmd->tap_buffers.size() >= 3) {
-                        const EdgeRunnerTapBuffer &pcm_tap = cmd->tap_buffers[2];
-                        size_t pcm_capacity_frames = pcm_tap.shape.frames > 0 ? pcm_tap.shape.frames : static_cast<size_t>(cmd->expected_frames);
-                        std::vector<double> pcm_legacy(pcm_capacity_frames, 0.0);
-                        TapMailboxReadResult pcm_read = PopulateLegacyPcmFromMailbox(pcm_tap, pcm_legacy.data(), pcm_capacity_frames);
-                        fprintf(stdout, "[PANIC-DUMP] pcm frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
-                                pcm_read.frames_committed,
-                                pcm_read.values_written,
-                                pcm_read.copied_from_mailbox ? 1 : 0,
-                                pcm_read.aliased_legacy_buffer ? 1 : 0);
-                        fflush(stdout);
-                        // Print the full populated PCM legacy buffer (not truncated)
-                        size_t dump_n = pcm_read.frames_committed > 0 ? pcm_read.frames_committed : 0;
-                        for (size_t i = 0; i < dump_n; ++i) {
-                            fprintf(stdout, "[PANIC-DUMP-PCM] idx=%zu sample=%.12g\n", i, pcm_legacy[i]);
-                        }
-                    } else {
-                        fprintf(stdout, "[PANIC-DUMP] no pcm tap available in command.tap_buffers (count=%zu)\n", cmd->tap_buffers.size());
-                    }
-
-                    // Spectral taps expected at outputs indices 0 (real) and 1 (imag)
-                    if (cmd->tap_buffers.size() >= 2) {
-                        const EdgeRunnerTapBuffer &real_tap = cmd->tap_buffers[0];
-                        const EdgeRunnerTapBuffer &imag_tap = cmd->tap_buffers[1];
-                        const size_t window = real_tap.shape.channels > 0U ? static_cast<size_t>(real_tap.shape.channels) : 1U;
-                        const size_t capacity_frames = real_tap.shape.frames > 0 ? static_cast<size_t>(real_tap.shape.frames) : static_cast<size_t>(cmd->expected_frames);
-                        const size_t legacy_value_count = capacity_frames * window;
-                        if (legacy_value_count > 0) {
-                            std::vector<double> real_legacy(legacy_value_count, 0.0);
-                            std::vector<double> imag_legacy(legacy_value_count, 0.0);
-                            TapMailboxReadResult spec_read = PopulateLegacySpectrumFromMailbox(real_tap, imag_tap, real_legacy.data(), imag_legacy.data(), legacy_value_count);
-                            fprintf(stdout, "[PANIC-DUMP] spectral frames_committed=%zu values_written=%zu copied=%d aliased=%d window=%zu\n",
-                                    spec_read.frames_committed,
-                                    spec_read.values_written,
-                                    spec_read.copied_from_mailbox ? 1 : 0,
-                                    spec_read.aliased_legacy_buffer ? 1 : 0,
-                                    window);
-                            fflush(stdout);
-                            size_t rows = spec_read.frames_committed;
-                            // Print all committed spectral rows and all bins so the dump
-                            // matches the full comparison output produced by the test harness.
-                            for (size_t r = 0; r < rows; ++r) {
-                                fprintf(stdout, "[PANIC-DUMP-SPEC] row=%zu", r);
-                                for (size_t b = 0; b < (size_t)window; ++b) {
-                                    size_t idx = r * window + b;
-                                    fprintf(stdout, " %.12g%+.12gi", real_legacy[idx], imag_legacy[idx]);
-                                }
-                                fprintf(stdout, "\n");
-                            }
-                        } else {
-                            fprintf(stdout, "[PANIC-DUMP] spectral legacy value count is zero (capacity_frames=%zu window=%zu)\n", capacity_frames, window);
-                        }
-                    } else {
-                        fprintf(stdout, "[PANIC-DUMP] no spectral taps available in command.tap_buffers (count=%zu)\n", cmd->tap_buffers.size());
-                    }
-                } else {
-                    fprintf(stdout, "[PANIC-DUMP] no recent command available to inspect (shared/active/pending empty)\n");
-                }
-                // If command-based tap buffers produced nothing, attempt a
-                // best-effort read directly from the mailbox heads exposed
-                // via the C API so we can still report PCM/spectral nodes.
-                if (state != nullptr) {
-                    // PCM: global chain head
-                    {
-                        AmpMailboxNode pcm_head = amp_mailbox_get_pcm_head((void*)state);
-                        if (pcm_head) {
-                            // scan to find base frame
-                            int base_frame = (std::numeric_limits<int>::max)();
-                            std::unordered_set<int> pcm_indices_seen;
-                            for (AmpMailboxNode n = pcm_head; n; n = amp_mailbox_node_next(n)) {
-                                if (amp_mailbox_node_is_pcm(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                    int idx = amp_mailbox_node_frame_index(n);
-                                    if (!pcm_indices_seen.insert(idx).second) {
-                                        fprintf(stdout, "[PANIC] Duplicate PCM frame_index %d detected in mailbox chain!\n", idx);
-                                        fflush(stdout);
-                                        std::_Exit(1);
-                                    }
-                                    base_frame = (std::min)(base_frame, idx);
-                                }
-                            }
-                            if (base_frame != (std::numeric_limits<int>::max)()) {
-                                std::vector<double> pcm_vals;
-                                pcm_indices_seen.clear();
-                                for (AmpMailboxNode n = pcm_head; n; n = amp_mailbox_node_next(n)) {
-                                    if (amp_mailbox_node_is_pcm(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                        int idx = amp_mailbox_node_frame_index(n);
-                                        if (!pcm_indices_seen.insert(idx).second) {
-                                            fprintf(stdout, "[PANIC] Duplicate PCM frame_index %d detected in mailbox chain!\n", idx);
-                                            fflush(stdout);
-                                            std::_Exit(1);
-                                        }
-                                        int fi = idx - base_frame;
-                                        if (fi >= 0) {
-                                            if ((size_t)fi >= pcm_vals.size()) pcm_vals.resize((size_t)fi + 1, 0.0);
-                                            pcm_vals[(size_t)fi] = amp_mailbox_node_pcm_sample(n);
-                                        }
-                                    }
-                                }
-                                fprintf(stdout, "[PANIC-DUMP-GBL-PCM] frames_committed=%zu values_written=%zu\n",
-                                        pcm_vals.size(), pcm_vals.size());
-                                // Print entire global PCM reconstruction so investigators
-                                // see the full buffer (not a truncated preview).
-                                for (size_t i = 0; i < pcm_vals.size(); ++i) {
-                                    fprintf(stdout, "[PANIC-DUMP-GBL-PCM] idx=%zu sample=%.12g\n", i, pcm_vals[i]);
-                                }
-                            } else {
-                                fprintf(stdout, "[PANIC-DUMP-GBL-PCM] no pcm nodes with frame_index found\n");
-                            }
-                        } else {
-                            fprintf(stdout, "[PANIC-DUMP-GBL-PCM] no pcm head available\n");
-                        }
-                    }
-
-                    // Spectral: per-slot tap heads named "spectral_<slot>"
-                    for (size_t slot_idx = 0; slot_idx < state->u.fftdiv.stream_slots.size(); ++slot_idx) {
-                        char tapname_buf[32];
-                        std::snprintf(tapname_buf, sizeof(tapname_buf), "spectral_%zu", slot_idx);
-                        AmpMailboxNode spec_head = amp_mailbox_get_spectral_head((void*)state, tapname_buf);
-                        if (spec_head) {
-                            int base_frame = (std::numeric_limits<int>::max)();
-                            size_t window = 0;
-                            std::unordered_set<int> spec_indices_seen;
-                            for (AmpMailboxNode n = spec_head; n; n = amp_mailbox_node_next(n)) {
-                                if (amp_mailbox_node_is_spectral(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                    int idx = amp_mailbox_node_frame_index(n);
-                                    if (!spec_indices_seen.insert(idx).second) {
-                                        fprintf(stdout, "[PANIC] Duplicate SPECTRAL frame_index %d detected in mailbox chain!\n", idx);
-                                        fflush(stdout);
-                                        std::_Exit(1);
-                                    }
-                                    base_frame = (std::min)(base_frame, idx);
-                                    if (window == 0) window = (size_t)amp_mailbox_node_window_size(n);
-                                }
-                            }
-                            if (base_frame != (std::numeric_limits<int>::max)() && window > 0) {
-                                // collect up to a few rows
-                                std::map<int, std::vector<std::pair<double,double>>> rows;
-                                spec_indices_seen.clear();
-                                for (AmpMailboxNode n = spec_head; n; n = amp_mailbox_node_next(n)) {
-                                    if (amp_mailbox_node_is_spectral(n) && amp_mailbox_node_frame_index(n) >= 0) {
-                                        int idx = amp_mailbox_node_frame_index(n);
-                                        if (!spec_indices_seen.insert(idx).second) {
-                                            fprintf(stdout, "[PANIC] Duplicate SPECTRAL frame_index %d detected in mailbox chain!\n", idx);
-                                            fflush(stdout);
-                                            std::_Exit(1);
-                                        }
-                                        int fi = idx - base_frame;
-                                        if (fi >= 0) {
-                                            auto &vec = rows[fi];
-                                            // collect bins up to window. Prefer reading the full
-                                            // per-node spectral bin arrays when the internal
-                                            // PersistentMailboxNode exposes them; otherwise fall
-                                            // back to the C API single-value helpers.
-                                            {
-                                                const size_t node_window = (amp_mailbox_node_window_size(n) > 0) ? static_cast<size_t>(amp_mailbox_node_window_size(n)) : 1U;
-                                                const size_t bins_to_collect = (node_window < window) ? node_window : window;
-                                                amp::tests::fft_division_shared::PersistentMailboxNode *pn = reinterpret_cast<amp::tests::fft_division_shared::PersistentMailboxNode*>(n);
-                                                if (pn != nullptr) {
-                                                    const auto &real_bins = pn->spectral_real_bins;
-                                                    const auto &imag_bins = pn->spectral_imag_bins;
-                                                    for (size_t b = 0; b < bins_to_collect; ++b) {
-                                                        double re = (b < real_bins.size()) ? real_bins[b] : amp_mailbox_node_real(n);
-                                                        double im = (b < imag_bins.size()) ? imag_bins[b] : amp_mailbox_node_imag(n);
-                                                        rows[fi].push_back(std::make_pair(re, im));
-                                                    }
-                                                } else {
-                                                    // Fallback: the C API exposes only a single
-                                                    // spectral scalar per node in legacy layouts.
-                                                    // Emit that value for the (single) bin.
-                                                    rows[fi].push_back(std::make_pair(amp_mailbox_node_real(n), amp_mailbox_node_imag(n)));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                fprintf(stdout, "[PANIC-DUMP-GBL-SPEC] tap=%s rows=%zu window=%zu\n", tapname_buf, rows.size(), window);
-                                // Print all collected rows and all collected bin values so the
-                                // dump mirrors the complete comparison output emitted by the
-                                // normal test finish path.
-                                for (const auto &pr : rows) {
-                                    fprintf(stdout, "[PANIC-DUMP-GBL-SPEC] row=%d", pr.first);
-                                    for (const auto &val : pr.second) {
-                                        fprintf(stdout, " %.12g%+.12gi", val.first, val.second);
-                                    }
-                                    fprintf(stdout, "\n");
-                                }
-                            } else {
-                                fprintf(stdout, "[PANIC-DUMP-GBL-SPEC] tap=%s no spectral nodes with frame_index/window\n", tapname_buf);
-                            }
-                        } else {
-                            // No head for this tap; that's normal for unused slots
-                        }
-                    }
-                }
-            } catch (...) {
-                fprintf(stdout, "[PANIC-DUMP] exception while attempting to dump mailbox contents\n");
-            }
-            fflush(stdout);
-            // Exit so test harnesses detect the failure instead of hanging.
-            std::_Exit(1);
-        }
-
-        if (!did_work && pipeline_adv) {
+        fprintf(stderr, "[DIAG] fftdiv_worker_main: loop did_work=%d pending=%zu active=%p\n", did_work ? 1 : 0, worker.pending_commands.size(), (void*)(worker.active_command ? worker.active_command.get() : nullptr));
+        if (!did_work && fftdiv_pipeline_can_advance(state)) {
             std::this_thread::yield();
         }
     }
@@ -4576,7 +4187,7 @@ static int fftdiv_start_worker(node_state_t *state) {
             fftdiv_worker_main(state);
         });
         worker.thread_started = true;
-        fprintf(stdout, "[DIAG] fftdiv_start_worker: started thread %p\n", (void*) &worker.thread);
+        fprintf(stderr, "[DIAG] fftdiv_start_worker: started thread %p\n", (void*) &worker.thread);
         worker.cv_request.notify_one();
     } catch (...) {
         worker.thread_started = false;
@@ -4704,21 +4315,21 @@ static int run_fft_division_node(
     *out_buffer = NULL;
     *out_channels = 0;
 
-    fprintf(stdout, "[DIAG] run_fft_division_node: entry descriptor=%p name=%s state=%p frames=%d\n", (void*)descriptor, descriptor ? descriptor->name : "<null>", (void*)state, frames);
+    fprintf(stderr, "[DIAG] run_fft_division_node: entry descriptor=%p name=%s state=%p frames=%d\n", (void*)descriptor, descriptor ? descriptor->name : "<null>", (void*)state, frames);
     {
         auto &worker = state->u.fftdiv.worker;
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.halt_requested) {
-            fprintf(stdout, "[DIAG] run_fft_division_node: halt already requested, rejecting new work\n");
+            fprintf(stderr, "[DIAG] run_fft_division_node: halt already requested, rejecting new work\n");
             fftdiv_abort_if_halt_requested(state, "run-node-halt");
             return -1;
         }
     }
     if (fftdiv_start_worker(state) != 0) {
-        fprintf(stdout, "[DIAG] run_fft_division_node: fftdiv_start_worker failed state=%p\n", (void*)state);
+        fprintf(stderr, "[DIAG] run_fft_division_node: fftdiv_start_worker failed state=%p\n", (void*)state);
         return -1;
     }
-    fprintf(stdout, "[DIAG] run_fft_division_node: fftdiv_start_worker succeeded state=%p\n", (void*)state);
+    fprintf(stderr, "[DIAG] run_fft_division_node: fftdiv_start_worker succeeded state=%p\n", (void*)state);
 
     int effective_batches = (batches > 0) ? batches : 1;
     int effective_channels = channels;
@@ -4755,7 +4366,7 @@ static int run_fft_division_node(
         }
         worker.pending_commands.push_back(command);
         worker.append_invocations++;
-        fprintf(stdout, "[DIAG] run_fft_division_node: pushed command pending=%zu expected_entries=%zu state=%p\n", worker.pending_commands.size(), worker.mailbox_expected_entries, (void*)state);
+        fprintf(stderr, "[DIAG] run_fft_division_node: pushed command pending=%zu expected_entries=%zu state=%p\n", worker.pending_commands.size(), worker.mailbox_expected_entries, (void*)state);
         size_t expected = command->expected_frames > 0
             ? static_cast<size_t>(command->expected_frames)
             : 1U;

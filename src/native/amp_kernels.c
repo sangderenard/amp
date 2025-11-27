@@ -31,10 +31,15 @@
 #endif
 
 #if defined(__cplusplus)
+#include <map>
+#include <string>
+#include <vector>
+#include <deque>
 #include <complex>
 #include <condition_variable>
 #include <deque>
 #include <memory>
+#include "amp_mailbox_capi.h"
 #include <mutex>
 #include <new>
 #include <thread>
@@ -42,6 +47,7 @@
 #include <cstring>
 #include <Eigen/Core>
 #include <unsupported/Eigen/CXX11/Tensor>
+#include "amp_native_mailbox_chain.hpp"
 using FftWorkingTensor = Eigen::Tensor<std::complex<double>, 4, Eigen::RowMajor>;
 #endif
 
@@ -1688,7 +1694,6 @@ bool FftDivWorkerCommand::append_inputs(
     int frames,
     int slot_count
 ) {
-    const bool already_bound = inputs_bound;
     const bool final_flag = (src_inputs != NULL)
         && ((src_inputs->audio.has_audio & EDGE_RUNNER_AUDIO_FLAG_FINAL) != 0U);
     if (task.final_delivery && !final_flag) {
@@ -1709,13 +1714,6 @@ bool FftDivWorkerCommand::append_inputs(
         appended_frames = 1;
     }
     expected_frames = appended_frames;
-    // On reuse of the same shared command, do not include audio again.
-    // Clear audio flags/data for this call so Stage 1 does not re-append.
-    // Keep frames unchanged to preserve downstream expectations.
-    if (already_bound) {
-        inputs.audio.has_audio = 0U;
-        inputs.audio.data = nullptr;
-    }
     if (final_flag) {
         task.final_delivery = true;
     }
@@ -1840,6 +1838,7 @@ typedef union {
                 std::vector<double> forward_stage_imag;
                 std::vector<double> forward_real;
                 std::vector<double> forward_imag;
+                std::vector<uint8_t> forward_expect_signal;
                 std::size_t forward_frame_capacity{0U};
                 std::size_t forward_ring_capacity_frames{0U};
                 std::size_t forward_ring_write{0U};
@@ -1853,15 +1852,26 @@ typedef union {
                 struct PendingSpectrum {
                     std::vector<double> real;
                     std::vector<double> imag;
+                    bool expect_signal{true};
+                    int64_t frame_index{0};
                 };
                 std::deque<PendingSpectrum> pending_spectra;
+                // Forward staging buffer: backend may produce many frames at once.
+                std::vector<double> forward_pending_real;
+                std::vector<double> forward_pending_imag;
+                std::size_t forward_pending_frames{0U};
+                bool forward_pending_expect_signal{false};
+                int64_t forward_pending_frame_index_base{0};
                 std::vector<double> pcm_backlog;
                 std::size_t pcm_consumed_samples{0U};
+                std::size_t pcm_push_cursor{0U};
                 std::size_t input_frame_cursor{0U};
+                int64_t next_spectral_frame_index{0};
                 bool warmup_complete{false};
                 double last_pcm_output{0.0};
                 std::size_t total_ingested_samples{0U};
                 std::size_t tail_injected_samples{0U};
+                std::size_t pending_zero_tail_frames{0U};
                 bool zero_tail_enqueued{false};
                 bool ingest_finalized{false};
                 bool final_flag_observed{false};
@@ -1938,6 +1948,7 @@ typedef union {
                 size_t append_invocations{0};
                 FftDivStageLockSnapshot cached_stage_locks{};
                 bool cached_stage_locks_valid{false};
+                bool halt_requested{false};
             };
             WorkerState worker;
             const EdgeRunnerNodeDescriptor *last_descriptor{nullptr};
@@ -1965,6 +1976,14 @@ typedef union {
             int64_t wheel_frame_counter;
             double sample_rate_hint;
             double timeline_seconds;
+            uint64_t total_pcm_emitted;
+// C++-only mailbox chains for persistent tap/PCM output
+
+#if defined(__cplusplus)
+            std::map<std::string, FftDivTapMailboxCursor> tap_mailbox_cursors;
+            std::map<std::string, amp::tests::fft_division_shared::MailboxChainHead> spectral_mailbox_chains;
+            amp::tests::fft_division_shared::MailboxChainHead pcm_mailbox_chain;
+#endif
         } fftdiv;
         struct {
             int mode;
@@ -2040,6 +2059,7 @@ static void fftdiv_construct_state(node_state_t *state) {
     state->u.fftdiv.log_slice_bin_cap = kFftDivDefaultSliceLogCap;
     state->u.fftdiv.halt_on_zero_stage_output = 0;
     state->u.fftdiv.halt_on_zero_stage5_pcm_output = 0;
+    state->u.fftdiv.total_pcm_emitted = 0ULL;
     state->fftdiv_constructed = true;
 }
 
@@ -3435,6 +3455,11 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.forward_stage_imag.clear();
         slot.forward_real.clear();
         slot.forward_imag.clear();
+        slot.forward_pending_real.clear();
+        slot.forward_pending_imag.clear();
+        slot.forward_pending_frames = 0U;
+        slot.forward_pending_expect_signal = false;
+        slot.forward_pending_frame_index_base = 0;
         slot.forward_frame_capacity = 0U;
         slot.forward_ring_capacity_frames = 0U;
         slot.forward_ring_write = 0U;
@@ -3447,10 +3472,12 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.pcm_backlog.clear();
         slot.pcm_consumed_samples = 0U;
         slot.input_frame_cursor = 0U;
+        slot.next_spectral_frame_index = 0;
         slot.warmup_complete = false;
         slot.last_pcm_output = 0.0;
         slot.total_ingested_samples = 0U;
         slot.tail_injected_samples = 0U;
+        slot.pending_zero_tail_frames = 0U;
         slot.zero_tail_enqueued = false;
         slot.ingest_finalized = false;
         slot.final_flag_observed = false;
@@ -3601,6 +3628,11 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.forward_stage_imag.assign(stage_capacity, 0.0);
             slot.forward_real.assign(spectral_capacity, 0.0);
             slot.forward_imag.assign(spectral_capacity, 0.0);
+            slot.forward_pending_real.clear();
+            slot.forward_pending_imag.clear();
+            slot.forward_pending_frames = 0U;
+            slot.forward_pending_expect_signal = false;
+            slot.forward_pending_frame_index_base = 0;
             slot.forward_frame_capacity = stage_frames;
             slot.forward_ring_capacity_frames = ring_frames;
             slot.forward_ring_write = 0U;
@@ -3613,6 +3645,7 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.pcm_backlog.clear();
             slot.pcm_consumed_samples = 0U;
             slot.input_frame_cursor = 0U;
+            slot.next_spectral_frame_index = 0;
             slot.warmup_complete = false;
             slot.last_pcm_output = 0.0;
             slot.total_ingested_samples = 0U;
@@ -3685,6 +3718,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.wheel_frame_counter = 0;
     state->u.fftdiv.sample_rate_hint = 0.0;
     state->u.fftdiv.timeline_seconds = 0.0;
+    state->u.fftdiv.total_pcm_emitted = 0ULL;
     state->u.fftdiv.last_descriptor = nullptr;
     state->u.fftdiv.last_batches = 0;
     state->u.fftdiv.last_channels = 0;

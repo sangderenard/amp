@@ -1,3 +1,11 @@
+// Forward declaration for pointer use
+#if defined(__cplusplus)
+struct AmpSpectralMailboxEntry;
+struct FftDivTapMailboxCursor {
+    const AmpSpectralMailboxEntry *read_cursor = nullptr;
+    int last_frame_index = -1;
+};
+#endif
 #pragma once
 
 #if defined(__cplusplus)
@@ -7,6 +15,7 @@
 
 struct FftDivLaneFrameState {
     bool frame_ready{false};
+    bool expect_signal{false};
     std::vector<double> spectral_real;
     std::vector<double> spectral_imag;
 };

@@ -50,6 +50,20 @@ typedef struct {
     EdgeRunnerTensorShape shape;
     size_t frame_stride;
     double *data;
+    void *mailbox_head; // Persistent head pointer for mailbox chain (opaque to C)
+    int read_flag; // 0 = no read, 1 = read requested
+    /* Generic tap cache: allows callers to stage an externally-provided
+       buffer as the legacy tap backing store. Consumers can mark the
+       buffer ACCEPTED (downstream took ownership) or READ (safe to
+       reuse/destroy in-place). The runtime and mailbox helpers use
+       these fields to decide whether to copy into the provided memory
+       or allocate/produce new storage. */
+    size_t cache_buffer_len; /* length in doubles of cache_data */
+    double *cache_data;      /* pointer to cached/externally-provided memory */
+    uint32_t cache_batches;  /* dimensional metadata for cached buffer */
+    uint32_t cache_channels;
+    uint32_t cache_frames;
+    int cache_state; /* 0 = empty, 1 = staged/filled, 2 = accepted, 3 = read */
 } EdgeRunnerTapBuffer;
 
 typedef struct {
@@ -604,6 +618,26 @@ AMP_CAPI int amp_graph_runtime_debug_snapshot(
     AmpGraphDebugSnapshot *snapshot
 );
 
+/* Tap cache API: stage an externally-provided buffer for a tap and
+   copy mailbox-chain contents into it when requested. These functions
+   do not free memory; ownership transitions are recorded via state
+   flags (accepted/read) and must be honoured by the caller. */
+AMP_CAPI int amp_tap_cache_stage(EdgeRunnerTapBuffer* tap, double* buffer, size_t buffer_len, uint32_t batches, uint32_t channels, uint32_t frames);
+AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap);
+// Block until the mailbox chain backing a tap has enough nodes to satisfy the
+// expected legacy buffer shape, then attach the chain head to the tap. Returns
+// the number of nodes observed when the wait finished. A timeout of 0 waits
+// indefinitely.
+AMP_CAPI int amp_tap_cache_block_until_ready(
+    void* state,
+    EdgeRunnerTapBuffer* tap,
+    const char* tap_name,
+    uint64_t timeout_ms);
+AMP_CAPI void amp_tap_cache_mark_accepted(EdgeRunnerTapBuffer* tap);
+AMP_CAPI void amp_tap_cache_mark_read(EdgeRunnerTapBuffer* tap);
+AMP_CAPI double* amp_tap_cache_get_buffer(EdgeRunnerTapBuffer* tap);
+AMP_CAPI int amp_tap_cache_state(EdgeRunnerTapBuffer* tap);
+
 typedef struct {
     uint32_t refresh_millis;
     int ansi_only;
@@ -620,6 +654,7 @@ AMP_CAPI AmpKpnOverlay *amp_kpn_overlay_create(
 AMP_CAPI int amp_kpn_overlay_start(AmpKpnOverlay *overlay);
 AMP_CAPI void amp_kpn_overlay_stop(AmpKpnOverlay *overlay);
 AMP_CAPI void amp_kpn_overlay_destroy(AmpKpnOverlay *overlay);
+
 
 #ifdef __cplusplus
 }

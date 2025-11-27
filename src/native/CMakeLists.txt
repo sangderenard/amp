@@ -107,14 +107,15 @@ else()
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}" CACHE PATH "" FORCE)
 endif()
 
-set_source_files_properties(amp_kernels.c PROPERTIES LANGUAGE CXX)
-set_source_files_properties(amp_debug_alloc.c PROPERTIES LANGUAGE CXX)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/amp_kernels.c PROPERTIES LANGUAGE CXX)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/amp_debug_alloc.c PROPERTIES LANGUAGE CXX)
 
 add_library(amp_native SHARED
     graph_runtime.cpp
     fft_backend.cpp
     amp_debug_alloc.c
-    amp_kernels.c
+    amp_kernels_wrapper.cpp
+    amp_mailbox_cpp.cpp
     amp_descriptor_builder.c
 )
 set_property(TARGET amp_native PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
