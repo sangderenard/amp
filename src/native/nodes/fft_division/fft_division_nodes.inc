@@ -872,11 +872,11 @@ static FftDivTailPlan fftdiv_calculate_tail_plan(
     plan.working_span = (fftdiv.wheel_active_window_span > 0) ? fftdiv.wheel_active_window_span : 1;
     plan.working_hop = (fftdiv.wheel_hop > 0) ? fftdiv.wheel_hop : 1;
 
-    const int64_t l_istft = fftdiv_delay_compute_l_istft(
-        plan.window_size,
-        plan.backend_hop,
-        plan.working_hop);
-    plan.istft_tail_frames = (l_istft > 0) ? static_cast<int>(l_istft) : 0;
+    // Defer computation of ISTFT tail frames to the canonical delay math.
+    // Pass a negative override so `fftdiv_delay_compute_t_max` derives the
+    // correct `l_istft` using the pipeline-wide logic in
+    // `fft_division_delay_math.h`.
+    plan.istft_tail_frames = -1;
 
     size_t pcm_frames = fftdiv_delay_frames_for_sample(
         0U,
@@ -884,7 +884,8 @@ static FftDivTailPlan fftdiv_calculate_tail_plan(
         plan.backend_hop,
         plan.working_hop,
         plan.window_size,
-        plan.istft_tail_frames);
+        plan.istft_tail_frames,
+        plan.working_span);
     if (pcm_frames == 0U) {
         pcm_frames = pipeline_active_hint
             ? (plan.window_size > 1 ? (size_t)(plan.window_size - 1) : 1U)
@@ -986,7 +987,7 @@ static FftDivActiveWindowView fftdiv_build_active_window_view_internal(
         ? state->u.fftdiv.working_tensor_lanes
         : state->u.fftdiv.default_lane_count;
     const int freq_bins = state->u.fftdiv.working_tensor_freq_bins;
-    const int wheel_length = state->u.fftdiv.working_tensor_time_slices;
+    const int wheel_length = state->u.fftdiv.wheel_length;
     if (lane_count <= 0 || freq_bins <= 0 || wheel_length <= 0) {
         return view;
     }
@@ -1637,7 +1638,7 @@ static int fftdiv_execute_block(
         descriptor->params_json,
         descriptor->params_len,
         "working_ft_hop",
-        (window_size > 1 ? window_size / 2 : 1)
+        1
     );
     if (working_hop <= 0) {
         working_hop = 1;
@@ -1651,13 +1652,13 @@ static int fftdiv_execute_block(
         descriptor->params_json,
         descriptor->params_len,
         "working_ft_active_window_span",
-        working_time_slices
+        working_time_slices - working_hop
     );
     if (working_active_window_span <= 0) {
-        working_active_window_span = working_time_slices;
+        working_active_window_span = working_time_slices - working_hop;
     }
     if (working_active_window_span > working_time_slices) {
-        working_active_window_span = working_time_slices;
+        working_active_window_span = working_time_slices - working_hop;
     }
     if (working_active_window_span < working_hop) {
         /* Enforce overlap so the active span always covers the most recent hop. */
@@ -1824,14 +1825,18 @@ static int fftdiv_execute_block(
     const int tensor_freq_bins = state->u.fftdiv.working_tensor_freq_bins > 0
         ? state->u.fftdiv.working_tensor_freq_bins
         : window_size;
-    int wheel_length = state->u.fftdiv.wheel_length > 0 ? state->u.fftdiv.wheel_length : tensor_time_slices;
+    int wheel_hop = state->u.fftdiv.wheel_hop > 0 ? state->u.fftdiv.wheel_hop : 1;
+    int wheel_length = state->u.fftdiv.wheel_length > 0 ? state->u.fftdiv.wheel_length : tensor_time_slices + wheel_hop;
     if (wheel_length <= 0) {
         wheel_length = 1;
     }
     int wheel_head = state->u.fftdiv.wheel_head;
     int wheel_tail = state->u.fftdiv.wheel_tail;
     int wheel_filled = state->u.fftdiv.wheel_filled_slices;
-    int wheel_hop = state->u.fftdiv.wheel_hop > 0 ? state->u.fftdiv.wheel_hop : 1;
+    int active_window_span = state->u.fftdiv.wheel_active_window_span > 0
+        ? state->u.fftdiv.wheel_active_window_span
+        : wheel_length-state->u.fftdiv.wheel_hop;
+    
     if (wheel_head < 0 || wheel_head >= wheel_length) {
         wheel_head = 0;
     }
@@ -2045,7 +2050,8 @@ static int fftdiv_execute_block(
                         final_tail_plan.backend_hop,
                         final_tail_plan.working_hop,
                         final_tail_plan.window_size,
-                        final_tail_plan.istft_tail_frames);
+                        final_tail_plan.istft_tail_frames,
+                        final_tail_plan.working_span);
                     if (tail_frames > 0U) {
                         slot_state.pending_zero_tail_frames = tail_frames;
                         slot_state.ingest_finalized = true;
@@ -2968,6 +2974,7 @@ static int fftdiv_execute_block(
             if ((size_t)idx >= meta.size()) {
                 break;
             }
+
             FftDivFilledSlice *slice_ptr = meta[idx].valid ? &meta[idx] : nullptr;
             visited += 1;
             if (slice_ptr == nullptr) {
@@ -3049,7 +3056,7 @@ static int fftdiv_execute_block(
                     : operator_lane_bindings.data();
                 operator_context.lane_count = operator_lane_bindings.size();
                 operator_context.hop = wheel_hop;
-                operator_context.window_size = window_size;
+                operator_context.window_size = active_window_span;
                 operator_context.wheel_length = wheel_length;
                 operator_context.wheel_head = slice.wheel_head;
                 operator_context.wheel_tail = slice.wheel_tail;
@@ -3278,7 +3285,7 @@ static int fftdiv_execute_block(
 
                         /* Emit spectral row aligned to PCM time: write at (frame + window_size - 1) */
                         const int emit_frame_index =
-                            (int)slice.frame_index + ((window_size > 0) ? (window_size - 1) : 0);
+                            (int)slice.frame_index + ((window_size > 0) ? (window_size - 1): 0);
 
                         stage_emit_spectral(
                             state,
@@ -3681,7 +3688,7 @@ static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *s
     // lane presenting at least one spectrum frame.
     int wheel_length = state->u.fftdiv.wheel_length;
     if (wheel_length <= 0) {
-        wheel_length = state->u.fftdiv.working_tensor_time_slices;
+        wheel_length = state->u.fftdiv.working_tensor_time_slices + state->u.fftdiv.wheel_hop;
     }
     if (wheel_length < 0) {
         wheel_length = 0;
@@ -3728,6 +3735,40 @@ static FftDivStageLockSnapshot fftdiv_snapshot_stage_locks(const node_state_t *s
             snapshot.stage3_ready = true;
             snapshot.stage4_ready = true;
             break;
+        }
+    }
+
+    /* Enforce warmup for Stage3/4: don't claim readiness until either
+       - the wheel contains at least `active_span_limit` filled slices, OR
+       - at least one un-emitted slice already contains a full active window
+         (i.e. was updated and its `view_filled_override >= active_span_limit`).
+       This prevents Stage3 from attempting partial active-window emissions
+       while still allowing progress when a slice itself already carries a
+       full active-window view. */
+    if (snapshot.stage3_ready || snapshot.stage4_ready) {
+        bool allow_stage34 = false;
+        if (active_span_limit <= 0) {
+            allow_stage34 = true;
+        } else if (wheel_filled_for_gate >= active_span_limit) {
+            allow_stage34 = true;
+        } else {
+            for (const auto &slice : state->u.fftdiv.wheel_slice_metadata) {
+                if (!slice.valid || slice.stage4_emitted) continue;
+                if (slice.working_tensor_updated && slice.view_filled_override >= active_span_limit) {
+                    allow_stage34 = true;
+                    break;
+                }
+            }
+        }
+        if (!allow_stage34) {
+            snapshot.stage3_ready = false;
+            snapshot.stage4_ready = false;
+            if (fftdiv_should_log(state, FFTDIV_LOG_LEVEL_TRACE)) {
+                FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_TRACE,
+                           "[STAGE-LOCKS] stage3/4 blocked: wheel not warmed and no slice has full active window (filled=%d need=%d)\n",
+                           wheel_filled_for_gate,
+                           active_span_limit);
+            }
         }
     }
 

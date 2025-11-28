@@ -100,9 +100,11 @@ struct TestConfig {
     double overlap_fraction;
     int hop_cli_override;
     double overlap_cli_override;
+    int working_hop_cli_override;
+    int working_window_cli_override;
+    bool frames_cli_override;
 };
-
-TestConfig g_config{4, 8, 1e-4, 4096, 64, 1, 0.0, -1, -1.0};
+TestConfig g_config{4, 8, 1e-4, 4096, 64, 1, 0.0, -1, -1.0, -1, -1, false};
 bool g_failed = false;
 bool g_quiet = false;
 VerbosityLevel g_verbosity = VerbosityLevel::Summary;
@@ -135,6 +137,20 @@ void set_hop_override(int hop) {
     }
     g_config.hop_cli_override = hop;
     g_config.overlap_cli_override = -1.0;
+}
+
+void set_working_hop_override(int whop) {
+    if (whop <= 0) {
+        return;
+    }
+    g_config.working_hop_cli_override = whop;
+}
+
+void set_working_window_override(int wwin) {
+    if (wwin <= 0) {
+        return;
+    }
+    g_config.working_window_cli_override = wwin;
 }
 
 void set_overlap_override(double overlap) {
@@ -331,6 +347,55 @@ bool handle_hop_overlap_flag(int argc, char **argv, int index, int *extra_consum
     }
 
     value = nullptr;
+    if (parse_value_from_arg("--whop", value, true)) {
+        if (value == nullptr || *value == '\0') {
+            emit_diagnostic("missing value for %s", arg);
+        } else {
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end != value && parsed > 0 && parsed <= std::numeric_limits<int>::max()) {
+                set_working_hop_override(static_cast<int>(parsed));
+            } else {
+                emit_diagnostic("invalid working hop '%s'", value);
+            }
+        }
+        return true;
+    }
+
+    value = nullptr;
+    if (parse_value_from_arg("--wwin", value, true)) {
+        if (value == nullptr || *value == '\0') {
+            emit_diagnostic("missing value for %s", arg);
+        } else {
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end != value && parsed > 0 && parsed <= std::numeric_limits<int>::max()) {
+                set_working_window_override(static_cast<int>(parsed));
+            } else {
+                emit_diagnostic("invalid working window '%s'", value);
+            }
+        }
+        return true;
+    }
+
+    value = nullptr;
+    if (parse_value_from_arg("--frames", value, true)) {
+        if (value == nullptr || *value == '\0') {
+            emit_diagnostic("missing value for %s", arg);
+        } else {
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end != value && parsed > 0 && parsed <= std::numeric_limits<int>::max()) {
+                g_config.frames = static_cast<int>(parsed);
+                g_config.frames_cli_override = true;
+            } else {
+                emit_diagnostic("invalid frames '%s'", value);
+            }
+        }
+        return true;
+    }
+
+    value = nullptr;
     if (parse_value_from_arg("--overlap", value, true)) {
         if (value == nullptr || *value == '\0') {
             emit_diagnostic("missing value for %s", arg);
@@ -483,6 +548,12 @@ bool maybe_print_help(int argc, char **argv) {
             "  --overlap R         Set fractional overlap (0.0-0.999); hop becomes window*(1-R).\n"
         );
         std::printf(
+            "  --whop N            Override working-tensor hop (spectral frames per working hop); must be >= 1.\n"
+        );
+        std::printf(
+            "  --wwin N            Override working-tensor duration/active window (in spectral frames); must be >= 1.\n"
+        );
+        std::printf(
             "  --quiet, -q         Suppress diagnostics; only the final PASS/FAIL line is printed.\n"
         );
         std::printf(
@@ -529,12 +600,14 @@ void apply_window_scaling(TestConfig &config) {
         }
         config.window_size = pow2;
     }
-    config.frames = config.window_size * 2;
+    if (!config.frames_cli_override) {
+        config.frames = config.window_size * 2;
+    }
     const size_t window = static_cast<size_t>(config.window_size);
     // Keep streaming runs small but still large enough to flush FFT latency reliably.
     constexpr size_t kStreamingChunkMultiplier = 16U;
-    constexpr size_t kStreamingPasses = 4U;
-    config.streaming_chunk = window * kStreamingChunkMultiplier;
+    constexpr size_t kStreamingPasses = 16U;
+    config.streaming_chunk = window * kStreamingChunkMultiplier / config.hop_size;
     if (config.streaming_chunk == 0U) {
         config.streaming_chunk = window;
     }
@@ -642,39 +715,45 @@ bool nearly_equal(double a, double b, double tol = -1.0) {
 //   W_istft:     ISTFT synthesis window size (PCM samples)
 //   L_istft:     ISTFT demand (working-hop units)
 // Returns: Latest output PCM index that can depend on n0
-int compute_t_max(int n0, int W_fft, int H_fft, int W_work, int H_work, int W_istft, int L_istft) {
+int compute_t_max(int n0, int W_fft, int H_fft, int W_work, int H_work, int W_istft, int L_istft, int W_active_span) {
     if (H_fft <= 0 || H_work <= 0) return n0;  // degenerate
-    
+
     // k*(n0) = ⌊n0 / H_fft⌋
     const int k_star = n0 / H_fft;
-    
+
     // j*(n0) = ⌊k*(n0) / H_work⌋
     const int j_star = k_star / H_work;
-    
-    // i*(n0) = j*(n0) + L_istft - 1
-    const int i_star = j_star + L_istft - 1;
-    
-    // t_max(n0) = i*(n0)·H_fft + W_istft - 1
-    const int t_max = i_star * H_fft + W_istft - 1;
-    
+
+    // working-hop size in PCM samples
+    const int working_hop_pcm = H_work * H_fft;
+
+    // extra working hops contributed by the active working-window span (in working-frame units)
+    const int extra_working_hops = (W_active_span > 0) ? W_active_span : 0;
+
+    // i*(n0) = j*(n0) + extra_working_hops + L_istft - 1
+    const int i_star = j_star + extra_working_hops + L_istft - 1;
+
+    // t_max(n0) = i*(n0)·H_working_pcm + W_istft - 1
+    const int t_max = i_star * working_hop_pcm + W_istft - 1;
+
     return t_max;
 }
 
 // Compute delay for sample n0
-int compute_delay(int n0, int W_fft, int H_fft, int W_work, int H_work, int W_istft, int L_istft) {
-    const int t_max = compute_t_max(n0, W_fft, H_fft, W_work, H_work, W_istft, L_istft);
+int compute_delay(int n0, int W_fft, int H_fft, int W_work, int H_work, int W_istft, int L_istft, int W_active_span) {
+    const int t_max = compute_t_max(n0, W_fft, H_fft, W_work, H_work, W_istft, L_istft, W_active_span);
     return t_max - n0;
 }
 
 // Compute minimum tail padding for finite signal of length N
-int compute_tail(int N, int W_fft, int H_fft, int W_work, int H_work, int W_istft, int L_istft) {
+int compute_tail(int N, int W_fft, int H_fft, int W_work, int H_work, int W_istft, int L_istft, int W_active_span) {
     if (N <= 0) return 0;
     
     int max_tail = 0;
     // Search a representative range (pattern repeats modulo combined hop lattice)
     const int search_range = std::min(N, W_fft * W_work);
     for (int n0 = 0; n0 < search_range; ++n0) {
-        const int t_max = compute_t_max(n0, W_fft, H_fft, W_work, H_work, W_istft, L_istft);
+        const int t_max = compute_t_max(n0, W_fft, H_fft, W_work, H_work, W_istft, L_istft, W_active_span);
         const int tail = std::max(0, t_max - (N - 1));
         max_tail = std::max(max_tail, tail);
     }
@@ -806,6 +885,19 @@ struct RunResult {
     size_t pcm_frames_committed{0};
     size_t spectral_rows_committed{0};
     AmpNodeMetrics metrics{};
+    // Snapshot of persistent mailbox nodes observed for this run
+    struct MailboxNodeSnapshot {
+        size_t index{0};
+        int frame_index{0};
+        int slot{0};
+        int window_size{0};
+        int node_kind{0}; // 0 = SPECTRAL, 1 = PCM
+        double pcm_sample{0.0};
+        std::vector<double> spectral_real_bins;
+        std::vector<double> spectral_imag_bins;
+    };
+    std::vector<MailboxNodeSnapshot> spectral_nodes;
+    std::vector<MailboxNodeSnapshot> pcm_nodes;
 };
 
 struct StreamingRunResult {
@@ -869,20 +961,28 @@ std::string build_params_json() {
     char buffer[512];
     const int log_level = static_cast<int>(g_verbosity);
     const int slice_log_cap = (g_verbosity == VerbosityLevel::Trace) ? 12 : 0;
+    const int working_hop = (g_config.working_hop_cli_override > 0) ? g_config.working_hop_cli_override : 1;
+    const int working_duration = (g_config.working_window_cli_override > 0) ? g_config.working_window_cli_override : 1;
+    const int working_active_span = working_duration;
+    const int working_total_span = working_duration * 2;
     std::snprintf(
         buffer,
         sizeof(buffer),
         "{\"window_size\":%d,\"algorithm\":\"fft\",\"window\":\"hann\",\"supports_v2\":true,"
         "\"declared_delay\":%d,\"oversample_ratio\":1,\"epsilon\":1e-9,\"max_batch_windows\":1,"
         "\"backend_hop\":%d,\"log_level\":%d,\"log_slice_bin_cap\":%d,"
-        "\"halt_on_zero_stage_output\":true,"
+        "\"halt_on_zero_stage_output\":false,"
         "\"halt_on_zero_stage5_pcm_output\":false,"
-        "\"working_ft_duration_frames\":1,\"working_ft_hop\":1,\"io_mode\":\"spectral\"}",
+        "\"working_ft_duration_frames\":%d,\"working_ft_hop\":%d,\"working_ft_active_window_span\":%d,\"working_ft_time_slices\":%d\"io_mode\":\"spectral\"}",
         g_config.window_size,
         g_config.window_size - 1,
         g_config.hop_size > 0 ? g_config.hop_size : 1,
         log_level,
-        slice_log_cap
+        slice_log_cap,
+        working_duration,
+        working_hop,
+        working_active_span,
+        working_active_span * 2U
     );
     return std::string(buffer);
 }
@@ -1060,6 +1160,48 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
 
     result.pcm_frames_committed = pcm_read.frames_committed;
     result.spectral_rows_committed = spectral_read.frames_committed;
+
+    // Capture persistent mailbox chain snapshots so callers can inspect nodes
+    using amp::tests::fft_division_shared::PersistentMailboxNode;
+    using amp::tests::fft_division_shared::EdgeRunnerTapMailboxChain;
+
+    // Spectral tap is at index 0
+    PersistentMailboxNode *spectral_head = EdgeRunnerTapMailboxChain::get_head(tap_buffers[0]);
+    PersistentMailboxNode *node = spectral_head;
+    size_t seen = 0;
+    while (node) {
+        RunResult::MailboxNodeSnapshot snap{};
+        snap.index = seen;
+        snap.frame_index = node->frame_index;
+        snap.slot = node->slot;
+        snap.window_size = node->window_size;
+        snap.node_kind = static_cast<int>(node->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL ? 0 : 1);
+        snap.pcm_sample = node->pcm_sample;
+        snap.spectral_real_bins = node->spectral_real_bins;
+        snap.spectral_imag_bins = node->spectral_imag_bins;
+        result.spectral_nodes.push_back(std::move(snap));
+        node = node->next;
+        ++seen;
+    }
+
+    // PCM tap is at index 2
+    PersistentMailboxNode *pcm_head = EdgeRunnerTapMailboxChain::get_head(tap_buffers[2]);
+    node = pcm_head;
+    seen = 0;
+    while (node) {
+        RunResult::MailboxNodeSnapshot snap{};
+        snap.index = seen;
+        snap.frame_index = node->frame_index;
+        snap.slot = node->slot;
+        snap.window_size = node->window_size;
+        snap.node_kind = static_cast<int>(node->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL ? 0 : 1);
+        snap.pcm_sample = node->pcm_sample;
+        snap.spectral_real_bins = node->spectral_real_bins;
+        snap.spectral_imag_bins = node->spectral_imag_bins;
+        result.pcm_nodes.push_back(std::move(snap));
+        node = node->next;
+        ++seen;
+    }
 
     if (out_buffer != nullptr) {
         amp_free(out_buffer);
@@ -1878,8 +2020,12 @@ int main(int argc, char **argv) {
     // For spectral mode, ISTFT demand L_istft = 0 (no ISTFT synthesis)
     const int W_fft = g_config.window_size;
     const int H_fft = g_config.hop_size;
-    const int W_work = 1;
-    const int H_work = 1;
+    const int W_work = g_config.working_window_cli_override > 0
+        ? g_config.working_window_cli_override
+        : 1;
+    const int H_work = g_config.working_hop_cli_override > 0
+        ? g_config.working_hop_cli_override
+        : 1;
     const int W_istft = W_fft;  // would match FFT if ISTFT were active
     
     // Analytical L_istft: working hops needed to emit ISTFT tail without FINAL flush
@@ -1890,7 +2036,7 @@ int main(int argc, char **argv) {
     const int L_istft = 0;  // spectral mode: no ISTFT synthesis
     
     // Node delay is max over all samples; for simplicity compute at n0=0
-    const int expected_delay = compute_delay(0, W_fft, H_fft, W_work, H_work, W_istft, L_istft);
+    const int expected_delay = compute_delay(0, W_fft, H_fft, W_work, H_work, W_istft, L_istft, W_work);
     
     verify_metrics(first.metrics, "forward_metrics", expected_delay);
     verify_metrics(second.metrics, "repeat_metrics", expected_delay);
@@ -1921,6 +2067,76 @@ int main(int argc, char **argv) {
     }
 
     const bool forward_failed = g_failed;
+    // If the single-shot forward pass failed, print full per-sample/per-bin
+    // tables showing actual, expected and diff for every value so failures
+    // are not summarized only around the first mismatch.
+    if (forward_failed) {
+        std::fprintf(stdout, "\n===== SINGLE-SHOT FAILURE DETAILS =====\n");
+        // PCM table
+        std::fprintf(stdout, "\n-- PCM (index | actual | expected | diff) --\n");
+        std::fprintf(stdout, "%6s | % .12s | % .12s | % .12s\n", "index", "actual", "expected", "diff");
+        for (size_t i = 0; i < pcm_frames_to_check; ++i) {
+            const double a = (i < first.pcm.size()) ? first.pcm[i] : 0.0;
+            const double e = (i < expected_pcm.size()) ? expected_pcm[i] : 0.0;
+            const double d = a - e;
+            std::fprintf(stdout, "%6zu | % .12f | % .12f | % .12f\n", i, a, e, d);
+        }
+
+        // Spectral real table
+        std::fprintf(stdout, "\n-- Spectral Real (index | actual | expected | diff) --\n");
+        std::fprintf(stdout, "%6s | % .12s | % .12s | % .12s\n", "index", "actual", "expected", "diff");
+        for (size_t i = 0; i < spectral_values_to_check; ++i) {
+            const double a = (i < first.spectral_real.size()) ? first.spectral_real[i] : 0.0;
+            const double e = (i < expected_spec.spectral_real.size()) ? expected_spec.spectral_real[i] : 0.0;
+            const double d = a - e;
+            std::fprintf(stdout, "%6zu | % .12f | % .12f | % .12f\n", i, a, e, d);
+        }
+
+        // Spectral imag table
+        std::fprintf(stdout, "\n-- Spectral Imag (index | actual | expected | diff) --\n");
+        std::fprintf(stdout, "%6s | % .12s | % .12s | % .12s\n", "index", "actual", "expected", "diff");
+        for (size_t i = 0; i < spectral_values_to_check; ++i) {
+            const double a = (i < first.spectral_imag.size()) ? first.spectral_imag[i] : 0.0;
+            const double e = (i < expected_spec.spectral_imag.size()) ? expected_spec.spectral_imag[i] : 0.0;
+            const double d = a - e;
+            std::fprintf(stdout, "%6zu | % .12f | % .12f | % .12f\n", i, a, e, d);
+        }
+        // Mailbox node details (spectral)
+        std::fprintf(stdout, "\n-- Persistent Spectral Mailbox Nodes --\n");
+        for (size_t ni = 0; ni < first.spectral_nodes.size(); ++ni) {
+            const auto &n = first.spectral_nodes[ni];
+            std::fprintf(stdout, "node[%zu] kind=%s index=%zu frame=%d slot=%d window=%d pcm_sample=% .12f bins_count=%zu\n",
+                         ni,
+                         (n.node_kind == 0) ? "SPECTRAL" : "PCM",
+                         n.index,
+                         n.frame_index,
+                         n.slot,
+                         n.window_size,
+                         n.pcm_sample,
+                         n.spectral_real_bins.size());
+            // Print bins (limit to reasonable amount)
+            const size_t max_bins = static_cast<size_t>(g_config.window_size);
+            for (size_t b = 0; b < n.spectral_real_bins.size() && b < max_bins; ++b) {
+                std::fprintf(stdout, "  bin[%zu]=% .12f imag=% .12f\n", b, n.spectral_real_bins[b], (b < n.spectral_imag_bins.size() ? n.spectral_imag_bins[b] : 0.0));
+            }
+        }
+
+        // Mailbox node details (pcm)
+        std::fprintf(stdout, "\n-- Persistent PCM Mailbox Nodes --\n");
+        for (size_t ni = 0; ni < first.pcm_nodes.size(); ++ni) {
+            const auto &n = first.pcm_nodes[ni];
+            std::fprintf(stdout, "node[%zu] kind=%s index=%zu frame=%d slot=%d window=%d pcm_sample=% .12f\n",
+                         ni,
+                         (n.node_kind == 0) ? "SPECTRAL" : "PCM",
+                         n.index,
+                         n.frame_index,
+                         n.slot,
+                         n.window_size,
+                         n.pcm_sample);
+        }
+        std::fprintf(stdout, "===== END SINGLE-SHOT FAILURE DETAILS =====\n\n");
+        std::fflush(stdout);
+    }
     if (!forward_failed) {
         std::vector<double> raw_streaming_signal(g_config.streaming_frames, 0.0);
         for (size_t i = 0; i < raw_streaming_signal.size(); ++i) {

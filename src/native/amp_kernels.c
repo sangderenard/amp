@@ -2087,13 +2087,15 @@ static size_t fftdiv_declared_latency_frames(const node_state_t *state) {
     const int H_fft = (fftdiv.backend_hop > 0) ? fftdiv.backend_hop : 1;
     const int H_work = (fftdiv.wheel_hop > 0) ? fftdiv.wheel_hop : 1;
     const int l_istft = -1; // auto-compute from configuration
+    const int working_span = (fftdiv.wheel_active_window_span > 0) ? fftdiv.wheel_active_window_span : 1;
     const size_t delay = fftdiv_delay_frames_for_sample(
         0U,
         W_fft,
         H_fft,
         H_work,
         W_fft,
-        l_istft
+        l_istft,
+        working_span
     );
 
     fprintf(
