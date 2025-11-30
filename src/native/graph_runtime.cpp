@@ -1820,6 +1820,12 @@ static int kpn_execute_node_block(
                     uint32_t to_write = std::min<uint32_t>(frames_written, frames);
                     edge_ring_write(*outbuf.tap->ring, outbuf.scratch.data(), to_write);
                     produced_any = true;
+                    runtime_node_record_debug_frame(
+                        node,
+                        std::max<uint32_t>(1U, tap_view.shape.batches),
+                        std::max<uint32_t>(1U, tap_view.shape.channels),
+                        to_write
+                    );
                 }
 
                 // Mark read to allow mailbox to free any owned staging buffers
