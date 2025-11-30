@@ -110,14 +110,19 @@ endif()
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/amp_kernels.c PROPERTIES LANGUAGE CXX)
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/amp_debug_alloc.c PROPERTIES LANGUAGE CXX)
 
-add_library(amp_native SHARED
+set(_AMP_NATIVE_SOURCES
     graph_runtime.cpp
     fft_backend.cpp
     amp_debug_alloc.c
     amp_kernels_wrapper.cpp
     amp_mailbox_cpp.cpp
     amp_descriptor_builder.c
+    kpn_cffi.cpp
+    kpn_stream_session.cpp
+    kpn_sampler_registry.cpp
 )
+
+add_library(amp_native SHARED ${_AMP_NATIVE_SOURCES})
 set_property(TARGET amp_native PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
 set_property(TARGET amp_native PROPERTY MSVC_DEBUG_INFORMATION_FORMAT None)
 
@@ -131,8 +136,58 @@ target_include_directories(amp_native
         ${_FFTFREE_INCLUDE_DIRS}
 )
 
-target_compile_definitions(amp_native PRIVATE AMP_NATIVE_BUILD AMP_NATIVE_USE_FFTFREE)
+# Allow configuring FFT division diagnostics at CMake configure time.
+# If the user passes -DFFTDIV_ENABLE_DIAGNOSTIC=1 when invoking CMake,
+# the AMP native target will be compiled with diagnostic prints enabled.
+if(NOT DEFINED FFTDIV_ENABLE_DIAGNOSTIC)
+    set(FFTDIV_ENABLE_DIAGNOSTIC 0 CACHE BOOL "Enable FFT division diagnostic prints" FORCE)
+endif()
+if(NOT DEFINED FFTDIV_TRACE_ENABLED)
+    set(FFTDIV_TRACE_ENABLED 0 CACHE BOOL "Enable FFT division trace prints" FORCE)
+endif()
+
+target_compile_definitions(amp_native PRIVATE AMP_NATIVE_BUILD AMP_NATIVE_USE_FFTFREE FFTDIV_ENABLE_DIAGNOSTIC=${FFTDIV_ENABLE_DIAGNOSTIC} FFTDIV_TRACE_ENABLED=${FFTDIV_TRACE_ENABLED})
 target_link_libraries(amp_native PRIVATE Threads::Threads ${_FFTFREE_TARGET})
+
+# Optionally build a diagnostic-enabled variant of the native library that
+# compiles FFT division nodes with diagnostic prints enabled. Default is OFF
+# (quiet build). Enabling this will create a second shared library
+# `amp_native_diagnostic` with `FFTDIV_ENABLE_DIAGNOSTIC` defined.
+option(AMP_NATIVE_BUILD_DIAGNOSTIC "Build diagnostic variant of amp_native (with FFT division diagnostics enabled)" OFF)
+if (AMP_NATIVE_BUILD_DIAGNOSTIC)
+    add_library(amp_native_diagnostic SHARED ${_AMP_NATIVE_SOURCES})
+    set_property(TARGET amp_native_diagnostic PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+    set_property(TARGET amp_native_diagnostic PROPERTY MSVC_DEBUG_INFORMATION_FORMAT None)
+
+    target_include_directories(amp_native_diagnostic
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${EIGEN3_INCLUDE_DIR}
+        PRIVATE
+            ${_FFTFREE_INCLUDE_DIRS}
+    )
+
+    target_compile_definitions(amp_native_diagnostic PRIVATE AMP_NATIVE_BUILD AMP_NATIVE_USE_FFTFREE FFTDIV_ENABLE_DIAGNOSTIC)
+    target_link_libraries(amp_native_diagnostic PRIVATE Threads::Threads ${_FFTFREE_TARGET})
+
+    if (_AMP_NATIVE_EXTRA_COMPILE_OPTIONS)
+        target_compile_options(amp_native_diagnostic PRIVATE ${_AMP_NATIVE_EXTRA_COMPILE_OPTIONS})
+    endif()
+    if (_AMP_NATIVE_EXTRA_LINK_OPTIONS)
+        target_link_options(amp_native_diagnostic PRIVATE ${_AMP_NATIVE_EXTRA_LINK_OPTIONS})
+    endif()
+    if (MSVC)
+        target_compile_options(amp_native_diagnostic PRIVATE $<$<CONFIG:Release>:/Od> /FS)
+        target_link_options(amp_native_diagnostic PRIVATE $<$<CONFIG:Release>:/DEBUG:NONE>)
+    endif()
+
+    set_target_properties(amp_native_diagnostic PROPERTIES
+        OUTPUT_NAME "amp_native_diagnostic"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    )
+endif()
 
 add_executable(demo_kpn_native
     demo_kpn_native.cpp
@@ -267,7 +322,22 @@ if (AMP_NATIVE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     target_link_libraries(test_fft_division_node PRIVATE amp_native)
-    add_test(NAME test_fft_division_node COMMAND test_fft_division_node)
+    # Run the FFT division node test quietly by default to avoid noisy diagnostics
+    # during ctest runs. Developers can still run the binary directly for verbose
+    # output (e.g. `test_fft_division_node --verbosity trace`).
+    add_test(NAME test_fft_division_node COMMAND test_fft_division_node --quiet)
+
+    # Minimal KPN harness to run a single FFTDivisionNode via the graph runtime.
+    add_executable(kpn_run_fft_division
+        tests/kpn_run_fft_division.cpp
+    )
+    target_include_directories(kpn_run_fft_division PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${EIGEN3_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(kpn_run_fft_division PRIVATE amp_native)
+    add_test(NAME kpn_run_fft_division COMMAND kpn_run_fft_division)
 
     # Diagnostic: compare Eigen FFT vs backend (fftfree) outputs
     add_executable(test_fft_backend_compare
@@ -337,6 +407,7 @@ if (AMP_NATIVE_BUILD_TESTS)
         test_thermo_param
         test_amp_run_node_v2
         test_fft_noise_gradient
+        kpn_run_fft_division
         test_fft_division_kpn
         test_fft_division_node
         test_fft_backend_compare
@@ -366,3 +437,14 @@ if(AMP_NATIVE_BUILD_TESTS)
 endif()
 # Create an aggregate ALL target that depends on the demo and all test binaries.
 add_custom_target(build_native_binaries ALL DEPENDS ${_AMP_NATIVE_DEFAULT_BINARIES})
+
+# Ensure the kpn_run_fft_division target is placed in the same runtime output
+# directory as the other native binaries and is pulled into the aggregate
+# `build_native_binaries` target. This guards against generator caching or
+# ordering causing the target to be omitted from the aggregate build.
+if(TARGET kpn_run_fft_division)
+    set_target_properties(kpn_run_fft_division PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+    )
+    add_dependencies(build_native_binaries kpn_run_fft_division)
+endif()

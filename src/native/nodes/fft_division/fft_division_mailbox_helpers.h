@@ -12,6 +12,18 @@ extern "C" {
 #include "amp_native.h"
 }
 
+/* Provide a fallback FFTDIV_DIAG macro so this header may be included
+    in translation units that don't define the macro already. If the
+    compile unit enables diagnostics via `FFTDIV_ENABLE_DIAGNOSTIC`,
+    emit prints to `stdout`, otherwise make the macro a no-op. */
+#if !defined(FFTDIV_DIAG)
+# if defined(FFTDIV_ENABLE_DIAGNOSTIC) && (FFTDIV_ENABLE_DIAGNOSTIC)
+#  define FFTDIV_DIAG(...) do { fprintf(stdout, __VA_ARGS__); fflush(stdout); } while(0)
+# else
+#  define FFTDIV_DIAG(...) ((void)0)
+# endif
+#endif
+
 /* Avoid conflicts with Windows `min`/`max` macros when this header is
     included into translation units that pull in Windows headers. Push/pop
     the macro state so we don't disturb other code. */
@@ -62,9 +74,8 @@ inline TapMailboxReadResult PopulateLegacyPcmFromMailbox(
         result.frames_committed = copy_frames;
         result.values_written = copy_frames;
         result.copied_from_mailbox = (result.values_written > 0U);
-        fprintf(stdout, "[MAILBOX-COPY] pcm copied_from_cache frames_committed=%zu values_written=%zu aliased=%d\n",
-            result.frames_committed, result.values_written, result.aliased_legacy_buffer ? 1 : 0);
-        fflush(stdout);
+        FFTDIV_DIAG("[MAILBOX-COPY] pcm copied_from_cache frames_committed=%zu values_written=%zu aliased=%d\n",
+                   result.frames_committed, result.values_written, result.aliased_legacy_buffer ? 1 : 0);
         return result;
     }
 
@@ -95,12 +106,10 @@ inline TapMailboxReadResult PopulateLegacyPcmFromMailbox(
 
     result.copied_from_mailbox = (result.values_written > 0U);
     if (result.copied_from_mailbox) {
-        fprintf(stdout, "[MAILBOX-COPY] pcm copied frames_committed=%zu values_written=%zu aliased=%d\n",
-            result.frames_committed, result.values_written, result.aliased_legacy_buffer ? 1 : 0);
-        fflush(stdout);
+        FFTDIV_DIAG("[MAILBOX-COPY] pcm copied frames_committed=%zu values_written=%zu aliased=%d\n",
+                   result.frames_committed, result.values_written, result.aliased_legacy_buffer ? 1 : 0);
     } else {
-        fprintf(stdout, "[MAILBOX-COPY] pcm nothing_copied\n");
-        fflush(stdout);
+        FFTDIV_DIAG("[MAILBOX-COPY] pcm nothing_copied\n");
     }
     return result;
 }
@@ -174,10 +183,9 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
                 values_written_scalars = pairs * 2U;
                 result.frames_committed = (cache_window > 0U) ? (pairs / cache_window) : pairs;
                 result.copied_from_mailbox = (result.values_written > 0U);
-                fprintf(stdout, "[MAILBOX-COPY] spectral deinterleaved_from_alias_cache window=%zu cache_frames=%zu cache_values=%zu frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
-                    cache_window, cache_frames, cache_values, result.frames_committed, result.values_written, values_written_complex,
-                    result.aliased_legacy_buffer ? 1 : 0);
-                fflush(stdout);
+                FFTDIV_DIAG("[MAILBOX-COPY] spectral deinterleaved_from_alias_cache window=%zu cache_frames=%zu cache_values=%zu frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
+                           cache_window, cache_frames, cache_values, result.frames_committed, result.values_written, values_written_complex,
+                           result.aliased_legacy_buffer ? 1 : 0);
                 return result;
             }
 
@@ -195,9 +203,8 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
                 // frames_committed computed from complex bins per row (copy_values / window)
                 result.frames_committed = (cache_window > 0U) ? (copy_values / cache_window) : 0U;
                 result.copied_from_mailbox = (result.values_written > 0U);
-                fprintf(stdout, "[MAILBOX-COPY] spectral copied_from_cache window=%zu cache_frames=%zu cache_values=%zu frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
-                    cache_window, cache_frames, cache_values, result.frames_committed, result.values_written, values_written_complex, result.aliased_legacy_buffer ? 1 : 0);
-            fflush(stdout);
+                FFTDIV_DIAG("[MAILBOX-COPY] spectral copied_from_cache window=%zu cache_frames=%zu cache_values=%zu frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
+                           cache_window, cache_frames, cache_values, result.frames_committed, result.values_written, values_written_complex, result.aliased_legacy_buffer ? 1 : 0);
             return result;
         }
     }
@@ -258,12 +265,10 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
         if (interpreted > capacity_frames) interpreted = capacity_frames;
         result.frames_committed = interpreted;
         result.copied_from_mailbox = true;
-        fprintf(stdout, "[MAILBOX-COPY] spectral copied frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
-            result.frames_committed, values_written_scalars, values_written_complex, result.aliased_legacy_buffer ? 1 : 0);
-        fflush(stdout);
+        FFTDIV_DIAG("[MAILBOX-COPY] spectral copied frames_committed=%zu values_written(scalars)=%zu values_written(complex)=%zu aliased=%d\n",
+                   result.frames_committed, values_written_scalars, values_written_complex, result.aliased_legacy_buffer ? 1 : 0);
     } else {
-        fprintf(stdout, "[MAILBOX-COPY] spectral nothing_copied\n");
-        fflush(stdout);
+        FFTDIV_DIAG("[MAILBOX-COPY] spectral nothing_copied\n");
     }
     return result;
 }

@@ -1475,6 +1475,8 @@ typedef enum {
     NODE_KIND_DRIVER,
     NODE_KIND_SUBHARM,
     NODE_KIND_RESAMPLER,
+    NODE_KIND_DRAIN,
+    NODE_KIND_SAMPLER,
     NODE_KIND_FFT_DIV,
     NODE_KIND_SPECTRAL_DRIVE,
 } node_kind_t;
@@ -2501,6 +2503,10 @@ static node_kind_t determine_node_kind(const EdgeRunnerNodeDescriptor *descripto
     if (strcmp(descriptor->type_name, "ResamplerNode") == 0
         || strcmp(descriptor->type_name, "resampler") == 0) {
         return NODE_KIND_RESAMPLER;
+    }
+    if (strcmp(descriptor->type_name, "SamplerNode") == 0
+        || strcmp(descriptor->type_name, "sampler") == 0) {
+        return NODE_KIND_SAMPLER;
     }
     if (strcmp(descriptor->type_name, "FFTDivisionNode") == 0) {
         return NODE_KIND_FFT_DIV;
@@ -3895,6 +3901,7 @@ static int ensure_fft_spectral_scratch(
 #include "nodes/mix/mix_node.inc"
 #include "nodes/sine_osc/sine_osc_node.inc"
 #include "nodes/safety/safety_node.inc"
+#include "nodes/sampler/sampler_node.inc"
 static void amp_reset_metrics(AmpNodeMetrics *metrics) {
     if (metrics == NULL) {
         return;
@@ -4339,6 +4346,11 @@ static int amp_run_node_impl(
         case NODE_KIND_SUBHARM:
             rc = (mode == AMP_EXECUTION_MODE_FORWARD)
                 ? run_subharm_node(descriptor, inputs, batches, frames, sample_rate, out_buffer, out_channels, node_state)
+                : AMP_E_UNSUPPORTED;
+            break;
+        case NODE_KIND_SAMPLER:
+            rc = (mode == AMP_EXECUTION_MODE_FORWARD)
+                ? run_sampler_node(descriptor, inputs, batches, channels, frames, sample_rate, out_buffer, out_channels, state, history, mode, metrics)
                 : AMP_E_UNSUPPORTED;
             break;
         case NODE_KIND_FFT_DIV:

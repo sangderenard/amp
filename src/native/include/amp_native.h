@@ -389,6 +389,9 @@ typedef struct {
     uint64_t debug_total_channels;
     uint64_t debug_metrics_samples;
     uint64_t debug_last_timestamp_millis;
+    uint64_t debug_execute_count;
+    uint64_t debug_ready_count;
+    uint64_t debug_failed_execute_count;
     double debug_sum_processing_seconds;
     double debug_sum_logging_seconds;
     double debug_sum_total_seconds;
@@ -419,6 +422,11 @@ typedef struct {
     uint32_t ring_capacity;
     uint32_t ring_size;
     uint32_t dump_queue_depth;
+    uint64_t streamer_loop_count;
+    int64_t last_error_code; /* 0 == no error, negative values indicate runtime error codes */
+    char last_error_stage[32]; /* short stage string (e.g. "execute", "streamer") */
+    char last_error_node[64];  /* node name where the last error occurred */
+    char last_error_detail[128]; /* human-readable detail string */
 } AmpGraphDebugSnapshot;
 
 AMP_CAPI int amp_run_node_v2(
@@ -617,6 +625,82 @@ AMP_CAPI int amp_graph_runtime_debug_snapshot(
     uint32_t node_capacity,
     AmpGraphDebugSnapshot *snapshot
 );
+
+/*
+ * High-level KPN session wrapper: create a streaming session around an
+ * AmpGraphRuntime/AmpGraphStreamer instance and allow consumers to poll
+ * and drain ring/dump outputs without using temporary files.
+ *
+ * The creator accepts either a compiled plan/descriptor blob (preferred),
+ * or NULL blobs in which case the implementation may build a demo descriptor
+ * for convenience (matching demo_kpn_native behaviour).
+ */
+
+typedef struct KpnStreamSession KpnStreamSession;
+
+AMP_CAPI KpnStreamSession *amp_kpn_session_create_from_blobs(
+    const uint8_t *descriptor_blob,
+    size_t descriptor_len,
+    const uint8_t *plan_blob,
+    size_t plan_len,
+    int frames_hint,
+    double sample_rate,
+    uint32_t ring_frames,
+    uint32_t block_frames
+);
+AMP_CAPI int amp_kpn_session_start(KpnStreamSession *session);
+AMP_CAPI void amp_kpn_session_stop(KpnStreamSession *session);
+AMP_CAPI void amp_kpn_session_destroy(KpnStreamSession *session);
+
+AMP_CAPI int amp_kpn_session_available(KpnStreamSession *session, uint64_t *out_frames);
+AMP_CAPI int amp_kpn_session_read(
+    KpnStreamSession *session,
+    double *destination,
+    size_t max_frames,
+    uint32_t *out_frames,
+    uint32_t *out_channels,
+    uint64_t *out_sequence
+);
+AMP_CAPI int amp_kpn_session_dump_count(KpnStreamSession *session, uint32_t *out_count);
+AMP_CAPI int amp_kpn_session_pop_dump(
+    KpnStreamSession *session,
+    double *destination,
+    size_t max_frames,
+    uint32_t *out_frames,
+    uint32_t *out_channels,
+    uint64_t *out_sequence
+);
+AMP_CAPI int amp_kpn_session_status(KpnStreamSession *session, uint64_t *out_produced_frames, uint64_t *out_consumed_frames);
+
+/* Request a debug snapshot for the given KPN session. This fills the provided
+ * `node_entries` array (with capacity `node_capacity`) and writes a global
+ * snapshot into `snapshot`. Returns 0 on success or a negative error code.
+ */
+AMP_CAPI int amp_kpn_session_debug_snapshot(
+    KpnStreamSession *session,
+    AmpGraphNodeDebugEntry *node_entries,
+    uint32_t node_capacity,
+    AmpGraphDebugSnapshot *snapshot
+);
+
+/* Sampler registry API
+ * --------------------
+ * Lightweight global registry that allows external hosts (Python/session)
+ * to stage a PCM buffer under a node name that sampler nodes can consume
+ * during runtime execution. The API is intentionally minimal: callers
+ * register a buffer (copied internally), peek into the buffer from
+ * native nodes, and advance the read cursor as frames are consumed.
+ */
+AMP_CAPI int amp_kpn_session_stage_sampler_buffer(
+    KpnStreamSession *session,
+    const double *samples,
+    size_t frames,
+    uint32_t channels,
+    const char *node_name
+);
+AMP_CAPI int amp_sampler_unregister(const char *node_name);
+AMP_CAPI int amp_sampler_peek(const char *node_name, const double **out_samples, size_t *out_frames, uint32_t *out_channels, size_t *out_read_pos);
+AMP_CAPI int amp_sampler_advance(const char *node_name, size_t consumed_frames);
 
 /* Tap cache API: stage an externally-provided buffer for a tap and
    copy mailbox-chain contents into it when requested. These functions

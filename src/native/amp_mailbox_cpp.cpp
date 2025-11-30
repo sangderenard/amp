@@ -13,6 +13,17 @@
 #include <unordered_map>
 #include "nodes/fft_division/fft_division_types.h"
 
+// Compile-time mailbox diagnostics: controlled by `FFTDIV_ENABLE_DIAGNOSTIC`.
+// When zero (default via CMake) these diagnostics compile out to no-ops.
+#ifndef FFTDIV_ENABLE_DIAGNOSTIC
+#define FFTDIV_ENABLE_DIAGNOSTIC 0
+#endif
+#if FFTDIV_ENABLE_DIAGNOSTIC
+#define MAILBOX_DIAG(...) do { fprintf(stderr, __VA_ARGS__); } while(0)
+#else
+#define MAILBOX_DIAG(...) ((void)0)
+#endif
+
 static std::mutex g_states_mtx;
 static std::unordered_map<void*, struct MailboxStateWrapper*> g_states;
 // Map of tap -> allocated buffer for buffers the mailbox allocated on behalf
@@ -247,7 +258,7 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
     }
     auto _now = std::chrono::steady_clock::now().time_since_epoch();
     long long _ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_now).count());
-    fprintf(stderr, "[TAP-FILL] t=%lldms tap=%p cache=%p owned=%d written=%zu capacity=%zu from_head=%p\n",
+        MAILBOX_DIAG("[TAP-FILL] t=%lldms tap=%p cache=%p owned=%d written=%zu capacity=%zu from_head=%p\n",
             _ms, reinterpret_cast<void*>(tap), reinterpret_cast<void*>(tap->cache_data), owned ? 1 : 0, written, capacity, reinterpret_cast<void*>(tap->mailbox_head));
     return static_cast<int>(written);
 }
@@ -290,17 +301,17 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
         size_t available_now = tap_chain_length_locked(w, tap, tap_name, nullptr, nullptr);
         long long _ms = now_ms_since_start();
         if (timeout_ms == 0) {
-            fprintf(stderr, "[TAP-WAIT-CHECK] t=%lldms tap=%p tap_name='%s' available=%zu expected=%zu\n",
+                MAILBOX_DIAG("[TAP-WAIT-CHECK] t=%lldms tap=%p tap_name='%s' available=%zu expected=%zu\n",
                     _ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", available_now, expected);
         } else {
-            fprintf(stderr, "[TAP-WAIT-CHECK] t=%lldms tap=%p tap_name='%s' available=%zu expected=%zu deadline_ms=%llu\n",
+                MAILBOX_DIAG("[TAP-WAIT-CHECK] t=%lldms tap=%p tap_name='%s' available=%zu expected=%zu deadline_ms=%llu\n",
                     _ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", available_now, expected,
                     static_cast<unsigned long long>(timeout_ms));
         }
         stagnant_checks = (available_now == last_available) ? (stagnant_checks + 1) : 0;
         last_available = available_now;
         if (stalled()) {
-            fprintf(stderr, "[TAP-WAIT-STALL] tap=%p tap_name='%s' available=%zu expected=%zu stalled_checks=%d\n",
+                MAILBOX_DIAG("[TAP-WAIT-STALL] tap=%p tap_name='%s' available=%zu expected=%zu stalled_checks=%d\n",
                     reinterpret_cast<void*>(tap),
                     tap_name ? tap_name : "(null)",
                     available_now,
@@ -346,7 +357,7 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
     }
     auto _now_init = std::chrono::steady_clock::now();
     long long _init_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_now_init - _start_time).count());
-    fprintf(stderr, "[TAP-BLOCK-INIT] t=%lldms tap=%p tap_name='%s' mailbox_head=%p cache=%p owned=%d expected=%zu available=%zu ready=%d\n",
+        MAILBOX_DIAG("[TAP-BLOCK-INIT] t=%lldms tap=%p tap_name='%s' mailbox_head=%p cache=%p owned=%d expected=%zu available=%zu ready=%d\n",
             _init_ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", reinterpret_cast<void*>(tap->mailbox_head), reinterpret_cast<void*>(tap->cache_data), initially_owned ? 1 : 0, expected, available, ready ? 1 : 0);
 
     // If a staged legacy buffer exists on the tap, attempt to fill it from
@@ -386,8 +397,8 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
                 g_owned_cache_buffers[tap] = buf;
                 auto _now_alloc = std::chrono::steady_clock::now();
                 long long _alloc_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_now_alloc - _start_time).count());
-                fprintf(stderr, "[TAP-ALLOC] t=%lldms tap_name='%s' tap=%p buf=%p len=%zu mailbox_owned=1\n",
-                        _alloc_ms, tap_name ? tap_name : "(null)", reinterpret_cast<void*>(tap), reinterpret_cast<void*>(buf), buf_len);
+                MAILBOX_DIAG("[TAP-ALLOC] t=%lldms tap_name='%s' tap=%p buf=%p len=%zu mailbox_owned=1\n",
+                    _alloc_ms, tap_name ? tap_name : "(null)", reinterpret_cast<void*>(tap), reinterpret_cast<void*>(buf), buf_len);
             }
         }
     }
@@ -423,7 +434,7 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
                     filled = amp_tap_cache_fill_from_chain(tap);
                     auto _now_retry = std::chrono::steady_clock::now();
                     long long _retry_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_now_retry - _start_time).count());
-                    fprintf(stderr, "[TAP-FILL-RETRY] t=%lldms tap=%p tap_name='%s' retry=%d filled=%d cache_frames=%u expected=%zu\n",
+                        MAILBOX_DIAG("[TAP-FILL-RETRY] t=%lldms tap=%p tap_name='%s' retry=%d filled=%d cache_frames=%u expected=%zu\n",
                             _retry_ms, reinterpret_cast<void*>(tap), tap_name ? tap_name : "(null)", _retry_count, filled, tap->cache_frames, expected);
                 }
             }
@@ -432,7 +443,7 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
 
     auto _end_time = std::chrono::steady_clock::now();
     long long _elapsed_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_end_time - _start_time).count());
-    fprintf(stderr, "[TAP-BLOCK] t=%lldms tap_name='%s' resolved='%s' expected=%zu available=%zu ready=%d filled=%d elapsed_ms=%lld\n",
+        MAILBOX_DIAG("[TAP-BLOCK] t=%lldms tap_name='%s' resolved='%s' expected=%zu available=%zu ready=%d filled=%d elapsed_ms=%lld\n",
             _elapsed_ms, tap_name ? tap_name : "(null)", resolved_name.c_str(), expected, available, ready ? 1 : 0, filled, _elapsed_ms);
 
     // Consider the tap ready only if the original predicate succeeded and,
@@ -472,7 +483,7 @@ extern "C" AMP_CAPI void amp_tap_cache_mark_read(EdgeRunnerTapBuffer* tap) {
             tap->cache_batches = 0;
             tap->cache_channels = 0;
             tap->cache_frames = 0;
-            fprintf(stderr, "[TAP-FREE] read free tap=%p\n", reinterpret_cast<void*>(tap));
+            MAILBOX_DIAG("[TAP-FREE] read free tap=%p\n", reinterpret_cast<void*>(tap));
         }
     }
 }
@@ -514,7 +525,7 @@ void amp_mailbox_attach_spectral_node(void* state, const char* tap_name, AmpMail
     // update instrumentation
     w->spectral_counts[std::string(tap_name)] = EdgeRunnerTapMailboxChain::count_nodes(chain.head);
     ++w->total_spectral_appends;
-        fprintf(stderr, "[MAILBOX-APPEND] spectral tap='%s' spectral_frame_index=%d appended total=%zu total_appends=%zu\n",
+        MAILBOX_DIAG("[MAILBOX-APPEND] spectral tap='%s' spectral_frame_index=%d appended total=%zu total_appends=%zu\n",
             tap_name ? tap_name : "(null)", n ? n->frame_index : -1,
             w->spectral_counts[std::string(tap_name)], w->total_spectral_appends);
     w->cv.notify_all();
@@ -545,8 +556,8 @@ void amp_mailbox_append_pcm_node(void* state, AmpMailboxNode node) {
     if (w->pcm_read_cursor == nullptr) {
         w->pcm_read_cursor = chain.head;
     }
-        fprintf(stderr, "[MAILBOX-APPEND] pcm pcm_sample_index=%d appended pcm_count=%zu total_pcm_appends=%zu\n",
-            n ? n->frame_index : -1, w->pcm_count, w->total_pcm_appends);
+            MAILBOX_DIAG("[MAILBOX-APPEND] pcm pcm_sample_index=%d appended pcm_count=%zu total_pcm_appends=%zu\n",
+                n ? n->frame_index : -1, w->pcm_count, w->total_pcm_appends);
     w->cv.notify_all();
     // Also notify the node worker (if any) so long-running workers that
     // wait on internal predicates can re-evaluate when mailbox entries
@@ -576,7 +587,7 @@ extern "C" AMP_CAPI int amp_mailbox_advance_pcm_cursor(void* state, const char* 
         available = EdgeRunnerTapMailboxChain::count_nodes(w->pcm_read_cursor);
     }
     // Notify potential waiters that a cursor moved (not strictly necessary)
-    fprintf(stderr, "[MAILBOX-CURSOR] tap='%s' advanced=%zu available=%zu new_cursor=%p\n",
+        MAILBOX_DIAG("[MAILBOX-CURSOR] tap='%s' advanced=%zu available=%zu new_cursor=%p\n",
             tap_name ? tap_name : "(pcm)", advanced, available, reinterpret_cast<void*>(w->pcm_read_cursor));
     w->cv.notify_all();
     // Wake the fft-division worker (if present) so it can re-evaluate
@@ -605,13 +616,13 @@ size_t amp_mailbox_pcm_chain_length(void* state) {
 void amp_mailbox_log_stats(void* state) {
     MailboxStateWrapper* w = state_for(state);
     std::lock_guard<std::mutex> lock(w->mtx);
-    fprintf(stderr, "[MAILBOX-STATS] PCM chain length=%zu\n", w->pcm_count);
-    fprintf(stderr, "[MAILBOX-STATS] total_pcm_appends=%zu total_spectral_appends=%zu\n", w->total_pcm_appends, w->total_spectral_appends);
+    MAILBOX_DIAG("[MAILBOX-STATS] PCM chain length=%zu\n", w->pcm_count);
+    MAILBOX_DIAG("[MAILBOX-STATS] total_pcm_appends=%zu total_spectral_appends=%zu\n", w->total_pcm_appends, w->total_spectral_appends);
     for (const auto &kv : w->spectral_mailbox_chains) {
         const std::string &tap = kv.first;
         size_t cnt = EdgeRunnerTapMailboxChain::count_nodes(kv.second.head);
         int last_frame = kv.second.tail ? kv.second.tail->frame_index : -1;
-        fprintf(stderr, "[MAILBOX-STATS] spectral tap='%s' len=%zu tail_spectral_frame=%d\n", tap.c_str(), cnt, last_frame);
+        MAILBOX_DIAG("[MAILBOX-STATS] spectral tap='%s' len=%zu tail_spectral_frame=%d\n", tap.c_str(), cnt, last_frame);
     }
 }
 

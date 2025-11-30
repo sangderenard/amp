@@ -35,13 +35,12 @@ static inline int64_t fftdiv_delay_compute_t_max(
     hop_working = fftdiv_delay_positive_or_default_int64((int)hop_working, 1);
 
     int64_t l_istft = l_istft_override;
+    int64_t ola_factor = (istft_window + hop_fft - 1) / hop_fft; // integer ceil    
     if (l_istft < 0) {
-        l_istft = ((window_fft / hop_fft) * window_fft + hop_working - 1)/ hop_working;
-        l_istft *= hop_fft;
-
-        if (sample_index <= working_span * hop_fft) {
-            l_istft += hop_fft * hop_working;
-        }
+        l_istft = (working_span - 1)* hop_fft + ola_factor * hop_fft;
+    }
+    else {
+        l_istft += ola_factor * hop_fft;
     }
 
     
@@ -52,12 +51,13 @@ static inline int64_t fftdiv_delay_compute_t_max(
         // integer ceil: (a + b - 1) / b
         extra_working_hops = (working_span - 1 + hop_working - 1) / hop_working;
     }
+    else {
+        extra_working_hops = 0;
+    }
     const int64_t extra_spectral_output = (extra_working_hops > 0) ? extra_working_hops * hop_working * hop_fft - (working_span - 1) : 0;
     l_istft -= extra_spectral_output * hop_fft;
-    fprintf(stderr, "sample_index=%lld stft_remainder=%lld extra_working_hops=%lld extra_spectral_output=%lld l_istft=%lld\n",
-        sample_index, stft_remainder, extra_working_hops, extra_spectral_output, l_istft);
     return extra_working_hops * working_hop_samples + l_istft - stft_remainder;
-     
+    
 }
 
 static inline size_t fftdiv_delay_frames_for_sample(

@@ -13,6 +13,8 @@
 #include <thread>
 #include <vector>
 #include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #if defined(_WIN32)
 #include <io.h>
 #define AMP_DUP   _dup
@@ -1654,14 +1656,6 @@ SimulationResult simulate_stream_identity(
         return produced;
     };
 
-    if (chunk_frames == 0) {
-        // Legacy single-shot path used for the non-streaming expectations.
-        std::vector<double> padded_signal = signal;
-        padded_signal.resize(total_frames, 0.0);
-        if (!padded_signal.empty()) {
-            push_and_capture(padded_signal.data(), padded_signal.size(), AMP_FFT_STREAM_FLUSH_NONE);
-        }
-    } else {
         // Streaming-accurate path: feed the signal in chunks, then append the zero tail
         // after the final audio block has been seen. This mirrors the node's behaviour
         // in run_fft_node_streaming and avoids front-loading the tail.
@@ -1675,7 +1669,6 @@ SimulationResult simulate_stream_identity(
             std::vector<double> zero_tail(tail_frames, 0.0);
             push_and_capture(zero_tail.data(), zero_tail.size(), AMP_FFT_STREAM_FLUSH_NONE);
         }
-    }
 
     // Drain any ready frames and then issue repeated final flushes until nothing remains.
     for (int flush_iteration = 0; flush_iteration < 8; ++flush_iteration) {
@@ -1843,6 +1836,19 @@ void require_backward_unsupported(const std::vector<double> &signal, const std::
 
 }  // namespace
 
+
+// Helper function to generate a clean, consistent test signal.
+// Uses the exact same logic previously used only in the streaming test:
+// signal[i] = sin(0.005*t) * cos(0.013*t)
+static std::vector<double> generate_test_signal(size_t frames) {
+    std::vector<double> signal(frames, 0.0);
+    for (size_t i = 0; i < frames; ++i) {
+        double t = static_cast<double>(i);
+        signal[i] = std::sin(0.005 * t) * std::cos(0.013 * t);
+    }
+    return signal;
+}
+
 int main(int argc, char **argv) {
     if (maybe_print_help(argc, argv)) {
         return 0;
@@ -1853,57 +1859,27 @@ int main(int argc, char **argv) {
         quiet_silencer.activate();
     }
     configure_from_args(argc, argv);
-    // Generate a test signal by starting with an arbitrary waveform,
-    // then pre-conditioning it through a forward+inverse FFT roundtrip.
-    // This ensures the signal is "well-behaved" and can be perfectly
-    // reconstructed, avoiding boundary artifacts from DC offsets or
-    // non-zero endpoints.
-    // Well-behaved original: starts and ends at zero (half-sine across 8 frames)
-    std::vector<double> raw_signal(static_cast<size_t>(g_config.frames), 0.0);
-    if (g_config.frames >= 2) {
-        const double pi = std::acos(-1.0);
-        for (int i = 0; i < g_config.frames; ++i) {
-            const double angle = pi * static_cast<double>(i) / static_cast<double>(g_config.frames - 1);
-            raw_signal[static_cast<size_t>(i)] = std::sin(angle);
-        }
-    }
 
-    // Pre-condition the signal: run it through FFT roundtrip once
-    std::vector<double> preconditioned_pcm = clean_pcm(raw_signal, g_config.window_size, g_config.hop_size);
-
-    // Recite original and cleaned signals for full visibility
-    emit_diagnostic("original_raw_signal (frames=%zu)", raw_signal.size());
-    for (size_t i = 0; i < raw_signal.size(); ++i) {
-        emit_diagnostic("raw[%04zu]= % .12f", i, raw_signal[i]);
-    }
-    emit_diagnostic("cleaned_signal (frames=%zu)", preconditioned_pcm.size());
-    for (size_t i = 0; i < preconditioned_pcm.size(); ++i) {
-        emit_diagnostic("cleaned[%04zu]= % .12f", i, preconditioned_pcm[i]);
-    }
-
-    // Hard fail immediately if lengths are not exactly as expected
-    if (raw_signal.size() != static_cast<size_t>(g_config.frames)) {
-        record_failure("raw_signal length %zu != expected %d", raw_signal.size(), g_config.frames);
-        return 1;
-    }
-    if (preconditioned_pcm.size() != static_cast<size_t>(g_config.frames)) {
-        record_failure("cleaned_signal length %zu != expected %d", preconditioned_pcm.size(), g_config.frames);
-        return 1;
-    }
-
-    // Use the pre-conditioned PCM as the actual test signal (identity-cleaned)
-    const std::vector<double> signal = preconditioned_pcm;
+    // Generate the test signal using the shared helper (same as streaming).
+    // This replaces the previous half-sine generation and FFT roundtrip pre-conditioning.
+    const std::vector<double> signal = generate_test_signal(g_config.frames);
 
     // Derive expectations from the identity-cleaned signal:
-    // - PCM expectation is the cleaned signal itself (identity target)
-    // - Spectral expectations come from a forward/inverse simulated pass on the cleaned signal
+    // - PCM expectation is the signal itself (identity target)
+    // - Spectral expectations come from the unified simulation helper
     const std::vector<double> expected_pcm = signal;
-    SimulationResult expected_spec;
-    auto [expected_real, expected_imag] = forward_fft(signal, g_config.window_size, g_config.hop_size);
-    expected_spec.pcm = signal;  // exact copy of input
-    expected_spec.spectral_frames = expected_real.size() / g_config.window_size;
-    expected_spec.spectral_real = expected_real;
-    expected_spec.spectral_imag = expected_imag;
+    
+    // Use the same simulation helper as streaming, but treat the entire signal as one chunk
+    SimulationResult expected_spec = simulate_stream_identity(
+        signal,
+        AMP_FFT_WINDOW_HANN,
+        g_config.window_size,
+        g_config.hop_size,
+        signal.size() // Chunk size = full length for single-shot
+    );
+    // Override PCM expectation to the raw input signal (identity target)
+    expected_spec.pcm = signal;
+
     if (expected_spec.spectral_frames == 0 ||
         expected_spec.spectral_real.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size) ||
         expected_spec.spectral_imag.size() != expected_spec.spectral_frames * static_cast<size_t>(g_config.window_size)) {
@@ -2138,22 +2114,13 @@ int main(int argc, char **argv) {
         std::fflush(stdout);
     }
     if (!forward_failed) {
-        std::vector<double> raw_streaming_signal(g_config.streaming_frames, 0.0);
-        for (size_t i = 0; i < raw_streaming_signal.size(); ++i) {
-            double t = static_cast<double>(i);
-            raw_streaming_signal[i] = std::sin(0.005 * t) * std::cos(0.013 * t);
-        }
-
-        const std::vector<double> streaming_signal = raw_streaming_signal;
+        // Use the same helper for the streaming signal
+        const std::vector<double> streaming_signal = generate_test_signal(g_config.streaming_frames);
 
         SimulationResult streaming_expected = simulate_stream_identity(streaming_signal, AMP_FFT_WINDOW_HANN, g_config.window_size, g_config.hop_size, g_config.streaming_chunk);
         // Override PCM expectation to the raw input signal, as identity should produce the input without padding.
         streaming_expected.pcm = streaming_signal;
-        // auto [streaming_exp_real, streaming_exp_imag] = forward_fft(streaming_signal, g_config.window_size, g_config.hop_size);
-        // streaming_expected.pcm = streaming_signal;  // exact copy of input
-        // streaming_expected.spectral_frames = streaming_exp_real.size() / g_config.window_size;
-        // streaming_expected.spectral_real = streaming_exp_real;
-        // streaming_expected.spectral_imag = streaming_exp_imag;
+        
         // Perform a full mailbox/global reset between single-shot and streaming
         // to ensure no persistent chains,-owned buffers, or other mailbox
         // artifacts survive into the streaming run.
@@ -2253,6 +2220,41 @@ int main(int argc, char **argv) {
     }
 
     require_backward_unsupported(signal, first.pcm);
+    // If the environment variable FFT_GUI_DUMP_PREFIX is set, write out
+    // key arrays so an external GUI can read them for visualization.
+    const char *dump_prefix_env = std::getenv("FFT_GUI_DUMP_PREFIX");
+    if (dump_prefix_env != nullptr) {
+        const std::string prefix(dump_prefix_env);
+        auto write_vector = [&](const std::string &path, const std::vector<double> &v) {
+            std::ofstream ofs(path, std::ios::out);
+            if (!ofs) return;
+            ofs << v.size() << "\n";
+            for (size_t i = 0; i < v.size(); ++i) {
+                ofs << std::setprecision(18) << v[i] << "\n";
+            }
+            ofs.close();
+        };
+        auto write_spectral = [&](const std::string &path, const std::vector<double> &v, size_t frames, int bins) {
+            std::ofstream ofs(path, std::ios::out);
+            if (!ofs) return;
+            ofs << frames << " " << bins << "\n";
+            const size_t total = v.size();
+            for (size_t i = 0; i < total; ++i) {
+                ofs << std::setprecision(18) << v[i] << "\n";
+            }
+            ofs.close();
+        };
+
+        // first run results
+        write_vector(prefix + "_first_pcm.txt", first.pcm);
+        write_spectral(prefix + "_first_spec_real.txt", first.spectral_real, first.spectral_rows_committed, g_config.window_size);
+        write_spectral(prefix + "_first_spec_imag.txt", first.spectral_imag, first.spectral_rows_committed, g_config.window_size);
+
+        // expected specification (simulator)
+        write_vector(prefix + "_expected_pcm.txt", expected_spec.pcm);
+        write_spectral(prefix + "_expected_spec_real.txt", expected_spec.spectral_real, expected_spec.spectral_frames, g_config.window_size);
+        write_spectral(prefix + "_expected_spec_imag.txt", expected_spec.spectral_imag, expected_spec.spectral_frames, g_config.window_size);
+    }
 
     quiet_silencer.restore();
     if (g_failed) {
@@ -2263,4 +2265,3 @@ int main(int argc, char **argv) {
     std::printf("test_fft_division_node: PASS\n");
     return 0;
 }
-
