@@ -4937,7 +4937,29 @@ static int run_fft_division_node(
     // as an async completion and does not interpret return values as
     // embedded counts. Use `1` for pending/not-ready and `0` only for
     // immediate synchronous success.
-    return 1;
+    bool mailbox_ready = false;
+    // Prefer an explicit mailbox length check so the runtime can drain
+    // any already-published async output instead of repeatedly treating
+    // the node as pending.
+    if (amp_mailbox_pcm_chain_length((void*)state) > 0) {
+        mailbox_ready = true;
+    } else if (inputs && inputs->taps.outputs.count > 0) {
+        for (uint32_t ti = 0; ti < inputs->taps.outputs.count; ++ti) {
+            const EdgeRunnerTapBuffer *tap_buf = &inputs->taps.outputs.items[ti];
+            const char *tap_name = tap_buf ? tap_buf->tap_name : nullptr;
+            if (tap_name != nullptr && amp_mailbox_spectral_chain_length((void*)state, tap_name) > 0) {
+                mailbox_ready = true;
+                break;
+            }
+        }
+    }
+
+    if (!mailbox_ready) {
+        const FftDivStageLockSnapshot snapshot = fftdiv_snapshot_stage_locks(state);
+        mailbox_ready = fftdiv_stage_snapshot_any_ready(snapshot);
+    }
+
+    return mailbox_ready ? 0 : 1;
 }
 
 static int run_fft_division_node_backward(
