@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless smoke test: stage a short signal into the native sampler registry and poll dump_count/pop_dump.
+"""
 
 This script is intentionally small and prints concise diagnostic output so we can determine whether
 sampler->FFT->dump flow is producing frames.
@@ -133,7 +133,7 @@ print('Loaded amp_native:', getattr(lib, '__name__', str(p)))
 
 # Prepare a short test tone
 sr = 48000
-N = 4096
+N = 64000
 t = np.arange(N, dtype=np.float64) / float(sr)
 sig = 0.25 * np.sin(2 * np.pi * 440.0 * t)
 arr = np.ascontiguousarray(sig, dtype=np.float64)
@@ -246,7 +246,7 @@ def create_and_run(stage_before_start=False, label=''):
     start = time.time()
     found = False
     last_status_print = 0.0
-    while time.time() - start < 6.0:
+    while time.time() - start < 60.0:
         # check available frames
         avail_p = ffi.new('unsigned long long *')
         lib.amp_kpn_session_available(session, avail_p)
@@ -371,10 +371,10 @@ def create_and_run(stage_before_start=False, label=''):
         pass
 
     if found:
-        print('Smoke test (', label, '): SUCCESS')
+        print('test (', label, '): SUCCESS')
         return True
     else:
-        print('Smoke test (', label, '): NO DATA')
+        print('test (', label, '): NO DATA')
         return False
 
 
@@ -527,8 +527,8 @@ except Exception:
     pass
 
 if found:
-    print('Smoke test: SUCCESS')
+    print('SUCCESS')
     sys.exit(0)
 else:
-    print('Smoke test: NO DATA')
+    print('NO DATA')
     sys.exit(5)

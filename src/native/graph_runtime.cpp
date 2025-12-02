@@ -23,7 +23,7 @@
 #include <condition_variable>
 #include <mutex>
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(_WIN64)
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
@@ -524,6 +524,13 @@ struct AmpGraphStreamer {
     std::thread worker;
     std::atomic<bool> running{false};
     std::atomic<bool> stop_requested{false};
+    // Backoff/wakeup support for transient no-progress (busy ramp)
+    std::mutex wake_mutex;
+    std::condition_variable wake_cv;
+    std::atomic<uint32_t> wake_count{0};
+    std::atomic<uint32_t> backoff_ms{0};
+    uint32_t backoff_min_ms{1};
+    uint32_t backoff_max_ms{1000};
     int frames_hint{0};
     int last_status{0};
     mutable std::mutex status_mutex;
@@ -1628,7 +1635,7 @@ static int kpn_execute_node_block(
             }
             tap_status_views.push_back(status);
 
-            if (tap.primary || !tap.expose_in_context || !tap.ring) {
+            if (!tap.expose_in_context || !tap.ring) {
                 continue;
             }
             TapOutputBuffer buffer_entry{};
@@ -1660,6 +1667,36 @@ static int kpn_execute_node_block(
             tap_buffer_views.push_back(view);
         }
         if (!tap_buffer_views.empty()) {
+            // Validate tap binding: ensure the tap buffer view's frame_stride
+            // and declared shape match the runtime ring storage layout.
+            for (size_t vi = 0; vi < tap_buffer_views.size() && vi < tap_output_buffers.size(); ++vi) {
+                const EdgeRunnerTapBuffer &v = tap_buffer_views[vi];
+                const TapOutputBuffer &ob = tap_output_buffers[vi];
+                if (!ob.tap || !ob.tap->ring || !ob.tap->ring->storage) continue;
+                size_t ring_stride = edge_ring_frame_stride(*ob.tap->ring);
+                if (v.frame_stride != ring_stride) {
+                    fprintf(stderr,
+                        "[TAP-BIND-MISMATCH] node=%s tap='%s' view_stride=%zu ring_stride=%zu ring=%p storage=%p\n",
+                        node.name.c_str(), v.tap_name ? v.tap_name : "(null)",
+                        v.frame_stride, ring_stride,
+                        reinterpret_cast<void *>(ob.tap->ring.get()),
+                        reinterpret_cast<void *>(ob.tap->ring->storage.get())
+                    );
+                    runtime_set_error(runtime, -1, "tap-bind", &node, std::string("tap frame_stride mismatch for ") + (v.tap_name ? v.tap_name : "(null)"));
+                    return 1;
+                }
+                if (v.shape.batches != ob.tap->ring->storage->shape.batches || v.shape.channels != ob.tap->ring->storage->shape.channels) {
+                    fprintf(stderr,
+                        "[TAP-BIND-MISMATCH] node=%s tap='%s' view_shape=%ux%u ring_shape=%ux%u ring=%p\n",
+                        node.name.c_str(), v.tap_name ? v.tap_name : "(null)",
+                        static_cast<unsigned int>(v.shape.batches), static_cast<unsigned int>(v.shape.channels),
+                        static_cast<unsigned int>(ob.tap->ring->storage->shape.batches), static_cast<unsigned int>(ob.tap->ring->storage->shape.channels),
+                        reinterpret_cast<void *>(ob.tap->ring.get())
+                    );
+                    runtime_set_error(runtime, -1, "tap-bind", &node, std::string("tap shape mismatch for ") + (v.tap_name ? v.tap_name : "(null)"));
+                    return 1;
+                }
+            }
             tap_context.outputs.items = tap_buffer_views.data();
             tap_context.outputs.count = static_cast<uint32_t>(tap_buffer_views.size());
         }
@@ -1715,15 +1752,30 @@ static int kpn_execute_node_block(
         );
         if (v2_status == AMP_E_UNSUPPORTED) {
             node.supports_v2 = false;
-        } else if (v2_status == AMP_E_PENDING || v2_status == 1) {
-            // Node signalled pending/not-ready. Map to KPN not-ready (1).
-            return 1;
+
         } else if (v2_status != 0) {
             execution_status = v2_status;
-            node.debug_frame_cache.failed_execute_count += 1ULL;
-            runtime_set_error(runtime, v2_status, "execute", &node, std::string("amp_run_node_v2 returned ") + std::to_string(v2_status));
+            // Accept legacy sentinel `1` as equivalent to `AMP_E_PENDING` to
+            // maintain compatibility with older nodes/tests that still return
+            // `1` for pending/not-ready. Treat only other non-zero codes as
+            // true errors. For pending or legacy-1 we should treat this as
+            // a v2 result (no legacy fallback) so the mailbox draining logic
+            // below can run instead of calling the legacy `amp_run_node`.
+            if (execution_status == AMP_E_PENDING || execution_status == 1) {
+                used_v2 = true; // mark v2 handled (even though no immediate frame)
+            } else {
+                fprintf(stderr, "[KPN-ERR] node=%s amp_run_node_v2 returned %d\n", node.name.c_str(), v2_status);
+
+                node.debug_frame_cache.failed_execute_count += 1ULL;
+                runtime_set_error(runtime, v2_status, "execute", &node, std::string("amp_run_node_v2 returned ") + std::to_string(v2_status));
+            }
         } else {
             used_v2 = true;
+            if (node.type_name == "FFTDivisionNode") {
+                size_t pcm_chain = amp_mailbox_pcm_chain_length(state_arg);
+                fprintf(stderr, "[KPN-V2] node=%s status=%d frame_buffer=%p out_channels=%d pcm_chain=%zu\n",
+                        node.name.c_str(), v2_status, (void*)frame_buffer, out_channels, pcm_chain);
+            }
             // Check mailbox for actual output
             AmpMailboxEntry *mail_entry = (state_arg != NULL)
                 ? amp_node_mailbox_pop(state_arg)
@@ -1759,27 +1811,43 @@ static int kpn_execute_node_block(
             history
         );
         if (status != 0 || frame_buffer == nullptr) {
-            if (frame_buffer != nullptr) amp_free(frame_buffer);
+            // Treat legacy `1` as pending; don't free buffers in that case.
+            if (frame_buffer != nullptr && status != 1 && status != AMP_E_PENDING) amp_free(frame_buffer);
             node.debug_frame_cache.failed_execute_count += 1ULL;
-            if (status != 0) {
+            if (status != 0 && status != AMP_E_PENDING && status != 1) {
                 runtime_set_error(runtime, status, "execute", &node, std::string("amp_run_node returned ") + std::to_string(status));
                 return status;
+            } else if (status != AMP_E_PENDING){
+                // If status indicates pending (either canonical or legacy), we
+                // shouldn't treat a NULL frame_buffer as an error here. Preserve
+                // the legacy behavior by accepting both sentinels.
+                if (status != 1) {
+                    runtime_set_error(runtime, -1, "execute", &node, std::string("amp_run_node returned NULL frame_buffer"));
+                    return -1;
+                }
             }
-            runtime_set_error(runtime, -1, "execute", &node, std::string("amp_run_node returned NULL frame_buffer"));
-            return -1;
+            execution_status = status;
         }
         node.has_latest_metrics = false;
     } else if (execution_status != 0 || frame_buffer == nullptr) {
-        if (frame_buffer != nullptr) amp_free(frame_buffer);
+        if (frame_buffer != nullptr && execution_status != AMP_E_PENDING && execution_status != 1) amp_free(frame_buffer);
         node.debug_frame_cache.failed_execute_count += 1ULL;
-        if (execution_status != 0) {
+        if (execution_status != 0 && execution_status != AMP_E_PENDING && execution_status != 1) {
             runtime_set_error(runtime, execution_status, "execute", &node, std::string("amp_run_node_v2 returned ") + std::to_string(execution_status));
+            fprintf(stderr, "[KPN-ERR] node=%s amp_run_node_v2 returned %d\n", node.name.c_str(), execution_status);
             return execution_status;
         }
+    }
+    if (execution_status == AMP_E_PENDING || execution_status == 1){
         // No immediate frame produced: attempt to drain any persistent-mailbox taps
         // into the node's tap rings (non-blocking). This lets async nodes that
         // publish via the persistent mailbox produce KPN-visible frames even
         // when they return pending or no immediate frame.
+        if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+            fprintf(stderr, "[DRAIN-ENTER] node=%s state=%p tap_views=%zu tap_outs=%zu\n",
+                node.name.c_str(), state_arg,
+                tap_buffer_views.size(), tap_output_buffers.size());
+        }
         bool produced_any = false;
         if (node.expose_tap_context && state_arg != nullptr && !tap_output_buffers.empty()) {
             for (size_t ti = 0; ti < tap_buffer_views.size() && ti < tap_output_buffers.size(); ++ti) {
@@ -1795,30 +1863,83 @@ static int kpn_execute_node_block(
 
                 // Resolve mailbox head for this tap (non-blocking)
                 if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
+                    fprintf(stderr, "[DRAIN-DBG] node=%s tap='%s' class='pcm' getting PCM head\n",
+                        node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)");
+
                     tap_view.mailbox_head = amp_mailbox_get_pcm_head(state_arg);
+                    fprintf(stderr, "[DRAIN-DBG] node=%s tap='%s' class='pcm' got PCM head=%p\n",
+                        node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                        reinterpret_cast<void *>(tap_view.mailbox_head));
                 } else {
+                    fprintf(stderr, "[DRAIN-DBG] node=%s tap='%s' class='%s' getting Spectral head\n",
+                        node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                        tap_view.buffer_class ? tap_view.buffer_class : "(null)");
+
                     tap_view.mailbox_head = amp_mailbox_get_spectral_head(state_arg, tap_view.tap_name);
+                    fprintf(stderr, "[DRAIN-DBG] node=%s tap='%s' class='%s' got Spectral head=%p\n",
+                        node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                        tap_view.buffer_class ? tap_view.buffer_class : "(null)",
+                        reinterpret_cast<void *>(tap_view.mailbox_head));
                 }
 
                 // Try filling from the chain (non-blocking)
                 int written = amp_tap_cache_fill_from_chain(&tap_view);
                 // Diagnostic: report tap mailbox drain attempt
-                if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
-                    fprintf(stderr, "[DRAIN-DBG] tap='%s' class='%s' head=%p written=%d cache_frames=%u frames_req=%u out_free=%u\n",
-                        tap_view.tap_name ? tap_view.tap_name : "(null)",
-                        tap_view.buffer_class ? tap_view.buffer_class : "(null)",
-                        reinterpret_cast<void *>(tap_view.mailbox_head),
-                        written,
-                        static_cast<unsigned int>(tap_view.cache_frames),
-                        static_cast<unsigned int>(frames),
-                        static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
-                }
+                
+                fprintf(stderr, "[DRAIN-DBG] node=%s state=%p tap='%s' class='%s' head=%p written=%d cache_frames=%u frames_req=%u out_free=%u\n",
+                    node.name.c_str(), state_arg,
+                    tap_view.tap_name ? tap_view.tap_name : "(null)",
+                    tap_view.buffer_class ? tap_view.buffer_class : "(null)",
+                    reinterpret_cast<void *>(tap_view.mailbox_head),
+                    written,
+                    static_cast<unsigned int>(tap_view.cache_frames),
+                    static_cast<unsigned int>(frames),
+                    static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                
                 // `amp_tap_cache_fill_from_chain` populates tap_view.cache_frames
                 uint32_t frames_written = tap_view.cache_frames > 0 ? tap_view.cache_frames : 0U;
                 if (written > 0 && frames_written > 0) {
                     // Limit to the requested frames window
                     uint32_t to_write = std::min<uint32_t>(frames_written, frames);
+                    if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                        fprintf(stderr, "[DRAIN-WRITE] node=%s tap='%s' ring=%p to_write=%u out_free_before=%u\n",
+                            node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                            reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
+                            static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                    }
+                    {
+                        const char * _amp_dbg = std::getenv("AMP_DEBUG_MAILBOX_DRAIN");
+                        bool _amp_dbg_allow_write = false;
+                        if (_amp_dbg) {
+                            if (std::strcmp(_amp_dbg, "2") == 0 || std::strstr(_amp_dbg, "write") != nullptr || std::strstr(_amp_dbg, "allow") != nullptr) {
+                                _amp_dbg_allow_write = true;
+                            }
+                        }
+                        if (!_amp_dbg_allow_write) {
+                            // Advance mailbox read cursor for this tap so streamer/tap
+                            // state reflects the consumption we attempted. Do this
+                            // before aborting so crash diagnostics can observe the
+                            // updated head/cursor state.
+                            {
+                                uint32_t consumed = tap_view.cache_frames > 0 ? tap_view.cache_frames : 0U;
+                                if (state_arg != nullptr) {
+                                    if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
+                                        amp_mailbox_consume_pcm_head(state_arg, static_cast<size_t>(consumed));
+                                    } else {
+                                        amp_mailbox_consume_spectral_head(state_arg, tap_view.tap_name, static_cast<size_t>(consumed));
+                                    }
+                                }
+                            }
+                            abort();
+                        }
+                    }
                     edge_ring_write(*outbuf.tap->ring, outbuf.scratch.data(), to_write);
+                    if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                        fprintf(stderr, "[DRAIN-WRITE-OK] node=%s tap='%s' ring=%p wrote=%u out_free_after=%u\n",
+                            node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                            reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
+                            static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                    }
                     produced_any = true;
                     runtime_node_record_debug_frame(
                         node,
@@ -1835,19 +1956,32 @@ static int kpn_execute_node_block(
 
         if (produced_any) {
             // We produced frames by draining the mailbox into rings.
+            if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                fprintf(stderr, "[DRAIN-PRODUCED] node=%s produced_any=%d\n", node.name.c_str(), produced_any ? 1 : 0);
+            }
             node.debug_frame_cache.execute_count += 1ULL;
             return 0;
         }
 
         // No immediate frame and mailbox produced nothing: treat as not-ready.
+        if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+            fprintf(stderr, "[KPN-NOTREADY] node=%s no mailbox output; returning pending\n", node.name.c_str());
+        }
         return 1;
     }
 
     auto output_edge = primary->ring;
     if (!output_edge) {
         amp_free(frame_buffer);
+        fprintf(stderr, "[KPN-ERR] node=%s has no output edge ring\n", node.name.c_str());
         return -1;
     }
+    if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+        fprintf(stderr, "[KPN-WRITE] node=%s output_edge=%p frames=%u head=%u tail=%u cap=%u\n",
+            node.name.c_str(), reinterpret_cast<void *>(output_edge.get()), frames,
+            output_edge->head, output_edge->tail, output_edge->capacity);
+    }
+    
     edge_ring_write(*output_edge, frame_buffer, frames);
     uint32_t debug_batches = static_cast<uint32_t>(workspace_batches > 0 ? workspace_batches : 1U);
     uint32_t debug_channels = out_channels > 0
@@ -1868,6 +2002,7 @@ static int kpn_execute_node_block(
 
     if (!tap_output_buffers.empty()) {
         for (TapOutputBuffer &buffer_entry : tap_output_buffers) {
+            abort();
             if (!buffer_entry.tap || !buffer_entry.tap->ring) continue;
             edge_ring_write(*buffer_entry.tap->ring, buffer_entry.scratch.data(), frames);
         }
@@ -2591,6 +2726,15 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
             uint32_t window_size = parse_uint_metadata(entry->params_json, "window_size", 0U);
             if (enable_spectrum_taps && window_size > 0U) {
                 uint32_t slot_batches = entry->channel_hint > 0U ? entry->channel_hint : 1U;
+                for (auto &tap : entry->outputs) {
+                    if (tap.primary) {
+                        tap.expose_in_context = true;
+                        if (tap.buffer_class.empty()) {
+                            tap.buffer_class = "pcm";
+                        }
+                        break;
+                    }
+                }
                 auto tap_exists = [&](const std::string &tap_name) {
                     for (const auto &tap : entry->outputs) {
                         if (tap.name == tap_name) {
@@ -2599,25 +2743,19 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
                     }
                     return false;
                 };
-                if (!tap_exists("spectral_real")) {
-                    OutputTap real{};
-                    real.name = "spectral_real";
-                    real.primary = false;
-                    real.contract = entry->output_contract;
-                    real.buffer_class = "spectrum";
-                    real.declared_shape = make_shape(slot_batches, window_size, 0U);
-                    real.expose_in_context = true;
-                    entry->outputs.push_back(std::move(real));
-                }
-                if (!tap_exists("spectral_imag")) {
-                    OutputTap imag{};
-                    imag.name = "spectral_imag";
-                    imag.primary = false;
-                    imag.contract = entry->output_contract;
-                    imag.buffer_class = "spectrum";
-                    imag.declared_shape = make_shape(slot_batches, window_size, 0U);
-                    imag.expose_in_context = true;
-                    entry->outputs.push_back(std::move(imag));
+                // Expose a single per-slot spectral tap named `spectral_<slot>`
+                // Use `spectral_0` as the canonical tap name when there is a
+                // single spectral lane. The FFT division node emits into
+                // `spectral_<slot>` so this keeps runtime tap names aligned.
+                if (!tap_exists("spectral_0")) {
+                    OutputTap spec{};
+                    spec.name = "spectral_0";
+                    spec.primary = false;
+                    spec.contract = entry->output_contract;
+                    spec.buffer_class = "spectrum";
+                    spec.declared_shape = make_shape(slot_batches, window_size, 0U);
+                    spec.expose_in_context = true;
+                    entry->outputs.push_back(std::move(spec));
                 }
                 entry->expose_tap_context = true;
             }
@@ -3157,10 +3295,43 @@ static void streamer_worker_main(AmpGraphStreamer *streamer) {
     }
 
     uint32_t step_frames = streamer->block_frames > 0U ? streamer->block_frames : 1U;
+    uint32_t cur_backoff = 0;
     while (!streamer->stop_requested.load(std::memory_order_acquire)) {
         streamer->loop_count.fetch_add(1ULL, std::memory_order_relaxed);
         int status = kpn_streamer_produce(streamer, history, step_frames);
-        if (status != 0) {
+        if (status == 0) {
+            // progress made — reset backoff
+            cur_backoff = 0;
+            streamer->backoff_ms.store(0, std::memory_order_release);
+            continue;
+        } else if (status == -1) {
+            // transient no-progress (busy ramp): apply exponential backoff
+            uint32_t next_backoff = (cur_backoff == 0) ? streamer->backoff_min_ms : std::min<uint32_t>(cur_backoff * 2U, streamer->backoff_max_ms);
+            cur_backoff = next_backoff;
+            streamer->backoff_ms.store(cur_backoff, std::memory_order_release);
+            // wait either until notified (requeue) or until timeout expires
+            std::unique_lock<std::mutex> lk(streamer->wake_mutex);
+            {
+                uint64_t _enter = steady_now_millis();
+                std::fprintf(stderr, "[STREAMER-BACKOFF-ENTER] t=%llu streamer=%p sleep_ms=%u wake_count=%u\n",
+                             (unsigned long long)_enter, (void*)streamer, (unsigned int)cur_backoff, (unsigned int)streamer->wake_count.load(std::memory_order_acquire));
+            }
+            bool predicate_result = streamer->wake_cv.wait_for(lk, std::chrono::milliseconds(cur_backoff), [&]() {
+                return streamer->stop_requested.load(std::memory_order_acquire) || streamer->wake_count.load(std::memory_order_acquire) > 0;
+            });
+            {
+                uint64_t _exit = steady_now_millis();
+                std::fprintf(stderr, "[STREAMER-BACKOFF-EXIT] t=%llu streamer=%p sleep_ms=%u predicate=%d stop=%d wake_count=%u\n",
+                             (unsigned long long)_exit, (void*)streamer, (unsigned int)cur_backoff, predicate_result ? 1 : 0,
+                             streamer->stop_requested.load(std::memory_order_acquire) ? 1 : 0,
+                             (unsigned int)streamer->wake_count.load(std::memory_order_acquire));
+            }
+            if (streamer->wake_count.load(std::memory_order_acquire) > 0) {
+                streamer->wake_count.fetch_sub(1, std::memory_order_acq_rel);
+            }
+            continue; // retry loop
+        } else {
+            // fatal or other non-zero status: propagate and stop
             streamer->last_status = status;
             break;
         }
@@ -3526,6 +3697,87 @@ static int execute_runtime_with_history_impl(
                 node.has_latest_metrics = false;
                 continue;
             }
+                // Attempt to drain persistent-mailbox taps into rings (non-blocking)
+                bool produced_any = false;
+                if (node.expose_tap_context && state_arg != nullptr && !tap_output_buffers.empty()) {
+                    for (size_t ti = 0; ti < tap_buffer_views.size() && ti < tap_output_buffers.size(); ++ti) {
+                        EdgeRunnerTapBuffer &tap_view = tap_buffer_views[ti];
+                        TapOutputBuffer &outbuf = tap_output_buffers[ti];
+                        if (!outbuf.tap || !outbuf.tap->ring) continue;
+
+                        size_t buf_len = outbuf.scratch.size();
+                        amp_tap_cache_stage(&tap_view, outbuf.scratch.data(), buf_len,
+                                            tap_view.shape.batches, tap_view.shape.channels, tap_view.shape.frames);
+
+                        if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
+                            tap_view.mailbox_head = amp_mailbox_get_pcm_head(state_arg);
+                        } else {
+                            tap_view.mailbox_head = amp_mailbox_get_spectral_head(state_arg, tap_view.tap_name);
+                        }
+
+                        int written = amp_tap_cache_fill_from_chain(&tap_view);
+                        if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                            fprintf(stderr, "[DRAIN-DBG] node=%s state=%p tap='%s' class='%s' head=%p written=%d cache_frames=%u frames_req=%u out_free=%u\n",
+                                    node.name.c_str(), state_arg,
+                                    tap_view.tap_name ? tap_view.tap_name : "(null)",
+                                    tap_view.buffer_class ? tap_view.buffer_class : "(null)",
+                                    reinterpret_cast<void *>(tap_view.mailbox_head),
+                                    written,
+                                    static_cast<unsigned int>(tap_view.cache_frames),
+                                    static_cast<unsigned int>(frames),
+                                    static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                        }
+
+                        uint32_t frames_written = tap_view.cache_frames > 0 ? tap_view.cache_frames : 0U;
+                        if (written > 0 && frames_written > 0) {
+                            uint32_t to_write = std::min<uint32_t>(frames_written, frames);
+                            if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                                fprintf(stderr, "[DRAIN-WRITE] node=%s tap='%s' ring=%p to_write=%u out_free_before=%u\n",
+                                        node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                                        reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
+                                        static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                            }
+                            {
+                                const char * _amp_dbg = std::getenv("AMP_DEBUG_MAILBOX_DRAIN");
+                                bool _amp_dbg_allow_write = false;
+                                if (_amp_dbg) {
+                                    if (std::strcmp(_amp_dbg, "2") == 0 || std::strstr(_amp_dbg, "write") != nullptr || std::strstr(_amp_dbg, "allow") != nullptr) {
+                                        _amp_dbg_allow_write = true;
+                                    }
+                                }
+                                abort();
+                                // The following code is removed to simplify the abort logic
+                                // if (!_amp_dbg_allow_write) {
+                                //     abort();
+                                // }
+                            }
+                            edge_ring_write(*outbuf.tap->ring, outbuf.scratch.data(), to_write);
+                            if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                                fprintf(stderr, "[DRAIN-WRITE-OK] node=%s tap='%s' ring=%p wrote=%u out_free_after=%u\n",
+                                        node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                                        reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
+                                        static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                            }
+                            produced_any = true;
+                            runtime_node_record_debug_frame(
+                                node,
+                                std::max<uint32_t>(1U, tap_view.shape.batches),
+                                std::max<uint32_t>(1U, tap_view.shape.channels),
+                                to_write
+                            );
+                        }
+
+                        amp_tap_cache_mark_read(&tap_view);
+                    }
+                }
+
+                if (produced_any) {
+                    if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                        fprintf(stderr, "[DRAIN-PRODUCED] node=%s produced_any=%d\n", node.name.c_str(), produced_any ? 1 : 0);
+                    }
+                    node.debug_frame_cache.execute_count += 1ULL;
+                    continue;
+                }
             // Treat null frame buffer as not-ready (pending). Preserve state and signal retry.
             if (node.state != state_arg) {
                 if (node.state) amp_release_state(node.state);
@@ -4198,6 +4450,17 @@ AMP_API int amp_graph_streamer_status(
     if (out_produced_frames) *out_produced_frames = streamer->produced_frames.load(std::memory_order_acquire);
     if (out_consumed_frames) *out_consumed_frames = streamer->consumed_frames.load(std::memory_order_acquire);
     return streamer->last_status;
+}
+
+AMP_API void amp_graph_streamer_notify(AmpGraphStreamer *streamer) {
+    AMP_LOG_NATIVE_CALL("amp_graph_streamer_notify", (size_t)(streamer != nullptr), 0);
+    if (!streamer) return;
+    streamer->wake_count.fetch_add(1, std::memory_order_release);
+    {
+        uint64_t _t = steady_now_millis();
+        std::fprintf(stderr, "[STREAMER-NOTIFY] t=%llu streamer=%p wake_count=%u\n", (unsigned long long)_t, (void*)streamer, (unsigned int)streamer->wake_count.load(std::memory_order_acquire));
+    }
+    streamer->wake_cv.notify_one();
 }
 
 AMP_API int amp_graph_streamer_evaluate_completion(

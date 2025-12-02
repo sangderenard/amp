@@ -57,7 +57,7 @@ inline TapDescriptor BuildPcmTapDescriptor(
     uint32_t channels = 1U
 ) {
     TapDescriptor descriptor{};
-    descriptor.name = "pcm";
+    descriptor.name = "pcm_0";
     descriptor.buffer_class = "pcm";
     descriptor.hop_size = hop_count > 0U ? hop_count : 1U;
     descriptor.shape.batches = 1U;
@@ -74,7 +74,7 @@ inline TapDescriptor BuildSpectralTapDescriptor(
     uint32_t spectral_lanes = 1U
 ) {
     TapDescriptor descriptor{};
-    descriptor.name = "spectral";
+    descriptor.name = "spectral_0";
     descriptor.buffer_class = "spectrum";
     descriptor.hop_size = hop_count > 0U ? hop_count : 1U;
     descriptor.shape.batches = std::max<uint32_t>(1U, spectral_lanes);

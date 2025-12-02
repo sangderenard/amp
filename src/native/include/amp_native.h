@@ -573,6 +573,7 @@ AMP_CAPI int amp_graph_streamer_status(
     uint64_t *out_produced_frames,
     uint64_t *out_consumed_frames
 );
+AMP_CAPI void amp_graph_streamer_notify(AmpGraphStreamer *streamer);
 
 typedef struct {
     uint64_t target_produced_frames;

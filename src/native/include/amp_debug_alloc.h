@@ -72,19 +72,24 @@ static inline void amp_debug_flush_memops(void) {}
 #endif
 
 #if defined(AMP_NATIVE_ENABLE_LOGGING) && !defined(AMP_DEBUG_ALLOC_IMPLEMENTATION)
+/* On MSVC the act of redefining allocation functions via macros has triggered
+    compiler internal failures in some large translation units (observed as
+    CL.exe crashes while writing PDB/type-server data). To avoid Windows/MSVC
+    toolchain instability we avoid redefining malloc/calloc/realloc/free on
+    MSVC builds — keep the logging API available but don't replace the global
+    allocation symbols. This keeps logging enabled while avoiding preprocessor
+    substitutions that can interfere with the compiler. */
+#if !defined(_MSC_VER)
 #undef malloc
 #undef calloc
 #undef realloc
 #undef free
-#undef memcpy
-#undef memset
 
 #define malloc(s) amp_debug_malloc((s), __FILE__, __LINE__, __func__)
 #define calloc(n, s) amp_debug_calloc((n), (s), __FILE__, __LINE__, __func__)
 #define realloc(p, s) amp_debug_realloc((p), (s), __FILE__, __LINE__, __func__)
 #define free(p) amp_debug_free((p), __FILE__, __LINE__, __func__)
-#define memcpy(d, s, n) amp_debug_memcpy((d), (s), (n), __FILE__, __LINE__, __func__)
-#define memset(p, c, n) amp_debug_memset((p), (c), (n), __FILE__, __LINE__, __func__)
+#endif
 
 #undef AMP_LOG_NATIVE_CALL
 #undef AMP_LOG_GENERATED

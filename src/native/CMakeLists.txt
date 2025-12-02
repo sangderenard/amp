@@ -153,7 +153,7 @@ target_link_libraries(amp_native PRIVATE Threads::Threads ${_FFTFREE_TARGET})
 # compiles FFT division nodes with diagnostic prints enabled. Default is OFF
 # (quiet build). Enabling this will create a second shared library
 # `amp_native_diagnostic` with `FFTDIV_ENABLE_DIAGNOSTIC` defined.
-option(AMP_NATIVE_BUILD_DIAGNOSTIC "Build diagnostic variant of amp_native (with FFT division diagnostics enabled)" OFF)
+option(AMP_NATIVE_BUILD_DIAGNOSTIC "Build diagnostic variant of amp_native (with FFT division diagnostics enabled)" ON)
 if (AMP_NATIVE_BUILD_DIAGNOSTIC)
     add_library(amp_native_diagnostic SHARED ${_AMP_NATIVE_SOURCES})
     set_property(TARGET amp_native_diagnostic PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
@@ -206,7 +206,7 @@ if (MSVC)
     target_link_options(demo_kpn_native PRIVATE $<$<CONFIG:Release>:/DEBUG:NONE>)
 endif()
 
-option(AMP_NATIVE_ENABLE_LOGGING "Enable native runtime logging" OFF)
+option(AMP_NATIVE_ENABLE_LOGGING "Enable native runtime logging" ON)
 if (AMP_NATIVE_ENABLE_LOGGING)
     target_compile_definitions(amp_native PRIVATE AMP_NATIVE_ENABLE_LOGGING)
 endif()
@@ -448,3 +448,39 @@ if(TARGET kpn_run_fft_division)
     )
     add_dependencies(build_native_binaries kpn_run_fft_division)
 endif()
+
+# Print a concise summary of compile-time options at the end of configure.
+# This prints cache variables that have a HELPSTRING (typical for variables
+# created via `option()` or `set(... CACHE ...)`) and then prints any cache
+# variables that use common project prefixes so developers can quickly see
+# the flags that affect our build.
+message(STATUS "------------------------------------------------------------")
+message(STATUS "Compile-time options summary:")
+message(STATUS "(Cache variables with HELPSTRING — likely user-facing options)")
+get_cmake_property(_cacheVars CACHE_VARIABLES)
+foreach(_var ${_cacheVars})
+    get_property(_type CACHE ${_var} PROPERTY TYPE)
+    if(_type)
+        get_property(_help CACHE ${_var} PROPERTY HELPSTRING)
+        if(NOT "${_help}" STREQUAL "")
+            message(STATUS "  ${_var} = ${${_var}} (${_type}) -- ${_help}")
+        endif()
+    endif()
+endforeach()
+
+message(STATUS "(Project-prefixed options — AMP_/FFTDIV_/FFTFREE_/AMP_NATIVE_)")
+set(_prefixes AMP_ FFTDIV_ FFTFREE_ AMP_NATIVE_)
+foreach(_pref IN LISTS _prefixes)
+    foreach(_var ${_cacheVars})
+        string(FIND "${_var}" "${_pref}" _found)
+        if(NOT _found EQUAL -1)
+            get_property(_type CACHE ${_var} PROPERTY TYPE)
+            if(NOT _type STREQUAL "")
+                message(STATUS "  ${_var} = ${${_var}} (${_type})")
+            else()
+                message(STATUS "  ${_var} = ${${_var}}")
+            endif()
+        endif()
+    endforeach()
+endforeach()
+message(STATUS "------------------------------------------------------------")

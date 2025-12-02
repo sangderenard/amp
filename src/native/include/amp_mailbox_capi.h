@@ -57,6 +57,10 @@ AmpMailboxNode amp_mailbox_get_pcm_head(void* state);
 // tap identified by `tap_name` (use "pcm" for the default PCM tap).
 // Returns the number of nodes remaining available after advancing.
 AMP_CAPI int amp_mailbox_advance_pcm_cursor(void* state, const char* tap_name, size_t count);
+// Consume (remove) up to `count` nodes from the PCM chain head and free them.
+AMP_CAPI int amp_mailbox_consume_pcm_head(void* state, size_t count);
+// Consume (remove) up to `count` nodes from the named spectral chain head and free them.
+AMP_CAPI int amp_mailbox_consume_spectral_head(void* state, const char* tap_name, size_t count);
 // Node accessors
 // Spectral getters expose raw values (not pointers) so legacy readers copy
 // discrete doubles from each mailbox node rather than aliasing node storage.

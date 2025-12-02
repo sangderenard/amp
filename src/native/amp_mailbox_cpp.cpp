@@ -93,7 +93,7 @@ static size_t tap_chain_length_locked(
         resolved_name = std::string(tap_name);
     }
     if (resolved_name.empty()) {
-        resolved_name = "spectral";
+        resolved_name = "spectral_0";
     }
     if (resolved_name_out) {
         *resolved_name_out = resolved_name;
@@ -200,6 +200,9 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
         (bclass != nullptr && std::strstr(bclass, "real") != nullptr);
     // Pack each mailbox node contiguously: spectral nodes contribute full window bins,
     // PCM nodes contribute a single sample.
+    fprintf(stderr, "[MAILBOX-FILL] amp_tap_cache_fill_from_chain: tap=%p head=%p capacity=%zu window=%zu prefer_real=%d prefer_imag=%d\n",
+        reinterpret_cast<void*>(tap), reinterpret_cast<void*>(cur), capacity, window,
+        prefer_real ? 1 : 0, prefer_imag ? 1 : 0);
     while (cur && written < capacity) {
         if (cur->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL) {
             const size_t node_window = static_cast<size_t>(cur->window_size > 0 ? cur->window_size : 1);
@@ -237,6 +240,8 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
                 break;
             }
         } else {
+            fprintf(stderr, "[MAILBOX-ERROR] amp_tap_cache_fill_from_chain: unknown node kind encountered\n");
+            abort();
             // unknown node kind; stop to avoid corrupt writes
             break;
         }
@@ -563,6 +568,7 @@ void amp_mailbox_append_pcm_node(void* state, AmpMailboxNode node) {
     // wait on internal predicates can re-evaluate when mailbox entries
     // have been appended. This bridges the mailbox condition variable and
     // the node worker condition used by some node implementations.
+    MAILBOX_DIAG("[MAILBOX-APPEND-NOTIFY] calling amp_fftdiv_notify_worker state=%p\n", state);
     amp_fftdiv_notify_worker(state);
 }
 
@@ -592,8 +598,56 @@ extern "C" AMP_CAPI int amp_mailbox_advance_pcm_cursor(void* state, const char* 
     w->cv.notify_all();
     // Wake the fft-division worker (if present) so it can re-evaluate
     // pipeline predicates that may depend on mailbox consumption.
+    MAILBOX_DIAG("[MAILBOX-CURSOR-NOTIFY] calling amp_fftdiv_notify_worker state=%p\n", state);
     amp_fftdiv_notify_worker(state);
     return static_cast<int>(available);
+}
+
+// Consume (remove) up to `count` nodes from the PCM chain head and free them.
+extern "C" AMP_CAPI int amp_mailbox_consume_pcm_head(void* state, size_t count) {
+    if (!state || count == 0) return 0;
+    MailboxStateWrapper* w = state_for(state);
+    std::lock_guard<std::mutex> lock(w->mtx);
+    size_t removed = 0;
+    PersistentMailboxNode* cur = w->pcm_mailbox_chain.head;
+    while (cur && removed < count) {
+        PersistentMailboxNode* next = cur->next;
+        delete cur;
+        cur = next;
+        ++removed;
+    }
+    w->pcm_mailbox_chain.head = cur;
+    if (!w->pcm_mailbox_chain.head) w->pcm_mailbox_chain.tail = nullptr;
+    w->pcm_count = EdgeRunnerTapMailboxChain::count_nodes(w->pcm_mailbox_chain.head);
+    MAILBOX_DIAG("[MAILBOX-CONSUME-PCM] state=%p removed=%zu new_head=%p pcm_count=%zu\n",
+        state, removed, reinterpret_cast<void*>(w->pcm_mailbox_chain.head), w->pcm_count);
+    w->cv.notify_all();
+    return static_cast<int>(removed);
+}
+
+// Consume (remove) up to `count` nodes from the named spectral chain head and free them.
+extern "C" AMP_CAPI int amp_mailbox_consume_spectral_head(void* state, const char* tap_name, size_t count) {
+    if (!state || !tap_name || count == 0) return 0;
+    MailboxStateWrapper* w = state_for(state);
+    std::lock_guard<std::mutex> lock(w->mtx);
+    auto it = w->spectral_mailbox_chains.find(std::string(tap_name));
+    if (it == w->spectral_mailbox_chains.end()) return 0;
+    MailboxChainHead &chain = it->second;
+    size_t removed = 0;
+    PersistentMailboxNode* cur = chain.head;
+    while (cur && removed < count) {
+        PersistentMailboxNode* next = cur->next;
+        delete cur;
+        cur = next;
+        ++removed;
+    }
+    chain.head = cur;
+    if (!chain.head) chain.tail = nullptr;
+    w->spectral_counts[std::string(tap_name)] = EdgeRunnerTapMailboxChain::count_nodes(chain.head);
+    MAILBOX_DIAG("[MAILBOX-CONSUME-SPECTRAL] state=%p tap='%s' removed=%zu new_head=%p count=%zu\n",
+        state, tap_name ? tap_name : "(null)", removed, reinterpret_cast<void*>(chain.head), w->spectral_counts[std::string(tap_name)]);
+    w->cv.notify_all();
+    return static_cast<int>(removed);
 }
 
 size_t amp_mailbox_spectral_chain_length(void* state, const char* tap_name) {
@@ -632,13 +686,17 @@ AmpMailboxNode amp_mailbox_get_spectral_head(void* state, const char* tap_name) 
     std::lock_guard<std::mutex> lock(w->mtx);
     auto it = w->spectral_mailbox_chains.find(std::string(tap_name));
     if (it == w->spectral_mailbox_chains.end()) return nullptr;
-    return reinterpret_cast<AmpMailboxNode>(it->second.head);
+    AmpMailboxNode head = reinterpret_cast<AmpMailboxNode>(it->second.head);
+    MAILBOX_DIAG("[MAILBOX-GET-SPECTRAL-HEAD] state=%p tap='%s' head=%p count=%zu\n", state, tap_name, reinterpret_cast<void*>(head), EdgeRunnerTapMailboxChain::count_nodes(it->second.head));
+    return head;
 }
 
 AmpMailboxNode amp_mailbox_get_pcm_head(void* state) {
     MailboxStateWrapper* w = state_for(state);
     std::lock_guard<std::mutex> lock(w->mtx);
-    return reinterpret_cast<AmpMailboxNode>(w->pcm_mailbox_chain.head);
+    AmpMailboxNode head = reinterpret_cast<AmpMailboxNode>(w->pcm_mailbox_chain.head);
+    MAILBOX_DIAG("[MAILBOX-GET-PCM-HEAD] state=%p head=%p pcm_count=%zu pcm_read_cursor=%p\n", state, reinterpret_cast<void*>(head), w->pcm_count, reinterpret_cast<void*>(w->pcm_read_cursor));
+    return head;
 }
 
 AmpMailboxNode amp_mailbox_node_next(AmpMailboxNode node) {
@@ -684,7 +742,9 @@ AmpMailboxNode amp_mailbox_get_tap_cursor(void* state, const char* tap_name) {
     auto it = w->tap_mailbox_cursors.find(std::string(tap_name));
     if (it == w->tap_mailbox_cursors.end()) return nullptr;
     const FftDivTapMailboxCursor &cursor = it->second;
-    return reinterpret_cast<AmpMailboxNode>(const_cast<AmpSpectralMailboxEntry*>(cursor.read_cursor));
+    AmpMailboxNode cur = reinterpret_cast<AmpMailboxNode>(const_cast<AmpSpectralMailboxEntry*>(cursor.read_cursor));
+    MAILBOX_DIAG("[MAILBOX-GET-CURSOR] state=%p tap='%s' cursor=%p last_frame=%d\n", state, tap_name, reinterpret_cast<void*>(cur), cursor.last_frame_index);
+    return cur;
 }
 
 double amp_mailbox_node_real(AmpMailboxNode node) {

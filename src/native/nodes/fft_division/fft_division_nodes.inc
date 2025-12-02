@@ -3,6 +3,7 @@
 #define NOMINMAX
 #endif
 #include "fft_division_delay_math.h"
+#include "mailbox.h"
 #include "amp_native.h" // for EdgeRunnerParamView, node_state_t
 
 #if defined(__cplusplus)
@@ -14,6 +15,7 @@
 #include <map>
 #include <unordered_set>
 #include <string>
+#include <limits>
 #include "amp_native_mailbox_chain.hpp"
 #include "fft_division_mailbox_helpers.h"
 // C++-only: Per-tap mailbox read cursor state
@@ -2084,8 +2086,8 @@ static int fftdiv_execute_block(
                 }
                 // If a pending tail is registered, append it only when no real input
                 // is waiting and capacity permits, so tail always sits behind data.
-                const size_t pending_samples_before_tail = (slot_state.pcm_backlog.size() > slot_state.pcm_consumed_samples)
-                    ? (slot_state.pcm_backlog.size() - slot_state.pcm_consumed_samples)
+                const size_t pending_samples_before_tail = (slot_state.pcm_backlog.size() > (slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor))
+                    ? (slot_state.pcm_backlog.size() - (slot_state.pcm_consumed_samples + slot_state.pcm_push_cursor))
                     : 0U;
                 const bool tail_can_append = (slot_state.pending_zero_tail_frames > 0U)
                     && (pending_samples_before_tail == 0U)
@@ -3523,7 +3525,7 @@ static int fftdiv_execute_block(
     if (pcm_written_samples == 0) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu (no-output)\n",
-                   pcm_written_samples, frames_to_push);
+                    pcm_written_samples, frames_to_push);
     } else if (pcm_written_samples > 1000) {
         FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_SUMMARY,
                "[STAGE5-PCM-DISPATCH] pcm_written=%zu frames_to_push=%zu ANOMALY\n",
@@ -3543,7 +3545,42 @@ static int fftdiv_execute_block(
                 return -1;
             }
             amp_mailbox_append_pcm_node((void*)state, pcm_node);
+            if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                size_t chain_len = amp_mailbox_pcm_chain_length((void*)state);
+                AmpMailboxNode head = amp_mailbox_get_pcm_head((void*)state);
+                fprintf(stderr, "[FFT-MAILBOX-APPEND] state=%p frame=%d ch=%d chain_len=%zu head=%p\n",
+                        (void*)state, frame_index_for_node, ch, chain_len, (void*)head);
+            }
         }
+    }
+    // Publish a contiguous PCM frame block into the legacy mailbox so the
+    // graph runtime can pop a single entry and forward it into downstream
+    // rings (e.g., the DrainNode sink) without relying solely on the
+    // persistent per-sample chain.
+    if (frames_to_push > 0 && buffer != nullptr && input_channels > 0) {
+        AmpMailboxEntry *entry = amp_mailbox_entry_create(
+            buffer,
+            input_channels,
+            frames_to_push,
+            0,
+            metrics,
+            buffer,
+            (AmpMailboxReleaseFn)free);
+        if (entry == NULL) {
+            free(buffer);
+            return -1;
+        }
+        amp_node_mailbox_push((void*)state, entry);
+        if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+            size_t chain_len = amp_mailbox_pcm_chain_length((void*)state);
+            AmpMailboxNode head = amp_mailbox_get_pcm_head((void*)state);
+            fprintf(stderr, "[FFT-MAILBOX-PUSH] state=%p frames=%zu channels=%d chain_len=%zu head=%p entry=%p\n",
+                    (void*)state, frames_to_push, input_channels, chain_len, (void*)head, (void*)entry);
+        }
+        FFTDIV_DIAG("[STAGE5-PCM-MAILBOX] pushed entry frames=%zu channels=%d buffer=%p\n",
+                    frames_to_push, input_channels, (void*)buffer);
+        // Ownership of `buffer` transferred to the mailbox entry.
+        buffer = NULL;
     }
     state->u.fftdiv.total_pcm_emitted += frames_to_push;
     FFTDIV_LOG(state, FFTDIV_LOG_LEVEL_DETAIL,
@@ -4463,19 +4500,27 @@ static void fftdiv_worker_main(node_state_t *state) {
                     // PCM tap is expected to be at outputs index 2 (tests use [real, imag, pcm])
                     if (cmd->tap_buffers.size() >= 3) {
                         const EdgeRunnerTapBuffer &pcm_tap = cmd->tap_buffers[2];
-                        size_t pcm_capacity_frames = pcm_tap.shape.frames > 0 ? pcm_tap.shape.frames : static_cast<size_t>(cmd->expected_frames);
-                        std::vector<double> pcm_legacy(pcm_capacity_frames, 0.0);
-                        TapMailboxReadResult pcm_read = PopulateLegacyPcmFromMailbox(pcm_tap, pcm_legacy.data(), pcm_capacity_frames);
-                        FFTDIV_DIAG("[PANIC-DUMP] pcm frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
-                               pcm_read.frames_committed,
-                               pcm_read.values_written,
-                               pcm_read.copied_from_mailbox ? 1 : 0,
-                               pcm_read.aliased_legacy_buffer ? 1 : 0);
-                        fflush(stdout);
-                        // Print the full populated PCM legacy buffer (not truncated)
-                        size_t dump_n = pcm_read.frames_committed > 0 ? pcm_read.frames_committed : 0;
-                        for (size_t i = 0; i < dump_n; ++i) {
-                            FFTDIV_DIAG("[PANIC-DUMP-PCM] idx=%zu sample=%.12g\n", i, pcm_legacy[i]);
+                        // Avoid attempting a blocking/expensive read when there is
+                        // no resolved mailbox head for this state: skip instead
+                        // so diagnostic trace cannot deadlock on empty chains.
+                        AmpMailboxNode pcm_head = amp_mailbox_get_pcm_head((void*)state);
+                        if (pcm_head) {
+                            size_t pcm_capacity_frames = pcm_tap.shape.frames > 0 ? pcm_tap.shape.frames : static_cast<size_t>(cmd->expected_frames);
+                            std::vector<double> pcm_legacy(pcm_capacity_frames, 0.0);
+                            TapMailboxReadResult pcm_read = PopulateLegacyPcmFromMailbox(pcm_tap, pcm_legacy.data(), pcm_capacity_frames);
+                            FFTDIV_DIAG("[PANIC-DUMP] pcm frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
+                                   pcm_read.frames_committed,
+                                   pcm_read.values_written,
+                                   pcm_read.copied_from_mailbox ? 1 : 0,
+                                   pcm_read.aliased_legacy_buffer ? 1 : 0);
+                            fflush(stdout);
+                            // Print the full populated PCM legacy buffer (not truncated)
+                            size_t dump_n = pcm_read.frames_committed > 0 ? pcm_read.frames_committed : 0;
+                            for (size_t i = 0; i < dump_n; ++i) {
+                                FFTDIV_DIAG("[PANIC-DUMP-PCM] idx=%zu sample=%.12g\n", i, pcm_legacy[i]);
+                            }
+                        } else {
+                            FFTDIV_DIAG("[PANIC-DUMP] skipping pcm diagnostic read: no pcm head for state=%p\n", (void*)state);
                         }
                     } else {
                         FFTDIV_DIAG("[PANIC-DUMP] no pcm tap available in command.tap_buffers (count=%zu)\n", cmd->tap_buffers.size());
@@ -4489,9 +4534,12 @@ static void fftdiv_worker_main(node_state_t *state) {
                         const size_t capacity_frames = real_tap.shape.frames > 0 ? static_cast<size_t>(real_tap.shape.frames) : static_cast<size_t>(cmd->expected_frames);
                         const size_t legacy_value_count = capacity_frames * window;
                         if (legacy_value_count > 0) {
-                            std::vector<double> real_legacy(legacy_value_count, 0.0);
-                            std::vector<double> imag_legacy(legacy_value_count, 0.0);
-                            TapMailboxReadResult spec_read = PopulateLegacySpectrumFromMailbox(real_tap, imag_tap, real_legacy.data(), imag_legacy.data(), legacy_value_count);
+                            const char *rt_name = real_tap.tap_name ? real_tap.tap_name : "(null)";
+                            AmpMailboxNode spec_head = amp_mailbox_get_spectral_head((void*)state, rt_name);
+                            if (spec_head) {
+                                std::vector<double> real_legacy(legacy_value_count, 0.0);
+                                std::vector<double> imag_legacy(legacy_value_count, 0.0);
+                                TapMailboxReadResult spec_read = PopulateLegacySpectrumFromMailbox(real_tap, imag_tap, real_legacy.data(), imag_legacy.data(), legacy_value_count);
                                 FFTDIV_DIAG("[PANIC-DUMP] spectral frames_committed=%zu values_written=%zu copied=%d aliased=%d window=%zu\n",
                                        spec_read.frames_committed,
                                        spec_read.values_written,
@@ -4499,16 +4547,19 @@ static void fftdiv_worker_main(node_state_t *state) {
                                        spec_read.aliased_legacy_buffer ? 1 : 0,
                                        window);
                                 fflush(stdout);
-                            size_t rows = spec_read.frames_committed;
-                            // Print all committed spectral rows and all bins so the dump
-                            // matches the full comparison output produced by the test harness.
-                            for (size_t r = 0; r < rows; ++r) {
-                                FFTDIV_DIAG("[PANIC-DUMP-SPEC] row=%zu", r);
-                                for (size_t b = 0; b < (size_t)window; ++b) {
-                                    size_t idx = r * window + b;
-                                    FFTDIV_DIAG(" %.12g%+.12gi", real_legacy[idx], imag_legacy[idx]);
+                                size_t rows = spec_read.frames_committed;
+                                // Print all committed spectral rows and all bins so the dump
+                                // matches the full comparison output produced by the test harness.
+                                for (size_t r = 0; r < rows; ++r) {
+                                    FFTDIV_DIAG("[PANIC-DUMP-SPEC] row=%zu", r);
+                                    for (size_t b = 0; b < (size_t)window; ++b) {
+                                        size_t idx = r * window + b;
+                                        FFTDIV_DIAG(" %.12g%+.12gi", real_legacy[idx], imag_legacy[idx]);
+                                    }
+                                    FFTDIV_DIAG("\n");
                                 }
-                                FFTDIV_DIAG("\n");
+                            } else {
+                                FFTDIV_DIAG("[PANIC-DUMP] skipping spectral diagnostic read for tap='%s' state=%p (no head)\n", rt_name, (void*)state);
                             }
                         } else {
                             FFTDIV_DIAG("[PANIC-DUMP] spectral legacy value count is zero (capacity_frames=%zu window=%zu)\n", capacity_frames, window);
@@ -4832,6 +4883,78 @@ static int run_fft_division_node(
     *out_buffer = NULL;
     *out_channels = 0;
 
+    // Fast path: if the worker has already published a mailbox entry, surface
+    // it immediately so the runtime can forward PCM without enqueueing another
+    // command. This lets the KPN scheduler see ready frames as soon as the
+    // async worker finishes.
+    {
+        AmpMailboxEntry *mail_entry = amp_node_mailbox_pop((void*)state);
+        if (mail_entry != NULL) {
+            double *mail_buffer = mail_entry->buffer;
+            int mail_channels = (mail_entry->channels > 0) ? mail_entry->channels : 0;
+            size_t mail_frames = mail_entry->frames;
+            if (mail_entry->context_release != NULL) {
+                // Transfer buffer ownership to the runtime; prevent the mailbox
+                // release hook from freeing it.
+                mail_entry->context_release = NULL;
+                mail_entry->context = NULL;
+            }
+            if (mail_buffer != NULL && mail_frames > 0) {
+                *out_buffer = mail_buffer;
+                *out_channels = (mail_channels > 0) ? mail_channels : 1;
+                if (metrics != NULL) {
+                    *metrics = mail_entry->metrics;
+                }
+                amp_mailbox_entry_release(mail_entry);
+                return 0;
+            }
+            amp_mailbox_entry_release(mail_entry);
+        }
+
+        // If the worker has produced PCM samples into the persistent mailbox
+        // but no aggregated entry is available yet, assemble a contiguous
+        // buffer directly from the PCM chain and return it synchronously.
+        size_t pcm_nodes = amp_mailbox_pcm_chain_length((void*)state);
+        if (pcm_nodes > 0) {
+            std::vector<double> pcm_values;
+            pcm_values.resize(pcm_nodes, 0.0);
+            AmpMailboxNode head = amp_mailbox_get_pcm_head((void*)state);
+            int base_frame = (std::numeric_limits<int>::max)();
+            for (AmpMailboxNode n = head; n; n = amp_mailbox_node_next(n)) {
+                if (amp_mailbox_node_is_pcm(n) && amp_mailbox_node_frame_index(n) >= 0) {
+                    base_frame = (std::min)(base_frame, amp_mailbox_node_frame_index(n));
+                }
+            }
+            if (base_frame == (std::numeric_limits<int>::max)()) {
+                base_frame = 0;
+            }
+            size_t max_frame = 0;
+            for (AmpMailboxNode n = head; n; n = amp_mailbox_node_next(n)) {
+                if (!amp_mailbox_node_is_pcm(n)) continue;
+                int idx = amp_mailbox_node_frame_index(n);
+                if (idx < 0) continue;
+                size_t rel = static_cast<size_t>(idx - base_frame);
+                if (rel < pcm_values.size()) {
+                    pcm_values[rel] = amp_mailbox_node_pcm_sample(n);
+                    if (rel > max_frame) max_frame = rel;
+                }
+            }
+            size_t frames_ready = max_frame + 1U;
+            if (frames_ready > 0) {
+                double *buf = (double *)malloc(frames_ready * sizeof(double));
+                if (buf != NULL) {
+                    std::memcpy(buf, pcm_values.data(), frames_ready * sizeof(double));
+                    *out_buffer = buf;
+                    *out_channels = 1;
+                    if (metrics != NULL) {
+                        metrics->measured_delay_frames = fftdiv_declared_latency_frames(state);
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+
     FFTDIV_DIAG("[DIAG] run_fft_division_node: entry descriptor=%p name=%s state=%p frames=%d\n", (void*)descriptor, descriptor ? descriptor->name : "<null>", (void*)state, frames);
     {
         auto &worker = state->u.fftdiv.worker;
@@ -4935,8 +5058,8 @@ static int run_fft_division_node(
     // will be published asynchronously via the mailbox/persistent chains.
     // Report 'not-ready' to the caller so the KPN scheduler treats this
     // as an async completion and does not interpret return values as
-    // embedded counts. Use `1` for pending/not-ready and `0` only for
-    // immediate synchronous success.
+    // embedded counts. Use the canonical `AMP_E_PENDING` sentinel for
+    // pending/not-ready and `0` only for immediate synchronous success.
     bool mailbox_ready = false;
     // Prefer an explicit mailbox length check so the runtime can drain
     // any already-published async output instead of repeatedly treating
@@ -4956,7 +5079,7 @@ static int run_fft_division_node(
         }
     }
 
-    return mailbox_ready ? 0 : 1;
+    return mailbox_ready ? 0 : AMP_E_PENDING;
 }
 
 static int run_fft_division_node_backward(

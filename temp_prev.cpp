@@ -140,7 +140,7 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
 
     EdgeRunnerTapBuffer tap_buffers[2]{};    std::vector<double> spectral_imag;
 
-    tap_buffers[0].tap_name = "spectral_real";
+    tap_buffers[0].tap_name = "spectral_0";
 
     tap_buffers[0].shape.batches = 1U;};constexpr int kWindowSize = 4;}
 
@@ -154,7 +154,7 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
 
 
 
-    tap_buffers[1].tap_name = "spectral_imag";    RunResult result;
+    tap_buffers[1].tap_name = "spectral_0";    RunResult result;
 
     tap_buffers[1].shape = tap_buffers[0].shape;
 
