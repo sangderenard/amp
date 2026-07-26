@@ -44,6 +44,12 @@ typedef struct {
     uint32_t frames;
 } EdgeRunnerTensorShape;
 
+typedef enum AmpFifoValueKind {
+    AMP_FIFO_VALUE_DOUBLE = 0,
+    AMP_FIFO_VALUE_I64 = 1,
+    AMP_FIFO_VALUE_PTR = 2
+} AmpFifoValueKind;
+
 typedef struct {
     const char *tap_name;
     const char *buffer_class;
@@ -58,12 +64,13 @@ typedef struct {
        reuse/destroy in-place). The runtime and mailbox helpers use
        these fields to decide whether to copy into the provided memory
        or allocate/produce new storage. */
-    size_t cache_buffer_len; /* length in doubles of cache_data */
+    size_t cache_buffer_len; /* element count (in units of fifo_value_kind) of cache_data */
     double *cache_data;      /* pointer to cached/externally-provided memory */
     uint32_t cache_batches;  /* dimensional metadata for cached buffer */
     uint32_t cache_channels;
     uint32_t cache_frames;
     int cache_state; /* 0 = empty, 1 = staged/filled, 2 = accepted, 3 = read */
+    AmpFifoValueKind fifo_value_kind; /* scalar kind for this FIFO (pcm or aux taps) */
 } EdgeRunnerTapBuffer;
 
 typedef struct {
@@ -339,6 +346,37 @@ typedef struct {
 } AmpNodeMetrics;
 
 typedef struct {
+    uint32_t frames_produced;   /* complete frames written into caller-provided out_buffer */
+    uint32_t samples_produced;  /* scalar samples written (frames_produced * out_channels) */
+    uint32_t frames_available;  /* frames that were ready/consumable for this call */
+    uint32_t samples_available; /* scalar samples that were ready/consumable */
+} AmpNodeOutputMetadata;
+
+#define AMP_FFTDIV_LOGGER_RECENT_COUNT 4
+
+typedef enum {
+    AMP_FFTDIV_STAGE_IDLE = 0,
+    AMP_FFTDIV_STAGE_STAGE1_INGEST = 1,
+    AMP_FFTDIV_STAGE_STAGE2_WHEEL = 2,
+    AMP_FFTDIV_STAGE_STAGE3_OPERATOR = 3,
+    AMP_FFTDIV_STAGE_STAGE4_EMIT = 4,
+    AMP_FFTDIV_STAGE_STAGE5_PCM = 5,
+    AMP_FFTDIV_STAGE_WORKER_DRAIN = 6
+} AmpFftDivPipelineStage;
+
+enum { AMP_FFTDIV_STAGE_COUNT = (int)AMP_FFTDIV_STAGE_WORKER_DRAIN + 1 };
+
+typedef struct {
+    uint32_t pipeline_stage_code;
+    uint32_t pipeline_step_counter;
+    uint64_t pipeline_last_tick_ns;
+    uint64_t logger_recent_ticks[AMP_FFTDIV_LOGGER_RECENT_COUNT];
+    double logger_recent_seconds[AMP_FFTDIV_LOGGER_RECENT_COUNT];
+    uint32_t stage_attempt_counts[AMP_FFTDIV_STAGE_COUNT];
+    uint32_t stage_work_counts[AMP_FFTDIV_STAGE_COUNT];
+} AmpFftDivDebugSnapshot;
+
+typedef struct {
     uint32_t declared_delay_frames;
     uint32_t oversample_ratio;
     int supports_v2;
@@ -441,7 +479,12 @@ AMP_CAPI int amp_run_node_v2(
     void **state,
     const EdgeRunnerControlHistory *history,
     AmpExecutionMode mode,
-    AmpNodeMetrics *metrics
+    AmpNodeMetrics *metrics,
+    AmpNodeOutputMetadata *out_metadata
+);
+AMP_CAPI int amp_fftdiv_get_debug_snapshot(
+    void *state,
+    AmpFftDivDebugSnapshot *snapshot
 );
 AMP_CAPI int amp_wait_node_completion(
     const EdgeRunnerNodeDescriptor *descriptor,

@@ -1832,6 +1832,8 @@ typedef union {
             int wheel_filled_slices;
             int wheel_hop;
             int wheel_active_window_span;
+            int wheel_prefill_zeroes;
+            int wheel_warmup_passthrough;
             int default_lane_count;
             struct StreamSlot {
                 void *forward_handle{nullptr};
@@ -1877,6 +1879,8 @@ typedef union {
                 bool zero_tail_enqueued{false};
                 bool ingest_finalized{false};
                 bool final_flag_observed{false};
+                std::size_t pending_prefill_samples{0U};
+                bool prefill_applied{false};
             };
             std::vector<StreamSlot> stream_slots;
             struct LaneBinding {
@@ -1969,6 +1973,8 @@ typedef union {
             int halt_on_zero_stage5_pcm_output;
             int log_level;
             int log_slice_bin_cap;
+            size_t wheel_prefill_zero_samples;
+            int wheel_prefill_forced;
             // Backend streaming configuration (hop and realized stream params)
             int backend_mode;
             int backend_hop;
@@ -1979,6 +1985,16 @@ typedef union {
             double sample_rate_hint;
             double timeline_seconds;
             uint64_t total_pcm_emitted;
+            uint64_t stream_frames_output_total;
+            double safe_division_epsilon;
+            uint32_t pr_warning_flags;
+            uint64_t logger_recent_ticks[AMP_FFTDIV_LOGGER_RECENT_COUNT];
+            uint32_t logger_emit_counter;
+            uint32_t pipeline_stage_code;
+            uint32_t pipeline_step_counter;
+            uint64_t pipeline_last_tick_ns;
+            uint32_t pipeline_stage_attempt_counts[AMP_FFTDIV_STAGE_COUNT];
+            uint32_t pipeline_stage_work_counts[AMP_FFTDIV_STAGE_COUNT];
 // C++-only mailbox chains for persistent tap/PCM output
 
 #if defined(__cplusplus)
@@ -2026,6 +2042,7 @@ struct node_state_t {
 #if defined(__cplusplus)
 static constexpr int kFftDivDefaultLogLevel = 2;
 static constexpr int kFftDivDefaultSliceLogCap = 12;
+static constexpr double kFftDivDefaultEpsilon = 1e-9;
 
 static inline AmpNodeCompletionMode amp_completion_mode_normalize(AmpNodeCompletionMode mode) {
     switch (mode) {
@@ -2061,7 +2078,24 @@ static void fftdiv_construct_state(node_state_t *state) {
     state->u.fftdiv.log_slice_bin_cap = kFftDivDefaultSliceLogCap;
     state->u.fftdiv.halt_on_zero_stage_output = 0;
     state->u.fftdiv.halt_on_zero_stage5_pcm_output = 0;
+    state->u.fftdiv.wheel_prefill_zeroes = 0;
+    state->u.fftdiv.wheel_warmup_passthrough = 1;
+    state->u.fftdiv.wheel_prefill_zero_samples = 0U;
+    state->u.fftdiv.wheel_prefill_forced = 0;
     state->u.fftdiv.total_pcm_emitted = 0ULL;
+    state->u.fftdiv.safe_division_epsilon = kFftDivDefaultEpsilon;
+    state->u.fftdiv.pr_warning_flags = 0U;
+    for (size_t i = 0; i < AMP_FFTDIV_LOGGER_RECENT_COUNT; ++i) {
+        state->u.fftdiv.logger_recent_ticks[i] = 0ULL;
+    }
+    state->u.fftdiv.logger_emit_counter = 0U;
+    state->u.fftdiv.pipeline_stage_code = AMP_FFTDIV_STAGE_IDLE;
+    state->u.fftdiv.pipeline_step_counter = 0U;
+    state->u.fftdiv.pipeline_last_tick_ns = 0ULL;
+    for (size_t i = 0; i < AMP_FFTDIV_STAGE_COUNT; ++i) {
+        state->u.fftdiv.pipeline_stage_attempt_counts[i] = 0U;
+        state->u.fftdiv.pipeline_stage_work_counts[i] = 0U;
+    }
     state->fftdiv_constructed = true;
 }
 
@@ -3495,6 +3529,8 @@ static void fftdiv_reset_stream_slots(node_state_t *state) {
         slot.zero_tail_enqueued = false;
         slot.ingest_finalized = false;
         slot.final_flag_observed = false;
+        slot.pending_prefill_samples = 0U;
+        slot.prefill_applied = false;
     }
     state->u.fftdiv.stream_slots.clear();
 }
@@ -3664,9 +3700,12 @@ static int ensure_fft_stream_slots(node_state_t *state, int slots, int window_si
             slot.last_pcm_output = 0.0;
             slot.total_ingested_samples = 0U;
             slot.tail_injected_samples = 0U;
+            slot.pending_zero_tail_frames = 0U;
             slot.zero_tail_enqueued = false;
             slot.ingest_finalized = false;
             slot.final_flag_observed = false;
+            slot.pending_prefill_samples = 0U;
+            slot.prefill_applied = false;
         }
     } catch (...) {
         fftdiv_reset_stream_slots(state);
@@ -3733,6 +3772,7 @@ static void fft_state_free_buffers(node_state_t *state) {
     state->u.fftdiv.sample_rate_hint = 0.0;
     state->u.fftdiv.timeline_seconds = 0.0;
     state->u.fftdiv.total_pcm_emitted = 0ULL;
+    state->u.fftdiv.stream_frames_output_total = 0ULL;
     state->u.fftdiv.last_descriptor = nullptr;
     state->u.fftdiv.last_batches = 0;
     state->u.fftdiv.last_channels = 0;
@@ -3915,6 +3955,16 @@ static void amp_reset_metrics(AmpNodeMetrics *metrics) {
     for (size_t i = 0; i < sizeof(metrics->reserved) / sizeof(metrics->reserved[0]); ++i) {
         metrics->reserved[i] = 0.0;
     }
+}
+
+static void amp_reset_output_metadata(AmpNodeOutputMetadata *metadata) {
+    if (metadata == NULL) {
+        return;
+    }
+    metadata->frames_produced = 0U;
+    metadata->samples_produced = 0U;
+    metadata->frames_available = 0U;
+    metadata->samples_available = 0U;
 }
 
 /* Thread-local accumulators used to separate time spent in logging helpers
@@ -4212,9 +4262,11 @@ static int amp_run_node_impl(
     void **state,
     const EdgeRunnerControlHistory *history,
     AmpExecutionMode mode,
-    AmpNodeMetrics *metrics
+    AmpNodeMetrics *metrics,
+    AmpNodeOutputMetadata *out_metadata
 ) {
     amp_reset_metrics(metrics);
+    amp_reset_output_metadata(out_metadata);
     (void)channels;
     if (out_buffer == NULL || out_channels == NULL) {
         return -1;
@@ -4365,7 +4417,8 @@ static int amp_run_node_impl(
                     out_buffer,
                     out_channels,
                     node_state,
-                    metrics
+                    metrics,
+                    out_metadata
                 );
             } else {
                 rc = run_fft_division_node(
@@ -4378,7 +4431,8 @@ static int amp_run_node_impl(
                     out_buffer,
                     out_channels,
                     node_state,
-                    metrics
+                    metrics,
+                    out_metadata
                 );
             }
             break;
@@ -4412,6 +4466,46 @@ static int amp_run_node_impl(
         _timing
     );
     return rc;
+}
+
+AMP_CAPI int amp_fftdiv_get_debug_snapshot(void *state_handle, AmpFftDivDebugSnapshot *snapshot) {
+    if (snapshot == NULL) {
+        return -1;
+    }
+    snapshot->pipeline_stage_code = AMP_FFTDIV_STAGE_IDLE;
+    snapshot->pipeline_step_counter = 0U;
+    snapshot->pipeline_last_tick_ns = 0ULL;
+    for (size_t i = 0; i < AMP_FFTDIV_LOGGER_RECENT_COUNT; ++i) {
+        snapshot->logger_recent_ticks[i] = 0ULL;
+        snapshot->logger_recent_seconds[i] = 0.0;
+    }
+    for (size_t i = 0; i < AMP_FFTDIV_STAGE_COUNT; ++i) {
+        snapshot->stage_attempt_counts[i] = 0U;
+        snapshot->stage_work_counts[i] = 0U;
+    }
+    if (state_handle == NULL) {
+        return -1;
+    }
+    node_state_t *state = (node_state_t *)state_handle;
+    if (state == NULL || state->kind != NODE_KIND_FFT_DIV || !state->fftdiv_constructed) {
+        return -1;
+    }
+    const int logging_enabled = amp_native_logging_enabled();
+    snapshot->pipeline_stage_code = state->u.fftdiv.pipeline_stage_code;
+    snapshot->pipeline_step_counter = state->u.fftdiv.pipeline_step_counter;
+    snapshot->pipeline_last_tick_ns = state->u.fftdiv.pipeline_last_tick_ns;
+    for (size_t i = 0; i < AMP_FFTDIV_LOGGER_RECENT_COUNT; ++i) {
+        const uint64_t ticks = state->u.fftdiv.logger_recent_ticks[i];
+        snapshot->logger_recent_ticks[i] = ticks;
+        snapshot->logger_recent_seconds[i] = (double)ticks * 1e-9;
+    }
+    if (logging_enabled) {
+        for (size_t i = 0; i < AMP_FFTDIV_STAGE_COUNT; ++i) {
+            snapshot->stage_attempt_counts[i] = state->u.fftdiv.pipeline_stage_attempt_counts[i];
+            snapshot->stage_work_counts[i] = state->u.fftdiv.pipeline_stage_work_counts[i];
+        }
+    }
+    return 0;
 }
 
 static int amp_wait_node_completion_impl(
@@ -4633,6 +4727,7 @@ AMP_CAPI int amp_run_node(
         state,
         history,
         AMP_EXECUTION_MODE_FORWARD,
+        NULL,
         NULL
     );
 }
@@ -4649,7 +4744,8 @@ AMP_CAPI int amp_run_node_v2(
     void **state,
     const EdgeRunnerControlHistory *history,
     AmpExecutionMode mode,
-    AmpNodeMetrics *metrics
+    AmpNodeMetrics *metrics,
+    AmpNodeOutputMetadata *out_metadata
 ) {
     AMP_LOG_NATIVE_CALL("amp_run_node_v2", (size_t)batches, (size_t)frames);
     return amp_run_node_impl(
@@ -4664,7 +4760,8 @@ AMP_CAPI int amp_run_node_v2(
         state,
         history,
         mode,
-        metrics
+        metrics,
+        out_metadata
     );
 }
 

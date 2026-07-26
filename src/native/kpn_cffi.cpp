@@ -107,7 +107,7 @@ AMP_CAPI int kpn_run_fft_division_from_buffer(
             EdgeRunnerNodeInputs inputs{};
             inputs.audio = audio; inputs.params = params; inputs.taps = tap_context;
 
-            int rc = amp_run_node_v2(&descriptor, &inputs, 1, 1, static_cast<int>(n), 48000.0, &out_buffer, &out_channels, &state, nullptr, AMP_EXECUTION_MODE_FORWARD, &metrics);
+            int rc = amp_run_node_v2(&descriptor, &inputs, 1, 1, static_cast<int>(n), 48000.0, &out_buffer, &out_channels, &state, nullptr, AMP_EXECUTION_MODE_FORWARD, &metrics, nullptr);
             if (rc != 0 && rc != AMP_E_PENDING) {
                 if (out_buffer) { amp_free(out_buffer); out_buffer = nullptr; }
                 if (state) { amp_release_state(state); state = nullptr; }
@@ -129,7 +129,7 @@ AMP_CAPI int kpn_run_fft_division_from_buffer(
         EdgeRunnerNodeInputs inputs{};
         inputs.audio = audio; inputs.params = params; inputs.taps = tap_context;
 
-        int rc = amp_run_node_v2(&descriptor, &inputs, 1, 1, static_cast<int>(total_frames), 48000.0, &out_buffer, &out_channels, &state, nullptr, AMP_EXECUTION_MODE_FORWARD, &metrics);
+        int rc = amp_run_node_v2(&descriptor, &inputs, 1, 1, static_cast<int>(total_frames), 48000.0, &out_buffer, &out_channels, &state, nullptr, AMP_EXECUTION_MODE_FORWARD, &metrics, nullptr);
         if (rc != 0) {
             if (out_buffer) { amp_free(out_buffer); out_buffer = nullptr; }
             if (state) { amp_release_state(state); state = nullptr; }

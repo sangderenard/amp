@@ -54,6 +54,18 @@ inline TapMailboxReadResult PopulateLegacyPcmFromMailbox(
 ) {
     using MailboxNode = PersistentMailboxNode;
     using MailboxChain = EdgeRunnerTapMailboxChain;
+    auto mailbox_pcm_as_double = [](const MailboxNode* node) -> double {
+        if (!node || node->node_kind != MailboxNode::NodeKind::PCM) return 0.0;
+        switch (node->fifo_value_kind) {
+            case MailboxNode::FifoValueKind::FIFO_I64:
+                return static_cast<double>(node->fifo_value.as_i64);
+            case MailboxNode::FifoValueKind::FIFO_PTR:
+                return 0.0;
+            case MailboxNode::FifoValueKind::FIFO_DOUBLE:
+            default:
+                return node->fifo_value.as_double;
+        }
+    };
 
     TapMailboxReadResult result{};
     if (legacy_pcm == nullptr || legacy_capacity_frames == 0U) {
@@ -81,22 +93,11 @@ inline TapMailboxReadResult PopulateLegacyPcmFromMailbox(
 
     MailboxNode *node = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(pcm_buffer));
 
-    int base_frame = std::numeric_limits<int>::max();
-    for (MailboxNode *cursor = node; cursor != nullptr; cursor = cursor->next) {
-        if (cursor->node_kind == MailboxNode::NodeKind::PCM && cursor->frame_index >= 0) {
-            base_frame = std::min(base_frame, cursor->frame_index);
-        }
-    }
-    if (base_frame == std::numeric_limits<int>::max()) {
-        return result;
-    }
-
     while (node != nullptr) {
         if (node->node_kind == MailboxNode::NodeKind::PCM && node->frame_index >= 0) {
-            const size_t frame = static_cast<size_t>(
-                static_cast<int>(node->frame_index) - base_frame);
+            const size_t frame = static_cast<size_t>(node->frame_index);
             if (frame < legacy_capacity_frames) {
-                legacy_pcm[frame] = node->pcm_sample;
+                legacy_pcm[frame] = mailbox_pcm_as_double(node);
                 result.frames_committed = std::max(result.frames_committed, frame + 1);
                 ++result.values_written;
             }
@@ -209,25 +210,12 @@ inline TapMailboxReadResult PopulateLegacySpectrumFromMailbox(
         }
     }
 
-    int base_frame = std::numeric_limits<int>::max();
-    MailboxNode *scan = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(real_buffer));
-    while (scan != nullptr) {
-        if (scan->node_kind == MailboxNode::NodeKind::SPECTRAL && scan->frame_index >= 0) {
-            base_frame = std::min(base_frame, scan->frame_index);
-        }
-        scan = scan->next;
-    }
-    if (base_frame == std::numeric_limits<int>::max()) {
-        return result;
-    }
-
     MailboxNode *node = MailboxChain::get_head(const_cast<EdgeRunnerTapBuffer &>(real_buffer));
     while (node != nullptr) {
         if (node->node_kind == MailboxNode::NodeKind::SPECTRAL &&
             node->frame_index >= 0) {
 
-            const size_t frame = static_cast<size_t>(
-                static_cast<int>(node->frame_index) - base_frame);
+            const size_t frame = static_cast<size_t>(node->frame_index);
             if (frame < capacity_frames) {
                 const size_t idx = frame * window;
                 const size_t bins_to_copy = std::min(

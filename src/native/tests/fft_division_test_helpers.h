@@ -29,6 +29,7 @@ struct TapDescriptor {
     std::string buffer_class;
     EdgeRunnerTensorShape shape{};
     uint32_t hop_size{1U};
+    AmpFifoValueKind fifo_kind{AMP_FIFO_VALUE_DOUBLE};
 
     size_t ValueCount() const {
         const size_t batches = std::max<uint32_t>(1U, shape.batches);
@@ -54,7 +55,8 @@ inline TapDescriptor BuildPcmTapDescriptor(
     uint32_t window_size,
     uint32_t hop_count,
     size_t total_frames,
-    uint32_t channels = 1U
+    uint32_t channels = 1U,
+    AmpFifoValueKind fifo_kind = AMP_FIFO_VALUE_DOUBLE
 ) {
     TapDescriptor descriptor{};
     descriptor.name = "pcm_0";
@@ -63,6 +65,7 @@ inline TapDescriptor BuildPcmTapDescriptor(
     descriptor.shape.batches = 1U;
     descriptor.shape.channels = std::max<uint32_t>(1U, channels);
     descriptor.shape.frames = static_cast<uint32_t>(total_frames);
+    descriptor.fifo_kind = fifo_kind;
     (void)window_size;
     return descriptor;
 }
@@ -80,6 +83,7 @@ inline TapDescriptor BuildSpectralTapDescriptor(
     descriptor.shape.batches = std::max<uint32_t>(1U, spectral_lanes);
     descriptor.shape.channels = std::max<uint32_t>(1U, window_size);
     descriptor.shape.frames = ComputeFrameCount(total_frames, descriptor.hop_size);
+    descriptor.fifo_kind = AMP_FIFO_VALUE_DOUBLE;
     return descriptor;
 }
 
@@ -101,6 +105,7 @@ inline EdgeRunnerTapBuffer InstantiateTapBuffer(
     tap.frame_stride = computed_stride;
     tap.data = data;
     tap.mailbox_head = mailbox_head;
+    tap.fifo_value_kind = descriptor.fifo_kind;
     return tap;
 }
 
@@ -108,10 +113,10 @@ inline EdgeRunnerTapBuffer InstantiateTapBuffer(
 inline amp::tests::fft_division_shared::PersistentMailboxNode* BuildPersistentMailboxChain(const std::vector<void*>& chunks, const std::vector<size_t>& sizes) {
     using Node = amp::tests::fft_division_shared::PersistentMailboxNode;
     if (chunks.empty() || chunks.size() != sizes.size()) return nullptr;
-    Node* head = new Node(chunks[0], sizes[0]);
+    Node* head = new Node(static_cast<const void*>(chunks[0]), sizes[0]);
     Node* current = head;
     for (size_t i = 1; i < chunks.size(); ++i) {
-        current->next = new Node(chunks[i], sizes[i]);
+        current->next = new Node(static_cast<const void*>(chunks[i]), sizes[i]);
         current = current->next;
     }
     return head;

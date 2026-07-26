@@ -99,6 +99,7 @@ def main():
         out_channels = ffi.new("int *")
         state_ptr = ffi.new("void **")
         metrics = ffi.new("AmpNodeMetrics *")
+        out_metadata = ffi.new("AmpNodeOutputMetadata *")
 
         rc = lib.amp_run_node_v2(
             descriptor,
@@ -113,6 +114,7 @@ def main():
             ffi.NULL,
             ffi.cast("AmpExecutionMode", 1),
             metrics,
+            out_metadata,
         )
 
         print("amp_run_node_v2 rc:", rc)

@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -84,13 +85,27 @@ enum class VerbosityLevel : int {
 using amp::tests::fft_division_shared::BuildPcmTapDescriptor;
 using amp::tests::fft_division_shared::BuildSpectralTapDescriptor;
 using amp::tests::fft_division_shared::InstantiateTapBuffer;
-using amp::tests::fft_division_shared::PopulateLegacyPcmFromMailbox;
-using amp::tests::fft_division_shared::PopulateLegacySpectrumFromMailbox;
 using amp::tests::fft_division_shared::TapDescriptor;
 using amp::tests::fft_identity::forward_fft;
 using amp::tests::fft_identity::reverse_fft;
 using amp::tests::fft_identity::clean_pcm;
 using amp::tests::fft_identity::clean_spectral;
+using MailboxNode = amp::tests::fft_division_shared::PersistentMailboxNode;
+
+static double mailbox_pcm_as_double(const MailboxNode* node) {
+    if (!node || node->node_kind != MailboxNode::NodeKind::PCM) {
+        return 0.0;
+    }
+    switch (node->fifo_value_kind) {
+        case MailboxNode::FifoValueKind::FIFO_I64:
+            return static_cast<double>(node->fifo_value.as_i64);
+        case MailboxNode::FifoValueKind::FIFO_PTR:
+            return 0.0;
+        case MailboxNode::FifoValueKind::FIFO_DOUBLE:
+        default:
+            return node->fifo_value.as_double;
+    }
+}
 
 struct TestConfig {
     int window_size;
@@ -105,12 +120,44 @@ struct TestConfig {
     int working_hop_cli_override;
     int working_window_cli_override;
     bool frames_cli_override;
+    bool wheel_prefill_zeroes;
+    bool wheel_warmup_passthrough;
 };
-TestConfig g_config{4, 8, 1e-4, 4096, 64, 1, 0.0, -1, -1.0, -1, -1, false};
+TestConfig g_config{4, 8, 1e-4, 4096, 64, 1, 0.0, -1, -1.0, -1, -1, false, false, true};
 bool g_failed = false;
 bool g_quiet = false;
 VerbosityLevel g_verbosity = VerbosityLevel::Summary;
 std::vector<int> g_consumed_cli_indices;
+
+struct ExitCodeConfig {
+    bool enabled{false};
+    int default_code{0};
+    int step_mod{0};
+    int many_threshold{16};
+    bool pack_flags{true};
+    std::unordered_map<uint32_t, int> stage_codes;
+};
+
+ExitCodeConfig g_exit_code_config{};
+
+static void ensure_native_logger_enabled(const char *reason) {
+    if (amp_native_logging_enabled()) {
+        return;
+    }
+    amp_native_logging_set(1);
+    if (reason != nullptr && *reason != '\0') {
+        emit_diagnostic("[FFT-LOGGER] %s", reason);
+    } else {
+        emit_diagnostic("[FFT-LOGGER] enabled native logger");
+    }
+}
+
+void ensure_exit_code_logger_enabled() {
+    if (!g_exit_code_config.enabled) {
+        return;
+    }
+    ensure_native_logger_enabled("enabled native logger for stage diagnostics");
+}
 
 bool equals_ignore_case(const char *lhs, const char *rhs) {
     if (lhs == nullptr || rhs == nullptr) {
@@ -131,6 +178,9 @@ bool equals_ignore_case(const char *lhs, const char *rhs) {
 void set_global_verbosity(VerbosityLevel level) {
     g_verbosity = level;
     g_quiet = (level == VerbosityLevel::Silent);
+    if (level >= VerbosityLevel::Detail) {
+        ensure_native_logger_enabled("enabled native logger for detail/trace verbosity");
+    }
 }
 
 void set_hop_override(int hop) {
@@ -153,6 +203,14 @@ void set_working_window_override(int wwin) {
         return;
     }
     g_config.working_window_cli_override = wwin;
+}
+
+void set_wheel_prefill(bool enable) {
+    g_config.wheel_prefill_zeroes = enable;
+}
+
+void set_wheel_warmup_passthrough(bool enable) {
+    g_config.wheel_warmup_passthrough = enable;
 }
 
 void set_overlap_override(double overlap) {
@@ -186,6 +244,22 @@ void update_hop_settings(TestConfig &config) {
     if (config.overlap_fraction < 0.0) {
         config.overlap_fraction = 0.0;
     }
+}
+
+int effective_working_window_frames(const TestConfig &config) {
+    if (config.working_window_cli_override > 0) {
+        return config.working_window_cli_override;
+    }
+    const int hop = std::max(1, config.hop_size);
+    const int derived = config.window_size / hop;
+    return std::max(1, derived);
+}
+
+int effective_working_hop_frames(const TestConfig &config) {
+    if (config.working_hop_cli_override > 0) {
+        return config.working_hop_cli_override;
+    }
+    return 1;
 }
 
 bool parse_verbosity_value(const char *token, VerbosityLevel &out_level) {
@@ -364,6 +438,23 @@ bool handle_hop_overlap_flag(int argc, char **argv, int index, int *extra_consum
         return true;
     }
 
+    if (std::strcmp(arg, "--wheel-prefill") == 0) {
+        set_wheel_prefill(true);
+        return true;
+    }
+    if (std::strcmp(arg, "--no-wheel-prefill") == 0) {
+        set_wheel_prefill(false);
+        return true;
+    }
+    if (std::strcmp(arg, "--warmup-passthrough") == 0) {
+        set_wheel_warmup_passthrough(true);
+        return true;
+    }
+    if (std::strcmp(arg, "--warmup-hold") == 0) {
+        set_wheel_warmup_passthrough(false);
+        return true;
+    }
+
     value = nullptr;
     if (parse_value_from_arg("--wwin", value, true)) {
         if (value == nullptr || *value == '\0') {
@@ -489,6 +580,266 @@ bool is_quiet_flag(const char *arg) {
     return matches_any_flag(arg, kQuietFlags);
 }
 
+std::string trim_copy(const std::string &value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        --end;
+    }
+    return value.substr(start, end - start);
+}
+
+std::string to_lower_copy(const std::string &value) {
+    std::string lowered = value;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lowered;
+}
+
+const char *pipeline_stage_label(uint32_t code) {
+    switch (static_cast<AmpFftDivPipelineStage>(code)) {
+        case AMP_FFTDIV_STAGE_IDLE:
+            return "idle";
+        case AMP_FFTDIV_STAGE_STAGE1_INGEST:
+            return "stage1_ingest";
+        case AMP_FFTDIV_STAGE_STAGE2_WHEEL:
+            return "stage2_wheel";
+        case AMP_FFTDIV_STAGE_STAGE3_OPERATOR:
+            return "stage3_operator";
+        case AMP_FFTDIV_STAGE_STAGE4_EMIT:
+            return "stage4_emit";
+        case AMP_FFTDIV_STAGE_STAGE5_PCM:
+            return "stage5_pcm";
+        case AMP_FFTDIV_STAGE_WORKER_DRAIN:
+            return "worker_drain";
+        default:
+            return "unknown";
+    }
+}
+
+bool decode_stage_token(const std::string &token, uint32_t &code) {
+    std::string lowered = to_lower_copy(trim_copy(token));
+    if (lowered.empty()) {
+        return false;
+    }
+    std::replace(lowered.begin(), lowered.end(), '-', '_');
+    if (lowered == "idle") {
+        code = static_cast<uint32_t>(AMP_FFTDIV_STAGE_IDLE);
+        return true;
+    }
+    if (lowered == "stage1" || lowered == "stage1_ingest" || lowered == "ingest") {
+        code = static_cast<uint32_t>(AMP_FFTDIV_STAGE_STAGE1_INGEST);
+        return true;
+    }
+    if (lowered == "stage2" || lowered == "wheel") {
+        code = static_cast<uint32_t>(AMP_FFTDIV_STAGE_STAGE2_WHEEL);
+        return true;
+    }
+    if (lowered == "stage3" || lowered == "operator") {
+        code = static_cast<uint32_t>(AMP_FFTDIV_STAGE_STAGE3_OPERATOR);
+        return true;
+    }
+    if (lowered == "stage4" || lowered == "emit") {
+        code = static_cast<uint32_t>(AMP_FFTDIV_STAGE_STAGE4_EMIT);
+        return true;
+    }
+    if (lowered == "stage5" || lowered == "pcm") {
+        code = static_cast<uint32_t>(AMP_FFTDIV_STAGE_STAGE5_PCM);
+        return true;
+    }
+    if (lowered == "worker" || lowered == "drain" || lowered == "worker_drain") {
+        code = static_cast<uint32_t>(AMP_FFTDIV_STAGE_WORKER_DRAIN);
+        return true;
+    }
+    return false;
+}
+
+bool parse_exit_code_stage_assignment(const char *spec) {
+    if (spec == nullptr || *spec == '\0') {
+        emit_diagnostic("missing value for --exit-code-stage");
+        return false;
+    }
+    const char *equals = std::strchr(spec, '=');
+    if (equals == nullptr || equals == spec || *(equals + 1) == '\0') {
+        emit_diagnostic("invalid exit-code-stage spec '%s' (expected stage=code)", spec);
+        return false;
+    }
+    std::string stage_token(spec, static_cast<size_t>(equals - spec));
+    uint32_t stage_code = 0;
+    if (!decode_stage_token(stage_token, stage_code)) {
+        emit_diagnostic("unknown exit-code stage '%s'", stage_token.c_str());
+        return false;
+    }
+    const char *code_str = equals + 1;
+    char *end = nullptr;
+    long parsed = std::strtol(code_str, &end, 10);
+    if (end == code_str || *end != '\0') {
+        emit_diagnostic("invalid exit-code value '%s'", code_str);
+        return false;
+    }
+    g_exit_code_config.stage_codes[stage_code] = static_cast<int>(parsed);
+    g_exit_code_config.enabled = true;
+    return true;
+}
+
+bool handle_exit_code_flag(int argc, char **argv, int index, int *extra_consumed) {
+    if (extra_consumed != nullptr) {
+        *extra_consumed = 0;
+    }
+    if (index <= 0 || index >= argc) {
+        return false;
+    }
+    const char *arg = argv[index];
+    if (arg == nullptr) {
+        return false;
+    }
+    auto parse_value = [&](const char *prefix, const char *&value, bool allow_next) -> bool {
+        const size_t prefix_len = std::strlen(prefix);
+        if (std::strncmp(arg, prefix, prefix_len) != 0) {
+            return false;
+        }
+        const char next_ch = arg[prefix_len];
+        if (next_ch == '=') {
+            value = arg + prefix_len + 1;
+            return true;
+        }
+        if (next_ch == '\0') {
+            if (allow_next && index + 1 < argc) {
+                value = argv[index + 1];
+                if (extra_consumed != nullptr) {
+                    *extra_consumed = 1;
+                }
+            } else {
+                value = nullptr;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    const char *value = nullptr;
+    if (parse_value("--exit-code-stage", value, true)) {
+        if (value == nullptr) {
+            emit_diagnostic("missing stage assignment for --exit-code-stage");
+        } else {
+            (void)parse_exit_code_stage_assignment(value);
+        }
+        return true;
+    }
+
+    value = nullptr;
+    if (parse_value("--exit-code-default", value, true)) {
+        if (value == nullptr) {
+            emit_diagnostic("missing value for --exit-code-default");
+        } else {
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0') {
+                emit_diagnostic("invalid --exit-code-default value '%s'", value);
+            } else {
+                g_exit_code_config.default_code = static_cast<int>(parsed);
+                g_exit_code_config.enabled = true;
+            }
+        }
+        return true;
+    }
+
+    value = nullptr;
+    if (parse_value("--exit-code-step-mod", value, true)) {
+        if (value == nullptr) {
+            emit_diagnostic("missing value for --exit-code-step-mod");
+        } else {
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed <= 0 || parsed > 65535) {
+                emit_diagnostic("invalid --exit-code-step-mod value '%s'", value);
+            } else {
+                g_exit_code_config.step_mod = static_cast<int>(parsed);
+                g_exit_code_config.enabled = true;
+            }
+        }
+        return true;
+    }
+
+    value = nullptr;
+    if (parse_value("--exit-code-many-threshold", value, true)) {
+        if (value == nullptr) {
+            emit_diagnostic("missing value for --exit-code-many-threshold");
+        } else {
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed <= 0 || parsed > 1000000L) {
+                emit_diagnostic("invalid --exit-code-many-threshold value '%s'", value);
+            } else {
+                g_exit_code_config.many_threshold = static_cast<int>(parsed);
+                g_exit_code_config.enabled = true;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+struct ExitCodePackResult {
+    uint32_t stage_code{0};
+    uint32_t once_mask{0};
+    uint32_t many_mask{0};
+    uint32_t step_value{0};
+    uint32_t packed_bits{0};
+};
+
+constexpr uint32_t kFftDivStageMask = (AMP_FFTDIV_STAGE_COUNT >= 32)
+    ? 0xFFFFFFFFu
+    : ((1u << AMP_FFTDIV_STAGE_COUNT) - 1u);
+
+ExitCodePackResult build_exit_code_pack(const AmpFftDivDebugSnapshot &snapshot) {
+    ExitCodePackResult result{};
+    result.stage_code = snapshot.pipeline_stage_code & 0x7u;
+    const int threshold = (g_exit_code_config.many_threshold > 0)
+        ? g_exit_code_config.many_threshold
+        : 1;
+    for (size_t i = 0; i < AMP_FFTDIV_STAGE_COUNT; ++i) {
+        if (snapshot.stage_work_counts[i] > 0U) {
+            result.once_mask |= (1u << i);
+        }
+        if (snapshot.stage_work_counts[i] >= static_cast<uint32_t>(threshold)) {
+            result.many_mask |= (1u << i);
+        }
+    }
+    uint32_t step_value = snapshot.pipeline_step_counter;
+    if (g_exit_code_config.step_mod > 0) {
+        const uint32_t mod = static_cast<uint32_t>(g_exit_code_config.step_mod);
+        if (mod != 0U) {
+            step_value %= mod;
+        }
+    }
+    result.step_value = step_value;
+    const uint32_t step_bits = (step_value & 0xFFFu) << 17;
+    result.packed_bits =
+        (result.stage_code & 0x7u)
+        | ((result.once_mask & kFftDivStageMask) << 3)
+        | ((result.many_mask & kFftDivStageMask) << 10)
+        | step_bits;
+    return result;
+}
+
+int combine_exit_code(int base_code, uint32_t packed_bits) {
+    long long combined = static_cast<long long>(base_code) + static_cast<long long>(packed_bits);
+    if (combined > static_cast<long long>(std::numeric_limits<int>::max())) {
+        combined = static_cast<long long>(std::numeric_limits<int>::max());
+    }
+    int exit_code = static_cast<int>(combined);
+    if (exit_code == 0) {
+        exit_code = 1;
+    }
+    return exit_code;
+}
+
 void apply_global_flags(int argc, char **argv) {
     g_consumed_cli_indices.clear();
     for (int i = 1; i < argc; ++i) {
@@ -513,6 +864,14 @@ void apply_global_flags(int argc, char **argv) {
             continue;
         }
         extra_consumed = 0;
+        if (handle_exit_code_flag(argc, argv, i, &extra_consumed)) {
+            mark_cli_index_consumed(i);
+            if (extra_consumed == 1 && (i + 1) < argc) {
+                mark_cli_index_consumed(i + 1);
+            }
+            continue;
+        }
+        extra_consumed = 0;
         if (handle_hop_overlap_flag(argc, argv, i, &extra_consumed)) {
             mark_cli_index_consumed(i);
             if (extra_consumed == 1 && (i + 1) < argc) {
@@ -520,6 +879,8 @@ void apply_global_flags(int argc, char **argv) {
             }
         }
     }
+
+    ensure_exit_code_logger_enabled();
 }
 
 bool maybe_print_help(int argc, char **argv) {
@@ -556,6 +917,12 @@ bool maybe_print_help(int argc, char **argv) {
             "  --wwin N            Override working-tensor duration/active window (in spectral frames); must be >= 1.\n"
         );
         std::printf(
+            "  --wheel-prefill     Zero-prefill the working wheel before ingest (use --no-wheel-prefill to disable).\n"
+        );
+        std::printf(
+            "  --warmup-passthrough Emit passthrough PCM during warm-up (use --warmup-hold to disable).\n"
+        );
+        std::printf(
             "  --quiet, -q         Suppress diagnostics; only the final PASS/FAIL line is printed.\n"
         );
         std::printf(
@@ -566,6 +933,21 @@ bool maybe_print_help(int argc, char **argv) {
         );
         std::printf(
             "  --trace             Shortcut for --verbosity trace.\n"
+        );
+        std::printf(
+            "  --exit-code-stage NAME=VALUE  Map pipeline stage NAME to VALUE when failures occur (e.g. stage3=23).\n"
+        );
+        std::printf(
+            "  --exit-code-default VALUE    Base failure exit code when no explicit stage mapping matches.\n"
+        );
+        std::printf(
+            "  --exit-code-step-mod N       Wrap the per-step increment using pipeline_step_counter %% N (omit to add the full counter).\n"
+        );
+        std::printf(
+            "  --exit-code-many-threshold N Treat stages with >=N work iterations as 'many' when packing exit-code flags (default 16).\n"
+        );
+        std::printf(
+            "                               Stage names: idle, stage1_ingest, stage2_wheel, stage3_operator, stage4_emit, stage5_pcm, worker_drain.\n"
         );
         std::printf(
             "  --help, -h          Show this message and exit.\n"
@@ -606,15 +988,16 @@ void apply_window_scaling(TestConfig &config) {
         config.frames = config.window_size * 2;
     }
     const size_t window = static_cast<size_t>(config.window_size);
+    update_hop_settings(config);
     // Keep streaming runs small but still large enough to flush FFT latency reliably.
     constexpr size_t kStreamingChunkMultiplier = 16U;
     constexpr size_t kStreamingPasses = 16U;
-    config.streaming_chunk = window * kStreamingChunkMultiplier / config.hop_size;
+    const int hop_for_streaming = (config.hop_size > 0) ? config.hop_size : 1;
+    config.streaming_chunk = window * kStreamingChunkMultiplier / static_cast<size_t>(hop_for_streaming);
     if (config.streaming_chunk == 0U) {
         config.streaming_chunk = window;
     }
     config.streaming_frames = config.streaming_chunk * kStreamingPasses;
-    update_hop_settings(config);
 }
 
 void configure_from_args(int argc, char **argv) {
@@ -661,15 +1044,21 @@ void configure_from_args(int argc, char **argv) {
     g_config.tolerance = tolerance;
     apply_window_scaling(g_config);
 
+    const int working_window_frames = effective_working_window_frames(g_config);
+    const int working_hop_frames = effective_working_hop_frames(g_config);
     emit_diagnostic(
-        "config: window_size=%d frames=%d tolerance=%g streaming_chunk=%zu streaming_frames=%zu hop=%d overlap=%.3f",
+        "config: window_size=%d frames=%d tolerance=%g streaming_chunk=%zu streaming_frames=%zu hop=%d overlap=%.3f working_window=%d working_hop=%d prefill=%s warmup_passthrough=%s",
         g_config.window_size,
         g_config.frames,
         g_config.tolerance,
         g_config.streaming_chunk,
         g_config.streaming_frames,
         g_config.hop_size,
-        g_config.overlap_fraction
+        g_config.overlap_fraction,
+        working_window_frames,
+        working_hop_frames,
+        g_config.wheel_prefill_zeroes ? "true" : "false",
+        g_config.wheel_warmup_passthrough ? "true" : "false"
     );
 }
 
@@ -866,7 +1255,7 @@ static void dump_mailbox_chain_snapshot(void * /*state*/, EdgeRunnerTapBuffer *t
     while (node && seen < max_nodes) {
         int frame_idx = node->frame_index;
         int is_pcm = (node->node_kind == PersistentMailboxNode::NodeKind::PCM) ? 1 : 0;
-        double pcmv = node->pcm_sample;
+        double pcmv = mailbox_pcm_as_double(node);
         std::fprintf(stdout, "[MAILBOX-DUMP] pcm node[%zu] ptr=%p frame=%d pcm=% .12f is_pcm=%d\n",
                 seen, reinterpret_cast<void*>(node), frame_idx, pcmv, is_pcm);
         node = node->next;
@@ -887,6 +1276,8 @@ struct RunResult {
     size_t pcm_frames_committed{0};
     size_t spectral_rows_committed{0};
     AmpNodeMetrics metrics{};
+    AmpFftDivDebugSnapshot debug_snapshot{};
+    bool has_debug_snapshot{false};
     // Snapshot of persistent mailbox nodes observed for this run
     struct MailboxNodeSnapshot {
         size_t index{0};
@@ -894,7 +1285,10 @@ struct RunResult {
         int slot{0};
         int window_size{0};
         int node_kind{0}; // 0 = SPECTRAL, 1 = PCM
-        double pcm_sample{0.0};
+        AmpFifoValueKind fifo_kind{AMP_FIFO_VALUE_DOUBLE};
+        double pcm_value{0.0};
+        int64_t pcm_value_i64{0};
+        void* pcm_value_ptr{nullptr};
         std::vector<double> spectral_real_bins;
         std::vector<double> spectral_imag_bins;
     };
@@ -911,6 +1305,8 @@ struct StreamingRunResult {
     bool state_allocated{false};
     size_t pcm_frames_committed{0};
     size_t spectral_rows_committed{0};
+    AmpFftDivDebugSnapshot final_snapshot{};
+    bool has_final_snapshot{false};
 };
 
 struct SimulationResult {
@@ -919,6 +1315,93 @@ struct SimulationResult {
     std::vector<double> spectral_imag;
     size_t spectral_frames{0};
 };
+
+int resolve_stage_exit_code(uint32_t stage_code) {
+    auto it = g_exit_code_config.stage_codes.find(stage_code);
+    if (it != g_exit_code_config.stage_codes.end()) {
+        return it->second;
+    }
+    return g_exit_code_config.default_code;
+}
+
+int compute_exit_code_from_snapshot(
+    const AmpFftDivDebugSnapshot &snapshot,
+    ExitCodePackResult *pack_out,
+    int *base_code_out
+) {
+    ExitCodePackResult pack = build_exit_code_pack(snapshot);
+    int base_code = resolve_stage_exit_code(snapshot.pipeline_stage_code);
+    const int exit_code = combine_exit_code(base_code, pack.packed_bits);
+    if (pack_out != nullptr) {
+        *pack_out = pack;
+    }
+    if (base_code_out != nullptr) {
+        *base_code_out = base_code;
+    }
+    return exit_code;
+}
+
+const AmpFftDivDebugSnapshot *select_exit_snapshot(
+    const RunResult &first,
+    const RunResult &second,
+    const StreamingRunResult &streaming,
+    bool streaming_attempted) {
+    if (streaming_attempted && streaming.has_final_snapshot) {
+        return &streaming.final_snapshot;
+    }
+    if (second.has_debug_snapshot) {
+        return &second.debug_snapshot;
+    }
+    if (first.has_debug_snapshot) {
+        return &first.debug_snapshot;
+    }
+    return nullptr;
+}
+
+void log_exit_code_snapshot(
+    const AmpFftDivDebugSnapshot &snapshot,
+    const ExitCodePackResult &pack,
+    int base_code,
+    int exit_code
+) {
+    emit_diagnostic(
+        "[EXIT-CODE] stage=%s(%u) step_raw=%u step_mod=%u once_mask=0x%02X many_mask=0x%02X base=%d packed=%u last_tick_ns=%llu exit_code=%d",
+        pipeline_stage_label(snapshot.pipeline_stage_code),
+        snapshot.pipeline_stage_code,
+        snapshot.pipeline_step_counter,
+        pack.step_value,
+        pack.once_mask,
+        pack.many_mask,
+        base_code,
+        pack.packed_bits,
+        static_cast<unsigned long long>(snapshot.pipeline_last_tick_ns),
+        exit_code
+    );
+}
+
+int compute_failure_exit_code(
+    const RunResult &first,
+    const RunResult &second,
+    const StreamingRunResult &streaming,
+    bool streaming_attempted) {
+    const AmpFftDivDebugSnapshot *snapshot = select_exit_snapshot(first, second, streaming, streaming_attempted);
+    if (!g_exit_code_config.enabled) {
+        return 1;
+    }
+    if (snapshot != nullptr) {
+        ExitCodePackResult pack{};
+        int base_code = 0;
+        const int exit_code = compute_exit_code_from_snapshot(*snapshot, &pack, &base_code);
+        log_exit_code_snapshot(*snapshot, pack, base_code, exit_code);
+        return exit_code;
+    }
+    int fallback = g_exit_code_config.default_code;
+    if (fallback == 0) {
+        fallback = 1;
+    }
+    emit_diagnostic("[EXIT-CODE] no debug snapshot; using fallback=%d", fallback);
+    return fallback;
+}
 
 void write_tap_row(
     const EdgeRunnerTapBuffer &buffer,
@@ -963,10 +1446,12 @@ std::string build_params_json() {
     char buffer[512];
     const int log_level = static_cast<int>(g_verbosity);
     const int slice_log_cap = (g_verbosity == VerbosityLevel::Trace) ? 12 : 0;
-    const int working_hop = (g_config.working_hop_cli_override > 0) ? g_config.working_hop_cli_override : 1;
-    const int working_duration = (g_config.working_window_cli_override > 0) ? g_config.working_window_cli_override : 1;
-    const int working_active_span = working_duration;
-    const int working_total_span = working_duration * 2;
+    const int working_hop = effective_working_hop_frames(g_config);
+    const int working_duration = effective_working_window_frames(g_config);
+    const int working_active_span = std::max(1, working_duration);
+    const int working_wheel_span = working_active_span + std::max(1, working_hop);
+    const char *prefill_flag = g_config.wheel_prefill_zeroes ? "true" : "false";
+    const char *warmup_flag = g_config.wheel_warmup_passthrough ? "true" : "false";
     std::snprintf(
         buffer,
         sizeof(buffer),
@@ -975,16 +1460,20 @@ std::string build_params_json() {
         "\"backend_hop\":%d,\"log_level\":%d,\"log_slice_bin_cap\":%d,"
         "\"halt_on_zero_stage_output\":false,"
         "\"halt_on_zero_stage5_pcm_output\":false,"
-        "\"working_ft_duration_frames\":%d,\"working_ft_hop\":%d,\"working_ft_active_window_span\":%d,\"working_ft_time_slices\":%d\"io_mode\":\"spectral\"}",
+        "\"working_ft_duration_frames\":%d,\"working_ft_hop\":%d,\"working_ft_active_window_span\":%d,\"working_ft_time_slices\":%d,"
+        "\"working_wheel_prefill_zeroes\":%s,\"working_wheel_warmup_passthrough\":%s,"
+        "\"io_mode\":\"spectral\"}",
         g_config.window_size,
         g_config.window_size - 1,
         g_config.hop_size > 0 ? g_config.hop_size : 1,
         log_level,
         slice_log_cap,
-        working_duration,
+        working_wheel_span,
         working_hop,
         working_active_span,
-        working_active_span * 2U
+        working_wheel_span,
+        prefill_flag,
+        warmup_flag
     );
     return std::string(buffer);
 }
@@ -1028,6 +1517,8 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     result.pcm.assign(signal.size(), 0.0);
     result.spectral_real.assign(signal.size() * g_config.window_size, 0.0);
     result.spectral_imag.assign(signal.size() * g_config.window_size, 0.0);
+    result.pcm_frames_committed = 0;
+    result.spectral_rows_committed = 0;
     std::array<EdgeRunnerTapBuffer, 3> tap_buffers{};
     TapDescriptor spectral_descriptor = BuildSpectralTapDescriptor(
         static_cast<uint32_t>(g_config.window_size),
@@ -1086,30 +1577,69 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     inputs.params = params;
     inputs.taps = tap_context;
 
-    double *out_buffer = nullptr;
-    int out_channels = 0;
+    const size_t requested_frames = signal.size();
+    double *out_buffer = (double *)calloc(requested_frames, sizeof(double));
+    int out_channels = 1;
     void *state = nullptr;
     AmpNodeMetrics metrics{};
+    AmpNodeOutputMetadata out_metadata{};
 
-    int rc = amp_run_node_v2(
-        &descriptor,
-        &inputs,
-        1,
-        1,
-        static_cast<int>(signal.size()),
-        kSampleRate,
-        &out_buffer,
-        &out_channels,
-        &state,
-        nullptr,
-        AMP_EXECUTION_MODE_FORWARD,
-        &metrics
-    );
+    size_t pcm_committed = 0;
+    int rc = 0;
+    while (true) {
+        out_metadata = AmpNodeOutputMetadata{};
+        rc = amp_run_node_v2(
+            &descriptor,
+            &inputs,
+            1,
+            1,
+            static_cast<int>(signal.size()),
+            kSampleRate,
+            &out_buffer,
+            &out_channels,
+            &state,
+            nullptr,
+            AMP_EXECUTION_MODE_FORWARD,
+            &metrics,
+            &out_metadata
+        );
 
-    // Allow asynchronous nodes to return AMP_E_PENDING here. The test
-    // will wait on the legacy tap cache to observe produced mailbox data
-    // before verifying results. Treat any non-zero *other* than
-    // AMP_E_PENDING as a failure.
+        size_t frames_produced = 0;
+        if (out_channels > 0) {
+            if (out_metadata.samples_produced > 0U) {
+                frames_produced = out_metadata.samples_produced / static_cast<size_t>(out_channels);
+            } else if (out_metadata.frames_produced > 0U) {
+                frames_produced = out_metadata.frames_produced;
+            }
+        }
+
+        if (out_buffer != nullptr && out_channels > 0 && frames_produced > 0) {
+            const size_t frames_copied = std::min(frames_produced, requested_frames - pcm_committed);
+            for (size_t i = 0; i < frames_copied; ++i) {
+                result.pcm[pcm_committed + i] = out_buffer[i * static_cast<size_t>(out_channels)];
+            }
+            pcm_committed += frames_copied;
+        }
+
+        if ((rc == 0 || rc == 1) && pcm_committed < requested_frames && frames_produced == 0) {
+            // No new data yet; continue polling until the node surfaces output.
+            rc = AMP_E_PENDING;
+        }
+
+        if ((rc != AMP_E_PENDING && rc != 1) || pcm_committed >= requested_frames) {
+            break;
+        }
+
+        EdgeRunnerNodeInputs poll_inputs = inputs;
+        poll_inputs.audio = {};
+        poll_inputs.audio.has_audio = 0;
+        poll_inputs.audio.batches = audio.batches;
+        poll_inputs.audio.channels = audio.channels;
+        poll_inputs.audio.frames = 0;
+        poll_inputs.audio.data = nullptr;
+        inputs = poll_inputs;
+    }
+
     if (rc != 0 && rc != AMP_E_PENDING && rc != 1) {
         record_failure(
             "amp_run_node_v2 failed rc=%d descriptor=%s expected_frames=%zu",
@@ -1120,95 +1650,12 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
     }
 
     result.metrics = metrics;
+    const size_t total_frames = signal.size();
 
-    // Allow the worker to populate mailbox chains, then copy into the legacy
-    // tap buffers. This enforces the contract that verification reads only
-    // traverse the legacy tap storage rather than aliasing mailbox nodes or
-    // using direct return buffers.
-    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[2], tap_buffers[2].tap_name, 0);
-    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[0], tap_buffers[0].tap_name, 0);
-    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
-
-    // Diagnostic: report tap pointers and buffers immediately before population
-    std::fprintf(stdout, "[TEST-DIAG] before_populate pcm_tap=%p mailbox_head=%p cache=%p data=%p\n",
-                 reinterpret_cast<void*>(&tap_buffers[2]), reinterpret_cast<void*>(tap_buffers[2].mailbox_head),
-                 reinterpret_cast<void*>(tap_buffers[2].cache_data), reinterpret_cast<void*>(tap_buffers[2].data));
-    fflush(stdout);
-
-    const auto pcm_read = PopulateLegacyPcmFromMailbox(
-        tap_buffers[2],
-        result.pcm.data(),
-        result.pcm.size()
-    );
-    std::fprintf(stdout, "[TEST-DIAG] after_populate pcm_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
-                 pcm_read.frames_committed, pcm_read.values_written, pcm_read.copied_from_mailbox ? 1 : 0, pcm_read.aliased_legacy_buffer ? 1 : 0);
-    fflush(stdout);
-    if (pcm_read.frames_committed > 0) {
-        std::fprintf(stdout, "[TEST-DIAG] advancing pcm cursor by=%zu\n", pcm_read.frames_committed);
-        fflush(stdout);
-        (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
-    }
-    std::fprintf(stdout, "[TEST-DIAG] before_populate spectral_tap_real=%p mailbox_head=%p cache=%p data=%p\n",
-                 reinterpret_cast<void*>(&tap_buffers[0]), reinterpret_cast<void*>(tap_buffers[0].mailbox_head),
-                 reinterpret_cast<void*>(tap_buffers[0].cache_data), reinterpret_cast<void*>(tap_buffers[0].data));
-    fflush(stdout);
-
-    const auto spectral_read = PopulateLegacySpectrumFromMailbox(
-        tap_buffers[0],
-        tap_buffers[1],
-        result.spectral_real.data(),
-        result.spectral_imag.data(),
-        result.spectral_real.size()
-    );
-    std::fprintf(stdout, "[TEST-DIAG] after_populate spectral_read frames_committed=%zu values_written=%zu copied=%d aliased=%d\n",
-                 spectral_read.frames_committed, spectral_read.values_written, spectral_read.copied_from_mailbox ? 1 : 0, spectral_read.aliased_legacy_buffer ? 1 : 0);
-    fflush(stdout);
-
-    result.pcm_frames_committed = pcm_read.frames_committed;
-    result.spectral_rows_committed = spectral_read.frames_committed;
-
-    // Capture persistent mailbox chain snapshots so callers can inspect nodes
-    using amp::tests::fft_division_shared::PersistentMailboxNode;
-    using amp::tests::fft_division_shared::EdgeRunnerTapMailboxChain;
-
-    // Spectral tap is at index 0
-    PersistentMailboxNode *spectral_head = EdgeRunnerTapMailboxChain::get_head(tap_buffers[0]);
-    PersistentMailboxNode *node = spectral_head;
-    size_t seen = 0;
-    while (node) {
-        RunResult::MailboxNodeSnapshot snap{};
-        snap.index = seen;
-        snap.frame_index = node->frame_index;
-        snap.slot = node->slot;
-        snap.window_size = node->window_size;
-        snap.node_kind = static_cast<int>(node->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL ? 0 : 1);
-        snap.pcm_sample = node->pcm_sample;
-        snap.spectral_real_bins = node->spectral_real_bins;
-        snap.spectral_imag_bins = node->spectral_imag_bins;
-        result.spectral_nodes.push_back(std::move(snap));
-        node = node->next;
-        ++seen;
-    }
-
-    // PCM tap is at index 2
-    PersistentMailboxNode *pcm_head = EdgeRunnerTapMailboxChain::get_head(tap_buffers[2]);
-    node = pcm_head;
-    seen = 0;
-    while (node) {
-        RunResult::MailboxNodeSnapshot snap{};
-        snap.index = seen;
-        snap.frame_index = node->frame_index;
-        snap.slot = node->slot;
-        snap.window_size = node->window_size;
-        snap.node_kind = static_cast<int>(node->node_kind == PersistentMailboxNode::NodeKind::SPECTRAL ? 0 : 1);
-        snap.pcm_sample = node->pcm_sample;
-        snap.spectral_real_bins = node->spectral_real_bins;
-        snap.spectral_imag_bins = node->spectral_imag_bins;
-        result.pcm_nodes.push_back(std::move(snap));
-        node = node->next;
-        ++seen;
-    }
-
+    const uint32_t real_cache_frames = tap_buffers[0].cache_frames;
+    const uint32_t imag_cache_frames = tap_buffers[1].cache_frames;
+    result.spectral_rows_committed = static_cast<size_t>(std::min(real_cache_frames, imag_cache_frames));
+    result.pcm_frames_committed = pcm_committed;
     if (out_buffer != nullptr) {
         amp_free(out_buffer);
         out_buffer = nullptr;
@@ -1216,6 +1663,7 @@ RunResult run_fft_node_once(const std::vector<double> &signal) {
 
     if (state != nullptr) {
         amp_release_state(state);
+        state = nullptr;
     }
     return result;
 }
@@ -1226,6 +1674,8 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     result.pcm.assign(total_frames, 0.0);
     result.spectral_real.assign(total_frames * g_config.window_size, 0.0);
     result.spectral_imag.assign(total_frames * g_config.window_size, 0.0);
+    result.pcm_frames_committed = 0;
+    result.spectral_rows_committed = 0;
 
     if (chunk_frames == 0) {
         record_failure("chunk size must be greater than zero");
@@ -1287,6 +1737,21 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
     double *out_buffer = nullptr;
     int out_channels = 0;
     AmpNodeMetrics metrics{};
+    AmpNodeOutputMetadata out_metadata{};
+    size_t pcm_write_cursor = 0;
+    int rc = 0;
+
+    auto capture_output = [&](size_t frames_produced) {
+        if (out_buffer == nullptr || out_channels <= 0 || frames_produced == 0) {
+            return;
+        }
+        const size_t frames_copied = std::min(frames_produced, result.pcm.size() - pcm_write_cursor);
+        for (size_t i = 0; i < frames_copied && (pcm_write_cursor + i) < result.pcm.size(); ++i) {
+            result.pcm[pcm_write_cursor + i] = out_buffer[i * static_cast<size_t>(out_channels)];
+        }
+        pcm_write_cursor += frames_copied;
+        result.pcm_frames_committed = std::max(result.pcm_frames_committed, pcm_write_cursor);
+    };
 
     size_t frames_processed = 0;
     size_t chunk_index = 0;
@@ -1321,6 +1786,11 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
 
         const size_t start_frame = frames_processed;
 
+        // Preallocate buffer for this chunk so the node can fill it directly.
+        out_buffer = (double *)calloc(frames_to_process, sizeof(double));
+        out_channels = 1;
+
+        out_metadata = AmpNodeOutputMetadata{};
         int rc = amp_run_node_v2(
             &descriptor,
             &inputs,
@@ -1333,10 +1803,28 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
             &state,
             nullptr,
             AMP_EXECUTION_MODE_FORWARD,
-            &metrics
+            &metrics,
+            &out_metadata
         );
 
-        if (rc != 0 && rc != AMP_E_PENDING) {
+        size_t frames_produced = 0;
+        if (out_channels > 0) {
+            if (out_metadata.samples_produced > 0U) {
+                frames_produced = out_metadata.samples_produced / static_cast<size_t>(out_channels);
+            } else if (out_metadata.frames_produced > 0U) {
+                frames_produced = out_metadata.frames_produced;
+            }
+        }
+        if ((rc == 0 || rc == 1) && frames_produced == 0) {
+            rc = AMP_E_PENDING;
+        }
+        capture_output(frames_produced);
+        if (out_buffer != nullptr) {
+            amp_free(out_buffer);
+            out_buffer = nullptr;
+        }
+
+        if (rc != 0 && rc != AMP_E_PENDING && rc != 1) {
             record_failure("amp_run_node_v2 failed rc=%d", rc);
             break;
         }
@@ -1347,45 +1835,92 @@ StreamingRunResult run_fft_node_streaming(const std::vector<double> &signal, siz
         result.call_count = chunk_index;
         result.metrics_per_call.push_back(metrics);
         result.state_allocated = result.state_allocated || (state != nullptr);
-        if (g_verbosity >= VerbosityLevel::Trace) {
-            // Dump mailbox chain right after this chunk was processed so we can
-            // conclusively observe whether nodes for this chunk were appended.
-            dump_mailbox_chain_snapshot(state, tap_buffers.data(), tap_set.count, (chunk_index > 0) ? (chunk_index - 1) : 0, start_frame);
+    }
+
+    const uint32_t streaming_real_frames = tap_buffers[0].cache_frames;
+    const uint32_t streaming_imag_frames = tap_buffers[1].cache_frames;
+    result.spectral_rows_committed = static_cast<size_t>(std::min(streaming_real_frames, streaming_imag_frames));
+
+    // Final drain after all chunks submitted: keep polling until no more output arrives
+    // or we've filled the expected PCM buffer. Avoid direct mailbox access; rely on the
+    // node to surface mailbox contents via the out_buffer path.
+    EdgeRunnerNodeInputs drain_inputs = inputs;
+    drain_inputs.audio.has_audio = 0;
+    drain_inputs.audio.frames = 0;
+    drain_inputs.audio.data = nullptr;
+
+    int32_t drain_attempts = 0;
+    while (pcm_write_cursor < result.pcm.size()) {
+        ++drain_attempts;
+        const size_t drain_frames = std::min(chunk_frames, result.pcm.size() - pcm_write_cursor);
+        emit_diagnostic(
+            "[stream-drain] cursor=%zu request=%zu remaining=%zu",
+            pcm_write_cursor,
+            drain_frames,
+            result.pcm.size() - pcm_write_cursor
+        );
+        out_buffer = (double *)calloc(drain_frames > 0 ? drain_frames : 1U, sizeof(double));
+        out_channels = 1;
+        out_metadata = AmpNodeOutputMetadata{};
+        rc = amp_run_node_v2(
+            &descriptor,
+            &drain_inputs, // no new input; request drain with taps bound
+            1,
+            1,
+            static_cast<int>(drain_frames),
+            kSampleRate,
+            &out_buffer,
+            &out_channels,
+            &state,
+            nullptr,
+            AMP_EXECUTION_MODE_FORWARD,
+            &metrics,
+            &out_metadata
+        );
+
+        size_t frames_produced = 0;
+        if (out_channels > 0) {
+            if (out_metadata.samples_produced > 0U) {
+                frames_produced = out_metadata.samples_produced / static_cast<size_t>(out_channels);
+            } else if (out_metadata.frames_produced > 0U) {
+                frames_produced = out_metadata.frames_produced;
+            }
         }
-    }
+        drain_attempts = drain_attempts - frames_produced;
+        if ((rc == 0 || rc == 1) && frames_produced == 0) {
+            rc = AMP_E_PENDING;
+        }
+        emit_diagnostic(
+            "[stream-drain] rc=%d frames_produced=%zu out_channels=%d committed=%zu/%zu",
+            rc,
+            frames_produced,
+            out_channels,
+            pcm_write_cursor,
+            result.pcm.size()
+        );
+        capture_output(frames_produced);
+        if (out_buffer != nullptr) {
+            amp_free(out_buffer);
+            out_buffer = nullptr;
+        }
+        if (pcm_write_cursor >= result.pcm.size()) {
+            emit_diagnostic("[stream-drain] pcm buffer full at cursor=%zu", pcm_write_cursor);
+            break;
 
-    // After all chunks (including the final flag), wait for mailbox chains to
-    // be ready and then copy into the legacy tap buffers for verification.
-    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[2], tap_buffers[2].tap_name, 0);
-    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[0], tap_buffers[0].tap_name, 0);
-    (void)amp_tap_cache_block_until_ready(state, &tap_buffers[1], tap_buffers[1].tap_name, 0);
+        }
+        if (drain_attempts >= g_config.frames) {
+            emit_diagnostic("[stream-drain] exceeded maximum drain attempts=%u", drain_attempts);
+            for(size_t i = 0; i < pcm_write_cursor; ++i) {
+                emit_diagnostic("[stream-drain] pcm[%zu]=%.12f", i, result.pcm[i]);
+            }
+            
+        }
 
-    const auto pcm_read = PopulateLegacyPcmFromMailbox(
-        tap_buffers[2],
-        result.pcm.data(),
-        result.pcm.size()
-    );
-    if (pcm_read.frames_committed > 0) {
-        (void)amp_mailbox_advance_pcm_cursor(state, tap_buffers[2].tap_name, pcm_read.frames_committed);
-    }
-    const auto spectral_read = PopulateLegacySpectrumFromMailbox(
-        tap_buffers[0],
-        tap_buffers[1],
-        result.spectral_real.data(),
-        result.spectral_imag.data(),
-        result.spectral_real.size()
-    );
-
-    result.pcm_frames_committed = pcm_read.frames_committed;
-    result.spectral_rows_committed = spectral_read.frames_committed;
-
-    if (out_buffer != nullptr) {
-        amp_free(out_buffer);
-        out_buffer = nullptr;
     }
 
     if (state != nullptr) {
         amp_release_state(state);
+        state = nullptr;
     }
 
     return result;
@@ -1792,6 +2327,7 @@ void require_backward_unsupported(const std::vector<double> &signal, const std::
     int out_channels = 0;
     void *state = nullptr;
     AmpNodeMetrics metrics{};
+    AmpNodeOutputMetadata out_metadata{};
 
     int rc = amp_run_node_v2(
         &descriptor,
@@ -1805,7 +2341,8 @@ void require_backward_unsupported(const std::vector<double> &signal, const std::
         &state,
         nullptr,
         AMP_EXECUTION_MODE_BACKWARD,
-        &metrics
+        &metrics,
+        &out_metadata
     );
 
     if (rc == AMP_E_PENDING) {
@@ -1858,6 +2395,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     apply_global_flags(argc, argv);
+
+    // Ensure trace runs always emit harness diagnostics even if --quiet was passed.
+    if (g_verbosity == VerbosityLevel::Trace) {
+        g_quiet = false;
+    }
     ScopedOutputSilencer quiet_silencer;
     if (g_quiet) {
         quiet_silencer.activate();
@@ -2046,6 +2588,8 @@ int main(int argc, char **argv) {
             "========================================");
     }
 
+    StreamingRunResult streaming_result{};
+    bool streaming_attempted = false;
     const bool forward_failed = g_failed;
     // If the single-shot forward pass failed, print full per-sample/per-bin
     // tables showing actual, expected and diff for every value so failures
@@ -2085,14 +2629,15 @@ int main(int argc, char **argv) {
         std::fprintf(stdout, "\n-- Persistent Spectral Mailbox Nodes --\n");
         for (size_t ni = 0; ni < first.spectral_nodes.size(); ++ni) {
             const auto &n = first.spectral_nodes[ni];
-            std::fprintf(stdout, "node[%zu] kind=%s index=%zu frame=%d slot=%d window=%d pcm_sample=% .12f bins_count=%zu\n",
+            std::fprintf(stdout, "node[%zu] kind=%s index=%zu frame=%d slot=%d window=%d fifo_kind=%d pcm_value=% .12f bins_count=%zu\n",
                          ni,
                          (n.node_kind == 0) ? "SPECTRAL" : "PCM",
                          n.index,
                          n.frame_index,
                          n.slot,
                          n.window_size,
-                         n.pcm_sample,
+                         static_cast<int>(n.fifo_kind),
+                         n.pcm_value,
                          n.spectral_real_bins.size());
             // Print bins (limit to reasonable amount)
             const size_t max_bins = static_cast<size_t>(g_config.window_size);
@@ -2105,14 +2650,15 @@ int main(int argc, char **argv) {
         std::fprintf(stdout, "\n-- Persistent PCM Mailbox Nodes --\n");
         for (size_t ni = 0; ni < first.pcm_nodes.size(); ++ni) {
             const auto &n = first.pcm_nodes[ni];
-            std::fprintf(stdout, "node[%zu] kind=%s index=%zu frame=%d slot=%d window=%d pcm_sample=% .12f\n",
+            std::fprintf(stdout, "node[%zu] kind=%s index=%zu frame=%d slot=%d window=%d fifo_kind=%d pcm_value=% .12f\n",
                          ni,
                          (n.node_kind == 0) ? "SPECTRAL" : "PCM",
                          n.index,
                          n.frame_index,
                          n.slot,
                          n.window_size,
-                         n.pcm_sample);
+                         static_cast<int>(n.fifo_kind),
+                         n.pcm_value);
         }
         std::fprintf(stdout, "===== END SINGLE-SHOT FAILURE DETAILS =====\n\n");
         std::fflush(stdout);
@@ -2129,7 +2675,8 @@ int main(int argc, char **argv) {
         // to ensure no persistent chains,-owned buffers, or other mailbox
         // artifacts survive into the streaming run.
         amp_mailbox_global_reset();
-        StreamingRunResult streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
+        streaming_result = run_fft_node_streaming(streaming_signal, g_config.streaming_chunk);
+        streaming_attempted = true;
 
         if (g_verbosity >= VerbosityLevel::Detail) {
             // Make the tail/chunk interaction explicit: this shows how many fixed-size chunks are
@@ -2263,7 +2810,8 @@ int main(int argc, char **argv) {
     quiet_silencer.restore();
     if (g_failed) {
         std::printf("test_fft_division_node: FAIL\n");
-        return 1;
+        const int exit_code = compute_failure_exit_code(first, second, streaming_result, streaming_attempted);
+        return exit_code;
     }
 
     std::printf("test_fft_division_node: PASS\n");

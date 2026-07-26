@@ -105,8 +105,19 @@ def _load_fft_interface() -> tuple[FFI, object]:
         typedef struct {
             uint32_t measured_delay_frames;
             float accumulated_heat;
-            float reserved[6];
+            double processing_time_seconds;
+            double logging_time_seconds;
+            double total_time_seconds;
+            double thread_cpu_time_seconds;
+            double reserved[6];
         } AmpNodeMetrics;
+
+        typedef struct {
+            uint32_t frames_produced;
+            uint32_t samples_produced;
+            uint32_t frames_available;
+            uint32_t samples_available;
+        } AmpNodeOutputMetadata;
 
         typedef enum {
             AMP_EXECUTION_MODE_FORWARD = 0,
@@ -125,7 +136,8 @@ def _load_fft_interface() -> tuple[FFI, object]:
             void **state,
             const EdgeRunnerControlHistory *history,
             AmpExecutionMode mode,
-            AmpNodeMetrics *metrics
+            AmpNodeMetrics *metrics,
+            AmpNodeOutputMetadata *out_metadata
         );
 
         void amp_free(double *buffer);
@@ -376,6 +388,7 @@ def test_fft_spectral_node_generates_high_resolution_spectrogram(tmp_path: Path)
     out_channels = ffi.new("int *")
     state_ptr = ffi.new("void **")
     metrics = ffi.new("AmpNodeMetrics *")
+    out_metadata = ffi.new("AmpNodeOutputMetadata *")
 
     rc = lib.amp_run_node_v2(
         descriptor,
@@ -390,6 +403,7 @@ def test_fft_spectral_node_generates_high_resolution_spectrogram(tmp_path: Path)
         ffi.NULL,
         ffi.cast("AmpExecutionMode", 1),
         metrics,
+        out_metadata,
     )
 
     try:

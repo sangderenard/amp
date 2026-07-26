@@ -192,6 +192,7 @@ std::vector<double> run_fft_backward(const GradientData &data, const std::string
     double *out_buffer = nullptr;
     int out_channels = 0;
     AmpNodeMetrics metrics{};
+    AmpNodeOutputMetadata out_metadata{};
 
     int rc = amp_run_node_v2(
         &descriptor,
@@ -205,7 +206,8 @@ std::vector<double> run_fft_backward(const GradientData &data, const std::string
         &state,
         nullptr,
         AMP_EXECUTION_MODE_BACKWARD,
-        &metrics
+        &metrics,
+        &out_metadata
     );
     if (rc != 0 || out_buffer == nullptr) {
         if (rc == AMP_E_UNSUPPORTED) {

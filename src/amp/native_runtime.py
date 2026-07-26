@@ -118,6 +118,12 @@ typedef struct {
     double thread_cpu_time_seconds;
     double reserved[6];
 } AmpNodeMetrics;
+typedef struct {
+    uint32_t frames_produced;
+    uint32_t samples_produced;
+    uint32_t frames_available;
+    uint32_t samples_available;
+} AmpNodeOutputMetadata;
 typedef enum {
     AMP_EXECUTION_MODE_FORWARD = 0,
     AMP_EXECUTION_MODE_BACKWARD = 1
@@ -234,7 +240,8 @@ int amp_run_node_v2(
     void **state,
     const EdgeRunnerControlHistory *history,
     AmpExecutionMode mode,
-    AmpNodeMetrics *metrics
+    AmpNodeMetrics *metrics,
+    AmpNodeOutputMetadata *out_metadata
 );
 int amp_native_logging_enabled(void);
 void amp_native_logging_set(int enabled);

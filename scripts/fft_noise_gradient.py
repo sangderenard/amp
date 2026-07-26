@@ -196,6 +196,7 @@ def render_with_native(
             ffi.NULL,
             ffi.cast("AmpExecutionMode", 1),  # backward mode for gradient synthesis
             metrics,
+            ffi.NULL,
         )
         if int(rc) != 0 or out_buffer[0] == ffi.NULL:
             raise RuntimeError(f"amp_run_node_v2 failed with rc={int(rc)}")

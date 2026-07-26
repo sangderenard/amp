@@ -195,6 +195,7 @@ def main():
         ffi.NULL,
         ffi.cast("AmpExecutionMode", 1),
         metrics,
+        ffi.NULL,
     )
 
     if int(rc) != 0:

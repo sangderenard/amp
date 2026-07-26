@@ -1,6 +1,7 @@
 # FFTDivisionNode Implementation Audit
 
 ## Scope and intent
+
 This audit now references the spectral workstation plan (`docs/spectral_workstation_plan.md`) and
 the spectral tensor packing ABI (`docs/spectral_packing_standard.md`). It captures the observable
 behaviour of the native `FFTDivisionNode` and documents the ongoing aggregation rewrite that
@@ -44,6 +45,12 @@ combined view.
   touching the work buffers. Non-positive window sizes are clamped to one frame, epsilon values
   are floored to `1e-12`, and a non power-of-two size automatically falls back to the slower
   direct DFT path.【F:src/native/amp_kernels.c†L4385-L4574】
+  New booleans `working_wheel_prefill_zeroes` and `working_wheel_warmup_passthrough` surface the
+  working-wheel warm-up policy directly in JSON so tests can request deterministic prefill or
+  passthrough behaviour before the tensor begins emitting FFT frames. The parser now emits
+  perfect-reconstruction (PR) warnings whenever: (a) analysis overlap falls below 0.5, (b) a
+  descriptor supplies an epsilon outside the benchmark envelope (`>1e-6`), or (c) the analysis
+  window drops under 16 frames, each logged with a unique `[FFT-PR][...]` tag.【F:src/native/nodes/fft_division/fft_division_nodes.inc†L1606-L1774】
 * **Algorithm scaffolding** – The selector now recognises `"nufft"`, `"czt"`, and
   `"dynamic"` (dynamic oscillator synthesis) in addition to the existing radix-2 FFT and
   direct DFT options. The dynamic variant bypasses the FFT entirely: each frame builds
@@ -164,6 +171,28 @@ The headless gradient harness (`test_fft_noise_gradient`) and its companion Pyth
 toggle between the FFT divider implementations (including the dynamic oscillator stub) without
 editing JSON descriptors. The flag simply injects the chosen label into the node parameters before
 invoking the native renderer.【F:scripts/fft_noise_gradient.py†L63-L86】【F:src/native/tests/test_fft_noise_gradient.cpp†L300-L363】
+
+## Sweep diagnostics
+
+* `scripts/run_fft_division_sweep.py` exercises only the native `test_fft_division_node` binary—no
+  Python fallbacks or “smoke” harnesses are permitted per the global policy. The helper exports a
+  JSON row per case capturing the canonical result type, timeout diagnostics, and two boolean
+  flags: `finished_flag` (run completed before timeout) and `quality_flag` (PASS or an active
+  timeout that still showed progress).
+* The two-bit schema forms four labelled outcomes used by automation and plotting:
+  `finished_good`, `finished_bad`, `timeout_active`, and `timeout_bad`. Any unrecognised pair is
+  recorded as `unknown_flag_combo` and should be triaged before trusting the sweep results.
+* `scripts/plot_fft_division_sweep.py` consumes the JSON and renders three panels (stacked result
+  type counts, runtime scatter, and a window/working-window heatmap). Colors follow the flag
+  combination so “good” completions, deterministic failures, and the two timeout flavours are
+  obvious at a glance.
+* The sweep driver now feeds every pending parameter permutation through an entropy-aware
+  scheduler that reprioritises the execution pool after each run. A lightweight network scores
+  the remaining cases using the observed flag entropy so testing gravitates toward “interesting”
+  regions without ever bypassing the native binary.
+* A configurable floor (`--min-execution-time`) forces each scheduled case to reserve a minimum
+  wall-clock budget. Combined with the adaptive scheduler, this keeps total runtime bounded while
+  letting the entropy heuristic decide which cases are worth spending that budget on.
 
 ## Audit observations
 

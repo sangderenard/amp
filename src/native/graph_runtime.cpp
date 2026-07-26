@@ -77,7 +77,8 @@ extern int amp_run_node_v2(
     void **state,
     const EdgeRunnerControlHistory *history,
     AmpExecutionMode mode,
-    AmpNodeMetrics *metrics
+    AmpNodeMetrics *metrics,
+    AmpNodeOutputMetadata *out_metadata
 );
 extern void amp_free(double *buffer);
 extern void amp_release_state(void *state);
@@ -202,6 +203,7 @@ struct EdgeRingContract {
     bool sample_rate_free{false};
     double sample_rate_ema_alpha{0.0};
     uint32_t sample_rate_window{0U};
+    AmpFifoValueKind value_kind{AMP_FIFO_VALUE_DOUBLE};
 };
 
 struct EdgeRing {
@@ -220,6 +222,7 @@ struct EdgeRing {
     bool sample_rate_free{false};
     double sample_rate_ema_alpha{0.0};
     uint32_t sample_rate_window{0U};
+    AmpFifoValueKind value_kind{AMP_FIFO_VALUE_DOUBLE};
 };
 
 struct EdgeReader {
@@ -253,7 +256,49 @@ struct OutputTap {
 
 struct TapOutputBuffer {
     OutputTap *tap{nullptr};
-    std::vector<double> scratch;
+    AmpFifoValueKind value_kind{AMP_FIFO_VALUE_DOUBLE};
+    std::vector<double> scratch_double;
+    std::vector<int64_t> scratch_i64;
+    std::vector<void*> scratch_ptr;
+
+    void resize(size_t count) {
+        switch (value_kind) {
+            case AMP_FIFO_VALUE_I64:
+                scratch_i64.assign(count, 0);
+                break;
+            case AMP_FIFO_VALUE_PTR:
+                scratch_ptr.assign(count, nullptr);
+                break;
+            case AMP_FIFO_VALUE_DOUBLE:
+            default:
+                scratch_double.assign(count, 0.0);
+                break;
+        }
+    }
+
+    void* data() {
+        switch (value_kind) {
+            case AMP_FIFO_VALUE_I64:
+                return scratch_i64.empty() ? nullptr : static_cast<void*>(scratch_i64.data());
+            case AMP_FIFO_VALUE_PTR:
+                return scratch_ptr.empty() ? nullptr : static_cast<void*>(scratch_ptr.data());
+            case AMP_FIFO_VALUE_DOUBLE:
+            default:
+                return scratch_double.empty() ? nullptr : static_cast<void*>(scratch_double.data());
+        }
+    }
+
+    size_t size() const {
+        switch (value_kind) {
+            case AMP_FIFO_VALUE_I64:
+                return scratch_i64.size();
+            case AMP_FIFO_VALUE_PTR:
+                return scratch_ptr.size();
+            case AMP_FIFO_VALUE_DOUBLE:
+            default:
+                return scratch_double.size();
+        }
+    }
 };
 
 struct ModConnectionInfo {
@@ -807,6 +852,19 @@ static std::string parse_string_metadata(const std::string &json, const char *ke
     return json.substr(start, pos - start);
 }
 
+static AmpFifoValueKind parse_fifo_value_kind_metadata(const std::string &json, const char *key, AmpFifoValueKind fallback) {
+    std::string value = parse_string_metadata(json, key, {});
+    if (value.empty()) return fallback;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "i64" || value == "int64" || value == "int64_t") {
+        return AMP_FIFO_VALUE_I64;
+    }
+    if (value == "ptr" || value == "pointer" || value == "void*" || value == "void_ptr") {
+        return AMP_FIFO_VALUE_PTR;
+    }
+    return AMP_FIFO_VALUE_DOUBLE;
+}
+
 static bool metadata_key_exists(const std::string &json, const char *key) {
     if (key == nullptr) return false;
     std::string needle;
@@ -1250,6 +1308,7 @@ static void runtime_initialize_edge_rings(AmpGraphRuntime *runtime, uint32_t def
             tap.ring->policy = node.vector_policy;
             tap.ring->constant = node.constant_node;
             tap.ring->contract = tap.contract;
+            tap.ring->value_kind = tap.contract.value_kind;
             tap.ring->nominal_sample_rate = tap.contract.sample_rate_hz;
             tap.ring->effective_sample_rate = tap.contract.sample_rate_hz;
             tap.ring->sample_rate_free = tap.contract.sample_rate_free;
@@ -1640,6 +1699,7 @@ static int kpn_execute_node_block(
             }
             TapOutputBuffer buffer_entry{};
             buffer_entry.tap = &tap;
+            buffer_entry.value_kind = tap.contract.value_kind;
             size_t stride = edge_ring_frame_stride(*tap.ring);
             if (stride == 0U) {
                 uint32_t batches_hint = tap.ring->storage ? tap.ring->storage->shape.batches : 1U;
@@ -1647,13 +1707,13 @@ static int kpn_execute_node_block(
                 stride = static_cast<size_t>(std::max<uint32_t>(1U, batches_hint) *
                                              std::max<uint32_t>(1U, channels_hint));
             }
-            buffer_entry.scratch.resize(static_cast<size_t>(frames) * stride);
-            std::fill(buffer_entry.scratch.begin(), buffer_entry.scratch.end(), 0.0);
+            buffer_entry.resize(static_cast<size_t>(frames) * stride);
             tap_output_buffers.push_back(std::move(buffer_entry));
 
             EdgeRunnerTapBuffer view{};
             view.tap_name = tap.name.c_str();
             view.buffer_class = tap.buffer_class.empty() ? "pcm" : tap.buffer_class.c_str();
+            view.fifo_value_kind = tap.contract.value_kind;
             if (tap.ring && tap.ring->storage) {
                 view.shape.batches = tap.ring->storage->shape.batches;
                 view.shape.channels = tap.ring->storage->shape.channels;
@@ -1663,7 +1723,7 @@ static int kpn_execute_node_block(
             }
             view.shape.frames = frames;
             view.frame_stride = stride;
-            view.data = tap_output_buffers.back().scratch.data();
+            view.data = reinterpret_cast<double*>(tap_output_buffers.back().data());
             tap_buffer_views.push_back(view);
         }
         if (!tap_buffer_views.empty()) {
@@ -1748,7 +1808,8 @@ static int kpn_execute_node_block(
             &state_arg,
             history,
             AMP_EXECUTION_MODE_FORWARD,
-            &metrics
+            &metrics,
+            nullptr
         );
         if (v2_status == AMP_E_UNSUPPORTED) {
             node.supports_v2 = false;
@@ -1849,6 +1910,8 @@ static int kpn_execute_node_block(
                 tap_buffer_views.size(), tap_output_buffers.size());
         }
         bool produced_any = false;
+        size_t pcm_rows_to_consume = 0;
+        std::unordered_map<std::string, size_t> spectral_rows_to_consume;
         if (node.expose_tap_context && state_arg != nullptr && !tap_output_buffers.empty()) {
             for (size_t ti = 0; ti < tap_buffer_views.size() && ti < tap_output_buffers.size(); ++ti) {
                 EdgeRunnerTapBuffer &tap_view = tap_buffer_views[ti];
@@ -1857,8 +1920,9 @@ static int kpn_execute_node_block(
 
                 // Stage the scratch buffer as the tap cache so the mailbox
                 // helper can copy into it.
-                size_t buf_len = outbuf.scratch.size();
-                amp_tap_cache_stage(&tap_view, outbuf.scratch.data(), buf_len,
+                size_t buf_len = outbuf.size();
+                double *stage_ptr = reinterpret_cast<double*>(outbuf.data());
+                amp_tap_cache_stage(&tap_view, stage_ptr, buf_len,
                                     tap_view.shape.batches, tap_view.shape.channels, tap_view.shape.frames);
 
                 // Resolve mailbox head for this tap (non-blocking)
@@ -1909,48 +1973,84 @@ static int kpn_execute_node_block(
                     }
                     {
                         const char * _amp_dbg = std::getenv("AMP_DEBUG_MAILBOX_DRAIN");
-                        bool _amp_dbg_allow_write = false;
+                        bool _amp_dbg_allow_write = true;
                         if (_amp_dbg) {
-                            if (std::strcmp(_amp_dbg, "2") == 0 || std::strstr(_amp_dbg, "write") != nullptr || std::strstr(_amp_dbg, "allow") != nullptr) {
-                                _amp_dbg_allow_write = true;
+                            // Optional opt-out: set AMP_DEBUG_MAILBOX_DRAIN=no-write to suppress writes for diagnostics
+                            if (std::strstr(_amp_dbg, "no-write") != nullptr) {
+                                _amp_dbg_allow_write = false;
                             }
                         }
                         if (!_amp_dbg_allow_write) {
-                            // Advance mailbox read cursor for this tap so streamer/tap
-                            // state reflects the consumption we attempted. Do this
-                            // before aborting so crash diagnostics can observe the
-                            // updated head/cursor state.
-                            {
-                                uint32_t consumed = tap_view.cache_frames > 0 ? tap_view.cache_frames : 0U;
-                                if (state_arg != nullptr) {
-                                    if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
-                                        amp_mailbox_consume_pcm_head(state_arg, static_cast<size_t>(consumed));
-                                    } else {
-                                        amp_mailbox_consume_spectral_head(state_arg, tap_view.tap_name, static_cast<size_t>(consumed));
-                                    }
+                            // Skip writing but advance mailbox cursors so state keeps moving forward.
+                            uint32_t consumed = tap_view.cache_frames > 0 ? tap_view.cache_frames : 0U;
+                            if (state_arg != nullptr) {
+                                if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
+                                    amp_mailbox_consume_pcm_head(state_arg, static_cast<size_t>(consumed));
+                                } else {
+                                    amp_mailbox_consume_spectral_head(state_arg, tap_view.tap_name, static_cast<size_t>(consumed));
                                 }
                             }
-                            abort();
+                            continue;
                         }
                     }
-                    edge_ring_write(*outbuf.tap->ring, outbuf.scratch.data(), to_write);
-                    if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
-                        fprintf(stderr, "[DRAIN-WRITE-OK] node=%s tap='%s' ring=%p wrote=%u out_free_after=%u\n",
-                            node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
-                            reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
-                            static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                    bool wrote_ring = false;
+                    if (tap_view.fifo_value_kind == AMP_FIFO_VALUE_DOUBLE) {
+                        edge_ring_write(*outbuf.tap->ring, reinterpret_cast<double*>(outbuf.data()), to_write);
+                        if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                            fprintf(stderr, "[DRAIN-WRITE-OK] node=%s tap='%s' ring=%p wrote=%u out_free_after=%u\n",
+                                node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                                reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
+                                static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                        }
+                        wrote_ring = true;
+                        runtime_node_record_debug_frame(
+                            node,
+                            std::max<uint32_t>(1U, tap_view.shape.batches),
+                            std::max<uint32_t>(1U, tap_view.shape.channels),
+                            to_write
+                        );
+                    } else {
+                        if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                            fprintf(stderr, "[DRAIN-WRITE-SKIP] node=%s tap='%s' kind=%d skipped_ring_write\n",
+                                node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                                static_cast<int>(tap_view.fifo_value_kind));
+                        }
                     }
-                    produced_any = true;
-                    runtime_node_record_debug_frame(
-                        node,
-                        std::max<uint32_t>(1U, tap_view.shape.batches),
-                        std::max<uint32_t>(1U, tap_view.shape.channels),
-                        to_write
-                    );
+                    if (wrote_ring) {
+                        produced_any = true;
+                        size_t rows_to_consume = static_cast<size_t>(to_write);
+                        if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
+                            pcm_rows_to_consume = (std::max)(pcm_rows_to_consume, rows_to_consume);
+                        } else {
+                            std::string tap_name = (tap_view.tap_name && tap_view.tap_name[0] != '\0')
+                                ? std::string(tap_view.tap_name)
+                                : std::string("spectral_0");
+                            auto it = spectral_rows_to_consume.find(tap_name);
+                            if (it == spectral_rows_to_consume.end()) {
+                                spectral_rows_to_consume.emplace(std::move(tap_name), rows_to_consume);
+                            } else if (rows_to_consume > it->second) {
+                                it->second = rows_to_consume;
+                            }
+                        }
+                    }
                 }
 
                 // Mark read to allow mailbox to free any owned staging buffers
                 amp_tap_cache_mark_read(&tap_view);
+            }
+        }
+
+        // Once mailbox content has been written to rings, drop consumed nodes
+        // from the persistent chains so later drains advance instead of
+        // re-reading the same entries.
+        if (state_arg != nullptr) {
+            if (pcm_rows_to_consume > 0) {
+                amp_mailbox_consume_pcm_head(state_arg, pcm_rows_to_consume);
+            }
+            for (const auto &kv : spectral_rows_to_consume) {
+                if (!kv.first.empty() && kv.second > 0) {
+                    amp_mailbox_consume_spectral_head(state_arg, kv.first.c_str(), kv.second);
+                }
             }
         }
 
@@ -2004,7 +2104,9 @@ static int kpn_execute_node_block(
         for (TapOutputBuffer &buffer_entry : tap_output_buffers) {
             abort();
             if (!buffer_entry.tap || !buffer_entry.tap->ring) continue;
-            edge_ring_write(*buffer_entry.tap->ring, buffer_entry.scratch.data(), frames);
+            if (buffer_entry.value_kind == AMP_FIFO_VALUE_DOUBLE) {
+                edge_ring_write(*buffer_entry.tap->ring, reinterpret_cast<double*>(buffer_entry.data()), frames);
+            }
         }
     }
 
@@ -2639,6 +2741,7 @@ static bool parse_node_blob(AmpGraphRuntime *runtime, const uint8_t *blob, size_
         node->output_contract.sample_rate_free = parse_bool_metadata(node->params_json, "fifo_sample_rate_free", false);
         node->output_contract.sample_rate_ema_alpha = parse_double_metadata(node->params_json, "fifo_sample_rate_ema_alpha", 0.0);
         node->output_contract.sample_rate_window = parse_uint_metadata(node->params_json, "fifo_sample_rate_window", 0U);
+        node->output_contract.value_kind = parse_fifo_value_kind_metadata(node->params_json, "fifo_value_kind", AMP_FIFO_VALUE_DOUBLE);
         uint32_t primary_consumer_index = parse_uint_metadata(
             node->params_json,
             "fifo_primary_consumer",
@@ -3517,6 +3620,7 @@ static int execute_runtime_with_history_impl(
                 }
                 TapOutputBuffer buffer_entry{};
                 buffer_entry.tap = &tap;
+                buffer_entry.value_kind = tap.contract.value_kind;
                 uint32_t tap_batches = tap.declared_shape.batches > 0U
                     ? tap.declared_shape.batches
                     : std::max<uint32_t>(1U, node.channel_hint);
@@ -3526,18 +3630,18 @@ static int execute_runtime_with_history_impl(
                         ? tap.ring->storage->shape.channels
                         : std::max<uint32_t>(1U, node.channel_hint));
                 size_t stride = static_cast<size_t>(tap_batches) * tap_channels;
-                buffer_entry.scratch.resize(static_cast<size_t>(frames) * stride);
-                std::fill(buffer_entry.scratch.begin(), buffer_entry.scratch.end(), 0.0);
+                buffer_entry.resize(static_cast<size_t>(frames) * stride);
                 tap_output_buffers.push_back(std::move(buffer_entry));
 
                 EdgeRunnerTapBuffer view{};
                 view.tap_name = tap.name.c_str();
                 view.buffer_class = tap.buffer_class.empty() ? "pcm" : tap.buffer_class.c_str();
+                view.fifo_value_kind = tap.contract.value_kind;
                 view.shape.batches = tap_batches;
                 view.shape.channels = tap_channels;
                 view.shape.frames = frames;
                 view.frame_stride = stride;
-                view.data = tap_output_buffers.back().scratch.data();
+                view.data = reinterpret_cast<double*>(tap_output_buffers.back().data());
                 tap_buffer_views.push_back(view);
             }
             if (!tap_buffer_views.empty()) {
@@ -3592,7 +3696,8 @@ static int execute_runtime_with_history_impl(
                 &state_arg,
                 history_view,
                 AMP_EXECUTION_MODE_FORWARD,
-                &frame_metrics
+                &frame_metrics,
+                nullptr
             );
             if (v2_status == AMP_E_UNSUPPORTED) {
                 node.supports_v2 = false;
@@ -3699,14 +3804,17 @@ static int execute_runtime_with_history_impl(
             }
                 // Attempt to drain persistent-mailbox taps into rings (non-blocking)
                 bool produced_any = false;
+                size_t pcm_rows_to_consume = 0;
+                std::unordered_map<std::string, size_t> spectral_rows_to_consume;
                 if (node.expose_tap_context && state_arg != nullptr && !tap_output_buffers.empty()) {
                     for (size_t ti = 0; ti < tap_buffer_views.size() && ti < tap_output_buffers.size(); ++ti) {
                         EdgeRunnerTapBuffer &tap_view = tap_buffer_views[ti];
                         TapOutputBuffer &outbuf = tap_output_buffers[ti];
                         if (!outbuf.tap || !outbuf.tap->ring) continue;
 
-                        size_t buf_len = outbuf.scratch.size();
-                        amp_tap_cache_stage(&tap_view, outbuf.scratch.data(), buf_len,
+                        size_t buf_len = outbuf.size();
+                        double *stage_ptr = reinterpret_cast<double*>(outbuf.data());
+                        amp_tap_cache_stage(&tap_view, stage_ptr, buf_len,
                                             tap_view.shape.batches, tap_view.shape.channels, tap_view.shape.frames);
 
                         if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
@@ -3739,35 +3847,78 @@ static int execute_runtime_with_history_impl(
                             }
                             {
                                 const char * _amp_dbg = std::getenv("AMP_DEBUG_MAILBOX_DRAIN");
-                                bool _amp_dbg_allow_write = false;
+                                bool _amp_dbg_allow_write = true;
                                 if (_amp_dbg) {
-                                    if (std::strcmp(_amp_dbg, "2") == 0 || std::strstr(_amp_dbg, "write") != nullptr || std::strstr(_amp_dbg, "allow") != nullptr) {
-                                        _amp_dbg_allow_write = true;
+                                    if (std::strstr(_amp_dbg, "no-write") != nullptr) {
+                                        _amp_dbg_allow_write = false;
                                     }
                                 }
-                                abort();
-                                // The following code is removed to simplify the abort logic
-                                // if (!_amp_dbg_allow_write) {
-                                //     abort();
-                                // }
+                                if (!_amp_dbg_allow_write) {
+                                    uint32_t consumed = tap_view.cache_frames > 0 ? tap_view.cache_frames : 0U;
+                                    if (state_arg != nullptr) {
+                                        if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
+                                            amp_mailbox_consume_pcm_head(state_arg, static_cast<size_t>(consumed));
+                                        } else {
+                                            amp_mailbox_consume_spectral_head(state_arg, tap_view.tap_name, static_cast<size_t>(consumed));
+                                }
                             }
-                            edge_ring_write(*outbuf.tap->ring, outbuf.scratch.data(), to_write);
-                            if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
-                                fprintf(stderr, "[DRAIN-WRITE-OK] node=%s tap='%s' ring=%p wrote=%u out_free_after=%u\n",
+                            continue;
+                        }
+                    }
+                            bool wrote_ring = false;
+                            if (tap_view.fifo_value_kind == AMP_FIFO_VALUE_DOUBLE) {
+                                edge_ring_write(*outbuf.tap->ring, reinterpret_cast<double*>(outbuf.data()), to_write);
+                                if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                                    fprintf(stderr, "[DRAIN-WRITE-OK] node=%s tap='%s' ring=%p wrote=%u out_free_after=%u\n",
+                                            node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
+                                            reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
+                                            static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                                }
+                                wrote_ring = true;
+                                runtime_node_record_debug_frame(
+                                    node,
+                                    std::max<uint32_t>(1U, tap_view.shape.batches),
+                                    std::max<uint32_t>(1U, tap_view.shape.channels),
+                                    to_write
+                                );
+                            } else {
+                                if (std::getenv("AMP_DEBUG_MAILBOX_DRAIN")) {
+                                    fprintf(stderr, "[DRAIN-WRITE-SKIP] node=%s tap='%s' kind=%d skipped_ring_write\n",
                                         node.name.c_str(), tap_view.tap_name ? tap_view.tap_name : "(null)",
-                                        reinterpret_cast<void *>(outbuf.tap->ring.get()), to_write,
-                                        static_cast<unsigned int>(edge_ring_free(*outbuf.tap->ring)));
+                                        static_cast<int>(tap_view.fifo_value_kind));
+                                }
                             }
-                            produced_any = true;
-                            runtime_node_record_debug_frame(
-                                node,
-                                std::max<uint32_t>(1U, tap_view.shape.batches),
-                                std::max<uint32_t>(1U, tap_view.shape.channels),
-                                to_write
-                            );
+                            if (wrote_ring) {
+                                produced_any = true;
+                                size_t rows_to_consume = static_cast<size_t>(to_write);
+                                if (tap_view.buffer_class && std::strcmp(tap_view.buffer_class, "pcm") == 0) {
+                                    pcm_rows_to_consume = (std::max)(pcm_rows_to_consume, rows_to_consume);
+                                } else {
+                                    std::string tap_name = (tap_view.tap_name && tap_view.tap_name[0] != '\0')
+                                        ? std::string(tap_view.tap_name)
+                                        : std::string("spectral_0");
+                                    auto it = spectral_rows_to_consume.find(tap_name);
+                                    if (it == spectral_rows_to_consume.end()) {
+                                        spectral_rows_to_consume.emplace(std::move(tap_name), rows_to_consume);
+                                    } else if (rows_to_consume > it->second) {
+                                        it->second = rows_to_consume;
+                                    }
+                                }
+                            }
                         }
 
                         amp_tap_cache_mark_read(&tap_view);
+                    }
+                }
+
+                if (state_arg != nullptr) {
+                    if (pcm_rows_to_consume > 0) {
+                        amp_mailbox_consume_pcm_head(state_arg, pcm_rows_to_consume);
+                    }
+                    for (const auto &kv : spectral_rows_to_consume) {
+                        if (!kv.first.empty() && kv.second > 0) {
+                            amp_mailbox_consume_spectral_head(state_arg, kv.first.c_str(), kv.second);
+                        }
                     }
                 }
 

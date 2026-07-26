@@ -64,8 +64,19 @@ def _load_native_interface() -> tuple[FFI, object]:
         typedef struct {
             uint32_t measured_delay_frames;
             float accumulated_heat;
-            float reserved[6];
+            double processing_time_seconds;
+            double logging_time_seconds;
+            double total_time_seconds;
+            double thread_cpu_time_seconds;
+            double reserved[6];
         } AmpNodeMetrics;
+
+        typedef struct {
+            uint32_t frames_produced;
+            uint32_t samples_produced;
+            uint32_t frames_available;
+            uint32_t samples_available;
+        } AmpNodeOutputMetadata;
 
         typedef enum {
             AMP_EXECUTION_MODE_FORWARD = 0,
@@ -84,7 +95,8 @@ def _load_native_interface() -> tuple[FFI, object]:
             void **state,
             const EdgeRunnerControlHistory *history,
             AmpExecutionMode mode,
-            AmpNodeMetrics *metrics
+            AmpNodeMetrics *metrics,
+            AmpNodeOutputMetadata *out_metadata
         );
 
         void amp_free(double *buffer);
@@ -189,6 +201,7 @@ def _run_native_node(
     out_channels = ffi.new("int *")
     state_ptr = ffi.new("void **")
     metrics = ffi.new("AmpNodeMetrics *")
+    out_metadata = ffi.new("AmpNodeOutputMetadata *")
 
     try:
         rc = lib.amp_run_node_v2(
@@ -202,9 +215,10 @@ def _run_native_node(
             out_channels,
             state_ptr,
             ffi.NULL,
-            ffi.cast("AmpExecutionMode", mode),
-            metrics,
-        )
+        ffi.cast("AmpExecutionMode", mode),
+        metrics,
+        out_metadata,
+    )
         if int(rc) != 0 or out_buffer[0] == ffi.NULL:
             raise RuntimeError(f"amp_run_node_v2 failed for {type_name} with rc={int(rc)}")
         total = int(out_channels[0]) * frames

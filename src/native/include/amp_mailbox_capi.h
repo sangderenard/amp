@@ -20,6 +20,8 @@ void amp_mailbox_attach_spectral_node(void* state, const char* tap_name, AmpMail
 
 // Create/append PCM node to per-state PCM chain
 AmpMailboxNode amp_mailbox_create_pcm_node(double value, int frame_index);
+AmpMailboxNode amp_mailbox_create_pcm_node_i64(int64_t value, int frame_index);
+AmpMailboxNode amp_mailbox_create_pcm_node_ptr(void* value, int frame_index);
 void amp_mailbox_append_pcm_node(void* state, AmpMailboxNode node);
 
 // Cursor helpers
@@ -71,6 +73,10 @@ int amp_mailbox_node_frame_index(AmpMailboxNode node);
 // PCM helpers
 int amp_mailbox_node_is_pcm(AmpMailboxNode node);
 double amp_mailbox_node_pcm_sample(AmpMailboxNode node);
+int amp_mailbox_node_fifo_kind(AmpMailboxNode node);
+double amp_mailbox_node_as_double(AmpMailboxNode node);
+int64_t amp_mailbox_node_as_i64(AmpMailboxNode node);
+void* amp_mailbox_node_as_ptr(AmpMailboxNode node);
 // Iterator helper: get the next node in the chain (or NULL)
 AmpMailboxNode amp_mailbox_node_next(AmpMailboxNode node);
 // Returns 1 if node is spectral (non-PCM)

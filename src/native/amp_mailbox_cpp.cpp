@@ -4,6 +4,7 @@
 #include "amp_native_mailbox_chain.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -31,7 +32,11 @@ static std::unordered_map<void*, struct MailboxStateWrapper*> g_states;
 // tap is marked READ, at which point mailbox will free them. If the tap
 // is marked ACCEPTED the caller is assumed to take ownership and mailbox
 // will not free the buffer.
-static std::unordered_map<EdgeRunnerTapBuffer*, double*> g_owned_cache_buffers;
+struct OwnedCacheBuffer {
+    void* ptr{nullptr};
+    AmpFifoValueKind kind{AMP_FIFO_VALUE_DOUBLE};
+};
+static std::unordered_map<EdgeRunnerTapBuffer*, OwnedCacheBuffer> g_owned_cache_buffers;
 
 using namespace amp::tests::fft_division_shared;
 
@@ -51,6 +56,79 @@ struct MailboxStateWrapper {
     size_t total_spectral_appends{0};
     size_t total_pcm_appends{0};
 };
+
+static AmpFifoValueKind tap_fifo_kind(const EdgeRunnerTapBuffer* tap) {
+    if (!tap) return AMP_FIFO_VALUE_DOUBLE;
+    switch (tap->fifo_value_kind) {
+        case AMP_FIFO_VALUE_I64:
+            return AMP_FIFO_VALUE_I64;
+        case AMP_FIFO_VALUE_PTR:
+            return AMP_FIFO_VALUE_PTR;
+        case AMP_FIFO_VALUE_DOUBLE:
+        default:
+            return AMP_FIFO_VALUE_DOUBLE;
+    }
+}
+
+static AmpFifoValueKind mailbox_node_fifo_kind(const PersistentMailboxNode* node) {
+    if (!node) return AMP_FIFO_VALUE_DOUBLE;
+    return ToAmpFifoValueKind(node->fifo_value_kind);
+}
+
+static double mailbox_value_as_double(const PersistentMailboxNode* node) {
+    if (!node || node->node_kind != PersistentMailboxNode::NodeKind::PCM) return 0.0;
+    switch (mailbox_node_fifo_kind(node)) {
+        case AMP_FIFO_VALUE_I64:
+            return static_cast<double>(node->fifo_value.as_i64);
+        case AMP_FIFO_VALUE_PTR:
+            return 0.0;
+        case AMP_FIFO_VALUE_DOUBLE:
+        default:
+            return node->fifo_value.as_double;
+    }
+}
+
+static int64_t mailbox_value_as_i64(const PersistentMailboxNode* node) {
+    if (!node || node->node_kind != PersistentMailboxNode::NodeKind::PCM) return 0;
+    switch (mailbox_node_fifo_kind(node)) {
+        case AMP_FIFO_VALUE_DOUBLE:
+            return static_cast<int64_t>(node->fifo_value.as_double);
+        case AMP_FIFO_VALUE_PTR:
+            return static_cast<int64_t>(reinterpret_cast<intptr_t>(node->fifo_value.as_ptr));
+        case AMP_FIFO_VALUE_I64:
+        default:
+            return node->fifo_value.as_i64;
+    }
+}
+
+static void* mailbox_value_as_ptr(const PersistentMailboxNode* node) {
+    if (!node || node->node_kind != PersistentMailboxNode::NodeKind::PCM) return nullptr;
+    switch (mailbox_node_fifo_kind(node)) {
+        case AMP_FIFO_VALUE_PTR:
+            return node->fifo_value.as_ptr;
+        case AMP_FIFO_VALUE_I64:
+            return reinterpret_cast<void*>(static_cast<intptr_t>(node->fifo_value.as_i64));
+        case AMP_FIFO_VALUE_DOUBLE:
+        default:
+            return nullptr;
+    }
+}
+
+static void free_owned_cache_buffer(const OwnedCacheBuffer& owned) {
+    if (!owned.ptr) return;
+    switch (owned.kind) {
+        case AMP_FIFO_VALUE_I64:
+            delete [] reinterpret_cast<int64_t*>(owned.ptr);
+            break;
+        case AMP_FIFO_VALUE_PTR:
+            delete [] reinterpret_cast<void**>(owned.ptr);
+            break;
+        case AMP_FIFO_VALUE_DOUBLE:
+        default:
+            delete [] reinterpret_cast<double*>(owned.ptr);
+            break;
+    }
+}
 
 static size_t expected_nodes_for_tap(const EdgeRunnerTapBuffer* tap) {
     if (!tap) return 0;
@@ -166,6 +244,11 @@ void amp_mailbox_append_node_to_tap(EdgeRunnerTapBuffer* tap_buf, AmpMailboxNode
 
 extern "C" AMP_CAPI int amp_tap_cache_stage(EdgeRunnerTapBuffer* tap, double* buffer, size_t buffer_len, uint32_t batches, uint32_t channels, uint32_t frames) {
     if (!tap) return -1;
+    if (tap->fifo_value_kind != AMP_FIFO_VALUE_DOUBLE &&
+        tap->fifo_value_kind != AMP_FIFO_VALUE_I64 &&
+        tap->fifo_value_kind != AMP_FIFO_VALUE_PTR) {
+        tap->fifo_value_kind = AMP_FIFO_VALUE_DOUBLE;
+    }
     tap->cache_data = buffer;
     tap->cache_buffer_len = buffer_len;
     tap->cache_batches = batches;
@@ -181,7 +264,7 @@ extern "C" AMP_CAPI int amp_tap_cache_stage(EdgeRunnerTapBuffer* tap, double* bu
 }
 
 // Copy up to the capacity of the staged cache from the mailbox chain into
-// the staged buffer. Returns number of doubles written, or negative on error.
+// the staged buffer. Returns number of elements written, or negative on error.
 extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) {
     if (!tap) return -1;
     if (!tap->cache_data) return -2; // no buffer staged
@@ -234,11 +317,29 @@ extern "C" AMP_CAPI int amp_tap_cache_fill_from_chain(EdgeRunnerTapBuffer* tap) 
             }
             ++frames_written;
         } else if (cur->node_kind == PersistentMailboxNode::NodeKind::PCM) {
-            if (written + 1 <= capacity) {
-                tap->cache_data[written++] = cur->pcm_sample;
-            } else {
+            if (written + 1 > capacity) {
                 break;
             }
+            const AmpFifoValueKind tap_kind = tap_fifo_kind(tap);
+            switch (tap_kind) {
+                case AMP_FIFO_VALUE_I64: {
+                    auto *dst = reinterpret_cast<int64_t*>(tap->cache_data);
+                    dst[written] = mailbox_value_as_i64(cur);
+                    break;
+                }
+                case AMP_FIFO_VALUE_PTR: {
+                    auto **dst = reinterpret_cast<void**>(tap->cache_data);
+                    dst[written] = mailbox_value_as_ptr(cur);
+                    break;
+                }
+                case AMP_FIFO_VALUE_DOUBLE:
+                default: {
+                    tap->cache_data[written] = mailbox_value_as_double(cur);
+                    break;
+                }
+            }
+            ++written;
+            ++frames_written; // Treat each PCM sample as one frame for cache readiness accounting.
         } else {
             fprintf(stderr, "[MAILBOX-ERROR] amp_tap_cache_fill_from_chain: unknown node kind encountered\n");
             abort();
@@ -386,20 +487,31 @@ extern "C" AMP_CAPI int amp_tap_cache_block_until_ready(
         size_t frames = static_cast<size_t>(std::max<uint32_t>(1U, tap->shape.frames));
         size_t buf_len = stride * frames;
         if (buf_len > 0) {
-            double *buf = nullptr;
+            void *buf = nullptr;
             try {
-                buf = new double[buf_len]();
+                switch (tap_fifo_kind(tap)) {
+                    case AMP_FIFO_VALUE_I64:
+                        buf = new int64_t[buf_len]();
+                        break;
+                    case AMP_FIFO_VALUE_PTR:
+                        buf = new void*[buf_len]();
+                        break;
+                    case AMP_FIFO_VALUE_DOUBLE:
+                    default:
+                        buf = new double[buf_len]();
+                        break;
+                }
             } catch (...) {
                 buf = nullptr;
             }
             if (buf != nullptr) {
-                tap->cache_data = buf;
+                tap->cache_data = reinterpret_cast<double*>(buf);
                 tap->cache_buffer_len = buf_len;
                 tap->cache_batches = tap->shape.batches;
                 tap->cache_channels = tap->shape.channels;
                 tap->cache_frames = tap->shape.frames > 0 ? tap->shape.frames : static_cast<uint32_t>(frames);
                 tap->cache_state = 0; // staged but empty
-                g_owned_cache_buffers[tap] = buf;
+                g_owned_cache_buffers[tap] = OwnedCacheBuffer{buf, tap_fifo_kind(tap)};
                 auto _now_alloc = std::chrono::steady_clock::now();
                 long long _alloc_ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(_now_alloc - _start_time).count());
                 MAILBOX_DIAG("[TAP-ALLOC] t=%lldms tap_name='%s' tap=%p buf=%p len=%zu mailbox_owned=1\n",
@@ -480,8 +592,7 @@ extern "C" AMP_CAPI void amp_tap_cache_mark_read(EdgeRunnerTapBuffer* tap) {
         std::lock_guard<std::mutex> lock(g_states_mtx);
         auto it = g_owned_cache_buffers.find(tap);
         if (it != g_owned_cache_buffers.end()) {
-            double *ptr = it->second;
-            delete [] ptr;
+            free_owned_cache_buffer(it->second);
             g_owned_cache_buffers.erase(it);
             tap->cache_data = nullptr;
             tap->cache_buffer_len = 0;
@@ -537,7 +648,17 @@ void amp_mailbox_attach_spectral_node(void* state, const char* tap_name, AmpMail
 }
 
 AmpMailboxNode amp_mailbox_create_pcm_node(double value, int frame_index) {
-    auto* node = new PersistentMailboxNode(value, frame_index);
+    auto* node = new PersistentMailboxNode(value, frame_index, PersistentMailboxNode::FifoValueKind::FIFO_DOUBLE);
+    return reinterpret_cast<AmpMailboxNode>(node);
+}
+
+AmpMailboxNode amp_mailbox_create_pcm_node_i64(int64_t value, int frame_index) {
+    auto* node = new PersistentMailboxNode(value, frame_index, PersistentMailboxNode::FifoValueKind::FIFO_I64);
+    return reinterpret_cast<AmpMailboxNode>(node);
+}
+
+AmpMailboxNode amp_mailbox_create_pcm_node_ptr(void* value, int frame_index) {
+    auto* node = new PersistentMailboxNode(value, frame_index, PersistentMailboxNode::FifoValueKind::FIFO_PTR);
     return reinterpret_cast<AmpMailboxNode>(node);
 }
 
@@ -618,6 +739,8 @@ extern "C" AMP_CAPI int amp_mailbox_consume_pcm_head(void* state, size_t count) 
     }
     w->pcm_mailbox_chain.head = cur;
     if (!w->pcm_mailbox_chain.head) w->pcm_mailbox_chain.tail = nullptr;
+    // Ensure the per-state cursor never points at freed nodes; advance it to the new head.
+    w->pcm_read_cursor = w->pcm_mailbox_chain.head;
     w->pcm_count = EdgeRunnerTapMailboxChain::count_nodes(w->pcm_mailbox_chain.head);
     MAILBOX_DIAG("[MAILBOX-CONSUME-PCM] state=%p removed=%zu new_head=%p pcm_count=%zu\n",
         state, removed, reinterpret_cast<void*>(w->pcm_mailbox_chain.head), w->pcm_count);
@@ -779,10 +902,23 @@ int amp_mailbox_node_is_pcm(AmpMailboxNode node) {
 }
 
 double amp_mailbox_node_pcm_sample(AmpMailboxNode node) {
-    PersistentMailboxNode* n = reinterpret_cast<PersistentMailboxNode*>(node);
-    if (!n) return 0.0;
-    if (n->node_kind == PersistentMailboxNode::NodeKind::PCM) return n->pcm_sample;
-    return 0.0;
+    return mailbox_value_as_double(reinterpret_cast<PersistentMailboxNode*>(node));
+}
+
+int amp_mailbox_node_fifo_kind(AmpMailboxNode node) {
+    return static_cast<int>(mailbox_node_fifo_kind(reinterpret_cast<PersistentMailboxNode*>(node)));
+}
+
+double amp_mailbox_node_as_double(AmpMailboxNode node) {
+    return mailbox_value_as_double(reinterpret_cast<PersistentMailboxNode*>(node));
+}
+
+int64_t amp_mailbox_node_as_i64(AmpMailboxNode node) {
+    return mailbox_value_as_i64(reinterpret_cast<PersistentMailboxNode*>(node));
+}
+
+void* amp_mailbox_node_as_ptr(AmpMailboxNode node) {
+    return mailbox_value_as_ptr(reinterpret_cast<PersistentMailboxNode*>(node));
 }
 
 #endif
@@ -855,8 +991,7 @@ extern "C" AMP_CAPI void amp_mailbox_global_reset(void) {
 
     // Free any mailbox-owned cache buffers
     for (auto &kv : g_owned_cache_buffers) {
-        double *ptr = kv.second;
-        if (ptr) delete [] ptr;
+        free_owned_cache_buffer(kv.second);
     }
     g_owned_cache_buffers.clear();
 }
